@@ -33,7 +33,10 @@ def main():
         gh("release", "create", tag, "-R", REPO, "--draft", "--verify-tag",
            "--title", f"Dauerbot {manifest['version']}", "--notes-file", str(directory / "release-notes.md"))
     gh("release", "upload", tag, "-R", REPO, "--clobber", *(str(directory / name) for name in names))
-    release = json.loads(gh("api", f"repos/{REPO}/releases/tags/{tag}"))
+    # GitHub's tag endpoint does not resolve draft releases. gh resolves the
+    # draft first, and its API URL addresses the release by its numeric ID.
+    api_url = json.loads(gh("release", "view", tag, "-R", REPO, "--json", "apiUrl"))["apiUrl"]
+    release = json.loads(gh("api", api_url))
     assets = {asset["name"]: asset for asset in release["assets"]}
     for name in names:
         expected = "sha256:" + hashlib.sha256((directory / name).read_bytes()).hexdigest()

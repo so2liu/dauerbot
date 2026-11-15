@@ -1,43 +1,45 @@
-# 更新记录
+# Changelog
+
+## 0.3.1 — 2026-11-15
+
+### Changed
+
+- Adopt English for project documentation, repository metadata, native desktop copy, CLI help, errors, MCP instructions, commit messages, and pull requests.
+- Remove the legacy Svelte interface, browser tests, embedded web assets, unused web-only endpoints and refresh notifications, and JavaScript build dependencies. The desktop and release builds now use Rust directly.
+- Make `hfb ui` open the native desktop application.
+- Remove the unused group-discovery permission from onboarding; incoming private and group messages still reach the bot's fixed project.
+
+### Fixed
+
+- Resolve draft releases by numeric ID before validating uploaded asset digests. GitHub's release-by-tag endpoint returned 404 during the first signing run, so 0.3.0 remained a draft.
 
 ## 0.3.0 — 2026-11-15
 
-### 新增
+### Added
 
-- 原生「应用更新」页和 `hfb update`：自动检查、下载并安装、稳定与预览通道、手动更新、重启桌面及回退上一版。
-- 每 6 小时检查 GitHub Releases，后台下载和替换，下次启动启用新版；支持关闭自动升级。
-- Ed25519 更新清单签名、SHA-256、Apple Team、bundle ID、版本和架构校验；解压目录限制及同盘替换、失败回滚。
-- main 上的版本 tag 自动触发签名发版，完整产物校验通过后才公开 Release；发版凭证独立保存在 Dauerbot CI 中。
+- Native App Updates page and `hfb update` commands for checks, downloads, installation, channels, restart, and rollback.
+- Automatic checks at startup and every six hours while the desktop is open. Background replacement takes effect on the next launch.
+- Ed25519 manifest signatures, SHA-256, Apple Team, bundle ID, version, and architecture checks, with restricted extraction and same-volume replacement.
+- Tag-triggered releases for commits on main. Publish only after complete assets pass checksum validation.
 
-### 修复
+### Fixed
 
-- 本地后台连接恢复后清除过期红色错误；后台退出后自动重启，无需重新打开桌面。
-- 本机 CLI、MCP、桌面控制请求绕过外部代理；外部更新下载支持已有环境和系统代理。
-- 升级后安全切换独立 daemon，保留 HERDR 终端、项目数据及 MCP 会话。
-- 指定独立数据目录时，窗口标题和页面显示独立实例标识及实际路径，避免将空白测试实例误认为原有配置丢失。
+- Clear stale local-service errors after reconnection and restart an exited daemon automatically.
+- Bypass external proxies for local desktop, CLI, and MCP control requests; support existing proxies for external update downloads.
+- Preserve project data, HERDR terminals, and MCP sessions when changing daemon versions.
+- Label independent data directories in the window title and page so test instances cannot be mistaken for missing user data.
 
-`v0.2.0` 用户需手动安装此版一次，之后可使用自动升级。此版仍使用 Apple Development 签名，尚未完成 Apple 公证。
+Version 0.2.0 requires one manual installation of an updater-enabled release. Packages use Apple Development signing and have not completed Apple notarization. The first 0.3.0 CI run built and signed successfully but stopped at draft publication; 0.3.1 fixes that step.
 
 ## 0.2.0 — 2026-11-15
 
-首次开源预览，仓库为 `so2liu/dauerbot`，采用 MIT 许可证。
+Initial open-source preview under the MIT license.
 
-### 新增
+- Native Rust/GPUI macOS app with Feishu bot setup, credential validation, and selected-path permission checks.
+- Independent Rust daemon, CLI, and MCP server; the daemon keeps working when the desktop closes.
+- One Feishu bot bound to one project with a switchable active CLI. Private and group messages share the same main session.
+- HERDR-hosted Codex, Claude Code, Pi, and Antigravity sessions, visible in Herdr App.
+- Markdown and file tools with explicit recipients, delivery deduplication, and preserved uncertain results.
+- Fixed initial message routing, inherited proxy settings, group-only XML metadata in direct messages, and incompatible native session settings after CLI switches.
 
-- GPUI 原生 macOS 应用，提供飞书机器人创建引导、凭证检查、目录与数据库访问检测。
-- 独立 Rust daemon、`hfb` CLI 和 MCP；关闭桌面窗口后后台继续运行。
-- 飞书私聊和群聊统一接入：一个机器人固定绑定一个项目，可切换当前智能体。
-- 通过 HERDR 托管 Codex、Claude Code、Pi 和 Antigravity 持久主会话，可在 Herdr App 监控或接管。
-- MCP 支持 Markdown、附件和显式 `to`，入站 XML 包含消息来源，发送请求支持去重及不确定结果保留。
-
-### 修复
-
-- 首条消息早于项目创建、陌生私聊与新群聊未关联时，自动投递到机器人所属项目。
-- 补传已有标准代理配置，避免 HERDR 子进程因网络环境缺失出现模型初始化错误。
-- 私聊 XML 省略不适用的群元数据；切换 CLI 时清理不兼容的原生会话和参数。
-
-### 发布说明
-
-桌面显示名称改为 Dauerbot，内部 CLI、bundle ID 和数据目录保持兼容。已有用户无需重新配置机器人。
-
-当前提供 Apple Silicon 预览安装包；开发证书签名不等于 Developer ID 分发签名，尚未完成 Apple 公证。Intel 和最低 macOS 兼容版本尚未验收。
+The visible name changed to Dauerbot while the internal executable names, bundle ID, and data directory stayed compatible. Apple Silicon preview only; Intel and minimum macOS compatibility remain unverified.

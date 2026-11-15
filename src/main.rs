@@ -13,7 +13,7 @@ use tokio::io::AsyncReadExt;
 #[command(
     name = "hfb",
     version,
-    about = "HERDR 飞书项目桥接：daemon、CLI、MCP 与本地管理界面"
+    about = "Dauerbot: native desktop, daemon, CLI, and MCP for Feishu and HERDR"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -23,9 +23,9 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
-    /// 初始化本机私有数据目录
+    /// Initialize the private local data directory
     Init,
-    /// 在前台运行 daemon，可交给 launchd/systemd 托管
+    /// Run the daemon in the foreground (or use launchd/systemd)
     Serve {
         #[arg(long)]
         port: Option<u16>,
@@ -36,38 +36,38 @@ enum Commands {
         #[arg(long, hide = true)]
         feishu_base: Option<String>,
     },
-    /// 查看 daemon、飞书与项目状态
+    /// Show daemon, Feishu, and project status
     Status,
-    /// 打开本地管理界面
+    /// Open the native Dauerbot desktop application
     Ui,
-    /// 项目管理
+    /// Manage projects
     Project {
         #[command(subcommand)]
         command: Projects,
     },
-    /// 主会话管理
+    /// Manage main sessions
     Session {
         #[command(subcommand)]
         command: Sessions,
     },
-    /// 消息管理
+    /// Manage messages
     Message {
         #[command(subcommand)]
         command: Messages,
     },
-    /// 飞书凭证管理（secret 从 stdin 读取）
+    /// Manage Feishu credentials (read the secret from stdin)
     Feishu {
         #[command(subcommand)]
         command: Feishu,
     },
-    /// MCP stdio 服务，通常由主 CLI 自动启动
+    /// Run the MCP stdio server, normally started by the agent CLI
     Mcp {
         #[arg(long)]
         credentials: PathBuf,
     },
-    /// 打印本机用户服务配置
+    /// Print a local user-service configuration
     Service,
-    /// 检查、安装或配置签名桌面更新
+    /// Check, install, or configure signed desktop updates
     Update {
         #[command(subcommand)]
         command: Updates,
@@ -142,7 +142,7 @@ enum Sessions {
     Attach {
         project: String,
     },
-    /// 切换项目的当前智能体，保留机器人、项目和消息队列
+    /// Switch the active agent while preserving the bot, project, and queues
     Switch {
         project: String,
         #[arg(long)]
@@ -203,11 +203,11 @@ impl Client {
         let response = request
             .send()
             .await
-            .context("daemon 不可用；请先运行 hfb serve")?;
+            .context("Daemon unavailable; run hfb serve first")?;
         let status = response.status();
         let v: Value = response.json().await?;
         if !status.is_success() {
-            bail!("{}", v["error"].as_str().unwrap_or("操作失败"));
+            bail!("{}", v["error"].as_str().unwrap_or("Operation failed"));
         }
         Ok(v)
     }
@@ -215,12 +215,12 @@ impl Client {
         let state = self.request("GET", "/state", None).await?;
         state["projects"]
             .as_array()
-            .context("无项目列表")?
+            .context("Missing project list")?
             .iter()
             .find(|p| p["id"] == key || p["name"] == key)
             .and_then(|p| p["id"].as_str())
             .map(str::to_owned)
-            .context("项目不存在")
+            .context("Project not found")
     }
 }
 fn print(v: &Value) {
@@ -241,7 +241,28 @@ async fn main() -> Result<()> {
     }
     let dir = cli.data_dir.unwrap_or_else(config::default_dir);
     config::private_dir(&dir)?;
-    let dir = std::fs::canonicalize(dir).context("无法解析数据目录")?;
+    let dir = std::fs::canonicalize(dir).context("Cannot resolve the data directory")?;
+    if let Commands::Ui = cli.command {
+        let desktop = std::env::current_exe()?
+            .parent()
+            .context("Cannot locate the application directory")?
+            .join("HerdrBridge");
+        if !desktop.is_file() {
+            bail!(
+                "Native desktop executable not found; launch Dauerbot.app or run scripts/build-desktop.sh"
+            );
+        }
+        // Let the desktop choose a free port when this directory is new.
+        std::process::Command::new(&desktop)
+            .arg("--data-dir")
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        print(&json!({"opened":desktop}));
+        return Ok(());
+    }
     if let Commands::Update { command } = cli.command {
         use herdr_feishu_bridge::update::{self, Preferences, Status};
         let mut prefs = Preferences::load(&dir)?;
@@ -292,13 +313,13 @@ async fn main() -> Result<()> {
                     if let Updates::Install { app } = command {
                         let app = app
                             .or_else(update::bundle)
-                            .context("请通过 --app 指定已安装的 Dauerbot.app")?;
+                            .context("Specify the installed Dauerbot.app with --app")?;
                         update::install(
                             &client,
                             &dir,
                             &app,
                             &release,
-                            |p| eprintln!("下载更新：{p}%"),
+                            |p| eprintln!("Downloading update: {p}%"),
                             false,
                         )
                         .await?;
@@ -340,20 +361,24 @@ async fn main() -> Result<()> {
             .create(true)
             .truncate(false)
             .open(dir.join("daemon.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock).context("此数据目录已有 daemon 在运行")?;
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .context("A daemon is already running for this data directory")?;
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port))
             .await
-            .context("管理端口被占用")?;
+            .context("The management port is already in use")?;
         cfg.save(&dir)?;
         let app = App::new(dir.clone(), cfg.clone())?;
         app.workers();
         eprintln!(
-            "Herdr Feishu Bridge {} · {} · 数据目录 {}",
+            "Dauerbot {} · {} · data directory {}",
             env!("CARGO_PKG_VERSION"),
             cfg.url(),
             dir.display()
         );
-        eprintln!("运行 hfb --data-dir '{}' ui 打开管理界面", dir.display());
+        eprintln!(
+            "Run hfb --data-dir '{}' ui to open the native desktop",
+            dir.display()
+        );
         let shutdown = app.shutdown.clone();
         let stop = app.shutdown.clone();
         let signal = async move {
@@ -387,11 +412,6 @@ async fn main() -> Result<()> {
     let value=match cli.command{
         Commands::Init=>json!({"data_dir":dir,"url":cfg.url()}),
         Commands::Status=>client.request("GET","/state",None).await?,
-        Commands::Ui=>{
-            client.request("GET","/state",None).await?;
-            webbrowser::open(&format!("{}/#token={}",cfg.url(),cfg.token))?;
-            json!({"opened":cfg.url()})
-        }
         Commands::Project{command}=>match command{
             Projects::List=>client.request("GET","/state",None).await?["projects"].clone(),
             Projects::Add{name,path,agent,chat_id,native_session,args}=>client.request("POST","/projects",Some(json!({"name":name,"path":path,"agent":agent,"chat_id":chat_id,"native_session":native_session,"extra_args":args}))).await?,
@@ -403,7 +423,7 @@ async fn main() -> Result<()> {
                 let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/pause"),Some(json!({"paused":false}))).await?
             }
             Projects::Remove{project,yes}=>{
-                if !yes{bail!("删除项目会清除消息记录，但不删除代码；确认后添加 --yes");}
+                if !yes{bail!("Removing a project deletes its message history, but not code. Add --yes to confirm.");}
                 let id=client.id(&project).await?;client.request("DELETE",&format!("/projects/{id}"),None).await?
             }
         },
@@ -416,12 +436,12 @@ async fn main() -> Result<()> {
             if let Sessions::Attach{project}=command{
                 let id=client.id(&project).await?;
                 let p=client.request("GET",&format!("/projects/{id}"),None).await?;
-                let terminal=p["project"]["terminal"].as_str().context("项目没有主会话")?;
+                let terminal=p["project"]["terminal"].as_str().context("The project has no main session")?;
                 let status=herdr_feishu_bridge::herdr::command(&cfg)
                     .args(["attach",terminal])
                     .stdin(std::process::Stdio::inherit()).stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit())
                     .status().await?;
-                if !status.success(){bail!("终端接管结束，hc 返回 {}",status);}
+                if !status.success(){bail!("Terminal attach ended; hc returned {}",status);}
                 return Ok(())
             }
             let (project,operation)=match command{
@@ -441,7 +461,7 @@ async fn main() -> Result<()> {
         },
         Commands::Feishu{command}=>match command{
             Feishu::Set{app_id}=>{
-                eprintln!("从 stdin 读取 app secret（不会输出或写入命令参数）");
+                eprintln!("Reading the app secret from stdin (never logged or added to command arguments)");
                 let mut secret=String::new();tokio::io::stdin().read_to_string(&mut secret).await?;
                 let v=client.request("PUT","/settings",Some(json!({"app_id":app_id,"app_secret":secret.trim()}))).await?;
                 secret.clear();v
@@ -456,7 +476,7 @@ async fn main() -> Result<()> {
             println!("[Unit]\nDescription=HERDR Feishu Bridge\nAfter=network-online.target\n\n[Service]\nExecStart=\"{}\" --data-dir \"{}\" serve\nRestart=on-failure\n\n[Install]\nWantedBy=default.target",exe.display(),dir.display());
             return Ok(())
         }
-        Commands::Serve{..}|Commands::Mcp{..}|Commands::Update{..}=>unreachable!(),
+        Commands::Serve{..}|Commands::Mcp{..}|Commands::Update{..}|Commands::Ui=>unreachable!(),
     };
     print(&value);
     Ok(())

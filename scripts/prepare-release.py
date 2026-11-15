@@ -35,8 +35,6 @@ def main():
         with (ROOT / name).open("rb") as source:
             if tomllib.load(source)["package"]["version"] != version:
                 raise ValueError(f"{name}: package version differs from tag")
-    if json.loads((ROOT / "frontend/package.json").read_text())["version"] != version:
-        raise ValueError("Frontend version differs from tag")
     app = ROOT / "dist/Dauerbot.app"
     with (app / "Contents/Info.plist").open("rb") as source:
         info = plistlib.load(source)
@@ -81,13 +79,15 @@ def main():
     (output / "SHA256SUMS").write_text("".join(f"{digest(path)}  {path.name}\n" for path in public))
     changelog = (ROOT / "CHANGELOG.md").read_text()
     section = re.search(rf"^## {re.escape(version)}[^\n]*\n(.*?)(?=^## |\Z)", changelog, re.M | re.S)
-    notes = section[1].strip() if section else "详见仓库 CHANGELOG.md。"
+    notes = section[1].strip() if section else "See CHANGELOG.md in the repository."
     (output / "release-notes.md").write_text(
         f"Dauerbot {version}\n\n{notes}\n\n"
-        "下载 Apple Silicon zip，解压后拖入 Applications。需先安装 HERDR Core（hc）和已登录的 Agent CLI。\n\n"
-        "此安装包已签名，但尚未完成 Apple 公证。macOS 可能阻止直接打开；开发证书不等于 Developer ID 分发验收。\n\n"
-        "已有自动升级版会校验更新清单签名、SHA-256、Apple Team 与 bundle ID；"
-        "后台替换应用，下次打开生效。更新不结束 HERDR 中的主会话。\n"
+        "Download the Apple Silicon zip, extract it, and move the app to Applications. "
+        "Install HERDR Core (hc) and sign in to your Agent CLI first.\n\n"
+        "This package is signed but not Apple-notarized. macOS may block opening it; "
+        "an Apple Development certificate does not establish Developer ID distribution acceptance.\n\n"
+        "Updater-enabled clients verify the manifest signature, SHA-256, Apple Team, and bundle ID. "
+        "The app updates in the background and takes effect on next launch without ending the HERDR session.\n"
     )
     print(f"Prepared {version}: {package.stat().st_size} bytes; signed update manifest.")
 

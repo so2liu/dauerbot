@@ -36,14 +36,14 @@ pub struct Ack {
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct Markdown {
-    /// 飞书聊天 ID oc_…（群聊或私聊）或用户 Open ID ou_…；由 Agent 选择回复目的地。
+    /// Feishu chat ID oc_... (group or direct) or user Open ID ou_...; the agent chooses the recipient.
     pub to: String,
     pub text: String,
     pub request_id: String,
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct File {
-    /// 飞书聊天 ID oc_…（群聊或私聊）或用户 Open ID ou_…。
+    /// Feishu chat ID oc_... (group or direct) or user Open ID ou_....
     pub to: String,
     pub path: String,
     pub request_id: String,
@@ -62,17 +62,22 @@ impl BridgeMcp {
             .json(&body)
             .send()
             .await
-            .context("无法连接 Bridge daemon")?;
+            .context("Cannot connect to the Dauerbot daemon")?;
         let status = response.status();
         let result: Value = response.json().await?;
         if !status.is_success() {
-            bail!("{}", result["error"].as_str().unwrap_or("Bridge 操作失败"));
+            bail!(
+                "{}",
+                result["error"]
+                    .as_str()
+                    .unwrap_or("Dauerbot operation failed")
+            );
         }
         Ok(result)
     }
     async fn ready(&self, native: &str) -> Result<Value> {
         let terminal = std::env::var("HC_TERMINAL_ID")
-            .context("未继承 HERDR 终端身份；Codex 请使用 --no-daemon")?;
+            .context("HERDR terminal identity is missing; use --no-daemon with Codex")?;
         self.post("ready",json!({"generation":self.credentials.generation,"terminal":terminal,"native_session":native})).await
     }
 }
@@ -96,7 +101,7 @@ fn result(value: Result<Value>, must_sent: bool) -> Result<CallToolResult, Error
 #[tool_router]
 impl BridgeMcp {
     #[tool(
-        description = "登记当前主会话已就绪。启动后先调用；如知道原生会话 ID 请提供，以便精确恢复。"
+        description = "Register the current main session as ready. Call this first after startup; provide the native session ID when known to support exact recovery."
     )]
     async fn session_ready(
         &self,
@@ -115,7 +120,7 @@ impl BridgeMcp {
         result(self.ready(&native).await, false)
     }
     #[tool(
-        description = "确认收到指定飞书 message_id。每条 <feishu_message> 到达后先调用，防止重复或乱序。"
+        description = "Acknowledge receipt of a Feishu message_id. Call this first for every incoming <feishu_message> to preserve queue order."
     )]
     async fn ack_message(
         &self,
@@ -128,7 +133,7 @@ impl BridgeMcp {
         )
     }
     #[tool(
-        description = "向 to 指定的飞书聊天或用户发送 Markdown。to 由你决定，oc_ 开头是群或私聊聊天 ID，ou_ 开头是用户 Open ID，无须回复原聊天。request_id 每次新消息唯一，重试同一内容和目的地复用；只有 status=sent 才表示成功。"
+        description = "Send Markdown to the Feishu chat or user selected in to. Use oc_ for chat IDs or ou_ for user Open IDs; replies may go to a different destination. Use a unique request_id for each message and reuse it only for retries with the same content and recipient. Only status=sent confirms success."
     )]
     async fn send_markdown(
         &self,
@@ -144,7 +149,7 @@ impl BridgeMcp {
         )
     }
     #[tool(
-        description = "向 to 指定的飞书聊天或用户发送本地附件（最大100MB）。to 为 oc_ 聊天 ID 或 ou_ 用户 Open ID，由你决定。路径须在项目目录或Bridge缓存内。新文件使用新的request_id。"
+        description = "Send a local file up to 100 MB to the recipient selected in to (oc_ chat ID or ou_ user Open ID). The file must be inside the project directory or Dauerbot cache. Use a new request_id for each new file request."
     )]
     async fn send_file(
         &self,
@@ -164,14 +169,14 @@ impl BridgeMcp {
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("你是飞书项目主会话。先 session_ready，收到用户消息先 ack_message；请使用 send_markdown/send_file 向用户回复，必填 to 由你决定，填 oc_ 聊天 ID 或 ou_ 用户 Open ID，可以与来源不同。不将仅在终端显示结果当作已送达。")
+            .with_instructions("You are the project's Feishu main session. Call session_ready first and ack_message for incoming messages. Reply with send_markdown or send_file, choosing the mandatory to field (oc_ chat ID or ou_ user Open ID) according to user intent. It may differ from the source. Terminal output alone does not deliver a reply.")
     }
 }
 pub async fn serve(path: &Path) -> Result<()> {
     let credentials: Credentials = serde_json::from_slice(&std::fs::read(path)?)?;
     let url = reqwest::Url::parse(&credentials.url)?;
     if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
-        bail!("MCP 凭证只能连接本机 daemon");
+        bail!("MCP credentials may connect only to a local daemon");
     }
     let server = BridgeMcp {
         credentials,
@@ -192,7 +197,7 @@ pub async fn serve(path: &Path) -> Result<()> {
     }
     if !registered {
         bail!(
-            "无法登记主终端身份，拒绝向其他终端提供此项目的飞书工具。请确认 daemon 可用、HC_TERMINAL_ID 正确，且 Codex 使用 --no-daemon"
+            "Cannot register the main terminal identity. Refusing to expose this project's tools to another terminal. Check daemon availability, HC_TERMINAL_ID, and Codex --no-daemon."
         );
     }
     server

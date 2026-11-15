@@ -10,9 +10,6 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -22,12 +19,6 @@ jobs:
           workspaces: |
             . -> desktop/target
             desktop -> target
-      - name: Install pnpm from packageManager
-        run: npm install --global pnpm@12.6.0
-      - name: Check frontend
-        run: |
-          pnpm --dir frontend install --frozen-lockfile
-          pnpm --dir frontend check
       - name: Build native application
         run: ./scripts/build-desktop.sh
       - name: Backend tests and lint

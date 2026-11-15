@@ -63,9 +63,9 @@ pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("无法启动 hc connect；请先安装 herdr-core")?;
+        .context("Cannot start hc connect; install herdr-core first")?;
     let result = tokio::time::timeout(Duration::from_secs(100), async {
-        let input = child.stdin.as_mut().context("hc stdin 不可用")?;
+        let input = child.stdin.as_mut().context("hc stdin is unavailable")?;
         input
             .write_all(
                 format!(
@@ -76,7 +76,8 @@ pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> 
             )
             .await?;
         input.flush().await?;
-        let mut lines = BufReader::new(child.stdout.take().context("hc stdout 不可用")?).lines();
+        let mut lines =
+            BufReader::new(child.stdout.take().context("hc stdout is unavailable")?).lines();
         while let Some(line) = lines.next_line().await? {
             let v: Value = serde_json::from_str(&line)?;
             if v["id"] != 1 {
@@ -85,7 +86,7 @@ pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> 
             if let Some(error) = v.get("error") {
                 return Err(RpcFailure {
                     kind: error["data"]["kind"].as_str().unwrap_or("error").into(),
-                    message: error["message"].as_str().unwrap_or("调用失败").into(),
+                    message: error["message"].as_str().unwrap_or("RPC failed").into(),
                     hint: error["data"]["hint"].as_str().unwrap_or("").into(),
                 }
                 .into());
@@ -96,10 +97,10 @@ pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> 
         if let Some(stderr) = child.stderr.take() {
             let _ = stderr.take(8192).read_to_string(&mut detail).await;
         }
-        bail!("hc connect 提前结束：{}", detail.trim())
+        bail!("hc connect exited early: {}", detail.trim())
     })
     .await
-    .context("HERDR 调用超时，投递结果可能不确定")?;
+    .context("HERDR request timed out; delivery may be uncertain")?;
     let _ = child.kill().await;
     result
 }
@@ -130,21 +131,23 @@ pub async fn subscribe(
 
 pub fn check_identity(p: &Project, t: &Value) -> Result<()> {
     if t["state"] != "live" {
-        bail!("主会话已退出，请恢复会话");
+        bail!("The main session exited; resume it before continuing");
     }
     if t["labels"]["hfb.project"] != p.id || t["labels"]["hfb.generation"] != p.generation {
-        bail!("HERDR 终端标签不匹配，已停止投递");
+        bail!("HERDR terminal labels do not match; delivery stopped");
     }
     if t["pid"].as_i64() != p.terminal_pid || p.terminal_pid.is_none() {
-        bail!("终端进程已改变，请重新绑定会话");
+        bail!("Terminal process changed; reconnect the session");
     }
-    let argv = t["argv"].as_array().context("无法核对终端程序")?;
+    let argv = t["argv"]
+        .as_array()
+        .context("Cannot verify the terminal program")?;
     let program = argv.first().and_then(Value::as_str).unwrap_or("");
     if matches!(
         Path::new(program).file_name().and_then(|s| s.to_str()),
         Some("sh" | "bash" | "zsh" | "fish" | "nu" | "pwsh")
     ) {
-        bail!("终端已回到 shell，拒绝自动投递");
+        bail!("The terminal returned to a shell; refusing automatic delivery");
     }
     Ok(())
 }
@@ -224,21 +227,23 @@ pub fn launch_args(
                     .replace("{instructions}", instructions)
             })
             .collect(),
-        _ => bail!("不支持的 Agent"),
+        _ => bail!("Unsupported agent"),
     };
     if p.agent != "custom" {
         argv.extend(p.extra_args.clone());
     }
     if resume {
         if p.native_session.is_empty() {
-            bail!("请先填写 CLI 原生会话 ID/路径，再执行恢复");
+            bail!("Provide the CLI's native session ID or path before resuming");
         }
         match p.agent.as_str() {
             "codex" => argv.extend(["resume".into(), p.native_session.clone()]),
             "claude" => argv.extend(["--resume".into(), p.native_session.clone()]),
             "pi" => argv.extend(["--session".into(), p.native_session.clone()]),
             "agy" => argv.extend(["--conversation".into(), p.native_session.clone()]),
-            _ => bail!("该 Agent 请通过自定义 argv 指定恢复参数，或重新绑定已有终端"),
+            _ => bail!(
+                "Use custom argv to supply this agent's resume arguments, or reconnect an existing terminal"
+            ),
         }
     }
     if p.agent != "custom" {
@@ -254,25 +259,25 @@ pub fn launch_args(
 pub fn merge_mcp(path: &Path, entry: &Value) -> Result<()> {
     let mut cfg: Value = if path.exists() {
         serde_json::from_slice(&std::fs::read(path)?)
-            .context("现有 MCP 配置不是合法 JSON，未覆盖")?
+            .context("Existing MCP configuration is not valid JSON; left unchanged")?
     } else {
         json!({})
     };
     if !cfg.is_object() {
-        bail!("MCP 配置根节点必须为对象");
+        bail!("The MCP configuration root must be an object");
     }
     if cfg.get("mcpServers").is_none() {
         cfg["mcpServers"] = json!({});
     }
     let servers = cfg["mcpServers"]
         .as_object_mut()
-        .context("mcpServers 必须为对象")?;
+        .context("mcpServers must be an object")?;
     if let Some(old) = servers.get("herdr_feishu") {
         let ours = old["args"]
             .as_array()
             .is_some_and(|args| args.iter().any(|v| v == "mcp"));
         if !ours {
-            bail!("已有同名 herdr_feishu MCP 服务，未覆盖");
+            bail!("A different herdr_feishu MCP entry already exists; left unchanged");
         }
     }
     servers.insert("herdr_feishu".into(), entry.clone());

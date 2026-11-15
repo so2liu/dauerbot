@@ -1,28 +1,141 @@
 # Dauerbot
 
-原生 macOS 项目工作台，把飞书机器人对话连接到 HERDR 托管的持久 CLI 主会话。桌面界面由 Rust / GPUI 绘制，Rust daemon、CLI 和 MCP 共用同一套业务逻辑。Svelte 页面保留为辅助管理入口。
+A native macOS workspace that connects Feishu bot conversations to persistent CLI agents managed by HERDR. Built with Rust and GPUI, with an independent daemon shared by the desktop app, CLI, and MCP server.
 
-一个飞书机器人对应一个项目和一个当前智能体，私聊与群聊都能进入同一主会话。支持 Codex、Claude Code、Pi 和 Antigravity；使用本机 CLI 已有账号与模型配置，不代理模型接口。你可以在 Herdr App 里监控和接管真实终端。
+One bot belongs to one project with one active agent. Direct messages and group messages reach the same main session; the agent chooses where to send its replies. Dauerbot supports Codex, Claude Code, Pi, and Antigravity through their installed CLIs and existing account and model settings. You can watch and take over the real terminal in Herdr App. Dauerbot does not proxy model APIs.
 
-## 安装
+## Install
 
-从 [GitHub Releases](https://github.com/so2liu/dauerbot/releases) 下载 Apple Silicon 安装包，解压后将 `Dauerbot.app` 拖入 Applications。先安装并登录你准备使用的 Agent CLI，以及 HERDR Core 的 `hc`；若需图形化监控，安装 Herdr App。
+Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. Install HERDR Core (`hc`) and sign in to the Agent CLI you want to use. Install Herdr App to monitor interactive terminals.
 
-当前版本提供开发证书签名的预览包，尚未完成 Developer ID 签名与 Apple 公证，macOS 可能阻止直接打开。不要将它视作已通过 Gatekeeper 分发验收的正式安装包。仅验证过 Apple Silicon 构建，尚未验证 Intel 或最低兼容系统版本。
+Current packages use an Apple Development certificate and have not completed Apple notarization. macOS may block opening them; this is not Developer ID distribution or Gatekeeper acceptance. Intel builds and the minimum supported macOS version have not been verified.
 
-项目采用 MIT 许可证。Dauerbot 是独立项目，与 HERDR、飞书及各 CLI 厂商没有官方隶属关系。
+Dauerbot uses the MIT license. It is an independent project with no official affiliation with HERDR, Feishu, or the CLI vendors.
 
-关闭桌面窗口不影响后台工作。重启 Bridge 不重建 Agent 会话；退出桌面应用也不会主动结束 HERDR 中的终端。
+## Connect your bot
 
-## 自动升级与发版
+The native app guides you through creating an enterprise custom app in the Feishu developer console, enabling its bot capability, and saving its App ID and App Secret locally. A group Webhook bot cannot provide the required two-way messaging.
 
-从包含升级器的版本开始，原生客户端在启动时及每 6 小时检查 GitHub Releases。默认使用稳定通道，自动下载、校验并替换应用；当前桌面和主会话继续运行，下次打开桌面启用新版，也可在「应用更新」点击「立即重启桌面」。新桌面会等待旧 daemon 完成请求，再启动同一数据目录的新 daemon，不结束 HERDR 中的 Agent 或现有 MCP 进程。
+Import the permission JSON supplied by the app, select long connections for event delivery, subscribe to `im.message.receive_v1`, and publish the app. The full permission set receives all group messages; the basic set receives group mentions. Add the bot to a group, or message it directly. Credential validation proves the app's identity; it does not prove that event permissions work.
 
-「应用更新」提供手动检查、下载并安装、关闭自动升级、切换稳定/预览通道及回退上一版。关闭自动升级不妨碍手动更新。预览通道也接受预发布版本；按语义版本选择最高版本，不依赖 GitHub 的发布时间或 Latest 标记。关闭桌面后 daemon 仍工作，下次打开时再检查应用更新。
+Create a project by choosing a directory and an Agent CLI. The first project becomes the bot's fixed owner. You do not need a chat ID or a separate chat-binding step. Messages received before project creation stay queued. Additional local projects do not share this bot's messages or sending permissions.
 
-升级器验证内置 Ed25519 公钥签署的 `update.json`、安装包大小和 SHA-256、Apple Team、bundle ID、应用版本与架构。解压拒绝路径越界及符号链接。通过全部检查后，在应用同一磁盘上替换并保留一份旧应用；替换或新 CLI 启动校验失败会恢复旧版本。开发构建、ad-hoc 签名和不可写目录不会被悄悄替换。安装目录不可写时，请手动将应用移至自己的 Applications 目录。
+Switch the active CLI in the workspace or with `hfb session switch`. This stops the old agent and starts a new main session while preserving the project, bot binding, and queues. You can also try local tasks before connecting Feishu.
 
-`v0.2.0` 没有升级器，需手动安装带升级器的新版本一次。CLI 也可管理升级：
+Avoid running another long-connection listener for the same Feishu app: the platform distributes events between listeners, so another program may receive the message instead.
+
+## Native desktop and local data
+
+The desktop renders native GPUI controls. There is no browser interface, WebView, Node.js runtime, or frontend build step. Closing the app leaves its daemon and HERDR agent running.
+
+Dauerbot checks only the project folders or SQLite files you select. Database checks read schema metadata rather than business records. Full Disk Access is optional and must be granted in System Settings to the application that actually performs the task. Granting access to Dauerbot does not automatically grant it to an existing HERDR or Agent process. Normal operation does not require Accessibility or Screen Recording.
+
+The internal desktop executable remains `HerdrBridge`, the CLI is `hfb`, and the bundle ID remains `dev.herdr.feishu-bridge` so upgrades preserve existing settings and messages. On macOS, the default data directory is `~/Library/Application Support/dev.herdr.feishu-bridge`. `hfb init` prints the platform's actual directory. Unix directories use mode 0700 and configuration files use 0600. Credentials currently use local files protected by these permissions, not Keychain.
+
+The desktop chooses an available loopback port on first setup; CLI commands read the same configuration. The daemon's management API uses a random bearer token and binds only to IPv4 loopback. Do not expose it directly to the public Internet.
+
+Use `--data-dir` for an independent instance. Its window shows an independent-instance label and the actual path:
+
+```sh
+open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
+```
+
+Use a separate data directory when selecting a different Core session, so saved terminal addresses cannot refer to the wrong Core instance.
+
+## Build and develop
+
+Install Rust and Xcode on macOS. The dependency lockfiles define the exact Rust dependencies. HERDR Core 0.1.20 has been verified locally; a compatible version must provide the same terminal protocol.
+
+```sh
+./scripts/build-desktop.sh
+open "dist/Dauerbot.app"
+
+# Build only the standalone daemon and CLI.
+./scripts/build.sh
+./target/release/hfb serve
+```
+
+The desktop package includes `hfb` beside `HerdrBridge`. The bundled `hfb ui` opens the native desktop; a standalone CLI reports a missing desktop executable instead of opening a browser. `hfb serve` runs in the foreground and handles SIGINT/SIGTERM. `hfb service` prints a launchd or systemd user-service template without installing it. Regenerate that template if you move the executable or data directory.
+
+Local builds use an ad-hoc signature. To sign with an existing certificate, run `./scripts/build-desktop.sh "Signing Identity"`; `scripts/sign-macos.sh` also accepts an optional keychain path. These scripts do not export private keys.
+
+```sh
+cargo test --locked --release --target-dir desktop/target --tests
+cargo test --locked --release --manifest-path desktop/Cargo.toml
+cargo clippy --locked --release --target-dir desktop/target --all-targets -- -D warnings
+cargo clippy --locked --release --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
+python3 scripts/smoke.py --binary "$PWD/desktop/target/release/hfb"
+```
+
+The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, and daemon/Core restarts. `--real-pi` or `--real-agent codex|claude` uses your locally configured account for a real model turn and may incur usage charges. Test artifacts stay in ignored directories.
+
+Live sending is opt-in: `tests/live_feishu.rs` reads `.local/live.json` with `app_id`, `app_secret`, and `chat_id`. Run `cargo test --test live_feishu -- --ignored` only for an explicitly selected bot and recipient, then remove the temporary credentials. It sends a test Markdown message and a small file without opening a competing event listener.
+
+## CLI and HERDR sessions
+
+```sh
+hfb project add my-project --path /absolute/path/to/repo --agent codex
+hfb project list
+hfb session start my-project
+hfb session screen my-project
+hfb session attach my-project
+hfb message inject my-project 'Review this project and send the result to Feishu'
+hfb session switch my-project --agent agy
+hfb project pause my-project
+hfb project unpause my-project
+hfb session stop my-project
+hfb session resume my-project
+```
+
+`--data-dir` is a global argument. For an isolated daemon, use `hfb --data-dir /absolute/private-data serve --port 49322 --core-session my-bridge`.
+
+Dauerbot preserves native CLI account, model, provider, and reasoning settings. It does not invent model flags. It forwards existing standard proxy variables to HERDR child processes without copying unrelated model or account variables. As configured for this project, Codex uses `--dangerously-bypass-approvals-and-sandbox`, Claude Code and Antigravity use `--dangerously-skip-permissions`, and Pi uses `--approve` for project files. Pi extensions can still enforce their own approval rules.
+
+A main session is a real CLI process in HERDR. The default Core session can appear in a Herdr App tab; an isolated Core session must use CLI attach to avoid opening an unrelated terminal with the same address. Press `Ctrl+\` to detach. Login and permission prompts remain visible in HERDR. Dauerbot confirms recognized Antigravity project-trust prompts only after matching the project path, PID, generation, structured trust state, and selected Yes option; other blocked states retain the queue.
+
+| CLI | MCP configuration | Native resume |
+| --- | --- | --- |
+| Codex | Dedicated launch configuration with `--no-daemon`; forwards HERDR terminal identity | `codex resume`, using the session registered through MCP metadata or a supplied ID |
+| Claude Code | Project-specific `--mcp-config` | A new UUID for a new session; `--resume` for recovery |
+| Pi | Merges `herdr_feishu` into `.pi/mcp.json` | `--session` |
+| Antigravity (`agy`) | Merges `.agents/mcp_config.json`; `-i` submits the initial interactive prompt | `--conversation` |
+
+Configuration merges preserve other MCP entries and reject invalid JSON or an entry belonging to a different project. Ignore generated local configuration in the target project. Custom CLI argument arrays run without a shell and can use `{mcp_config}`, `{credentials}`, `{bridge_exe}`, and `{instructions}`. Per-session credentials live under `sessions/<project>/<generation>/` and cannot administer other projects.
+
+## Messages and MCP
+
+The managed CLI starts `hfb mcp --credentials <private-file>` automatically.
+
+| Tool | Arguments | Purpose |
+| --- | --- | --- |
+| `session_ready` | Optional `native_session` | Verify the terminal and process generation, then register readiness |
+| `ack_message` | `message_id` | Confirm receipt and unblock the next incoming message |
+| `send_markdown` | `to`, `text`, `request_id` | Send Markdown to the chosen chat or user |
+| `send_file` | `to`, `path`, `request_id` | Stream a local file, up to 100 MB |
+
+`to` is mandatory for MCP sends: `oc_…` identifies a chat and `ou_…` a user Open ID. The agent follows user intent and may reply somewhere other than the source chat. Reuse `request_id` only when retrying the same content and destination. Only `status=sent` means the API confirmed the send. Files must resolve inside the project or Dauerbot cache; symlinks cannot escape those directories.
+
+Incoming messages use an escaped XML envelope with source IDs, sender, body, attachments, mentions, and thread context. Group messages include a bounded member snapshot when available. Direct messages omit group-only `<chat>` and `<members>` elements; they do not emit `not_applicable` placeholders. Missing group permissions produce `status="unavailable"` without blocking the message. User text remains untrusted input, even inside XML.
+
+SQLite stores incoming and outgoing messages. Incoming events persist before SDK acknowledgment and deduplicate by project and platform message ID. Each project's queue waits for the agent's explicit acknowledgment before delivering the next message.
+
+| Status | Meaning |
+| --- | --- |
+| `queued` | Saved and waiting for a ready, idle main session |
+| `submitting` / `submitted` | Writing to the terminal / waiting for acknowledgment |
+| `acknowledged` | The agent confirmed receipt; the task may still be running |
+| `pending` / `sending` / `sent` | Outbound waiting / sending / API-confirmed |
+| `failed` | A definite failure allows an informed retry |
+| `uncertain` | Verify the result before retrying |
+| `dismissed` | Manually excluded from blocking delivery |
+
+Restarts preserve uncertain operations instead of blindly resending. PTY input and Feishu have no atomic transaction, so Dauerbot does not promise exactly-once delivery. It checks Core labels, PID, generation, and program identity before typing; exited agents and replacement shells do not receive queued tasks.
+
+## Updates and releases
+
+The native app checks GitHub Releases at startup and every six hours while open. The stable channel accepts stable versions; preview also accepts prereleases. Selection uses semantic version order, not upload time or the Latest badge. Automatic updates download and replace the app in the background; the current desktop and HERDR agent keep running until you restart the desktop. The new desktop safely reconnects to a daemon using the same data directory.
+
+App Updates supports manual checks, installation, disabling automatic updates, channel selection, and rollback. Rollback pauses automatic updates so the reverted version stays installed. Version 0.2.0 requires one manual installation of an updater-enabled version.
 
 ```sh
 hfb update status
@@ -35,272 +148,19 @@ hfb update channel stable
 hfb update rollback
 ```
 
-发版采用 tag 触发，参考 Magpie 的校验、替换和回滚流程；当前无需单独的 releases 仓库或更新服务器。更新来自 `so2liu/dauerbot`，CI 凭证留在该仓库的 Actions secrets：
+The updater verifies the Ed25519-signed manifest, size, SHA-256, Apple Team, bundle ID, version, and architecture. It rejects unsafe archive paths and symlinks. Same-volume replacement retains one old bundle and restores it if replacement or CLI validation fails. Ad-hoc and development builds cannot silently replace themselves; the installed bundle must already have a trusted signature and a writable parent directory.
 
-- `APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_TEAM_ID`：现有 Apple 签名配置。
-- `UPDATE_SIGNING_KEY`：32 字节 Ed25519 seed 的 Base64，只供 CI 签署清单；对应公钥位于 `packaging/update-public-key.txt`。
+Release tags must reference commits on `main`. Update both crate versions, lockfiles, Info.plist, and CHANGELOG before tagging. CI builds, tests, signs, and uploads the zip, `SHA256SUMS`, `signing.txt`, `update.json`, and `update.json.sig` to a draft release. It publishes only after GitHub's uploaded digests match. Public versions cannot be overwritten, and an older release cannot take Latest from a newer version.
 
-发布时统一修改根 crate、desktop crate、前端、Info.plist 和 lockfile 的版本，更新 CHANGELOG，将完整改动合入 main，然后：
+The repository's Actions secrets hold `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_TEAM_ID`, and the Base64 32-byte Ed25519 seed `UPDATE_SIGNING_KEY`. The public update key lives in `packaging/update-public-key.txt`. Do not rotate it without a transition release that existing clients can verify. Manifest signing does not replace Apple notarization.
 
-```sh
-git tag v0.3.0
-git push origin v0.3.0
-```
-
-`Release` workflow 会拒绝 main 之外的提交，运行构建、测试和 lint，签名应用，生成 zip、`SHA256SUMS`、`signing.txt`、`update.json` 及 `update.json.sig`。先创建不可见的草稿 Release，上传并核对服务器记录的文件摘要，再公开；数字版本进入稳定通道，带 `-beta.1` 等后缀的版本进入预览通道。已公开版本不能覆盖，失败的草稿可重新运行。延迟发布的旧版不会抢走较新版的 Latest 标记。
-
-现在的 Apple Development 证书支持现有签名流程，尚未完成 Apple 公证。清单签名与 Apple 公证是两项独立检查。不要直接替换更新公钥或私钥；轮换时应先发布兼容旧、新公钥的过渡版，否则旧客户端无法验证新发布。
-
-## 桌面应用
-
-在 macOS 上安装 Xcode 和 Rust 后构建：
-
-```sh
-./scripts/build-desktop.sh
-open "dist/Dauerbot.app"
-```
-
-应用直接打开原生窗口，自动启动或连接本机后台服务，无需浏览器或前端开发服务器。可将 `.app` 拖入 Applications 再运行。构建产物使用 ad-hoc 本地签名；对外分发仍需 Developer ID 签名与 Apple 公证。
-
-已有证书时可运行 `./scripts/build-desktop.sh "签名身份名称"`；独立签名入口为 `scripts/sign-macos.sh`，可选第三个参数指定钥匙串。签名脚本不会读取或导出私钥。证书类型和公证状态须在每次 release 中单独说明。
-
-为兼容早期本机版本，内部可执行文件仍名为 `HerdrBridge`、CLI 仍为 `hfb`，bundle ID 和默认数据目录保留 `dev.herdr.feishu-bridge`。升级沿用原有机器人配置和消息记录。
-
-首次引导包括创建企业自建应用、启用机器人、填写并验证凭证、复制权限导入 JSON、配置长连接与消息订阅、发布应用和加群、本机权限检测、选择代码目录与 CLI。可以选择「先在本机试用」跳过飞书，稍后补齐。引导进度保存在本机，随时可重新打开；发布和订阅的手动确认不会显示为自动检测成功。
-
-在「添加项目」中通过 macOS 系统选择器选择目录，填写名称并选择 Codex / Claude Code / Pi / Antigravity。当前机器人会自动固定绑定首个项目；私聊和群聊都是消息来源，无需查找或关联聊天 ID。工作台直接显示当前智能体，可点击切换为其他 CLI；切换会停止旧智能体、清除不兼容的原生会话 ID 和旧启动参数，再启动新主会话，机器人、项目和消息队列保持。默认 Core 的主会话会自动展示在 Herdr App 的「项目名 · 主会话」标签页。用户选择目录并启动，即授权信任该项目目录；当前会自动确认已识别的 Antigravity 目录信任提示。项目消息与状态自动刷新。
-
-本机访问采用按需引导：
-
-- 项目目录：只检测用户选择的目录，尝试枚举目录和创建、清理临时文件。桌面、文稿、下载等文件夹的用途说明已加入应用 Info.plist。
-- 应用数据库：位于本机私有数据目录，无需完全磁盘访问。可选的外部 SQLite 检测只读打开用户选择的文件并查询 schema 元数据，不读取业务记录。
-- 完全磁盘访问：可选，通过按钮进入系统设置，由用户为实际执行任务的应用手动开启。没有使用私有 TCC 接口，不会把“选中文件能打开”误报为全盘权限已开启。
-- Bridge、后台服务和既有 HERDR/Agent 进程的权限可能不同。Bridge 目录检测通过不等于 HERDR 权限已经通过；需要在实际主会话验证。当前功能不要求辅助功能、屏幕录制或自动化权限。
-
-默认共享 CLI 的用户数据目录。桌面首次创建配置时选择可用的本机端口，后续固定使用该配置中的端口；CLI 会读取同一份配置。需要隔离预览时：
-
-```sh
-open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
-```
-
-## 运行
-
-需要 Rust 1.89+、Node.js 22.12+、pnpm 12.6，以及已安装的 `hc`。建议使用已核查的 HERDR Core 0.1.20 或兼容版本。只有查看原始交互终端时才需要 Herdr App。
-
-```sh
-./scripts/build.sh
-
-# 终端一：运行 daemon
-./target/release/hfb serve
-
-# 终端二：打开管理界面，令牌通过 URL fragment 交给当前浏览器会话
-./target/release/hfb ui
-```
-
-默认地址是 `http://127.0.0.1:49321`。程序只监听 IPv4 loopback。管理 API 使用随机 bearer token，写入本机配置文件；UI 接收后立即清除 URL fragment，仅在当前 sessionStorage 中保存。
-
-需要隔离数据或 Core 时：
-
-```sh
-./target/release/hfb --data-dir /absolute/path/to/private-data serve \
-  --port 49322 --core-session my-bridge
-./target/release/hfb --data-dir /absolute/path/to/private-data ui
-```
-
-`--data-dir` 是所有 CLI 子命令的全局参数。更换 Core session 时应使用独立数据目录，避免已有终端地址指向另一实例。
-
-## 项目与主会话
-
-在原生工作台新建项目，选择代码目录和 Agent 类型。私聊与群聊可以同时进入同一主会话，无需手动填写聊天 ID。也可通过 CLI：
-
-```sh
-hfb project add my-project --path /absolute/path/to/repo --agent codex
-hfb project list
-hfb session start my-project
-hfb session screen my-project
-hfb session attach my-project
-hfb project pause my-project
-hfb project unpause my-project
-hfb session stop my-project
-hfb session resume my-project
-```
-
-一个飞书机器人固定对应一个项目，项目只运行一个当前智能体。所有私聊、群聊消息直接进入该项目，切换 CLI 不改变绑定。来源聊天的类型、ID、成员等信息由 XML 提供，Agent 通过 MCP 的 `to` 自行决定回复目标。机器人收到消息时项目尚未创建，会先保存，创建后自动按顺序接入。额外本机项目不会分享当前机器人的消息或发信权限。未配置飞书也能先在本机试用：
-
-```sh
-hfb message inject my-project '检查这个项目的目录结构，完成后回复飞书'
-```
-
-Bridge 沿用 CLI 已有的账号、模型、provider、推理强度和执行模式，不自动注入 `--model`、`--provider`、`--settings` 或 `--mode`。用户自填的启动参数原样保留。Herdr Core 是常驻进程，可能早于桌面应用启动；Bridge 会通过 `terminal.run.env` 补传当前已有的标准代理变量（含大小写及 `NO_PROXY`），避免 CLI 在 Core 中丢失网络环境。不会把 Bridge 的终端身份或模型环境变量覆盖到 Agent。按用户要求，Codex 使用 `--dangerously-bypass-approvals-and-sandbox`，Claude Code / Antigravity 使用 `--dangerously-skip-permissions`，Pi 使用 `--approve` 信任当前项目的本地文件；Pi 的这个参数不代表能覆盖扩展自行实现的授权逻辑。MCP 配置、初始化提示和原生恢复参数仍按各 CLI 支持的方式传递；Antigravity 的 `-i` 仅用于提交首次交互提示。
-
-Agent 启动后必须完成当前 CLI 的信任或登录流程。Bridge 自动确认已识别的 Antigravity 项目目录信任：必须匹配当前项目目录、终端 PID/代次、结构化 trust 状态以及屏幕上已选中的 Yes；每代会话最多发送一次确认。其他 blocked 状态在桌面显示“等待交互”，可点击“在 HERDR 监控”查看；队列保留，继续使用原进程。
-
-「启动主会话」会创建一个 HERDR 托管的真实 CLI 进程，后续飞书消息持续进入同一终端。在 Herdr App 中可以查看完整实时输出、处理权限提示和直接输入；Bridge 的「在 HERDR 监控」也可以重新定位到该终端。展示失败会在项目中提示，进程启动后立即退出则返回实际错误，不误报为正在等待就绪。
-
-`session attach` 使用项目所属的 Core session 交互接管，按 `Ctrl+\` 脱离。使用独立 Core session 时，「在 HERDR 打开」会拒绝向默认 App 发送同号终端地址，以免打开其它会话；此时使用 CLI 接管。
-
-原生会话恢复的处理方式：
-
-| Agent | MCP 接入 | 原生恢复 |
-|---|---|---|
-| Codex | 启动参数注入独立 MCP 配置，强制 `--no-daemon`；向 MCP 显式转发 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` | 从 `session_ready` 的 MCP `threadId` 元信息登记；也可手动填写，然后使用 `codex resume` |
-| Claude Code | `--mcp-config` 加项目专用配置 | 新会话指定 UUID，恢复时使用 `--resume` |
-| Pi | 合并项目 `.pi/mcp.json` 中的 `herdr_feishu` 项 | 新会话指定 UUID，恢复时使用 `--session` |
-| Antigravity `agy` | 合并项目 `.agents/mcp_config.json`，使用 `-i` 传入交互启动提示 | `--conversation <原生会话 ID>` |
-| 自定义 CLI | 用生成的 stdio MCP 配置接入 | 通过自定义 argv 指定 CLI 自己的恢复方式 |
-
-Pi/Antigravity 的配置写入保留其他 MCP 项；遇到非法 JSON 或不属于本项目的同名项会拒绝覆盖。将这些本机配置加入对应项目的忽略规则，避免提交个人路径。
-
-自动投递要求终端报告 OSC 7501 的 `idle` 或 `done` 状态，并且 MCP 已确认会话身份。无法报告状态的 CLI 会保留消息，不按屏幕文字猜测是否能输入。Antigravity 使用本机 `agy --help` 核对过的 `-i` 交互启动形式。模型登录、项目授权及恢复行为仍受当前安装版本约束。
-
-可在项目高级设置中填写额外启动参数。例如 CLI 的 `--model` 参数通过字符串数组保存。自定义 Agent 的数组则是完整 argv，不经过 shell，支持以下占位符：
-
-```json
-["my-agent", "--mcp-config", "{mcp_config}", "{instructions}"]
-```
-
-占位符包括 `{mcp_config}`、`{credentials}`、`{bridge_exe}`、`{instructions}`。运行数据目录下的 `sessions/<project>/<generation>/` 保存当次配置；生成的 MCP 凭证只允许当前项目、当前会话代次的操作。
-
-## 飞书配置
-
-使用企业自建应用，在飞书后台启用机器人。选择「使用长连接接收事件」，订阅 `im.message.receive_v1`，开通机器人发送消息和图片/文件资源权限。接收群内所有普通消息需要相应全量消息权限；只有 @机器人 权限时只能收到相应事件。发布配置，并将机器人加入项目群。
-
-通过 UI「连接设置」保存 App ID 和 App Secret，再点击检查凭证。Secret 不会由管理 API 回传。更换 App ID 时会清除旧 Secret，避免误用。
-
-也可以从 stdin 读取 Secret：
-
-```sh
-hfb feishu set --app-id cli_your_app
-# 输入 Secret，然后 EOF；推荐在 UI 中配置，避免终端回显
-hfb feishu check
-hfb session switch my-project --agent agy
-```
-
-同一个飞书应用的长连接事件采用集群分发。不要在已有生产机器人同时使用此应用建立第二套收件监听；应为 Bridge 选用专用应用，或让现有接收端统一路由。真实发送测试可以单独运行，不建立新的监听。
-
-飞书监听器状态的含义：
-
-- `unconfigured`：尚无完整凭证。
-- `connecting` / `awaiting_events`：正在运行 SDK 连接流程，首条实际事件尚未确认；不等于已证明事件权限正确。
-- `receiving`：实际收到过消息事件。
-- `reconnecting`：连接结束或失败，daemon 正在退避重试。
-
-## MCP 工具
-
-受管理的主 CLI 会自动启动 `hfb mcp --credentials <private-file>`。
-
-| 工具 | 参数 | 行为 |
-|---|---|---|
-| `session_ready` | 可选 `native_session` | 核对终端、进程与会话代次，登记就绪和原生会话 ID |
-| `ack_message` | `message_id` | 确认已接收指定入站消息，解除后续队列阻塞 |
-| `send_markdown` | `to`, `text`, `request_id` | 向 Agent 指定的聊天或用户发送 Markdown |
-| `send_file` | `to`, `path`, `request_id` | 向 Agent 指定的聊天或用户流式发送本地文件，最大 100 MB |
-
-`to` 是必填字段：`oc_…` 是聊天 ID（群聊或私聊），`ou_…` 是用户 Open ID。Agent 按用户意图决定目的地，可与来源聊天不同，无须 `reply_to`，后端不自动锁定回复来源；最终可达范围由飞书机器人的权限和应用可用范围决定。CLI 的 `message send` / `message file` 支持 `--to`；旧 CLI 调用省略时兼容项目原有主聊天。
-
-同一发送请求重试复用 `request_id`；不同内容或目的地须使用不同 ID。工具只有返回 `status=sent` 才表示 API 已确认接收。MCP 不能管理其他项目、读取管理设置或启动/停止会话。
-
-附件须位于当前项目目录或 Bridge 缓存内。路径会做 canonicalize 校验，符号链接不能绕出允许范围。入站消息资源和出站文件均使用流式 I/O。
-
-## 入站 XML 上下文
-
-主会话收到统一的 XML 信封，包含平台、聊天类型及 ID、message_id、发送者各类 ID、群名、成员快照、@ 提及、话题根消息/父消息、正文和附件路径。所有字段与正文均做 XML 转义，正文无法闭合信封伪造平台字段。XML 只是上下文格式，用户文本仍按用户输入处理。
-
-```xml
-<feishu_message version="1" message_id="om_example">
-  <source platform="feishu" chat_type="group" chat_id="oc_team"
-          root_id="" parent_id="" create_time=""/>
-  <sender open_id="ou_person" user_id="" union_id="" name="小明"/>
-  <chat name="产品群"/>
-  <members status="snapshot" truncated="false" includes_bots="false">
-    <member id="ou_person" id_type="open_id" name="小明"/>
-  </members>
-  <body type="text" trust="user_input">请把结果私聊给我</body>
-</feishu_message>
-```
-
-Agent 可以据此调用 `send_markdown(to="ou_person", text="结果…", request_id="…")`。私聊使用 `chat_type="p2p"`，直接省略群聊的 `<chat>` 和 `<members>` 元数据，不输出 `not_applicable` 占位。没有 @ 提及时省略 `<mentions>`。群聊适用但未能读取成员时仍保留 `status="unavailable"`，与“不适用”区分。未知姓名和 ID 留空；群成员 API 只返回人类成员，最多获取一页（100 个分页额度，平台可能返回更多同批加入成员），超过时标记 `truncated=true`。快照缓存五分钟，权限不足或超时时标记 `unavailable`，不阻止正文投递，也不虚构成员。首次配置权限时可导入工作台提供的群成员读取权限。
-
-## 持久化与交付状态
-
-SQLite 保存项目和收发队列。入站事件在返回 SDK ACK 前先入库，按项目和飞书 message_id 去重。自动投递使用每个项目的 FIFO 队列；已提交的消息需 Agent 明确确认，下一条才会继续。
-
-| 状态 | 含义 |
-|---|---|
-| `queued` | 已保存，等待主会话就绪或结束当前工作 |
-| `submitting` / `submitted` | 正在写入终端 / 已写入，等待 Agent 确认 |
-| `acknowledged` | Agent 调用了确认工具；不代表任务已完成 |
-| `pending` / `sending` / `sent` | 出站待发 / 发送中 / 飞书 API 已确认 |
-| `failed` | 已观察到明确错误，可处理后重试 |
-| `uncertain` | 网络或进程中断导致结果不能确定；先核对再手动重试 |
-| `dismissed` | 用户手动忽略，不再阻塞后续入站消息 |
-
-程序重启会将操作中的记录转为 `uncertain`，不盲目重发。PTY 和飞书之间没有原子提交，因此不承诺严格 exactly-once。`hc send` 的 started 也不作为某条业务消息的最终确认。
-
-Bridge 核对 Core 标签、会话代次、PID 和程序类型；程序返回 shell 或更换进程后拒绝自动投递。通过 Herdr App 接入标签页时，App 会临时启用 keep；Bridge 在确认标签页已出现后将其关闭，避免 Agent 退出时自动恢复成 shell。主机重启或 Agent 退出后，需按原生会话 ID 恢复。
-
-## 用户服务
-
-`hfb serve` 在前台运行，支持 SIGINT/SIGTERM。`hfb service` 打印当前平台的用户服务配置，不会自行修改系统服务。
-
-macOS：
-
-```sh
-mkdir -p ~/Library/LaunchAgents
-hfb service > ~/Library/LaunchAgents/dev.herdr.feishu-bridge.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.herdr.feishu-bridge.plist
-```
-
-Linux：
-
-```sh
-mkdir -p ~/.config/systemd/user
-hfb service > ~/.config/systemd/user/herdr-feishu-bridge.service
-systemctl --user daemon-reload
-systemctl --user enable --now herdr-feishu-bridge
-```
-
-服务模板记录可执行文件和数据目录的绝对路径，移动文件后需重新生成。macOS 的 `service.log` 由使用者定期清理或配置轮转。
-
-## 开发与验证
-
-```sh
-cd frontend
-pnpm install --frozen-lockfile
-pnpm check
-pnpm build
-cd ..
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked
-python3 scripts/smoke.py --browser
-```
-
-前端开发使用 `pnpm dev`，API 代理到默认端口 49321。生产构建无需 Node.js 或 Vite 常驻。
-
-验证分层：
-
-- Rust 测试覆盖去重、异常恢复、项目级凭证、跨项目拒绝、来源校验、终端身份和附件目录边界。
-- `scripts/smoke.py` 使用真实 SDK WebSocket、真实隔离 Core 终端、真实 MCP stdio 和本地飞书 HTTP fixture，验证多轮往返、附件、重连、daemon/Core 重启。
-- `--browser` 额外运行桌面/手机 Playwright 测试，并在 `test-results` 保存截图。优先使用本机 Chrome；没有时执行 `pnpm --dir frontend exec playwright install chromium`。
-- `--real-pi` 使用本机已配置的 Pi 账号执行一个真实模型回合，可能产生模型费用；飞书端仍为本地模拟服务。它仅对测试脚本自己生成的工作目录使用 `--approve`，不修改全局信任配置。
-- `--real-agent codex` / `--real-agent claude` 可验证相应本机 CLI；首次运行时可能需要在隔离 HERDR 终端确认已知测试目录的信任，脚本不会跳过工具权限提示。
-- `tests/live_feishu.rs` 是显式启用的真实发信测试。它读取被忽略的 `.local/live.json`，包含 `app_id`、`app_secret`、`chat_id`，只发送一条测试 Markdown 和一个小文件，不启动 WebSocket：
-
-```sh
-cargo test --test live_feishu -- --ignored
-```
-
-真实测试后应删除该临时凭证文件。真实飞书收件权限、各厂商 CLI 登录、信任与授权对话框仍需按实际账号验证。本项目未调用模型反向代理。
-
-## 目录
+## Repository layout
 
 ```text
-src/             Rust daemon、HTTP API、CLI、MCP、数据库和连接器
-frontend/        Svelte + TypeScript + Vite
-tests/           有回归价值的状态与边界测试、可选真实飞书测试
-scripts/         构建脚本、无模型的端到端协议 fixture
-test-results/    本机测试证据，Git 忽略
+src/          Rust daemon, API, CLI, MCP, storage, and connectors
+desktop/      Native GPUI macOS client
+packaging/    Bundle metadata, icon, and public update key
+scripts/      Rust builds, signing, release automation, and protocol fixtures
+tests/        Behavioral regressions and optional live sending
+test-results/ Ignored local verification artifacts
 ```
-
-默认数据目录使用操作系统的本地应用数据目录；运行 `hfb init` 可查看。配置文件权限为 0600、目录为 0700（Unix）。凭证以受文件权限保护的本机明文保存，当前未接入系统钥匙串。管理接口面向同一台机器的受信任用户，不应直接转发到公网。

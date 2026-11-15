@@ -1,171 +1,45 @@
-# 本机验证记录
+# Verification record
 
-日期：2026-11-15。环境：macOS，Rust 1.96.0，Node.js 22.23.2，pnpm 12.6.0，HERDR Core 0.1.20。这是本机开发验证，不等同于跨平台或长期生产压测。
+Date: November 15, 2026. Local environment: macOS on Apple Silicon, Rust 1.96.0, HERDR Core 0.1.20. These are development checks, not a cross-platform or long-running production load test. Evidence lives in ignored `test-results/` and `.local/` directories and must not contain credentials.
 
-## 独立实例与原有配置核实
+## Current native-only cleanup
 
-自动升级界面预览使用空的独立数据目录，但旧窗口标题仍为 Dauerbot，导致用户误以为之前的飞书配置丢失。已关闭预览窗口并重新打开安装版，原生截图确认「双王 · agy · 已就绪」、原终端 t1x8 和机器人绑定均保留，HERDR connected、飞书 awaiting_events；后台与 Agent 未因本次恢复重启。
+The native desktop no longer depends on Svelte, Vite, Playwright, Node.js, pnpm, embedded HTML, or a web development server. The daemon retains its authenticated API for the desktop, CLI, and MCP. Browser-only group discovery, manual chat binding, private-default routing, and SSE refresh endpoints have been removed. Existing storage migrations and user data remain compatible.
 
-非默认数据目录现在显示「Dauerbot · 独立实例」窗口标题、页面提示及实际目录。原生截图已验证标识和独立目录，随后关闭预览并恢复日常工作台。桌面 release 构建及 clippy 通过；未增加只检查文案或常量的测试。
+English is the default project language. User-provided project names, messages, and multilingual protocol fixtures retain their original text. Existing published Git history has not been rewritten.
 
-## 私聊 XML 精简与当前内存采样
+The native package builds without Node.js or pnpm. Twenty backend tests and three desktop tests passed; the opt-in live test stayed ignored. Root and desktop clippy passed. The isolated protocol smoke passed all 12 checks (`.local/smoke-39f0470d`, `test-results/native-only-smoke.log`). A real bundled `hfb ui` launch opened the English GPUI window and selected an available port rather than preempting the default port. API inspection confirmed that `/`, `/api/events`, and `/api/onboarding/chats` return 404. The independent preview was closed and its own daemon shut down after verification. A second native screenshot verified that the English welcome cards fit within the content area after removing their intrinsic minimum width.
 
-私聊与本机消息省略群聊专属 `<chat>` / `<members>`，非群上下文不再产生 `not_applicable`。空 mentions 也省略；群聊成员读取失败仍保留 `unavailable`。在既有 XML 回归中补充私聊携带旧群上下文时不会输出群成员的断言。conversations 的 4 项测试和后端 clippy 通过；新版 hfb 已签名安装，仅重启后台服务，当前 GUI、Agent 与 MCP 进程保留。
+## Configuration and independent instances
 
-一个「双王」项目、agy 待命、桌面窗口打开时，连续 4 秒的 5 次 RSS 快照稳定：GUI 108.5 MiB、daemon 26.4 MiB、MCP 9.6 MiB、Core 连接辅助进程 7.0 MiB、agy 250.8 MiB。Bridge 后台合计约 43.0 MiB，计入 GUI 为 151.5 MiB，再计入 agy 为 402.3 MiB；这些进程采样时 ps CPU 均为 0.0%。不包含用户共享的 Herdr App/Core 及其他 Agent；RSS 相加可能重复计算共享页，不代表峰值、GPU 内存或长期运行保证。原始记录位于 `test-results/memory-current.json`。
+An update-page preview used an empty independent directory while its old window title still said Dauerbot. That made it look as though the real Feishu configuration had disappeared. The preview was closed and the installed app reopened with its original data directory. API inspection and a native screenshot confirmed the existing project, bot binding, ready agent, and original terminal t1x8/PID 17625. The shared Core and user Agent were not restarted during this recovery.
 
-## 机器人与项目固定绑定修正
+Independent directories now have a distinct window title, a visible banner, and their actual path. A native screenshot verified the marker before closing the preview and restoring the everyday workspace. The desktop build and clippy passed.
 
-按用户明确的关系实现为“一个机器人 → 一个固定项目 → 一个当前智能体”。首个项目创建时保存机器人归属；从旧版单项目数据升级时自动补齐。飞书真实入站处理统一使用机器人归属，私聊和群聊不再依赖 chat_id 关联，也不会因为新增本机项目而改变目标。创建项目之前收到的消息会保留，创建后按顺序接入。其他本机项目不能借用该机器人发信。
+## Updates and signing
 
-GPUI 移除了聊天选择、逐个关联和私聊默认路由。工作台显示固定绑定，并提供 Codex / Claude Code / Pi / Antigravity 切换按钮；CLI 增加 `hfb session switch <项目> --agent <CLI>`。切换先停止当前智能体，再清除旧 CLI 的会话 ID 与参数并启动新主会话，保留机器人、项目和消息队列。辅助 Svelte 页面也移除聊天绑定步骤，手动发信的目的地仅作用于本次发送。
+The updater checks signed manifests, semantic versions and channels, bounded downloads and extraction, Apple Team, bundle ID, architecture, and executable version. It retains a rollback bundle and restores the old app when replacement fails. Rollback pauses automatic updates and restarts only the daemon associated with the selected data directory. Project MCP credentials cannot invoke administrative shutdown.
 
-后端 17 项测试通过，真实飞书发送测试默认忽略；前端 check 为 0 errors / 0 warnings，生产构建、后端及桌面 clippy 通过。回归覆盖首条消息早于项目创建、陌生私聊与群聊自动进入固定项目、旧聊天路由不能覆盖机器人归属、重启与 CLI 切换后关系保持，以及活跃智能体不能被直接修改配置。
+Before the native-only cleanup, 21 backend tests and three desktop tests passed; the opt-in live sending test remained ignored. Root and desktop clippy passed. GPUI's upstream `block 0.1.6` dependency reports a future-compatibility warning. The native update page was opened through the macOS menu and visually checked. Coordinate clicks fail in the available computer-control interface, so update button clicks are not claimed as fully automated GUI acceptance.
 
-现场确认：用户此前的 3 条 hello 和 2 条“1”已全部变为 acknowledged，Agent 自主产生的 5 条飞书回复均为 sent。本轮未额外发送人工测试消息，也未停止用户当前 Agent。
+The first 0.3.0 CI run built, tested, signed the app, signed the manifest, and uploaded all five assets. Publication stopped because GitHub's release-by-tag API did not resolve the draft. The publication script now resolves the draft by numeric release ID before checking digests. Actual upgrade and rollback results must be recorded after the replacement release runs.
 
-更新后的隔离 SDK / HERDR / MCP / 飞书 fixture 全链路冒烟 12 项通过：创建项目不传 chat_id，新私聊及新群聊无需任何关联调用即进入同一主会话，显式 to、Markdown/附件、去重、断线重连、daemon/Core 重启及停止后的排队行为保持。证据为 `test-results/smoke.json`。安装使用逐文件原子替换，仅重启 Bridge GUI/daemon，保留用户当前 Agent 及 MCP 进程。只读 API 核实固定归属为「双王」、原 t1x8 / PID 17625 仍 ready；原生窗口截图确认“已绑定此项目”和四个智能体切换按钮正常呈现，未在用户主会话上实际切换 CLI。
+## Message and session checks
 
-## GPUI 桌面版追加验证
+The isolated SDK/HERDR/MCP/Feishu fixture smoke passed 12 checks before this cleanup. It covered Markdown and file sends, explicit recipients, deduplication and ordered turns, newly discovered private and group chats reaching the fixed bot project, reconnection, daemon restart preserving the original terminal and queue, isolated Core restart, and messages remaining queued after stopping an agent.
 
-桌面版本 0.2.0，GPUI 0.2.2、GPUI Component 0.5.1。使用系统 Metal 运行时编译着色器；构建机器无需另行下载离线 Metal Toolchain。桌面与 daemon 分开运行，原生窗口不加载网页或 WebView。
+Rust regression coverage includes queue fairness, ACK ownership, generation and PID verification, canonical attachment paths, symlink boundaries, local API authentication and Origin checks, project-scoped MCP access, uncertain recovery, and native model arguments. Private-message XML omits group-only metadata and empty mentions; group metadata failures remain explicit without blocking delivery.
 
-本轮执行：
+Real local CLI checks previously completed one model turn each with Pi 1.5.1, Claude Code 2.1.319, and Codex CLI 0.167.2 against the local Feishu fixture. A separate explicitly authorized live test sent one Markdown message and one small file and received platform message IDs. The temporary credentials were removed. Those historical checks do not establish current account login or live event permissions.
 
-- `cargo test --locked --release --target-dir desktop/target --tests`：9 项通过，1 项真实飞书发送测试按默认忽略。新增的群列表 HTTP 测试覆盖本机认证、分页合并、上游敏感字段过滤及缺少 scope 时的错误透传。
-- `cargo test --locked --release --manifest-path desktop/Cargo.toml`：2 项通过，覆盖所选目录探测临时文件清理、数据库文件内容保持不变，以及“文件不存在”与实际 OS 权限拒绝的错误区分。
-- daemon 与桌面 crate 的 `cargo clippy --locked --all-targets -- -D warnings` 通过。GPUI 上游 `block 0.1.6` 依赖存在 Rust future-incompatibility 提示，未产生本项目 lint 错误。
-- 前端生产资源重新构建成功；`scripts/build-desktop.sh` 成功生成含 `hfb` sidecar、图标和用途声明的 `.app`，`plutil -lint` 和 `codesign --verify --deep --strict` 通过。
-- 实际启动 `.app`，通过 macOS 窗口快照和截图确认 GPUI 欢迎页完成渲染，CLI 路径检测显示正常。后台 API 确认 HERDR `connected`、飞书 `unconfigured`，没有加载既有生产机器人凭证。
+## Service recovery and permissions
 
-交互验收限制：本轮电脑控制工具可观察原生窗口和截图，但坐标点击返回 `noWindowsAvailable`。因此没有将引导按钮、文件选择器、系统设置跳转及项目工作台操作记为已完成的 GUI 自动化测试。相关 OS 权限拒绝、用户在系统设置开启权限后的恢复，以及 HERDR 外部进程的实际访问权限仍需在用户授权场景中验收。未自动授予完全磁盘访问权限，也未扫描任何隐私数据库。
+A prior isolated recovery test terminated its daemon while leaving the GUI running. The GUI started a replacement daemon and reconnected with HTTP 200. A native screenshot confirmed that the stale connection error cleared. Local control requests bypass external proxies; normal polling reloads changed local endpoint settings after failures.
 
-飞书凭证检查只验证已保存应用身份；事件订阅和应用发布为用户手动确认项。完整双向收发需要用户完成配置并向绑定聊天发出测试消息后才能确认。完整权限 JSON 包含 `im:message.group_msg`，用于接收群内全部用户回复；基础清单仅接收群内 @ 消息。群列表由真实 API 获取，不包含单聊。
+Selected-directory access tests clean up temporary probe files. SQLite probes preserve database contents and distinguish missing files from an actual OS permission denial. No private databases were scanned and no Full Disk Access was granted automatically. The desktop, daemon, and HERDR Agent have separate OS access contexts; successful desktop checks do not establish Agent permissions.
 
-## HERDR 监控与目录信任追加验证
+Recognized Antigravity directory-trust prompts require the expected project path, PID, generation, structured trust state, and selected Yes option. Other prompts remain in HERDR for interactive handling. The initial Antigravity model error was reproduced with a bare CLI and resolved by forwarding existing proxy variables into the Core child process; no model/provider override was introduced.
 
-修复 Antigravity 的启动提示必须通过 `-i` 传递、恢复使用 `--conversation`。默认 Core 中启动的主会话自动展示到 Herdr App 的“项目名 · 主会话”标签页；展示失败单独保留提示，Agent 继续运行。实机确认「双王 · 主会话」展示的是 Bridge 创建的原终端 `t1x4`，PID 46064。
+## Historical memory sample
 
-用户明确要求代为确认目录信任后，通过 `hc keys t1x4 enter` 确认了 `/Users/yangliu35/ai-videos/双王`。之后同一 PID 仍运行，状态从 `blocked / permission` 变为 `idle`。终端显示 Antigravity 1.5.9 的 `plan model not specified` 错误，因此该结果仅证明目录信任和原进程继续运行，不能算 MCP 已就绪或飞书已完成收发。
-
-自动目录信任实现限定为已识别的 Antigravity 对话框：同时核对项目目录、PID、代次、结构化 permission/trust 状态及当前选中的 Yes；确认前重新读取终端状态，每代进程最多发一次确认。回归测试覆盖其他目录、未选 Yes、普通工具权限、旧代次、PID 更换、退出进程和 MCP 已就绪后的拒绝路径。其他阻塞在 GPUI 显示“等待交互”，排队消息保留。
-
-本轮 `cargo test --locked --release --target-dir desktop/target --test invariants` 的 10 项全部通过；后端及 GPUI 的 `clippy --all-targets -- -D warnings` 通过（GPUI 上游 `block` 仍有 future-incompatibility 提示）。两个 release 二进制构建通过，安装包通过 ad-hoc 签名验证，已更新并重新打开 `~/Applications/Herdr Bridge.app`。重启 Bridge 后只读验证 Core 连接成功、项目仍指向同一终端/PID，`ready=false`；没有重启 Herdr Core 或 Agent。自动识别与拒绝条件经过回归测试，真实目录信任由本轮显式按键完成，尚未将未来首次启动的自动按键流程记为实机验收完成。
-
-## 原生模型与代理环境适配追加验证
-
-参考本机 Magpie `67f61bd78` 的 `internal/agent/agent.go`、`agy.go`、`pi.go`、`applied.go` 和 `plugged_launch.go`，确认它把 Agent 配置、原生模型与网关模型分开。Bridge 保留原生账号、默认模型及用户启动参数，不引入其网关、模型目录或 `--settings` 覆盖。新增回归覆盖四个 CLI 不自动注入模型/provider/模式参数，以及用户显式模型参数保持一次且原样传递。
-
-按用户明确要求，Codex 追加 `--dangerously-bypass-approvals-and-sandbox`，Claude Code / Antigravity 追加 `--dangerously-skip-permissions`，Pi 追加用于信任本地项目文件的 `--approve`。桌面单独呈现 Core 的 `error` 状态与 CLI 原始错误。
-
-实机对照：同一「双王」工作目录中，仅运行 `agy`，不带 `-i` 或 MCP 初始化提示，发送“仅回复 OK”仍复现 `plan model not specified`。当前 shell 与 Bridge 含本机代理，但默认 Core 子进程没有标准代理变量。只通过 `terminal.run.env` 补传已有代理后，同样的裸 `agy` 自动选中原有 Gemini 4 Carbon (Medium)，真实模型返回 `OK`，Core 报告 `done`。因此该错误已证实与网络环境传递有关，不能归因为必须手工指定模型。新增代理白名单回归确保包含大小写代理和 NO_PROXY，并排除 HC 身份、模型与无关账号变量。
-
-本轮 invariants 共 12 项通过，后端与桌面 clippy 通过，两个 release 二进制构建及安装签名验证通过，已更新并重新打开桌面应用。GPUI 上游仍有 `block` future-incompatibility 提示。完整 AGY MCP 初始化在隔离测试工作目录中遇到 CLI `Sign in required`，本轮未记为通过；测试用 Core、终端和 daemon 已停止。生产「双王」原终端 t1x4 / PID 46064 保留，仍未 ready；原进程需要重启才能继承修复后的环境。本轮未向真实飞书发信，未改全局模型配置。
-
-## 私聊、群聊与 Agent 自选目的地追加验证
-
-本轮后端测试增加 3 项，共 12 项通过、1 项真实飞书发送测试默认忽略；桌面权限逻辑 2 项通过。新增场景覆盖：未关联私聊的首条消息持久化及关联后重放、一个主会话接收多个群与私聊、显式关联优先于默认私聊项目、群消息不被私聊默认值接收、重新关联后全局 message_id 去重、旧主聊天接口无法抢占其他项目的接收聊天、XML 闭合注入与非法控制字符，以及 `to` 映射到飞书 `chat_id` / `open_id` 的真实 HTTP 请求和跨目的地幂等校验。
-
-更新协议 fixture 后运行 `python3 scripts/smoke.py --binary "$PWD/desktop/target/release/hfb"`，11 项检查通过。真实 SDK 接收私聊事件，保留未关联消息；将该私聊关联至已有主会话后，真实 MCP fixture 解析 XML，再通过显式 `to=ou_fixture` 发给指定用户。该验证也覆盖群名、成员元数据的本地 API fixture、Markdown / 文件、重连、daemon 与隔离 Core 重启。证据保存在 `test-results/smoke.json`，不涉及生产飞书收件或真实用户发信。
-
-桌面 UI 以“接收聊天”列表替代日常 ID 输入，支持按群名和最近消息搜索，多聊天关联及可选默认私聊项目；手动 ID 输入只在高级设置显示。原生按钮的自动点击验收限制仍适用。
-
-## 结果
-
-| 层级 | 结果 | 证据 |
-|---|---|---|
-| Rust 状态与边界测试 | 8 项通过 | `cargo test --locked` |
-| Rust 静态检查 | 通过，无警告 | `cargo clippy --locked --all-targets -- -D warnings` |
-| Svelte 类型与组件检查 | 0 errors / 0 warnings | `pnpm --dir frontend check` |
-| 前端生产构建 | 通过 | `pnpm --dir frontend build` |
-| 浏览器操作 | 4 项通过 | `test-results/browser` |
-| 完整协议冒烟 | 11 项检查通过 | `test-results/smoke.json` |
-| 真实 Pi 1.5.1 | 通过一个模型回合 | `test-results/real-pi.json` |
-| 真实 Claude Code 2.1.319 | 通过一个模型回合 | `test-results/real-claude.json` |
-| 真实 Codex CLI 0.167.2 | 通过一个模型回合，自动投递无需人工重试 | `test-results/real-codex.json` |
-| 真实飞书发送 | 一条 Markdown 和一个小附件，均获得 message_id | `test-results/live-receipts.json` |
-| release 构建 | 通过，前端已嵌入 | `target/release/hfb` |
-
-默认 Rust 测试会忽略真实飞书测试，防止常规测试发出消息。本次经用户授权，另行显式运行 `cargo test --test live_feishu -- --ignored`，结果通过。
-
-## 验证范围
-
-Rust 测试覆盖入站去重、出站幂等键、崩溃后的 uncertain 恢复、项目间队列公平性、ACK 归属、机器人消息过滤、终端 PID/标签/代次核对、附件路径和符号链接边界、本机 API 身份/Origin 校验、项目级 MCP 权限，以及明确未输入与结果不确定错误的区分。隔离 Core 的「在 HERDR 打开」也会拒绝向默认 App 传递同号终端。
-
-浏览器测试实际执行创建项目、无效 chat_id 校验、编辑、未启动项目的消息排队、忽略、刷新持久化、手动令牌登录、桌面活动展示、手机布局和密钥不回显。检查手机页面没有横向溢出，并保存：
-
-- `test-results/desktop.png`
-- `test-results/mobile.png`
-- `test-results/settings.png`
-
-协议冒烟使用真实 `openlark` SDK 连接本地 WebSocket/HTTP fixture，建立真实隔离 HERDR 终端，运行真实 MCP stdio 初始化和工具调用。检查内容包括多轮收发、入站附件落盘、出站流式上传、重复事件不重复执行、WebSocket 断线重连、daemon 重启保留队列和原终端、Core 重启后继续原会话、停止 Agent 后继续保留入站消息。
-
-真实 CLI 测试使用本机账号和默认模型配置，在脚本创建的工作目录中运行。模型实际调用 `session_ready`、`ack_message`、`send_markdown`、`send_file`；飞书端仍为本地 fixture。测试没有配置或实现模型反向代理。
-
-真实飞书测试复用了现成 MBP 机器人的凭证及其已配置会话，只调用发送 API，不启动该应用的第二套长连接监听。两条消息均标记为开发测试；临时凭证文件已删除，源码中没有真实凭证。
-
-所有测试使用独立 HC_SESSION、XDG 状态和短 socket 路径。测试 Core 已停止，临时 socket 目录已清理；最后检查未发现测试 Agent/MCP 遗留进程。用户原有默认 Core/App 未被停止或重启。
-
-## 真实测试发现并修复的问题
-
-1. Codex 对 MCP 子进程使用环境白名单，需要在单次启动配置中显式传递 HERDR 身份。仅 `--no-daemon` 不能替代这一步。
-2. Core 的启动 settle 失败可能明确保证「没有输入」。现在保留结构化错误和 hint，只有确认未输入时自动重新排队；未知网络结果仍标记 uncertain。
-3. 单个项目积压超过读取批次时可能遮住其他项目。入站读取改为每项目取队首，并补充回归测试。
-4. 手工填写管理令牌时不应在输入首字符就切换页面，已修复并通过浏览器验证。
-5. 图标按钮的 title 不等于可靠的可访问名称，为编辑项目补充 aria-label。
-6. 相对数据目录需转成绝对路径，否则不同工作目录的 CLI 无法加载生成的 MCP 凭证。
-7. 不同 Core session 的终端短地址可能相同。独立 Core 使用 `hfb session attach` 接管，避免在默认 App 打开其它终端。
-
-## 资源短时采样
-
-release 可执行文件为 **11,528,688 字节，约 11.0 MiB**，包括前端静态资源。本机对一个未启动项目、已连接 Core、未配置飞书的 release 服务进行空闲短时采样：
-
-- daemon RSS：13,600 KiB，约 **13.3 MiB**。
-- `hc connect` 辅助进程 RSS：7,280 KiB，约 **7.1 MiB**。
-- 两者 RSS 相加：20,880 KiB，约 **20.4 MiB**。
-- `ps` 报告 CPU：0.0%。
-
-该值不包含浏览器、Core 或 Agent 进程，也不是峰值或长时间运行保证；RSS 相加可能重复计算共享页。原始记录及较早的一次单进程采样在 `test-results/runtime.json`。
-
-通过 HTTP 读取 release 中的 HTML、JS、CSS，并逐字节核对当前 `frontend/dist`，确认打包资源一致。前端构建的 JS gzip 约 25.4 kB，CSS gzip 约 4.4 kB。
-
-## 保留的本地预览
-
-- 地址：`http://127.0.0.1:49321`
-- 数据目录：`.local/review`
-- Core session：`hfb-review`
-- 初始项目：Herdr Bridge，指向当前源码目录，未启动 Agent。
-- 飞书凭证：未配置，不会与 MBP 机器人的生产收件竞争。
-
-打开：
-
-```sh
-./target/release/hfb --data-dir .local/review ui
-```
-
-预览未安装成系统自动启动服务。若预览进程已退出，可以重新运行：
-
-```sh
-./target/release/hfb --data-dir .local/review serve --port 49321 --core-session hfb-review
-```
-
-## 未验证
-
-- Antigravity 1.5.9 已实机启动并通过项目目录信任；当前账号运行时报 `plan model not specified`，尚未完成真实 MCP 模型回合。
-- 用户真实飞书入站事件的权限和生产路由，未通过启动第二个监听器进行验证。
-- 原生会话恢复参数与 ID 登记已实现；每种厂商 CLI 的退出后恢复、授权窗口、上下文压缩尚未覆盖所有组合。
-- Linux/Windows 构建、整机重启、数小时运行和接近 100 MB 附件的压力场景。
-
-## 本地服务恢复修复
-
-修复连接恢复后保留旧红色提示的问题；恢复通知独立于业务状态变化。本机管理请求显式绕过代理，后台连接探测使用较短超时；连接被拒绝时按退避间隔重新拉起 daemon，不重启 HERDR 或 Agent。桌面 3 项测试和前后端 clippy 通过。
-
-隔离实测结束测试 daemon 后，GUI 保持同一进程并自动拉起新 daemon，API 恢复 HTTP 200。生产 GUI 单独更新并重开，原 daemon 和项目主会话保持；原生窗口截图确认旧错误已清除。证据保存在忽略目录 `test-results/connection-recovery`。
-
-## 自动升级与发版实现验证
-
-0.3.0 新增签名清单、语义版本及通道筛选、流式下载、压缩包目录限制、Apple Team / bundle ID / 架构校验、同盘替换及失败恢复。回退暂停自动升级并重启对应后台；项目级 MCP 凭证不能调用管理关闭接口。
-
-本地后端 21 项测试通过，真实飞书发送测试默认忽略；桌面 3 项测试通过，前后端 clippy 通过（上游 block 的未来兼容性提示仍存在）。0.3.0 原生构建及隔离 SDK / HERDR / MCP / 飞书 fixture 12 项冒烟通过，包括 daemon 重启保留主会话及队列。原生应用更新页通过 macOS 系统菜单实际打开，视觉确认版本、通道、检查更新和自动升级开关正常呈现。自动化坐标点击受到电脑控制接口限制，没有将按钮点击记为完整自动化验收。
-
-首次 CI 签名发布及从旧签名版的真实升级、回退验证，在发版后补充结果；当前不将其记为已通过。
+For one idle project with the desktop open, five RSS snapshots over four seconds were stable: GUI 108.5 MiB, daemon 26.4 MiB, MCP 9.6 MiB, Core connection helper 7.0 MiB, and Antigravity 250.8 MiB. The Dauerbot background processes totaled about 43.0 MiB, or 151.5 MiB including the GUI; including the agent gave 402.3 MiB. Sampled ps CPU values were 0.0%. Shared Herdr App/Core and unrelated agents were excluded. RSS sums can double-count shared pages and do not represent peak or GPU memory, or the current release's measured footprint. Evidence: `test-results/memory-current.json`.

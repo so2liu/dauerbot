@@ -48,14 +48,14 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                     status.progress = None;
                                 }
                                 status.message = if status.preferences.automatic {
-                                    "自动升级已开启：每 6 小时检查".into()
+                                    "Automatic updates enabled: checks every six hours".into()
                                 } else {
-                                    "自动升级已关闭，仍可手动检查".into()
+                                    "Automatic updates disabled. Manual checks remain available.".into()
                                 };
                                 send(&status);
                             }
                             Action::Restart => {
-                                let app = app.as_ref().context("当前不是已安装的 macOS 应用")?;
+                                let app = app.as_ref().context("This executable is not inside an installed macOS app")?;
                                 update::relaunch_after_exit(app, &data, std::process::id())?;
                                 let _ = replies.send(Reply::Restart);
                                 return Ok(());
@@ -65,7 +65,7 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                 status.preferences = Preferences::load(&data)?;
                                 status.phase = "installed".into();
                                 status.message =
-                                    "已回退并重启后台，桌面重开后生效；自动升级已暂停".into();
+                                    "Rolled back and restarted the daemon. Reopen the desktop to apply; automatic updates are paused.".into();
                                 status.latest = None;
                                 status.rollback_available = false;
                                 send(&status);
@@ -76,7 +76,7 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                 let install = matches!(action, Action::Install);
                                 if !install || latest.is_none() {
                                     status.phase = "checking".into();
-                                    status.message = "正在检查 GitHub 发布…".into();
+                                    status.message = "Checking GitHub releases...".into();
                                     status.progress = None;
                                     send(&status);
                                     status.preferences = Preferences::load(&data)?;
@@ -87,7 +87,7 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                     status.notes = release.notes.clone();
                                     status.release_url = release.page.clone();
                                     status.phase = "available".into();
-                                    status.message = format!("发现新版本 {}", release.version());
+                                    status.message = format!("New version available: {}", release.version());
                                     send(&status);
                                     if app
                                         .as_ref()
@@ -97,7 +97,7 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                     {
                                         status.phase = "installed".into();
                                         status.message =
-                                            format!("{} 已安装，重启桌面后生效", release.version());
+                                            format!("{} installed. Restart the desktop to apply.", release.version());
                                         send(&status);
                                         return Ok(());
                                     }
@@ -110,9 +110,9 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                     {
                                         let app = app
                                             .as_ref()
-                                            .context("请先安装签名版 Dauerbot，再使用自动升级")?;
+                                            .context("Install a signed Dauerbot app before using automatic updates")?;
                                         status.phase = "downloading".into();
-                                        status.message = "正在下载并校验更新，项目继续运行".into();
+                                        status.message = "Downloading and verifying the update. Your project keeps running.".into();
                                         send(&status);
                                         update::install(
                                             &client,
@@ -123,9 +123,9 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                                 let mut progress = status.clone();
                                                 progress.progress = Some(percent);
                                                 progress.message = if percent == 100 {
-                                                    "下载完成，正在校验签名并替换应用…".into()
+                                                    "Download complete. Verifying signatures and replacing the app...".into()
                                                 } else {
-                                                    format!("正在下载更新 {percent}%")
+                                                    format!("Downloading update: {percent}%")
                                                 };
                                                 let _ = replies.send(Reply::Update(
                                                     serde_json::to_value(progress)
@@ -139,7 +139,7 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                         status.rollback_available = true;
                                         status.progress = None;
                                         status.message = format!(
-                                            "{} 已安装，重启后生效；当前主会话继续运行",
+                                            "{} installed. Restart to apply; the current main session keeps running.",
                                             release.version()
                                         );
                                         send(&status);
@@ -147,7 +147,7 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
                                 } else {
                                     status.phase = "current".into();
                                     status.latest = None;
-                                    status.message = "当前已是此通道的最新版本".into();
+                                    status.message = "You have the latest version on this channel".into();
                                     send(&status);
                                 }
                             }
@@ -182,7 +182,7 @@ pub fn start(data: PathBuf, replies: mpsc::Sender<Reply>) -> mpsc::Sender<Action
         if let Err(error) = result {
             let mut status = Status::new(Preferences::default());
             status.phase = "error".into();
-            status.message = format!("更新服务未启动：{error:#}");
+            status.message = format!("Update service failed to start: {error:#}");
             let _ = replies.send(Reply::Update(
                 serde_json::to_value(status).unwrap_or_default(),
             ));

@@ -88,7 +88,8 @@ impl Config {
         private_dir(dir)?;
         let path = dir.join("config.json");
         if path.exists() {
-            let cfg: Self = serde_json::from_slice(&fs::read(path)?).context("读取配置失败")?;
+            let cfg: Self =
+                serde_json::from_slice(&fs::read(path)?).context("Cannot read configuration")?;
             cfg.validate()?;
             Ok(cfg)
         } else {
@@ -103,14 +104,14 @@ impl Config {
     }
     fn validate(&self) -> Result<()> {
         if self.port == 0 || self.token.len() < 32 || self.core_session.is_empty() {
-            bail!("port、token 或 core_session 配置无效");
+            bail!("Invalid port, token, or core_session configuration");
         }
         let url = reqwest::Url::parse(&self.feishu_base)?;
         if url.scheme() != "https"
             && !(url.scheme() == "http"
                 && matches!(url.host_str(), Some("127.0.0.1" | "localhost")))
         {
-            bail!("飞书接口必须为 HTTPS（本机测试可用 HTTP）");
+            bail!("Feishu endpoints require HTTPS (HTTP is allowed for local tests)");
         }
         Ok(())
     }

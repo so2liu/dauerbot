@@ -22,7 +22,7 @@ pub struct TokenCache {
 pub async fn token(app: &App) -> Result<String> {
     let cfg = app.config.read().await.clone();
     if cfg.app_id.is_empty() || cfg.app_secret.is_empty() {
-        bail!("请先配置飞书应用凭证");
+        bail!("Configure Feishu app credentials first");
     }
     let mut cache = app.token.lock().await;
     let key = format!("{}:{}", cfg.app_id, cfg.feishu_base);
@@ -42,7 +42,7 @@ pub async fn token(app: &App) -> Result<String> {
     cache.key = key;
     cache.token = v["tenant_access_token"]
         .as_str()
-        .context("飞书未返回 tenant_access_token")?
+        .context("Feishu did not return tenant_access_token")?
         .into();
     cache.until = Some(
         Instant::now()
@@ -59,13 +59,16 @@ pub async fn token(app: &App) -> Result<String> {
 
 pub async fn api_json(response: reqwest::Response) -> Result<Value> {
     let status = response.status();
-    let v: Value = response.json().await.context("飞书响应不是 JSON")?;
+    let v: Value = response
+        .json()
+        .await
+        .context("Feishu response is not JSON")?;
     if !status.is_success() || v["code"].as_i64() != Some(0) {
         bail!(
-            "飞书 API {} / code {}: {}",
+            "Feishu API {} / code {}: {}",
             status,
             v["code"],
-            v["msg"].as_str().unwrap_or("请求失败")
+            v["msg"].as_str().unwrap_or("Request failed")
         );
     }
     Ok(v)
@@ -80,12 +83,12 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String>
         let path = allowed_file(p, Path::new(path), &app.dir)?;
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.len() == 0 || metadata.len() > MAX_FILE {
-            bail!("附件须大于 0 且不超过 100 MB");
+            bail!("File size must be greater than 0 and at most 100 MB");
         }
         let file = tokio::fs::File::open(&path).await?;
         let filename = path
             .file_name()
-            .context("附件文件名无效")?
+            .context("File name is invalid")?
             .to_string_lossy()
             .into_owned();
         let part = reqwest::multipart::Part::stream_with_length(
@@ -108,11 +111,11 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String>
         .await?;
         (
             "file",
-            json!({"file_key":v["data"]["file_key"].as_str().context("未返回 file_key")?}),
+            json!({"file_key":v["data"]["file_key"].as_str().context("Missing file_key in the response")?}),
         )
     } else {
         if m.content.len() > 24_000 {
-            bail!("Markdown 超过 24000 字节，请改发附件");
+            bail!("Markdown exceeds 24000 bytes; send it as a file");
         }
         (
             "post",
@@ -132,7 +135,7 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String>
     .await?;
     Ok(v["data"]["message_id"]
         .as_str()
-        .context("未返回 message_id")?
+        .context("Missing message_id in the response")?
         .into())
 }
 
@@ -145,7 +148,7 @@ pub fn allowed_file(p: &db::Project, path: &Path, data_dir: &Path) -> Result<Pat
     let project = std::fs::canonicalize(&p.path)?;
     let cache = std::fs::canonicalize(data_dir.join("files"))?;
     if !absolute.is_file() || (!absolute.starts_with(project) && !absolute.starts_with(cache)) {
-        bail!("附件必须位于该项目目录或 Bridge 文件缓存内");
+        bail!("File must resolve inside the project directory or Dauerbot cache");
     }
     Ok(absolute)
 }
@@ -159,7 +162,7 @@ pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
     let token = token(app).await?;
     let mut url = reqwest::Url::parse(&format!("{}/open-apis/im/v1/messages", cfg.feishu_base))?;
     url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("URL 无效"))?
+        .map_err(|_| anyhow::anyhow!("Invalid URL"))?
         .push(&m.source_id)
         .push("resources")
         .push(key);
@@ -173,7 +176,7 @@ pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
         .await?
         .error_for_status()?;
     if response.content_length().is_some_and(|n| n > MAX_FILE) {
-        bail!("入站附件超过 100 MB");
+        bail!("Incoming file exceeds 100 MB");
     }
     let name = m.attachment["file_name"]
         .as_str()
@@ -192,7 +195,7 @@ pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
         while let Some(chunk) = response.chunk().await? {
             size += chunk.len() as u64;
             if size > MAX_FILE {
-                bail!("入站附件超过 100 MB");
+                bail!("Incoming file exceeds 100 MB");
             }
             file.write_all(&chunk).await?;
         }
@@ -219,7 +222,6 @@ impl EventHandler for Inbound {
                 runtime.feishu_error.clear();
             }
             self.0.notify.notify_one();
-            self.0.changed();
         }
         Ok(())
     }
@@ -236,11 +238,11 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
     let msg = &event["message"];
     let chat = msg["chat_id"]
         .as_str()
-        .context("消息缺少 chat_id")?
+        .context("Message is missing chat_id")?
         .to_owned();
     let source = msg["message_id"]
         .as_str()
-        .context("消息缺少 message_id")?
+        .context("Message is missing message_id")?
         .to_owned();
     let content: Value = serde_json::from_str(msg["content"].as_str().unwrap_or("{}"))?;
     let kind = msg["message_type"].as_str().unwrap_or("unknown");
@@ -258,7 +260,7 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
     };
     if text.is_empty() {
         text = format!(
-            "[{kind} 消息] {}",
+            "[{kind} message] {}",
             content
                 .get("file_name")
                 .and_then(Value::as_str)
@@ -297,14 +299,14 @@ pub async fn websocket(app: Arc<App>) {
         let cfg = app.config.read().await.clone();
         if cfg.app_id.is_empty() || cfg.app_secret.is_empty() {
             app.runtime.write().await.feishu = "unconfigured".into();
-            app.changed();
+
             if revision.changed().await.is_err() {
                 return;
             }
             continue;
         }
         app.runtime.write().await.feishu = "connecting".into();
-        app.changed();
+
         let handler = EventDispatcherHandler::builder()
             .register_raw("im.message.receive_v1", Inbound(app.clone()))
             .expect("unique handler")
@@ -318,17 +320,17 @@ pub async fn websocket(app: Arc<App>) {
         // open() owns one session. This supervisor also cancels old credentials on change.
         let started = Instant::now();
         app.runtime.write().await.feishu = "awaiting_events".into();
-        app.changed();
+
         tokio::select! {
             _=app.shutdown.cancelled()=>return,
             result=LarkWsClient::open(Arc::new(config),handler)=>{
                 // SDK errors can contain a gateway URL; keep credentials out of UI/logs.
-                let reason=if result.is_ok(){"连接结束"}else{"连接断开或认证失败；请检查应用凭证和事件订阅"};
+                let reason=if result.is_ok(){"Connection ended"}else{"Connection lost or authentication failed; check app credentials and event subscriptions"};
                 let mut rt=app.runtime.write().await;rt.feishu="reconnecting".into();rt.feishu_error=reason.into();
             }
             _=revision.changed()=>{delay=1;continue}
         }
-        app.changed();
+
         if started.elapsed() > Duration::from_secs(60) {
             delay = 1;
         }
@@ -351,14 +353,14 @@ pub fn public_config(cfg: &Config) -> Value {
 pub fn recipient_type(to: &str) -> Result<&'static str> {
     if to.len() > 200 || to.len() < 4 || !to.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        bail!("to 须为飞书聊天 ID（oc_…）或用户 Open ID（ou_…）");
+        bail!("to must be a Feishu chat ID (oc_...) or user Open ID (ou_...)");
     }
     if to.starts_with("oc_") {
         Ok("chat_id")
     } else if to.starts_with("ou_") {
         Ok("open_id")
     } else {
-        bail!("to 须为飞书聊天 ID（oc_…）或用户 Open ID（ou_…）")
+        bail!("to must be a Feishu chat ID (oc_...) or user Open ID (ou_...)")
     }
 }
 
