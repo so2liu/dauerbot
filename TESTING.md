@@ -2,6 +2,12 @@
 
 Date: November 15, 2026. Local environment: macOS on Apple Silicon, Rust 1.96.0, HERDR Core 0.1.20. These are development checks, not a cross-platform or long-running production load test. Evidence lives in ignored `test-results/` and `.local/` directories and must not contain credentials.
 
+## Actions budget policy
+
+Routine push and pull-request triggers have been removed. Full native checks are manual only, with a 30-minute limit and cancellation of an older manual run for the same ref. Release automation requires staged local output; an Ubuntu preflight must succeed before macOS signing can start. The release workflow contains no Rust toolchain setup, cache restore, or compilation fallback.
+
+Local validation passed 11 staging scenarios: missing draft, missing metadata, missing archive, wrong commit, wrong tree, wrong version, invalid size, invalid checksum metadata, valid metadata inspection, actual macOS archive restoration, and rejection of a tampered package checksum. The archive restoration used the existing locally built 0.3.2 package and real `ditto` and `codesign`. Workflow parsing confirmed manual-only native checks and the Ubuntu-to-macOS job dependency. Python and shell syntax checks passed. Evidence: `test-results/actions-budget/staging-checks.json`.
+
 ## Developer ID and notarization, 0.3.2
 
 The existing ma-agent Developer ID Application certificate and notarization credentials were transferred directly between GitHub Actions secret stores using sealed-box encryption. Only destination-encrypted values left the source runner. The certificate belongs to the existing Apple Team, `366ADQ28F6`. The transfer artifact and temporary source branch were removed; ma-agent main and product source were unchanged.
@@ -9,6 +15,8 @@ The existing ma-agent Developer ID Application certificate and notarization cred
 The native 0.3.2 package builds without Node.js. All 20 backend tests and three desktop tests pass; the optional live Feishu test remains ignored. Both clippy checks pass. The release YAML and Python scripts parse successfully. A local preflight check confirms the notarization script rejects an ad-hoc app before attempting to access notarization credentials.
 
 Release acceptance requires an actual Apple submission, a stapled ticket, and successful `codesign`, `stapler`, and `spctl` checks against the downloaded public package. CI retains the submission receipt for inspection. These checks must complete before closing the Gatekeeper issue.
+
+Release run 43726215368, attempt 2, completed that acceptance after the account holder signed the pending Apple agreement. The notarization, stapling, and Gatekeeper step took 31 seconds. The downloaded public package passed checksums, `codesign`, `stapler`, `spctl` (`Notarized Developer ID`), and `syspolicy_check distribution`. The installed 0.3.1 updater successfully installed 0.3.2; both desktop and daemon run 0.3.2. The configuration digest, bot binding, native session, terminal t1x8, and Agent PID 17625 stayed unchanged. All 12 isolated HERDR/MCP/simulated-Feishu smoke checks passed, and an independent native UI instance created a local project successfully. Gatekeeper issue #8 is closed.
 
 ## Current native-only cleanup
 

@@ -3,9 +3,9 @@
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path, PurePosixPath
 import plistlib
+import re
 import stat
 import subprocess
 import tempfile
@@ -98,54 +98,71 @@ def stage(tag, version):
     print(f"Staged verified local build for {tag}. Push the main-branch tag to sign, notarize, and publish.")
 
 
-def restore(tag, version):
+def staged_manifest(tag, version, directory):
     release = draft(tag)
     names = {asset["name"] for asset in release["assets"]} if release else set()
-    available = "prebuilt.json" in names
-    if available:
-        archive_name = f"Dauerbot-{tag}-macos-arm64-unsigned.zip"
-        with tempfile.TemporaryDirectory(prefix="dauerbot-prebuilt-") as directory:
-            run("gh", "release", "download", tag, "-R", REPO, "--dir", directory,
-                "--pattern", "prebuilt.json", "--pattern", archive_name)
-            manifest = json.loads((Path(directory) / "prebuilt.json").read_text())
-            if (manifest["version"], manifest["source_tree"], manifest["file"]) != (
-                version, run("git", "rev-parse", "HEAD^{tree}"), archive_name
-            ):
-                raise ValueError("Staged build does not match the release source tree")
-            archive = Path(directory) / archive_name
-            if (archive.stat().st_size > 128 * 1024 * 1024
-                    or archive.stat().st_size != manifest["size"]
-                    or digest(archive) != manifest["sha256"]):
-                raise ValueError("Staged build size or checksum differs")
-            with zipfile.ZipFile(archive) as bundle:
-                if sum(entry.file_size for entry in bundle.infolist()) > 512 * 1024 * 1024:
-                    raise ValueError("Staged build is too large")
-                for entry in bundle.infolist():
-                    path = PurePosixPath(entry.filename)
-                    if (path.is_absolute() or ".." in path.parts
-                            or not path.parts or path.parts[0] not in ("Dauerbot.app", "__MACOSX")
-                            or stat.S_ISLNK(entry.external_attr >> 16)):
-                        raise ValueError("Unsafe staged archive entry")
-            (ROOT / "dist").mkdir(exist_ok=True)
-            run("ditto", "-x", "-k", str(archive), str(ROOT / "dist"))
-            verify_app(version)
-        print("Restored verified local build; CI will sign and notarize without recompiling.")
-    else:
-        print("No local build staged; CI will compile and test from source.")
-    with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-        output.write(f"available={str(available).lower()}\n")
+    archive_name = f"Dauerbot-{tag}-macos-arm64-unsigned.zip"
+    if not {"prebuilt.json", archive_name}.issubset(names):
+        raise ValueError(
+            f"No complete local build staged. Run "
+            f"`python3 scripts/prebuilt-macos.py stage --tag {tag}` "
+            "before pushing the tag. Releases never compile Rust in Actions."
+        )
+    run("gh", "release", "download", tag, "-R", REPO, "--dir", directory,
+        "--pattern", "prebuilt.json")
+    manifest = json.loads((Path(directory) / "prebuilt.json").read_text())
+    if (manifest["version"], manifest["source_commit"], manifest["source_tree"], manifest["file"]) != (
+        version, run("git", "rev-parse", "HEAD"),
+        run("git", "rev-parse", "HEAD^{tree}"), archive_name
+    ):
+        raise ValueError("Staged build does not match the release commit and source tree")
+    if (type(manifest["size"]) is not int or not 0 < manifest["size"] <= 128 * 1024 * 1024
+            or not isinstance(manifest["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])):
+        raise ValueError("Invalid staged build size or checksum metadata")
+    return manifest
+
+
+def inspect(tag, version):
+    with tempfile.TemporaryDirectory(prefix="dauerbot-preflight-") as directory:
+        manifest = staged_manifest(tag, version, directory)
+        print(f"Verified staged metadata for {tag} at {manifest['source_commit']}.")
+
+
+def restore(tag, version):
+    with tempfile.TemporaryDirectory(prefix="dauerbot-prebuilt-") as directory:
+        manifest = staged_manifest(tag, version, directory)
+        run("gh", "release", "download", tag, "-R", REPO, "--dir", directory,
+            "--pattern", manifest["file"])
+        archive = Path(directory) / manifest["file"]
+        if (archive.stat().st_size != manifest["size"]
+                or digest(archive) != manifest["sha256"]):
+            raise ValueError("Staged build size or checksum differs")
+        with zipfile.ZipFile(archive) as bundle:
+            if sum(entry.file_size for entry in bundle.infolist()) > 512 * 1024 * 1024:
+                raise ValueError("Staged build is too large")
+            for entry in bundle.infolist():
+                path = PurePosixPath(entry.filename)
+                if (path.is_absolute() or ".." in path.parts
+                        or not path.parts or path.parts[0] not in ("Dauerbot.app", "__MACOSX")
+                        or stat.S_ISLNK(entry.external_attr >> 16)):
+                    raise ValueError("Unsafe staged archive entry")
+        (ROOT / "dist").mkdir(exist_ok=True)
+        run("ditto", "-x", "-k", str(archive), str(ROOT / "dist"))
+        verify_app(version)
+    print("Restored verified local build; CI will sign and notarize without recompiling.")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("stage", "restore"))
+    parser.add_argument("command", choices=("stage", "inspect", "restore"))
     parser.add_argument("--tag", required=True)
     args = parser.parse_args()
     version = args.tag.removeprefix("v")
     with (ROOT / "Cargo.toml").open("rb") as source:
         if args.tag != "v" + tomllib.load(source)["package"]["version"]:
             raise ValueError("Tag must match the package version")
-    (stage if args.command == "stage" else restore)(args.tag, version)
+    {"stage": stage, "inspect": inspect, "restore": restore}[args.command](args.tag, version)
 
 
 if __name__ == "__main__":

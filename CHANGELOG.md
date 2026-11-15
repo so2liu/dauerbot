@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Stop automatic Actions runs on pushes and pull requests; retain full native checks as an explicit manual workflow.
+- Require locally built and tested release packages. Reject missing or mismatched staging metadata on Ubuntu before starting macOS signing, with no cloud Rust compilation fallback.
+- Limit manual native checks to 30 minutes, cancel superseded manual runs for the same ref, and retain notarization receipts for seven days.
+
 ## 0.3.2 — 2026-11-15
 
 ### Fixed
