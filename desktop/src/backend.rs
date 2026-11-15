@@ -31,6 +31,7 @@ pub enum Reply {
     Access(String),
     Environment(Vec<(String, String)>),
     Error(String),
+    Connection(Option<String>),
 }
 
 pub struct Backend {
@@ -55,47 +56,76 @@ impl Backend {
                     cfg.port = listener.local_addr()?.port();
                     cfg.save(&data)?;
                 }
-                let http = reqwest::Client::builder().timeout(Duration::from_secs(110)).build()?;
-                if request(&http, &cfg, "GET", "/state", None).await.is_err() {
-                    let binary = std::env::current_exe()?.with_file_name("hfb");
-                    anyhow::ensure!(binary.is_file(), "缺少随应用打包的 hfb 服务，请重新构建应用");
-                    let log = std::fs::OpenOptions::new().create(true).append(true).open(data.join("desktop-service.log"))?;
-                    // An explicit launch-time PATH is required for apps opened from Finder.
-                    let mut paths = vec![];
-                    if let Some(home) = std::env::var_os("HOME") {
-                        paths.push(PathBuf::from(&home).join(".local/bin"));
-                        paths.push(PathBuf::from(home).join(".cargo/bin"));
+                // Local bearer tokens and control traffic must never reach a proxy.
+                let http = reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(Duration::from_secs(2))
+                    .timeout(Duration::from_secs(110))
+                    .build()?;
+                let probe = reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(Duration::from_secs(1))
+                    .timeout(Duration::from_secs(3))
+                    .build()?;
+                if let Err(e) = request(&probe, &cfg, "GET", "/state", None).await {
+                    if !connection_refused(&e) {
+                        return Err(e);
                     }
-                    paths.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
-                    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
-                    Command::new(binary).arg("--data-dir").arg(&data).arg("serve")
-                        .env("PATH", std::env::join_paths(paths)?)
-                        .stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
-                    let mut ready = false;
-                    for _ in 0..60 {
-                        if request(&http, &cfg, "GET", "/state", None).await.is_ok() { ready = true; break; }
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                    }
-                    anyhow::ensure!(ready, "本地服务未能启动。查看应用数据目录中的 desktop-service.log，检查端口占用及 HERDR 安装。");
+                    let mut child = spawn_service(&data)?;
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        loop {
+                            if request(&probe, &cfg, "GET", "/state", None).await.is_ok() {
+                                break Ok::<_, anyhow::Error>(());
+                            }
+                            if let Some(status) = child.try_wait()? {
+                                bail!(
+                                    "本地后台已退出（{status}），请查看 {}",
+                                    data.join("desktop-service.log").display()
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                        }
+                    })
+                    .await
+                    .context("本地后台启动超时，请查看 desktop-service.log")??;
                 }
+                let mut connection = ConnectionState::default();
+                let mut last_restart = std::time::Instant::now() - Duration::from_secs(10);
                 let mut last_state = Value::Null;
                 let mut watched = String::new();
                 let mut last_detail = Value::Null;
                 loop {
                     match requests.recv_timeout(Duration::from_millis(1200)) {
-                        Ok(CommandRequest::Api { method, path, body, success }) => {
-                            match request(&http, &cfg, method, &path, body).await {
-                                Ok(value) => { let _ = replies.send(Reply::Done { path, value, message: success }); }
-                                Err(e) => { let _ = replies.send(Reply::Error(e.to_string())); }
+                        Ok(CommandRequest::Api {
+                            method,
+                            path,
+                            body,
+                            success,
+                        }) => match request(&http, &cfg, method, &path, body).await {
+                            Ok(value) => {
+                                let _ = replies.send(Reply::Done {
+                                    path,
+                                    value,
+                                    message: success,
+                                });
                             }
-                        }
+                            Err(e) => {
+                                let _ = replies.send(Reply::Error(e.to_string()));
+                            }
+                        },
                         Ok(CommandRequest::Folder(path)) => {
                             let result = crate::access::project_access(&path);
-                            let _ = replies.send(Reply::Access(match result { Ok(s) => s, Err(e) => crate::access::explain(&e) }));
+                            let _ = replies.send(Reply::Access(match result {
+                                Ok(s) => s,
+                                Err(e) => crate::access::explain(&e),
+                            }));
                         }
                         Ok(CommandRequest::Database(path)) => {
                             let result = crate::access::database_access(&path);
-                            let _ = replies.send(Reply::Access(match result { Ok(s) => s, Err(e) => crate::access::explain(&e) }));
+                            let _ = replies.send(Reply::Access(match result {
+                                Ok(s) => s,
+                                Err(e) => crate::access::explain(&e),
+                            }));
                         }
                         Ok(CommandRequest::Environment) => {
                             let _ = replies.send(Reply::Environment(environment(&cfg, &data)));
@@ -107,16 +137,41 @@ impl Backend {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    match request(&http, &cfg, "GET", "/state", None).await {
-                        Ok(state) if state != last_state => {
-                            last_state = state.clone();
-                            let _ = replies.send(Reply::State(state));
+                    match request(&probe, &cfg, "GET", "/state", None).await {
+                        Ok(state) => {
+                            if let Some(reply) = connection.observe(None) {
+                                let _ = replies.send(reply);
+                            }
+                            if state != last_state {
+                                last_state = state.clone();
+                                let _ = replies.send(Reply::State(state));
+                            }
                         }
-                        Ok(_) => {}
-                        Err(e) => { let _ = replies.send(Reply::Error(format!("本地服务连接失败：{e}"))); }
+                        Err(e) => {
+                            if let Some(reply) = connection.observe(Some(format!("{e:#}"))) {
+                                let _ = replies.send(reply);
+                            }
+                            if connection_refused(&e)
+                                && last_restart.elapsed() >= Duration::from_secs(10)
+                            {
+                                last_restart = std::time::Instant::now();
+                                // A service restart may have changed its endpoint or token.
+                                if let Ok(current) = Config::load(&data) {
+                                    cfg = current;
+                                }
+                                if request(&probe, &cfg, "GET", "/state", None).await.is_err()
+                                    && let Err(error) = spawn_service(&data)
+                                    && let Some(reply) =
+                                        connection.observe(Some(format!("后台重启失败：{error:#}")))
+                                {
+                                    let _ = replies.send(reply);
+                                }
+                            }
+                        }
                     }
                     if !watched.is_empty()
-                        && let Ok(detail) = request(&http, &cfg, "GET", &format!("/projects/{watched}"), None).await
+                        && let Ok(detail) =
+                            request(&http, &cfg, "GET", &format!("/projects/{watched}"), None).await
                         && detail != last_detail
                     {
                         last_detail = detail.clone();
@@ -132,6 +187,58 @@ impl Backend {
         Self { tx, rx, dir }
     }
 }
+#[derive(Default)]
+struct ConnectionState {
+    error: Option<String>,
+}
+impl ConnectionState {
+    fn observe(&mut self, error: Option<String>) -> Option<Reply> {
+        if self.error == error {
+            return None;
+        }
+        self.error = error.clone();
+        Some(Reply::Connection(error))
+    }
+}
+fn connection_refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_connect)
+}
+fn spawn_service(data: &std::path::Path) -> Result<std::process::Child> {
+    let binary = std::env::current_exe()?.with_file_name("hfb");
+    anyhow::ensure!(
+        binary.is_file(),
+        "缺少随应用打包的 hfb 服务，请重新安装应用"
+    );
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data.join("desktop-service.log"))?;
+    let mut paths = vec![];
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(&home).join(".local/bin"));
+        paths.push(PathBuf::from(home).join(".cargo/bin"));
+    }
+    paths.extend([
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ]);
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    Command::new(binary)
+        .arg("--data-dir")
+        .arg(data)
+        .arg("serve")
+        .env("PATH", std::env::join_paths(paths)?)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("无法启动本地后台")
+}
+
 async fn request(
     http: &reqwest::Client,
     cfg: &Config,
@@ -212,4 +319,21 @@ pub fn scopes(all_group_replies: bool) -> Value {
         scopes.push("im:message.group_msg");
     }
     json!({"scopes":{"tenant":scopes,"user":[]}})
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    #[test]
+    fn recovery_is_emitted_even_when_the_api_state_has_not_changed() {
+        let mut state = ConnectionState::default();
+        assert!(state.observe(None).is_none());
+        assert!(matches!(
+            state.observe(Some("connection refused".into())),
+            Some(Reply::Connection(Some(_)))
+        ));
+        assert!(state.observe(Some("connection refused".into())).is_none());
+        assert!(matches!(state.observe(None), Some(Reply::Connection(None))));
+        assert!(state.observe(None).is_none());
+    }
 }
