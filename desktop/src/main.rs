@@ -39,6 +39,7 @@ struct Setup {
 }
 struct Desktop {
     backend: Backend,
+    independent_data: bool,
     setup: Setup,
     state: Value,
     detail: Value,
@@ -62,6 +63,7 @@ struct Desktop {
 }
 impl Desktop {
     fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let independent_data = independent_data_dir(&backend.dir);
         let mut setup: Setup = std::fs::read(backend.dir.join("desktop.json"))
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
@@ -105,6 +107,7 @@ impl Desktop {
         .detach();
         Self {
             backend,
+            independent_data,
             setup,
             state: Value::Null,
             detail: Value::Null,
@@ -872,7 +875,9 @@ impl Render for Desktop {
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .child(format!("工作空间  /  {}", STEPS[page]))
-                            .child(if self.busy {
+                            .child(if self.independent_data {
+                                "●  独立数据目录"
+                            } else if self.busy {
                                 "●  正在处理"
                             } else {
                                 "●  本机私有工作台"
@@ -885,7 +890,25 @@ impl Render for Desktop {
                             .min_h_0()
                             .overflow_y_scroll()
                             .p_10()
-                            .child(div().max_w(px(850.)).child(content)),
+                            .child(
+                                div()
+                                    .max_w(px(850.))
+                                    .when(self.independent_data, |view| {
+                                        view.child(
+                                            div()
+                                                .mb_6()
+                                                .p_4()
+                                                .rounded_lg()
+                                                .bg(rgb(0xfff1ce))
+                                                .text_sm()
+                                                .child("独立实例 · 此窗口使用单独的数据，与你日常工作台的配置分开保存。")
+                                                .child(div().mt_2().text_xs().child(
+                                                    self.backend.dir.display().to_string(),
+                                                )),
+                                        )
+                                    })
+                                    .child(content),
+                            ),
                     )
                     .child(
                         div()
@@ -900,12 +923,22 @@ impl Render for Desktop {
             )
     }
 }
+fn independent_data_dir(dir: &std::path::Path) -> bool {
+    let default = herdr_feishu_bridge::config::default_dir();
+    dir.canonicalize().unwrap_or_else(|_| dir.to_owned())
+        != default.canonicalize().unwrap_or(default)
+}
 fn main() {
     let dir = std::env::args()
         .skip_while(|v| v != "--data-dir")
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(herdr_feishu_bridge::config::default_dir);
+    let title = if independent_data_dir(&dir) {
+        "Dauerbot · 独立实例"
+    } else {
+        "Dauerbot"
+    };
     let backend = Backend::start(dir);
     Application::new().run(move |cx| {
         gpui_component::init(cx);
@@ -930,7 +963,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(980.), px(680.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Dauerbot".into()),
+                    title: Some(title.into()),
                     ..Default::default()
                 }),
                 ..Default::default()
