@@ -46,6 +46,7 @@ pub struct App {
     pub shutdown: CancellationToken,
     session_lock: Mutex<()>,
     outbound_lock: Mutex<()>,
+    view_lock: Mutex<()>,
 }
 
 impl App {
@@ -67,6 +68,7 @@ impl App {
             shutdown: CancellationToken::new(),
             session_lock: Mutex::new(()),
             outbound_lock: Mutex::new(()),
+            view_lock: Mutex::new(()),
         }))
     }
     pub async fn start(self: &Arc<Self>, key: &str, resume: bool) -> Result<Project> {
@@ -127,12 +129,26 @@ impl App {
         if p.agent != "custom" {
             argv = herdr::login_shell_args(argv);
         }
-        let result=herdr::rpc(&cfg,"terminal.run",json!({
-            "argv":argv,"cwd":p.path,"name":format!("hfb-{}",&p.id[..8]),
-            "env":herdr::launch_network_env(std::env::vars()),
-                "no_parent":true,"no_notify":true,"keep":false,
-            "labels":{"hfb.owner":"herdr-feishu-bridge","hfb.project":p.id,"hfb.generation":generation},
-        })).await?;
+        let mut labels = json!({"hfb.owner":"herdr-feishu-bridge","hfb.project":p.id,"hfb.generation":generation});
+        if cfg.core_session == "default" {
+            labels.as_object_mut().unwrap().extend(
+                herdr::view_labels(&p, &Value::Null)
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        let result = herdr::rpc(
+            &cfg,
+            "terminal.run",
+            json!({
+                "argv":argv,"cwd":p.path,"name":format!("hfb-{}",&p.id[..8]),
+                "env":herdr::launch_network_env(std::env::vars()),
+                    "no_parent":true,"no_notify":true,"keep":false,
+                "labels":labels,
+            }),
+        )
+        .await?;
         let address = result["address"]
             .as_str()
             .or(result["terminal"].as_str())
@@ -189,96 +205,57 @@ impl App {
             .terminal
             .as_deref()
             .context("The project has no main session; start it first")?;
-        let record = herdr::rpc(&cfg, "terminal.get", json!({"terminal":t})).await?;
-        if record["state"] != "live" {
-            bail!(
-                "The main session exited. Start it again; use hfb session screen to inspect the output."
-            );
-        }
-        herdr::check_identity(&p, &record)?;
-        // Herdr App may need a frame to observe the newly created Core terminal.
-        for attempt in 0..15 {
-            let output = tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::process::Command::new("herdr-app")
-                    .kill_on_drop(true)
-                    .args(["do", "terminal.keep", "--terminal", t, "--place", "tab"])
-                    .output(),
-            )
-            .await
-            .context("Herdr App request timed out")?
-            .context("Cannot call herdr-app; install and open Herdr App first")?;
-            let result: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-            let error = result["error"].as_str().unwrap_or("");
-            if output.status.success() && result.is_object() && error.is_empty() {
-                // Wait for the App's asynchronous pane adoption, not for the agent's turn.
-                for _ in 0..20 {
-                    let layout = tokio::time::timeout(
-                        Duration::from_secs(3),
-                        tokio::process::Command::new("herdr-app").arg("ls").output(),
-                    )
-                    .await;
-                    if let Ok(Ok(layout)) = layout
-                        && let Ok(value) = serde_json::from_slice::<Value>(&layout.stdout)
-                        && let Some(spaces) = value["spaces"].as_array()
-                    {
-                        for space in spaces {
-                            if let Some(tabs) = space["tabs"].as_array() {
-                                for tab in tabs {
-                                    if tab["terminals"]
-                                        .as_array()
-                                        .is_some_and(|ts| ts.iter().any(|v| v["terminal"] == t))
-                                    {
-                                        if let Some(tab) = tab["id"].as_str() {
-                                            let _ = tokio::process::Command::new("herdr-app")
-                                                .args([
-                                                    "do",
-                                                    "tab.rename",
-                                                    "--id",
-                                                    tab,
-                                                    "--name",
-                                                    &format!("{} · Main session", p.name),
-                                                ])
-                                                .output()
-                                                .await;
-                                        }
-                                        // A pane is for viewing; do not turn an exited CLI into an auto-restored shell.
-                                        herdr::rpc(
-                                            &cfg,
-                                            "terminal.keep",
-                                            json!({"terminal":t,"keep":false}),
-                                        )
-                                        .await?;
-                                        self.runtime.write().await.view_errors.remove(&p.id);
-
-                                        return Ok(
-                                            json!({"ok":true,"terminal":t,"pane":result["pane"]}),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+        let _view_guard = self.view_lock.lock().await;
+        // The login shell may not have exec'd the CLI yet. Only that precise
+        // transition is retryable; changed identities and restored shells fail.
+        let mut record = Value::Null;
+        for attempt in 0..40 {
+            record = herdr::rpc(&cfg, "terminal.get", json!({"terminal":t})).await?;
+            match herdr::check_identity(&p, &record) {
+                Ok(()) => break,
+                Err(error) if error.is::<herdr::SessionStarting>() && attempt < 39 => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
-                bail!(
-                    "Herdr App accepted the request but did not confirm a terminal tab. Try Monitor in HERDR again."
-                );
+                Err(error) => return Err(error),
             }
-            if error.contains("no running terminal") && attempt < 14 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-            bail!(
-                "Cannot show the main session in Herdr App: {}. Check that Herdr App is open.",
-                if error.is_empty() {
-                    "Command failed or returned invalid output"
-                } else {
-                    error
-                }
-            );
         }
-        bail!("Herdr App has not found the main session; try again")
+        // Placement labels let App reconcile on the terminal's own machine,
+        // even if it is currently showing a remote space or opens later.
+        herdr::rpc(
+            &cfg,
+            "terminal.label",
+            json!({"terminal":t,"labels":herdr::view_labels(&p, &record)}),
+        )
+        .await?;
+        for _ in 0..40 {
+            let layout = herdr::app_command(&["ls"]).await?;
+            if let Some((tab, pane)) = herdr::view_pane(&layout, t) {
+                let current = self.db.project(key).await?;
+                if current.terminal != p.terminal || current.generation != p.generation {
+                    bail!("The main session changed while opening Herdr App; try again");
+                }
+                let record = herdr::rpc(&cfg, "terminal.get", json!({"terminal":t})).await?;
+                herdr::check_identity(&current, &record)?;
+                herdr::app_command(&[
+                    "do",
+                    "tab.rename",
+                    "--id",
+                    &tab,
+                    "--name",
+                    &format!("{} · Main session", p.name),
+                ])
+                .await?;
+                herdr::app_command(&["do", "agent.focus", "--terminal", t]).await?;
+                // A pane is for viewing, not for restoring an exited CLI as a shell.
+                herdr::rpc(&cfg, "terminal.keep", json!({"terminal":t,"keep":false})).await?;
+                self.runtime.write().await.view_errors.remove(&p.id);
+                return Ok(json!({"ok":true,"terminal":t,"pane":pane}));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        bail!(
+            "Herdr App has not confirmed a main session tab. Open Herdr App and try Monitor again."
+        )
     }
     pub async fn stop(&self, key: &str) -> Result<()> {
         let _guard = self.session_lock.lock().await;
@@ -582,6 +559,7 @@ impl App {
                         let Ok(v) = serde_json::from_str::<Value>(&line) else {
                             continue;
                         };
+                        let mut restoration = Vec::new();
                         let mut rt = app.runtime.write().await;
                         let snap = v
                             .get("result")
@@ -594,12 +572,18 @@ impl App {
                                 for t in terminals {
                                     if let Some(id) = t["address"].as_str() {
                                         rt.terminals.insert(id.into(), t.clone());
+                                        if t["keep"] == true {
+                                            restoration.push(id.to_owned());
+                                        }
                                     }
                                 }
                             }
                         } else if v["method"] == "event" {
                             let event = &v["params"];
                             let id = event["terminal"].as_str().unwrap_or("").to_owned();
+                            if event["type"] == "keep" && event["data"]["keep"] == true {
+                                restoration.push(id.clone());
+                            }
                             match event["type"].as_str() {
                                 Some("created" | "restarted") => {
                                     rt.terminals.insert(id, event["data"].clone());
@@ -619,6 +603,9 @@ impl App {
                                         if kind == "foreground" {
                                             t["foreground"] = event["data"].clone();
                                         }
+                                        if kind == "keep" {
+                                            t["keep"] = event["data"]["keep"].clone();
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -626,6 +613,35 @@ impl App {
                         }
                         drop(rt);
 
+                        // App can adopt a session long after start() returned, or
+                        // while the daemon was offline. Enforce retention on the
+                        // actual keep event/snapshot, without polling the App.
+                        if !restoration.is_empty()
+                            && let Ok(projects) = app.db.projects().await
+                        {
+                            for terminal in restoration {
+                                let Some(project) = projects
+                                    .iter()
+                                    .find(|p| p.terminal.as_deref() == Some(&terminal))
+                                else {
+                                    continue;
+                                };
+                                let Ok(record) =
+                                    herdr::rpc(&cfg, "terminal.get", json!({"terminal":terminal}))
+                                        .await
+                                else {
+                                    continue;
+                                };
+                                if herdr::should_disable_restoration(project, &record) {
+                                    let _ = herdr::rpc(
+                                        &cfg,
+                                        "terminal.keep",
+                                        json!({"terminal":terminal,"keep":false}),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                         app.notify.notify_one();
                     }
                     let _ = child.kill().await;

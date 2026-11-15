@@ -492,3 +492,104 @@ async fn login_wrapper_accepts_running_agent_but_rejects_initializing_or_restore
     terminal["foreground"]["argv"] = json!(["/bin/zsh", "-l"]);
     assert!(herdr::check_identity(&p, &terminal).is_err());
 }
+
+#[tokio::test]
+async fn pending_login_foreground_is_retryable_only_for_the_owned_generation() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db
+        .create(input(&dir, "Starting session", ""))
+        .await
+        .unwrap();
+    p.agent = "agy".into();
+    p.generation = "generation".into();
+    p.terminal_pid = Some(123);
+    let mut terminal = json!({
+        "state":"live", "pid":123,
+        "argv":herdr::login_shell_args(vec!["agy".into()]),
+        "labels":{"hfb.project":p.id,"hfb.generation":p.generation}
+    });
+    assert!(
+        herdr::check_identity(&p, &terminal)
+            .unwrap_err()
+            .is::<herdr::SessionStarting>()
+    );
+    terminal["foreground"] = json!({"pid":123,"argv":terminal["argv"]});
+    assert!(
+        herdr::check_identity(&p, &terminal)
+            .unwrap_err()
+            .is::<herdr::SessionStarting>()
+    );
+    terminal["labels"]["hfb.generation"] = json!("replaced");
+    assert!(
+        !herdr::check_identity(&p, &terminal)
+            .unwrap_err()
+            .is::<herdr::SessionStarting>()
+    );
+    terminal["labels"]["hfb.generation"] = json!(p.generation);
+    terminal["foreground"] = json!({"argv":["/bin/zsh", "-l"]});
+    assert!(
+        !herdr::check_identity(&p, &terminal)
+            .unwrap_err()
+            .is::<herdr::SessionStarting>()
+    );
+    terminal["foreground"] = json!({"argv":["/Users/example/.local/bin/agy"]});
+    assert!(herdr::check_identity(&p, &terminal).is_ok());
+}
+
+#[tokio::test]
+async fn monitor_placement_stays_local_and_reuses_existing_space() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let p = db
+        .create(input(&dir, "Monitor placement", ""))
+        .await
+        .unwrap();
+    let labels = herdr::view_labels(&p, &Value::Null);
+    assert!(!labels["herdr.space"].as_str().unwrap().contains('/'));
+    assert_eq!(labels, herdr::view_labels(&p, &Value::Null));
+    let existing = json!({"labels":{"herdr.space":"sp-existing","herdr.tab":"tb-existing"}});
+    assert_eq!(herdr::view_labels(&p, &existing), existing["labels"]);
+    let mirrored = json!({"labels":{"herdr.space":"mbp/sp-remote","herdr.tab":"mbp/tb-remote"}});
+    assert_eq!(herdr::view_labels(&p, &mirrored), labels);
+    let layout = json!({"spaces":[
+        {"id":"mbp/sp-remote","tabs":[{"id":"mbp/tb-remote","terminals":[{"pane":"mbp/p1","terminal":"t22"}]}]},
+        {"id":"sp-existing","tabs":[{"id":"tb-existing","terminals":[{"pane":"p1","terminal":"t22"}]}]}
+    ]});
+    assert_eq!(
+        herdr::view_pane(&layout, "t22"),
+        Some(("tb-existing".into(), json!("p1")))
+    );
+    assert_eq!(herdr::view_pane(&layout, "t23"), None);
+}
+
+#[tokio::test]
+async fn late_app_adoption_disables_restoration_only_for_the_owned_process() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db.create(input(&dir, "Late adoption", "")).await.unwrap();
+    p.agent = "agy".into();
+    p.generation = "generation".into();
+    p.terminal_pid = Some(123);
+    let mut record = json!({
+        "state":"live", "pid":123, "keep":true,
+        "argv":herdr::login_shell_args(vec!["agy".into()]),
+        "labels":{"hfb.owner":"herdr-feishu-bridge","hfb.project":p.id,"hfb.generation":p.generation},
+        "foreground":{"argv":["/Users/example/.local/bin/agy"]}
+    });
+    assert!(herdr::should_disable_restoration(&p, &record));
+    for (field, value) in [
+        ("/keep", json!(false)),
+        ("/pid", json!(999)),
+        ("/labels/hfb.owner", json!("another-owner")),
+        ("/labels/hfb.generation", json!("replaced")),
+        ("/foreground/argv", json!(["/bin/zsh", "-l"])),
+        ("/state", json!("finished")),
+    ] {
+        let mut invalid = record.clone();
+        *invalid.pointer_mut(field).unwrap() = value;
+        assert!(!herdr::should_disable_restoration(&p, &invalid), "{field}");
+    }
+    record["foreground"] = Value::Null;
+    assert!(herdr::should_disable_restoration(&p, &record));
+}

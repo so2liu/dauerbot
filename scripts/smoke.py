@@ -297,6 +297,13 @@ def main():
             (results / f"real-{real_agent}.json").write_text(json.dumps({"passed": True,"checks": checks,"project":project["id"],"run_dir":str(run)},ensure_ascii=False,indent=2))
             print(f"Real {real_agent} model + MCP + HERDR + simulated Feishu round trip passed.")
             return
+        def terminal_record(address):
+            return json.loads(subprocess.check_output(["hc", "get", address], env=env, text=True, timeout=10))
+
+        terminal = api(f"/projects/{key}")["project"]["terminal"]
+        subprocess.run(["hc", "keep", terminal], env=env, check=True, capture_output=True, timeout=10)
+        wait_for(lambda: terminal_record(terminal)["keep"] is False, "late App adoption left shell restoration enabled")
+        checks.append("late App adoption keep event disables shell restoration for the owned agent")
         before = len(FIXTURE.messages)
         FIXTURE.emit(message("om_first", "duplicate payload"))
         wait_for(lambda: FIXTURE.acks >= 2, "duplicate event did not receive SDK ack")
@@ -324,9 +331,14 @@ def main():
         FIXTURE.emit(message("om_after_restart", "persist across daemon restart"))
         wait_for(lambda: any(m["source_id"] == "om_after_restart" for m in api(f"/projects/{key}")["messages"]), "paused event did not persist")
         old_terminal = api(f"/projects/{key}")["project"]["terminal"]
-        daemon.terminate(); daemon.wait(timeout=15); daemon = boot()
+        daemon.terminate(); daemon.wait(timeout=15)
+        subprocess.run(["hc", "keep", old_terminal], env=env, check=True, capture_output=True, timeout=10)
+        assert terminal_record(old_terminal)["keep"] is True
+        daemon = boot()
         wait_for(lambda: api("/state"), "daemon did not restart")
         assert api(f"/projects/{key}")["project"]["terminal"] == old_terminal
+        wait_for(lambda: terminal_record(old_terminal)["keep"] is False, "restart snapshot left shell restoration enabled")
+        checks.append("daemon restart snapshot disables shell restoration after offline App adoption")
         api(f"/projects/{key}/pause", {"paused": False})
         wait_for(lambda: any(m["source_id"] == "om_after_restart" and m["status"] == "acknowledged" for m in api(f"/projects/{key}")["messages"]), "persistent queue did not resume")
         checks.append("daemon restart preserves agent terminal and resumes persistent paused queue")
