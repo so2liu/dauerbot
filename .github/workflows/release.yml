@@ -5,26 +5,46 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing main-branch release tag, e.g. v0.3.0"
+        description: "Existing main-branch tag with a staged local build, e.g. v0.3.3"
         required: true
         type: string
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: dauerbot-release
   cancel-in-progress: false
 env:
   RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 jobs:
-  macos-arm64:
-    runs-on: macos-15
-    timeout-minutes: 120
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
-      - name: Validate release tag and credentials
+      - name: Validate main-branch release tag
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          git rev-parse --verify "refs/tags/$RELEASE_TAG"
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Require staged local build metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/prebuilt-macos.py inspect --tag "$RELEASE_TAG"
+  macos-arm64:
+    needs: preflight
+    runs-on: macos-15
+    timeout-minutes: 80
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Validate signing credentials
         env:
           CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           UPDATE_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
@@ -33,38 +53,15 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
-          git merge-base --is-ancestor HEAD origin/main
           test -n "$CERTIFICATE"
           test -n "$UPDATE_KEY"
           test -n "$APPLE_ID"
           test -n "$APPLE_APP_SPECIFIC_PASSWORD"
           test "$APPLE_TEAM_ID" = "366ADQ28F6"
-      - name: Restore a verified local build when available
-        id: prebuilt
+      - name: Restore the verified local build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 scripts/prebuilt-macos.py restore --tag "$RELEASE_TAG"
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.prebuilt.outputs.available != 'true'
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        if: steps.prebuilt.outputs.available != 'true'
-        with:
-          shared-key: macos-arm64
-          workspaces: |
-            . -> desktop/target
-            desktop -> target
-      - name: Build and verify
-        if: steps.prebuilt.outputs.available != 'true'
-        run: |
-          set -euo pipefail
-          ./scripts/build-desktop.sh
-          cargo test --locked --release --target-dir desktop/target --tests
-          cargo test --locked --release --manifest-path desktop/Cargo.toml
-          cargo clippy --locked --release --target-dir desktop/target --all-targets -- -D warnings
-          cargo clippy --locked --release --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
       - name: Import Developer ID signing certificate
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -99,7 +96,7 @@ jobs:
           name: notarization-receipt
           path: dist/notarization*.json
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 7
       - name: Prepare signed update manifest and package
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
