@@ -22,7 +22,11 @@ The updater checks signed manifests, semantic versions and channels, bounded dow
 
 Before the native-only cleanup, 21 backend tests and three desktop tests passed; the opt-in live sending test remained ignored. Root and desktop clippy passed. GPUI's upstream `block 0.1.6` dependency reports a future-compatibility warning. The native update page was opened through the macOS menu and visually checked. Coordinate clicks fail in the available computer-control interface, so update button clicks are not claimed as fully automated GUI acceptance.
 
-The first 0.3.0 CI run built, tested, signed the app, signed the manifest, and uploaded all five assets. Publication stopped because GitHub's release-by-tag API did not resolve the draft. The publication script now resolves the draft by numeric release ID before checking digests. Actual upgrade and rollback results must be recorded after the replacement release runs.
+The first 0.3.0 CI run built, tested, signed the app, signed the manifest, and uploaded all five assets. Publication stopped because GitHub's release-by-tag API did not resolve the draft. The publication script now resolves the draft by numeric release ID before checking digests. The replacement v0.3.1 Release run 43721151816 completed build, tests, Apple signing, manifest signing, upload digest checks, and public publication successfully. All five assets are public. The 16,545,752-byte package has SHA-256 `aba9e9f95c644df97bb0b16cceb05e3938cfa06f786884d59702508fcba8756e`, matching both the verified download and GitHub asset digest.
+
+An isolated signed 0.2.0 app upgraded to 0.3.1 through the real updater, then the new desktop switched its daemon to 0.3.1. Rollback restored both app and daemon to 0.2.0 and paused automatic updates. Reinstalling 0.3.1 reused the verified cached package. At every stage, the project, fixed bot binding, queued message, and byte-for-byte configuration digest stayed intact. Evidence: `test-results/update-e2e/result.json` and `acceptance.log`.
+
+The installed everyday app then received the verified signed 0.3.1 bundle at its existing path. Its daemon reports 0.3.1; the original project remains ready on terminal t1x8 with Agent PID 17625. The bot binding and configuration digest are unchanged. A native screenshot confirmed the English workspace, 0.3.1 version, and existing project. The old app bundle is retained locally for recovery. No user Agent, MCP process, or shared Core was terminated.
 
 ## Message and session checks
 
