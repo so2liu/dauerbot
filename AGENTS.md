@@ -1,11 +1,15 @@
-# 项目约定
+# Project conventions
 
-- 面向用户的客户端是 `desktop/` 中的 GPUI 原生 macOS 应用，禁止用网页或 WebView 替代最终桌面交付。Svelte 页面保留为辅助管理入口。
-- 业务状态集中在独立 Rust daemon，桌面应用、CLI、辅助网页和 MCP 共用接口。后台网络与文件检测不得阻塞 GPUI 主线程。
-- macOS 权限以明确选择的路径和实际访问结果为准，不扫描用户隐私数据库、不调用私有 TCC API，不把单个文件访问成功当作完全磁盘访问已授权；说明 Bridge 与 HERDR/Agent 的进程权限差异。
-- 不改用户的真实 Core/App 配置或终止其终端。HERDR 测试使用独立 HC_SESSION 和短的 XDG_RUNTIME_DIR。
-- 凭证不进入 Git、日志或截图。真实飞书测试须明确选择机器人与聊天，不与已有机器人竞争长连接事件。
-- 消息提交不等于处理完成；网络结果不确定时保留 uncertain，不自动重复执行。
-- 仅补充能捕获真实业务回归的测试。前端修改运行 pnpm check/build，Rust 修改运行相关测试和 clippy。
-- 发布构建先生成 frontend/dist，再构建 Rust。运行时不依赖前端开发服务器。
-- 桌面打包使用 `scripts/build-desktop.sh`；本地 ad-hoc 签名只用于开发验证，不代表完成 Developer ID 签名、公证或分发验收。
+Dauerbot is an open-source project for a global audience. English is the project language. Use English for repository descriptions, README and other documentation, code comments, user-facing UI and CLI text, release notes, commit messages, issue titles, and pull request titles and descriptions. This project-specific rule overrides the parent's default of Chinese commits and PRs. Preserve user content, proper names, and multilingual test fixtures in their original language. Do not rewrite published Git history to translate old commits.
+
+The user-facing client is the native Rust/GPUI macOS application in `desktop/`. Do not add a web interface, WebView, Svelte, or a JavaScript build toolchain. Desktop, CLI, and MCP share the independent Rust daemon's API. Network requests and file access checks must never block GPUI's main thread.
+
+Check macOS access against paths that the user explicitly selects. Do not scan private databases, call private TCC APIs, or treat one accessible file as proof of Full Disk Access. Explain that the desktop, daemon, HERDR, and Agent can have different permissions.
+
+Do not change a user's real Core/App configuration or terminate their terminals. HERDR tests must use an isolated `HC_SESSION` and a short `XDG_RUNTIME_DIR`. Keep the default bundle ID and data directory compatible across renames and upgrades; clearly label windows that use independent data directories.
+
+Keep credentials out of Git, logs, and screenshots. Live Feishu tests must name the intended bot and chat and must not compete with an existing bot's event listener. Message submission does not prove completion; preserve `uncertain` results rather than retrying automatically.
+
+Remove obsolete code and dependencies with the feature they served. Preserve storage migrations and compatibility required to read existing user data. Add tests only for meaningful behavioral regressions. Run the relevant Rust tests and clippy; use the isolated protocol smoke test when changing daemon, CLI, MCP, or message handling.
+
+Package the native app with `scripts/build-desktop.sh`; it must build without Node.js or pnpm. Local ad-hoc signatures are for development, not proof of Developer ID signing, notarization, or Gatekeeper acceptance. Publish version tags only from `main`. Never overwrite a public release or silently change the update signing key.

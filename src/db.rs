@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
@@ -132,14 +132,14 @@ impl Db {
         ")?;
         crate::conversation::migrate(&conn)?;
         crate::bot::migrate(&conn)?;
-        conn.execute("UPDATE messages SET status='uncertain',error='服务在操作中退出；请核对后手动重试',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
+        conn.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
     pub fn sync<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self
             .0
             .lock()
-            .map_err(|_| anyhow::anyhow!("数据库锁已损坏"))?;
+            .map_err(|_| anyhow::anyhow!("Database lock is poisoned"))?;
         f(&conn)
     }
     pub async fn call<T: Send + 'static>(
@@ -167,15 +167,16 @@ impl Db {
                 [key],
                 project,
             )
-            .context("项目不存在")
+            .context("Project not found")
         })
         .await
     }
     pub async fn create(&self, input: ProjectInput) -> Result<Project> {
         validate(&input)?;
-        let path = std::fs::canonicalize(&input.path).context("项目目录不存在")?;
+        let path =
+            std::fs::canonicalize(&input.path).context("Project directory does not exist")?;
         if !path.is_dir() {
-            bail!("项目路径必须是目录");
+            bail!("Project path must be a directory");
         }
         let key = id();
         let out = key.clone();
@@ -195,14 +196,14 @@ impl Db {
         let p = self.project(key).await?;
         let path = std::fs::canonicalize(&input.path)?;
         if !path.is_dir() {
-            bail!("项目路径必须是目录");
+            bail!("Project path must be a directory");
         }
         if p.terminal.is_some()
             && (p.path != path.to_string_lossy()
                 || p.agent != input.agent
                 || p.extra_args != input.extra_args)
         {
-            bail!("请先停止会话，再修改目录、Agent 或启动参数");
+            bail!("Stop the session before changing the directory, agent, or launch arguments");
         }
         let out = p.id.clone();
         self.call(move |c| {
@@ -245,7 +246,7 @@ impl Db {
     pub async fn switch_agent(&self, key: &str, agent: &str) -> Result<()> {
         anyhow::ensure!(
             ["codex", "claude", "pi", "agy"].contains(&agent),
-            "不支持的 Agent"
+            "Unsupported agent"
         );
         let key = self.project(key).await?.id;
         let agent = agent.to_owned();
@@ -255,7 +256,7 @@ impl Db {
                  WHERE id=? AND terminal IS NULL",
                 params![agent,key],
             )?;
-            anyhow::ensure!(n == 1, "请先停止当前智能体，再进行切换");
+            anyhow::ensure!(n == 1, "Stop the current agent before switching");
             Ok(())
         })
         .await
@@ -276,17 +277,8 @@ impl Db {
         self.call(move|c|{
             let n=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END WHERE id=?2 AND generation=?3 AND terminal=?4",
                 params![native,key,generation,terminal])?;
-            if n!=1 {bail!("会话身份已变更，请重新连接 MCP");} Ok(())
+            if n!=1 {bail!("Session identity changed; reconnect MCP");} Ok(())
         }).await
-    }
-    pub fn ingest(
-        &self,
-        chat: &str,
-        source: &str,
-        content: &str,
-        attachment: &serde_json::Value,
-    ) -> Result<Option<String>> {
-        self.ingest_impl(chat, source, content, attachment, false)
     }
     /// All events from the configured bot enter its project, regardless of chat type or ID.
     pub fn ingest_bot(
@@ -296,32 +288,17 @@ impl Db {
         content: &str,
         attachment: &serde_json::Value,
     ) -> Result<Option<String>> {
-        self.ingest_impl(chat, source, content, attachment, true)
-    }
-    fn ingest_impl(
-        &self,
-        chat: &str,
-        source: &str,
-        content: &str,
-        attachment: &serde_json::Value,
-        bot_only: bool,
-    ) -> Result<Option<String>> {
         self.sync(|c|{
             let context = &attachment["source"];
             let kind = context["chat_type"].as_str().unwrap_or("unknown");
             c.execute("INSERT INTO conversations(chat_id,kind,seen_at,preview) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET seen_at=excluded.seen_at,preview=excluded.preview,kind=CASE WHEN excluded.kind='unknown' THEN conversations.kind ELSE excluded.kind END", params![chat,kind,now(),content.chars().take(96).collect::<String>()])?;
             if c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE direction='in' AND source_id=?)",[source],|r|r.get::<_,bool>(0))? { return Ok(None); }
-            let legacy:Option<String>=c.query_row("SELECT id FROM projects WHERE chat_id=?",[chat],|r|r.get(0)).optional()?;
-            let bound:Option<String>=c.query_row("SELECT project_id FROM conversations WHERE chat_id=?",[chat],|r|r.get::<_,Option<String>>(0)).optional()?.flatten();
-            let fallback: Option<String> = if kind == "p2p" { c.query_row("SELECT project_id FROM routing_defaults WHERE slot='p2p'",[],|r|r.get(0)).optional()? } else {None};
-            let destination = if bot_only { crate::bot::owner(c)? } else { legacy.or(bound).or(fallback) };
+            let destination = crate::bot::owner(c)?;
             let Some(project)=destination else {
                 c.execute("INSERT OR IGNORE INTO unrouted_messages(source_id,chat_id,content,attachment,created_at) VALUES(?,?,?,?,?)",params![source,chat,content,serde_json::to_string(attachment)?,now()])?;
                 return Ok(None)
             };
-            if bot_only {
-                c.execute("UPDATE conversations SET project_id=? WHERE chat_id=?",params![project,chat])?;
-            }
+            c.execute("UPDATE conversations SET project_id=? WHERE chat_id=?",params![project,chat])?;
             let key=id();
             let n=c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
                 params![key,project,source,content,serde_json::to_string(attachment)?,now(),now()])?;
@@ -379,13 +356,13 @@ impl Db {
         let (key, source) = (key.to_owned(), source.to_owned());
         self.call(move|c|{
             let n=c.execute("UPDATE messages SET status='acknowledged',error='',updated_at=? WHERE project_id=? AND source_id=? AND direction='in' AND status IN ('submitting','submitted','uncertain','acknowledged')",params![now(),key,source])?;
-            if n!=1 {bail!("消息不属于该项目或尚未投递");} Ok(())
+            if n!=1 {bail!("This message does not belong to the project or has not been submitted");} Ok(())
         }).await
     }
     pub async fn remove_project(&self, key: &str) -> Result<()> {
         let p = self.project(key).await?;
         if p.terminal.is_some() {
-            bail!("先停止会话再删除项目");
+            bail!("Stop the session before removing the project");
         }
         self.call(move |c| {
             c.execute_batch("BEGIN IMMEDIATE")?;
@@ -411,16 +388,16 @@ impl Db {
 
 fn validate(p: &ProjectInput) -> Result<()> {
     if p.name.trim().is_empty() || p.name.len() > 120 {
-        bail!("项目名须为 1–120 字符");
+        bail!("Project name must contain 1 to 120 characters");
     }
     if !["codex", "claude", "pi", "agy", "custom"].contains(&p.agent.as_str()) {
-        bail!("不支持的 Agent");
+        bail!("Unsupported agent");
     }
     if p.agent == "custom" && p.extra_args.is_empty() {
-        bail!("自定义 Agent 需要完整 argv");
+        bail!("Custom agents require a complete argv");
     }
     if !p.chat_id.is_empty() && !p.chat_id.starts_with("oc_") {
-        bail!("请填写飞书 chat_id（oc_ 开头）");
+        bail!("Enter a Feishu chat_id starting with oc_");
     }
     Ok(())
 }

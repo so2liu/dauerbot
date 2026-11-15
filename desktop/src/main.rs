@@ -19,14 +19,14 @@ const MUTED: u32 = 0x74808c;
 const LINE: u32 = 0xe6e9ec;
 const ACCENT: u32 = 0x1c796c;
 const STEPS: [&str; 8] = [
-    "欢迎使用",
-    "创建飞书机器人",
-    "连接机器人",
-    "订阅消息事件",
-    "本机访问权限",
-    "添加首个项目",
-    "项目工作台",
-    "应用更新",
+    "Welcome",
+    "Create a Feishu bot",
+    "Connect your bot",
+    "Message events",
+    "Local permissions",
+    "Add your first project",
+    "Workspace",
+    "App Updates",
 ];
 actions!(bridge, [Quit, ShowUpdates]);
 
@@ -72,17 +72,17 @@ impl Desktop {
         let mut input = |placeholder: &'static str, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
-        let name = input("例如：个人网站", cx);
-        let path = input("选择项目代码所在的文件夹", cx);
+        let name = input("For example: personal website", cx);
+        let path = input("Choose the project folder", cx);
         let app_id = input("cli_…", cx);
         let secret = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("只在你的 Mac 本地保存")
+                .placeholder("Stored only on this Mac")
                 .masked(true)
         });
         let message = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("给这个项目的主会话发送任务…")
+                .placeholder("Send a task to the main session...")
                 .multi_line(true)
                 .rows(3)
         });
@@ -119,7 +119,7 @@ impl Desktop {
             secret,
             message,
             agent: 0,
-            notice: "正在启动本地服务…".into(),
+            notice: "Starting the local service...".into(),
             error: false,
             busy: false,
             access_result: String::new(),
@@ -139,7 +139,8 @@ impl Desktop {
                 Reply::Restart => cx.quit(),
                 Reply::State(value) => {
                     if self.state.is_null() {
-                        self.notice = "本地服务已就绪，可以开始设置，也可以先创建本机项目".into();
+                        self.notice =
+                            "Local service ready. Connect a bot or create a local project.".into();
                         if let Some(id) = value["settings"]["app_id"].as_str()
                             && self.app_id.read(cx).value().is_empty()
                         {
@@ -156,12 +157,12 @@ impl Desktop {
                     self.state = value;
                 }
                 Reply::Connection(Some(reason)) => {
-                    self.notice = format!("本地服务连接失败：{reason}");
+                    self.notice = format!("Local service connection failed: {reason}");
                     self.error = true;
                 }
                 Reply::Connection(None) => {
-                    if self.notice.starts_with("本地服务连接失败：") {
-                        self.notice = "本地服务已恢复连接".into();
+                    if self.notice.starts_with("Local service connection failed: ") {
+                        self.notice = "Local service connection restored".into();
                         self.error = false;
                     }
                 }
@@ -243,7 +244,7 @@ impl Desktop {
         }
         self.busy = true;
         self.error = false;
-        self.notice = "正在处理…".into();
+        self.notice = "Working...".into();
         if self
             .backend
             .tx
@@ -257,7 +258,7 @@ impl Desktop {
         {
             self.busy = false;
             self.error = true;
-            self.notice = "后台服务已退出，请重新打开应用".into();
+            self.notice = "The background service exited. Reopen the app.".into();
         }
     }
     fn pick(&mut self, database: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -267,9 +268,9 @@ impl Desktop {
             multiple: false,
             prompt: Some(
                 if database {
-                    "选择需要检测的 SQLite 文件"
+                    "Choose a SQLite file to check"
                 } else {
-                    "选择项目文件夹"
+                    "Choose a project folder"
                 }
                 .into(),
             ),
@@ -285,7 +286,7 @@ impl Desktop {
                             input.set_value(path.to_string_lossy().to_string(), window, cx)
                         });
                     }
-                    this.access_result = format!("正在检测：{}", path.display());
+                    this.access_result = format!("Checking: {}", path.display());
                     let command = if database {
                         CommandRequest::Database(path.clone())
                     } else {
@@ -345,6 +346,7 @@ impl Desktop {
     }
     fn card(title: &str, text: &str) -> Div {
         div()
+            .min_w_0()
             .p_5()
             .rounded_xl()
             .bg(rgb(0xffffff))
@@ -382,81 +384,81 @@ impl Desktop {
     }
     fn welcome(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("YOUR AGENTS, A LITTLE CLOSER", "让工作继续，\n让对话随行。", "在飞书里和项目的主会话交谈，回到 Mac 后接着做。先花几分钟，连接你的第一个机器人。"))
+            .child(Self::title("YOUR AGENTS, A LITTLE CLOSER", "Keep working.\nTake the conversation with you.", "Talk to your project's main session in Feishu, then continue on your Mac. Connect your first bot to get started."))
             .child(div().flex().gap_4()
-                .child(Self::card("01  连接飞书", "创建企业自建机器人。凭证保留在本机。" ).flex_1())
-                .child(Self::card("02  选择项目", "连接已有 CLI 与 HERDR 持久会话。").flex_1())
-                .child(Self::card("03  继续对话", "文本、任务和附件，回到同一主会话。").flex_1()))
-            .child(Self::card("你掌握每一次授权", "项目文件夹由你选择。访问受保护文件时再申请对应权限；普通项目无需完全磁盘访问、辅助功能或屏幕录制权限。"))
-            .child(self.btn("begin", "开始设置 →", |this, _, _| this.go(1), cx).primary())
-            .child(self.btn("local-first", "先在本机试用，稍后连接飞书", |this, _, _| this.go(5), cx))
-            .child(div().mt_6().text_sm().font_weight(FontWeight::SEMIBOLD).child("本机环境"))
+                .child(Self::card("01  Connect Feishu", "Create an enterprise app bot. Credentials stay on your Mac." ).flex_1())
+                .child(Self::card("02  Choose a project", "Connect an installed CLI to a persistent HERDR session.").flex_1())
+                .child(Self::card("03  Continue the conversation", "Messages, tasks, and files reach the same main session.").flex_1()))
+            .child(Self::card("You control access", "Choose the project folder yourself. Protected files may require additional access; ordinary projects do not need Full Disk Access, Accessibility, or Screen Recording."))
+            .child(self.btn("begin", "Start setup →", |this, _, _| this.go(1), cx).primary())
+            .child(self.btn("local-first", "Try locally and connect Feishu later", |this, _, _| this.go(5), cx))
+            .child(div().mt_6().text_sm().font_weight(FontWeight::SEMIBOLD).child("Local environment"))
             .children(self.environment.iter().map(|(name, status)| div().flex().gap_4().text_sm().child(div().w_32().child(name.clone())).child(div().text_color(rgb(MUTED)).child(status.clone()))))
-            .child(self.btn("rescan", "重新检测环境", |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Environment); }, cx))
+            .child(self.btn("rescan", "Check environment again", |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Environment); }, cx))
             .into_any_element()
     }
     fn bot(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 01", "创建你的飞书机器人", "使用企业自建应用，而不是群里的自定义 Webhook 机器人。后者无法完成双向消息交互。"))
-            .child(Self::card("1. 创建应用", "打开飞书开放平台 → 开发者后台 → 创建企业自建应用。名称可填「项目助手」，描述写明用途。需要有创建应用的企业权限。"))
-            .child(self.btn("console", "打开飞书开发者后台 ↗", |_, _, cx| cx.open_url("https://open.feishu.cn/app"), cx).primary())
-            .child(Self::card("2. 添加机器人能力", "进入应用，在「添加应用能力」中启用机器人。先不要创建 Webhook，也不需要公网服务器。"))
-            .child(Self::card("3. 找到凭证", "进入「凭证与基础信息」，复制 App ID 和 App Secret。下一步粘贴到本机应用，不要发到群里。"))
-            .child(Self::card("已有机器人？", "建议为 Bridge 创建独立应用。同一机器人同时被其他程序通过长连接监听，可能导致消息由其他程序收到。"))
-            .child(self.btn("bot-next", "已启用机器人，填写凭证 →", |this, _, _| this.go(2), cx).primary()).into_any_element()
+            .child(Self::title("SETUP / 01", "Create your Feishu bot", "Use an enterprise custom app with bot capability. Group Webhook bots cannot receive the messages needed for two-way conversations."))
+            .child(Self::card("1. Create an app", "Open the Feishu developer console and create an enterprise custom app. Give it a name and description. Your organization must allow you to create apps."))
+            .child(self.btn("console", "Open Feishu developer console ↗", |_, _, cx| cx.open_url("https://open.feishu.cn/app"), cx).primary())
+            .child(Self::card("2. Enable bot capability", "Open the app and enable Bot under Add App Capabilities. You do not need a Webhook or a public server."))
+            .child(Self::card("3. Find the credentials", "Copy the App ID and App Secret from Credentials and Basic Information. Paste them into the next step on your Mac; do not send them in a chat."))
+            .child(Self::card("Already have a bot?", "Use a dedicated app for Dauerbot. If another program listens to the same bot, Feishu may deliver messages to that program instead."))
+            .child(self.btn("bot-next", "Bot enabled. Add credentials →", |this, _, _| this.go(2), cx).primary()).into_any_element()
     }
     fn credentials(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 02", "把机器人连接到这台 Mac", "保存后，本地服务会连接飞书。凭证验证只证明身份有效，消息权限和事件订阅将在下一步配置。"))
+            .child(Self::title("SETUP / 02", "Connect the bot to this Mac", "The local service connects after you save. Credential validation checks app identity; message permissions and subscriptions come next."))
             .child(Self::field("App ID", &self.app_id))
             .child(Self::field("App Secret", &self.secret))
-            .child(div().text_xs().text_color(rgb(MUTED)).child("Secret 使用密码输入框，不从已保存配置回显。留空保存会保留原 Secret；更换 App ID 时需要重新填写。凭证保存在仅当前用户可读的本地文件。"))
-            .child(self.btn("save-credentials", "保存并建立连接", |this, _, cx| {
+            .child(div().text_xs().text_color(rgb(MUTED)).child("The secret stays masked and saved values are never shown. Leave it blank to keep the current secret; enter a new one when changing App ID. Credentials stay in a local file readable only by your user."))
+            .child(self.btn("save-credentials", "Save and connect", |this, _, cx| {
                 let id = this.app_id.read(cx).value().to_string();
-                if !id.starts_with("cli_") { this.notice = "请输入以 cli_ 开头的 App ID".into(); this.error = true; return; }
+                if !id.starts_with("cli_") { this.notice = "Enter an App ID starting with cli_".into(); this.error = true; return; }
                 let secret = this.secret.read(cx).value().to_string();
                 this.pending_secret = secret.clone();
                 this.credentials_checked = false;
-                this.api("PUT", "/settings".into(), Some(json!({"app_id":id,"app_secret":secret})), "凭证已保存，请点击验证");
+                this.api("PUT", "/settings".into(), Some(json!({"app_id":id,"app_secret":secret})), "Credentials saved. Validate them to continue.");
             }, cx).primary())
-            .child(self.btn("check-credentials", "验证应用凭证", |this, _, _| this.api("POST", "/settings/check".into(), None, "应用身份验证成功；继续配置事件订阅"), cx))
-            .child(Self::card("连接状态", &format!("{} · {}", self.state["runtime"]["feishu"].as_str().unwrap_or("等待服务"), self.state["runtime"]["feishu_error"].as_str().unwrap_or(""))))
-            .child(self.btn("credentials-next", "继续配置消息权限 →", |this, _, _| this.go(3), cx).primary().disabled(!self.credentials_checked || self.busy))
+            .child(self.btn("check-credentials", "Validate credentials", |this, _, _| this.api("POST", "/settings/check".into(), None, "App identity verified. Configure message events next."), cx))
+            .child(Self::card("Connection status", &format!("{} · {}", self.state["runtime"]["feishu"].as_str().unwrap_or("Waiting for service"), self.state["runtime"]["feishu_error"].as_str().unwrap_or(""))))
+            .child(self.btn("credentials-next", "Configure message permissions →", |this, _, _| this.go(3), cx).primary().disabled(!self.credentials_checked || self.busy))
             .into_any_element()
     }
     fn events(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 03", "让消息能来，也能回", "请在飞书开发者后台完成下面的配置。手动确认项不会被当作已经通过的自动检测。"))
-            .child(Self::card("1. 导入应用权限", "在「权限管理」批量导入下方清单：发送机器人消息、读取单聊和群内 @ 消息、读取消息资源、上传附件，以及列出机器人所在群。"))
-            .child(self.btn("copy-scopes-full", "复制完整权限 JSON（接收群内全部用户回复）", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(true)).unwrap())), cx).primary())
-            .child(self.btn("copy-scopes", "复制基础权限 JSON（仅接收群内 @ 消息）", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(false)).unwrap())), cx))
-            .child(Self::card("2. 使用长连接接收事件", "进入「事件与回调」→「事件配置」，选择「使用长连接接收事件」。先在上一步保存有效凭证，保持应用运行，再在后台保存。添加事件 im.message.receive_v1（接收消息）。"))
-            .child(Self::card("群内所有回复都要转发？", "请选择完整权限 JSON，其中的 im:message.group_msg 用于接收群内全部用户消息，属于敏感权限，通常需要管理员批准。基础权限清单只接收群内 @ 机器人的消息。Bridge 只将已绑定聊天的消息送入项目。"))
-            .child(Self::card("3. 发布应用并添加到群", "在「版本管理与发布」创建版本，设置可用范围并发布；如企业要求审核，等待管理员通过。将机器人加入用于此项目的群。权限或订阅改动后也需要发布新版本。"))
-            .child(self.btn("confirmed-events", if self.setup.events_confirmed { "✓ 已手动确认事件与权限" } else { "我已配置权限和事件订阅" }, |this, _, _| { this.setup.events_confirmed = !this.setup.events_confirmed; this.go(3); }, cx))
-            .child(self.btn("confirmed-release", if self.setup.published { "✓ 已手动确认发布与加群" } else { "我已发布应用并添加机器人到群" }, |this, _, _| { this.setup.published = !this.setup.published; this.go(3); }, cx))
-            .child(self.btn("events-next", "继续检查本机权限 →", |this, _, _| this.go(4), cx).primary().disabled(!self.setup.events_confirmed || !self.setup.published))
+            .child(Self::title("SETUP / 03", "Receive messages and send replies", "Complete these steps in the Feishu developer console. Manual confirmations are separate from automatic checks."))
+            .child(Self::card("1. Import app permissions", "In Permissions, import the JSON below to send bot messages, receive direct messages and group mentions, read message resources, upload files, and read group context."))
+            .child(self.btn("copy-scopes-full", "Copy full permission JSON (all group messages)", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(true)).unwrap())), cx).primary())
+            .child(self.btn("copy-scopes", "Copy basic permission JSON (group mentions)", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(false)).unwrap())), cx))
+            .child(Self::card("2. Receive events over a long connection", "Under Events and Callbacks, choose long connections. Save valid credentials in Dauerbot and keep it running before saving the subscription. Add im.message.receive_v1 to receive messages."))
+            .child(Self::card("Need every group reply?", "The full JSON includes im:message.group_msg for all user messages in groups; your administrator may need to approve it. The basic set only receives bot mentions. All messages this bot receives reach its fixed project."))
+            .child(Self::card("3. Publish the app and add the bot", "Create a version in Version Management and Release, choose its availability, and publish it. Wait for administrator approval if required. Add the bot to a group or use direct messages. Publish a new version after changing permissions or subscriptions."))
+            .child(self.btn("confirmed-events", if self.setup.events_confirmed { "✓ Events and permissions confirmed manually" } else { "I configured permissions and event subscriptions" }, |this, _, _| { this.setup.events_confirmed = !this.setup.events_confirmed; this.go(3); }, cx))
+            .child(self.btn("confirmed-release", if self.setup.published { "✓ Publishing and bot access confirmed manually" } else { "I published the app and made the bot available" }, |this, _, _| { this.setup.published = !this.setup.published; this.go(3); }, cx))
+            .child(self.btn("events-next", "Check local permissions →", |this, _, _| this.go(4), cx).primary().disabled(!self.setup.events_confirmed || !self.setup.published))
             .into_any_element()
     }
     fn permissions(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 04", "只在需要的地方，打开权限", "检测结果以当前进程的实际访问为准。应用窗口、后台服务和 HERDR 主会话可能拥有不同的权限。"))
-            .child(Self::card("项目文件夹 · 使用时需要", "通过 macOS 文件选择器选定目录，再检测读取和创建临时文件的能力。若项目位于桌面、文稿或下载，系统可能询问文件夹访问权限。你可以随时拒绝并选择其他目录。"))
-            .child(self.btn("choose-access-folder", "选择项目文件夹并检测…", |this, window, cx| this.pick(false, window, cx), cx).primary())
-            .child(Self::card("数据库 · 按任务需要", "应用自己的 SQLite 数据库在私有数据目录，无需额外系统权限。只有任务需要访问其他应用的数据库时，才选择该文件进行只读检测；不读取业务记录，不扫描邮件、聊天、浏览器或系统权限数据库。"))
-            .child(self.btn("choose-db", "选择 SQLite 数据库并检测…", |this, window, cx| this.pick(true, window, cx), cx))
-            .child(Self::card("完全磁盘访问权限 · 可选", "受系统保护的第三方应用数据可能需要此权限。请在系统设置中手动添加真正执行任务的应用（如 HERDR）；授权 Bridge 不保证已有 HERDR 进程能访问。开启后可能需要退出并重新打开对应应用，再重新检测。"))
+            .child(Self::title("SETUP / 04", "Grant access where you need it", "Checks reflect this process's actual access. The desktop, daemon, and HERDR agent may have different permissions."))
+            .child(Self::card("Project folder · required for project work", "Select a folder with the macOS picker to check reading and temporary-file creation. macOS may request access to Desktop, Documents, or Downloads. You can decline and choose another folder."))
+            .child(self.btn("choose-access-folder", "Choose and check a project folder...", |this, window, cx| this.pick(false, window, cx), cx).primary())
+            .child(Self::card("Databases · when a task needs them", "Dauerbot's SQLite database lives in its private data directory. Select another database only when a task needs it. Checks read schema metadata without reading business records or scanning private app databases."))
+            .child(self.btn("choose-db", "Choose and check a SQLite database...", |this, window, cx| this.pick(true, window, cx), cx))
+            .child(Self::card("Full Disk Access · optional", "Protected app data may require Full Disk Access. In System Settings, add the app that actually runs the task, such as HERDR. Granting Dauerbot access does not grant it to existing HERDR processes. Reopen the relevant app and check again after granting access."))
             .child(div().flex().gap_3()
-                .child(self.btn("files-settings", "打开「文件与文件夹」↗", |_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"), cx))
-                .child(self.btn("disk-settings", "打开「完全磁盘访问权限」↗", |_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"), cx)))
-            .child(self.btn("reveal-app", "在 Finder 中显示此应用", |_, _, cx| {
+                .child(self.btn("files-settings", "Open Files and Folders ↗", |_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"), cx))
+                .child(self.btn("disk-settings", "Open Full Disk Access ↗", |_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"), cx)))
+            .child(self.btn("reveal-app", "Reveal this app in Finder", |_, _, cx| {
                 if let Ok(exe) = std::env::current_exe()
                     && let Some(bundle) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
                 { cx.reveal_path(bundle); }
             }, cx))
-            .child(Self::card("辅助功能、屏幕录制与自动化", "当前 Bridge 通过 HERDR 协议管理会话，不模拟键盘和读取屏幕，因此不会要求这些权限。未来启用对应功能时再说明用途并申请。"))
-            .when(!self.access_result.is_empty(), |view| view.child(Self::card("本次检测结果", &self.access_result)))
-            .child(self.btn("access-next", "继续添加项目 →", |this, _, _| this.go(5), cx).primary())
+            .child(Self::card("Accessibility, Screen Recording, and Automation", "Dauerbot manages sessions through HERDR's protocol, without screen capture or system input simulation. These permissions are not required."))
+            .when(!self.access_result.is_empty(), |view| view.child(Self::card("Access check result", &self.access_result)))
+            .child(self.btn("access-next", "Add a project →", |this, _, _| this.go(5), cx).primary())
             .into_any_element()
     }
     fn project_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -475,21 +477,21 @@ impl Desktop {
             );
         }
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 05", "给第一个项目，一个主会话", "一个机器人固定对应一个项目，私聊和群聊自动进入当前智能体。智能体可在项目工作台切换。"))
-            .child(Self::field("项目名称", &self.name))
-            .child(Self::field("项目目录（可手动输入绝对路径）", &self.path))
-            .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("已选择：{picked}"))))
-            .child(self.btn("pick-project", "用系统选择器选择文件夹…", |this, window, cx| this.pick(false, window, cx), cx))
+            .child(Self::title("SETUP / 05", "Create your first main session", "One bot belongs to one project. Direct and group messages reach its active agent, which you can switch in the workspace."))
+            .child(Self::field("Project name", &self.name))
+            .child(Self::field("Project folder (or enter an absolute path)", &self.path))
+            .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("Selected: {picked}"))))
+            .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
-            .child(Self::card("自动绑定", "首个项目创建后，当前飞书机器人会自动绑定到它。无需选择聊天或填写 ID；机器人收到的私聊和群聊都会进入这个项目。"))
-            .child(Self::card("可以先在本机试用", "没有飞书凭证或群聊也能创建项目、启动 Agent，并从工作台发送任务。首次使用 CLI 可能需要在 HERDR 中完成登录或项目目录信任。"))
-            .child(self.btn("create-project", "创建项目 →", |this, _, cx| {
+            .child(Self::card("Automatic binding", "Your first project becomes this bot's fixed owner. You do not need to select chats or enter IDs. Direct and group messages both reach this project."))
+            .child(Self::card("Try it locally first", "Create a project, start an agent, and send local tasks before connecting Feishu. The CLI may require sign-in or project trust in HERDR on first use."))
+            .child(self.btn("create-project", "Create project →", |this, _, cx| {
                 let manual = this.path.read(cx).value().to_string();
                 let path = if manual.trim().is_empty() { this.picked_path.clone() } else { manual };
                 let name = this.name.read(cx).value().to_string();
-                if name.trim().is_empty() || path.is_empty() { this.notice = "请填写项目名称并选择目录".into(); this.error = true; return; }
+                if name.trim().is_empty() || path.is_empty() { this.notice = "Enter a project name and choose a folder".into(); this.error = true; return; }
                 let agent = ["codex","claude","pi","agy"][this.agent];
-                this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":""})), "项目已创建。点击「启动主会话」开始工作");
+                this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":""})), "Project created. Start the main session to begin.");
             }, cx).primary())
             .into_any_element()
     }
@@ -505,8 +507,8 @@ impl Desktop {
             .gap_4()
             .child(Self::title(
                 "WORKSPACE",
-                "所有项目，触手可及",
-                "飞书对话和本机任务在这里汇合。关闭窗口后，已启动的后台服务与主会话继续运行。",
+                "Your projects, within reach",
+                "Feishu conversations and local tasks meet here. Closing this window leaves the daemon and main session running.",
             ))
             .child(
                 div()
@@ -515,7 +517,7 @@ impl Desktop {
                     .child(
                         self.btn(
                             "add-project",
-                            "＋ 添加项目",
+                            "＋ Add project",
                             |this, _, _| {
                                 this.go(5);
                             },
@@ -525,50 +527,50 @@ impl Desktop {
                     )
                     .child(self.btn(
                         "return-setup",
-                        "重新查看使用引导",
+                        "Reopen setup guide",
                         |this, _, _| this.go(0),
                         cx,
                     )),
             )
             .child(Self::card(
-                "实时连接",
+                "Live connections",
                 &format!(
-                    "HERDR：{}    飞书：{}",
-                    self.state["runtime"]["core"].as_str().unwrap_or("等待服务"),
-                    self.state["runtime"]["feishu"].as_str().unwrap_or("未连接")
+                    "HERDR: {}    Feishu: {}",
+                    self.state["runtime"]["core"].as_str().unwrap_or("Waiting for service"),
+                    self.state["runtime"]["feishu"].as_str().unwrap_or("Disconnected")
                 ),
             ));
         if projects.is_empty() {
             body = body.child(Self::card(
-                "还没有项目",
-                "先添加一个项目。可以跳过飞书连接，在本机体验主会话。",
+                "No projects yet",
+                "Add a project to get started. You can try a local main session before connecting Feishu.",
             ));
         }
         for project in &projects {
             let id = project["id"].as_str().unwrap_or_default().to_owned();
             let label = format!(
                 "{}  ·  {}  ·  {}",
-                project["name"].as_str().unwrap_or("项目"),
+                project["name"].as_str().unwrap_or("Project"),
                 project["agent"].as_str().unwrap_or(""),
                 if project["terminal"]
                     .as_str()
                     .is_some_and(|t| self.state["runtime"]["terminals"][t]["state"] == "finished")
                 {
-                    "已退出"
+                    "Exited"
                 } else if project["terminal"].as_str().is_some_and(|t| {
                     self.state["runtime"]["terminals"][t]["status"]["state"] == "blocked"
                 }) {
-                    "等待交互"
+                    "Needs input"
                 } else if project["terminal"].as_str().is_some_and(|t| {
                     self.state["runtime"]["terminals"][t]["status"]["state"] == "error"
                 }) {
-                    "CLI 运行出错"
+                    "CLI error"
                 } else if project["ready"] == true {
-                    "已就绪"
+                    "Ready"
                 } else if !project["terminal"].is_null() {
-                    "会话待就绪"
+                    "Waiting for session"
                 } else {
-                    "未启动"
+                    "Stopped"
                 }
             );
             body = body.child(
@@ -579,7 +581,7 @@ impl Desktop {
                         this.selected = id.clone();
                         this.detail = Value::Null;
                         let _ = this.backend.tx.send(CommandRequest::Watch(id.clone()));
-                        this.api("GET", format!("/projects/{id}"), None, "已选择项目");
+                        this.api("GET", format!("/projects/{id}"), None, "Project selected");
                     })),
             );
         }
@@ -594,7 +596,7 @@ impl Desktop {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            let terminal = project["terminal"].as_str().unwrap_or("尚未创建");
+            let terminal = project["terminal"].as_str().unwrap_or("Not created");
             let mut agent_controls = div().flex().flex_wrap().gap_2();
             for (index, (agent, label)) in [
                 ("codex", "Codex"),
@@ -616,7 +618,7 @@ impl Desktop {
                                 "POST",
                                 format!("/projects/{project_id}/agent"),
                                 Some(json!({"agent":agent})),
-                                "智能体已切换，机器人和项目绑定保持不变",
+                                "Agent switched. The bot and project binding are preserved.",
                             );
                         })),
                 );
@@ -626,67 +628,67 @@ impl Desktop {
                 .unwrap_or("")
                 .to_owned();
             if !issue.is_empty() {
-                body = body.child(Self::card("Herdr App 展示提示", &issue));
+                body = body.child(Self::card("Herdr App notice", &issue));
             }
             if let Some(t) = project["terminal"].as_str()
                 && self.state["runtime"]["terminals"][t]["state"] == "finished"
             {
-                body = body.child(Self::card("主会话已经退出", "点击「启动主会话」重新启动。启动成功后会自动在 Herdr App 展示；首次登录、项目信任和权限确认也会显示在那里。"));
+                body = body.child(Self::card("The main session exited", "Start the main session again. Its terminal will appear in Herdr App, including sign-in, project trust, and approval prompts."));
             }
             if let Some(t) = project["terminal"].as_str()
                 && self.state["runtime"]["terminals"][t]["status"]["state"] == "blocked"
             {
                 let reason = self.state["runtime"]["terminals"][t]["status"]["msg"]
                     .as_str()
-                    .unwrap_or("CLI 正在等待交互");
-                body = body.child(Self::card("主会话正在等待交互", &format!("{reason}\n已识别的 Antigravity 项目目录信任会自动确认。其他登录、提问或权限提示可在 Herdr 中查看；排队消息会保留，原进程继续运行。")));
+                    .unwrap_or("The CLI needs input");
+                body = body.child(Self::card("The main session needs input", &format!("{reason}\nRecognized Antigravity project-trust prompts are confirmed automatically. Handle other sign-in, question, or approval prompts in Herdr. Queued messages and the current process remain intact.")));
             }
             if let Some(t) = project["terminal"].as_str()
                 && self.state["runtime"]["terminals"][t]["status"]["state"] == "error"
             {
                 let reason = self.state["runtime"]["terminals"][t]["status"]["msg"]
                     .as_str()
-                    .unwrap_or("CLI 上报运行错误，请在 Herdr 查看详情");
-                body = body.child(Self::card("CLI 运行出错", reason));
+                    .unwrap_or("The CLI reported an error. Check Herdr for details.");
+                body = body.child(Self::card("CLI error", reason));
             }
 
             body = body
-                .child(Self::card(project["name"].as_str().unwrap_or("项目"), &format!("{}\n终端：{}", project["path"].as_str().unwrap_or(""), terminal)))
-                .child(Self::card("飞书机器人", if self.state["bot_project"] == project["id"] {
-                    "已绑定此项目。机器人收到的所有私聊和群聊都会自动进入当前智能体，无需逐个关联聊天。"
+                .child(Self::card(project["name"].as_str().unwrap_or("Project"), &format!("{}\nTerminal: {}", project["path"].as_str().unwrap_or(""), terminal)))
+                .child(Self::card("Feishu bot", if self.state["bot_project"] == project["id"] {
+                    "Bound to this project. All direct and group messages this bot receives reach the active agent without per-chat binding."
                 } else {
-                    "此项目是本机项目，当前飞书机器人固定绑定到另一个项目。"
+                    "This is a local project. The current Feishu bot belongs to another project."
                 }))
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("当前智能体 · 点击切换"))
+                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Active agent · click to switch"))
                 .child(agent_controls)
-                .child(div().text_xs().text_color(rgb(MUTED)).child("切换会停止当前智能体并启动新的主会话；项目、机器人绑定和消息队列保留。"))
+                .child(div().text_xs().text_color(rgb(MUTED)).child("Switching stops the current agent and starts a new main session. The project, bot binding, and message queue stay intact."))
                 .child(div().flex().flex_wrap().gap_2()
-                    .child(self.btn("start", "启动主会话", move |this, _, _| this.api("POST", format!("/projects/{id}/start"), None, "启动请求已完成。等待主会话完成登录、信任和 MCP 登记"), cx).primary())
-                    .child(self.btn("resume", "恢复会话", move |this, _, _| this.api("POST", format!("/projects/{id2}/resume"), None, "恢复请求已完成"), cx))
-                    .child(self.btn("show", "在 HERDR 监控", move |this, _, _| this.api("POST", format!("/projects/{id3}/show"), None, "主会话已在 Herdr App 标签页中展示"), cx))
-                    .child(self.btn("refresh-project", "刷新消息", move |this, _, _| this.api("GET", format!("/projects/{id4}"), None, "消息已刷新"), cx))
-                    .child(self.btn("stop", "停止会话…", move |_this, window, cx| {
-                        let answer = window.prompt(PromptLevel::Warning, "停止这个项目的主会话？", Some("将结束 Agent 及关联子终端。项目配置和消息记录会保留。"), &["取消", "停止"], cx);
+                    .child(self.btn("start", "Start main session", move |this, _, _| this.api("POST", format!("/projects/{id}/start"), None, "Start requested. Waiting for sign-in, project trust, and MCP registration."), cx).primary())
+                    .child(self.btn("resume", "Resume session", move |this, _, _| this.api("POST", format!("/projects/{id2}/resume"), None, "Resume requested"), cx))
+                    .child(self.btn("show", "Monitor in HERDR", move |this, _, _| this.api("POST", format!("/projects/{id3}/show"), None, "Main session opened in a Herdr App tab"), cx))
+                    .child(self.btn("refresh-project", "Refresh messages", move |this, _, _| this.api("GET", format!("/projects/{id4}"), None, "Messages refreshed"), cx))
+                    .child(self.btn("stop", "Stop session...", move |_this, window, cx| {
+                        let answer = window.prompt(PromptLevel::Warning, "Stop this project's main session?", Some("This ends the agent and its child terminals. Project settings and message history stay intact."), &["Cancel", "Stop"], cx);
                         let id = id5.clone();
                         cx.spawn(async move |entity, cx| {
-                            if answer.await.ok() == Some(1) { let _ = entity.update(cx, |this, _| this.api("POST", format!("/projects/{id}/stop"), None, "会话已停止")); }
+                            if answer.await.ok() == Some(1) { let _ = entity.update(cx, |this, _| this.api("POST", format!("/projects/{id}/stop"), None, "Session stopped")); }
                         }).detach();
                     }, cx)))
-                    .child(Self::field("本机任务", &self.message))
-                .child(self.btn("inject", "发送到主会话", move |this, _, cx| {
+                    .child(Self::field("Local task", &self.message))
+                .child(self.btn("inject", "Send to main session", move |this, _, cx| {
                     let text = this.message.read(cx).value().to_string();
                     if text.trim().is_empty() { return; }
                     this.pending_message = text.clone();
-                    this.api("POST", format!("/projects/{id7}/messages"), Some(json!({"content":text})), "任务已加入队列。请在消息记录中确认处理状态");
+                    this.api("POST", format!("/projects/{id7}/messages"), Some(json!({"content":text})), "Task queued. Check message history for acknowledgment and replies.");
                 }, cx).primary())
-                .child(Self::card("验证消息链路", "给机器人发送私聊，或在机器人所在群中发送消息。确认入站记录、Agent 确认与出站回复。Agent 使用 to 选择接收聊天或用户，不强制回复消息来源。群消息的接收范围由飞书权限决定。"))
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("消息记录"));
+                .child(Self::card("Check message delivery", "Send a direct message to the bot or post in its group. Check the incoming record, agent acknowledgment, and outgoing reply. The agent uses to to select a chat or user; Feishu permissions determine which group messages arrive."))
+                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Message history"));
             if messages.is_empty() {
                 body = body.child(
                     div()
                         .text_sm()
                         .text_color(rgb(MUTED))
-                        .child("暂无消息，或尚未刷新。"),
+                        .child("No messages yet. Refresh to check again."),
                 );
             }
             for item in messages.iter().rev().take(30) {
@@ -717,38 +719,38 @@ impl Desktop {
             .unwrap_or("stable");
         let message = self.update_status["message"]
             .as_str()
-            .unwrap_or("正在初始化更新服务…");
+            .unwrap_or("Starting the update service...");
         div().flex().flex_col().gap_5()
-            .child(Self::title("UPDATES", "应用更新", "自动检查并下载签名更新，下次打开生效。项目文件、机器人配置和正在运行的主会话保留。"))
-            .child(Self::card("当前版本", &format!("Dauerbot {} · {}通道", env!("CARGO_PKG_VERSION"), if channel == "preview" { "预览" } else { "稳定" })))
-            .child(Self::card("更新状态", message))
+            .child(Self::title("UPDATES", "App Updates", "Signed updates download in the background and take effect next time you open the app. Project files, bot settings, and active sessions stay intact."))
+            .child(Self::card("Current version", &format!("Dauerbot {} · {} channel", env!("CARGO_PKG_VERSION"), if channel == "preview" { "preview" } else { "stable" })))
+            .child(Self::card("Update status", message))
             .child(div().flex().gap_3().flex_wrap()
-                .child(Button::new("update-check").label("检查更新").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .child(Button::new("update-check").label("Check for updates").disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Check); cx.notify();
                 })))
-                .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").label("下载并安装").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").label("Download and install").disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Install); cx.notify();
                 }))))
-                .when(phase == "installed", |row| row.child(Button::new("update-restart").label("立即重启桌面").on_click(cx.listener(|this, _, _, cx| {
+                .when(phase == "installed", |row| row.child(Button::new("update-restart").label("Restart desktop now").on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Restart); cx.notify();
                 }))))
-                .when(self.update_status["rollback_available"].as_bool().unwrap_or(false), |row| row.child(Button::new("update-rollback").label("回退上一版").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .when(self.update_status["rollback_available"].as_bool().unwrap_or(false), |row| row.child(Button::new("update-rollback").label("Roll back").disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Rollback); cx.notify();
                 }))))
             )
             .child(div().flex().gap_3()
-                .child(Button::new("update-auto").label(if automatic { "关闭自动升级" } else { "开启自动升级" }).on_click(cx.listener(move |this, _, _, cx| {
+                .child(Button::new("update-auto").label(if automatic { "Disable automatic updates" } else { "Enable automatic updates" }).on_click(cx.listener(move |this, _, _, cx| {
                     let channel = this.update_status["preferences"]["channel"].as_str().unwrap_or("stable").to_owned();
                     let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic: !automatic, channel }); cx.notify();
                 })))
-                .child(Button::new("update-channel").label(if channel == "stable" { "切换到预览通道" } else { "切换到稳定通道" }).on_click(cx.listener(|this, _, _, cx| {
+                .child(Button::new("update-channel").label(if channel == "stable" { "Switch to preview channel" } else { "Switch to stable channel" }).on_click(cx.listener(|this, _, _, cx| {
                     let channel = if this.update_status["preferences"]["channel"] == "preview" { "stable" } else { "preview" }.into();
                     let automatic = this.update_status["preferences"]["automatic"].as_bool().unwrap_or(true);
                     let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic, channel }); cx.notify();
                 })))
             )
-            .child(Self::card("自动升级", "默认每 6 小时检查。关闭后仍可手动检查和安装；稳定通道只接收正式版本，预览通道也接收预发布版本。只有校验通过的同一开发者签名应用才会被安装。"))
-            .when(!self.update_status["notes"].as_str().unwrap_or("").is_empty(), |page| page.child(Self::card("版本说明", self.update_status["notes"].as_str().unwrap_or(""))))
+            .child(Self::card("Automatic updates", "Checks run every six hours by default. Manual updates remain available when automatic updates are off. Stable excludes prereleases; preview includes them. Installation requires a verified signature from the same developer."))
+            .when(!self.update_status["notes"].as_str().unwrap_or("").is_empty(), |page| page.child(Self::card("Release notes", self.update_status["notes"].as_str().unwrap_or(""))))
     }
 }
 impl Render for Desktop {
@@ -778,7 +780,7 @@ impl Render for Desktop {
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .mb_8()
-                    .child("你的项目，始终在线"),
+                    .child("Your projects, always available"),
             );
         for (i, step) in STEPS.iter().enumerate().take(7) {
             sidebar = sidebar.child(
@@ -820,9 +822,9 @@ impl Render for Desktop {
                     .bg(rgb(if page == 7 { 0xe0ebe6 } else { 0xf1f3f2 }))
                     .text_color(rgb(ACCENT))
                     .child(if self.update_status["phase"] == "installed" {
-                        "应用更新 · 重启生效"
+                        "App Updates · restart to apply"
                     } else {
-                        "应用更新"
+                        "App Updates"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.go(7);
@@ -874,13 +876,13 @@ impl Render for Desktop {
                             .border_color(rgb(LINE))
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(format!("工作空间  /  {}", STEPS[page]))
+                            .child(format!("Workspace  /  {}", STEPS[page]))
                             .child(if self.independent_data {
-                                "●  独立数据目录"
+                                "●  Independent data directory"
                             } else if self.busy {
-                                "●  正在处理"
+                                "●  Working"
                             } else {
-                                "●  本机私有工作台"
+                                "●  Private local workspace"
                             }),
                     )
                     .child(
@@ -901,7 +903,7 @@ impl Render for Desktop {
                                                 .rounded_lg()
                                                 .bg(rgb(0xfff1ce))
                                                 .text_sm()
-                                                .child("独立实例 · 此窗口使用单独的数据，与你日常工作台的配置分开保存。")
+                                                .child("Independent instance · This window uses separate data from your everyday workspace.")
                                                 .child(div().mt_2().text_xs().child(
                                                     self.backend.dir.display().to_string(),
                                                 )),
@@ -935,7 +937,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(herdr_feishu_bridge::config::default_dir);
     let title = if independent_data_dir(&dir) {
-        "Dauerbot · 独立实例"
+        "Dauerbot · Independent instance"
     } else {
         "Dauerbot"
     };
@@ -953,8 +955,8 @@ fn main() {
         cx.set_menus(vec![Menu {
             name: "Dauerbot".into(),
             items: vec![
-                MenuItem::action("应用更新…", ShowUpdates),
-                MenuItem::action("退出 Dauerbot", Quit),
+                MenuItem::action("App Updates…", ShowUpdates),
+                MenuItem::action("Quit Dauerbot", Quit),
             ],
         }]);
         let bounds = Bounds::centered(None, size(px(1180.), px(860.)), cx);
@@ -980,7 +982,7 @@ fn main() {
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )
-        .expect("无法创建桌面窗口");
+        .expect("Cannot create the desktop window");
         cx.activate(true);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

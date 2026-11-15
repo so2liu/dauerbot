@@ -34,9 +34,6 @@ jobs:
           git merge-base --is-ancestor HEAD origin/main
           test -n "$CERTIFICATE"
           test -n "$UPDATE_KEY"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -46,13 +43,10 @@ jobs:
           workspaces: |
             . -> desktop/target
             desktop -> target
-      - name: Install pnpm
-        run: npm install --global pnpm@12.6.0
       - name: Build and verify
         run: |
           set -euo pipefail
           ./scripts/build-desktop.sh
-          pnpm --dir frontend check
           cargo test --locked --release --target-dir desktop/target --tests
           cargo test --locked --release --manifest-path desktop/Cargo.toml
           cargo clippy --locked --release --target-dir desktop/target --all-targets -- -D warnings

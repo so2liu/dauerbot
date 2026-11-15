@@ -45,18 +45,18 @@ impl Preferences {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let prefs: Self =
-            serde_json::from_slice(&fs::read(path)?).context("升级偏好文件损坏，已保留原文件")?;
+        let prefs: Self = serde_json::from_slice(&fs::read(path)?)
+            .context("Update preferences are corrupt; the original file is preserved")?;
         ensure!(
             matches!(prefs.channel.as_str(), "stable" | "preview"),
-            "未知更新通道"
+            "Unknown update channel"
         );
         Ok(prefs)
     }
     pub fn save(&self, data: &Path) -> Result<()> {
         ensure!(
             matches!(self.channel.as_str(), "stable" | "preview"),
-            "未知更新通道"
+            "Unknown update channel"
         );
         config::private_dir(&data.join("updates"))?;
         config::write_private(
@@ -83,7 +83,7 @@ impl Status {
     pub fn new(prefs: Preferences) -> Self {
         Self {
             phase: "idle".into(),
-            message: "尚未检查更新".into(),
+            message: "No update check yet".into(),
             current: CURRENT.into(),
             latest: None,
             progress: None,
@@ -139,7 +139,7 @@ impl Release {
     }
 }
 fn version(text: &str) -> Result<Version> {
-    Version::parse(text.strip_prefix('v').unwrap_or(text)).context("无效发布版本")
+    Version::parse(text.strip_prefix('v').unwrap_or(text)).context("Invalid release version")
 }
 pub fn is_newer(candidate: &str, current: &str) -> Result<bool> {
     Ok(version(candidate)?
@@ -160,22 +160,25 @@ fn verify_manifest(bytes: &[u8], signature: &[u8], key: &str) -> Result<Manifest
     let key: [u8; 32] = STANDARD
         .decode(key.trim())?
         .try_into()
-        .map_err(|_| anyhow::anyhow!("无效更新公钥"))?;
+        .map_err(|_| anyhow::anyhow!("Invalid update public key"))?;
     let signature =
         Signature::from_slice(&STANDARD.decode(std::str::from_utf8(signature)?.trim())?)?;
     VerifyingKey::from_bytes(&key)?
         .verify_strict(&[SIGNING_CONTEXT, bytes].concat(), &signature)
-        .context("更新清单签名不匹配，拒绝安装")?;
+        .context("Update manifest signature does not match; refusing installation")?;
     let manifest: Manifest = serde_json::from_slice(bytes)?;
     let parsed = version(&manifest.version)?;
-    ensure!(parsed.to_string() == manifest.version, "发布版本格式不规范");
+    ensure!(
+        parsed.to_string() == manifest.version,
+        "Release version is not canonical"
+    );
     ensure!(
         manifest.bundle_id == BUNDLE_ID && manifest.team_id == TEAM_ID,
-        "更新包身份不匹配"
+        "Update package identity does not match"
     );
     ensure!(
         manifest.architecture == architecture(),
-        "当前设备没有对应架构的安装包"
+        "No package is available for this device architecture"
     );
     ensure!(
         manifest.file
@@ -184,15 +187,15 @@ fn verify_manifest(bytes: &[u8], signature: &[u8], key: &str) -> Result<Manifest
                 manifest.version,
                 architecture()
             ),
-        "无效安装包名称"
+        "Invalid package filename"
     );
     ensure!(
         manifest.size > 0 && manifest.size <= MAX_ARCHIVE,
-        "安装包大小超过限制"
+        "Package exceeds the size limit"
     );
     ensure!(
         manifest.sha256.len() == 64 && manifest.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-        "无效 SHA-256"
+        "Invalid SHA-256"
     );
     Ok(manifest)
 }
@@ -200,11 +203,11 @@ fn secure_url(text: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(text)?;
     ensure!(
         url.scheme() == "https" && matches!(url.host_str(), Some("github.com" | "api.github.com")),
-        "更新地址必须来自 GitHub HTTPS"
+        "Update URLs must use GitHub HTTPS"
     );
     ensure!(
         url.username().is_empty() && url.password().is_none(),
-        "更新地址不得包含凭证"
+        "Update URLs must not contain credentials"
     );
     Ok(url)
 }
@@ -225,13 +228,16 @@ async fn small(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<
             .error_for_status()?;
         let mut bytes = vec![];
         while let Some(chunk) = response.chunk().await? {
-            ensure!(bytes.len() + chunk.len() <= limit, "更新元数据超过限制");
+            ensure!(
+                bytes.len() + chunk.len() <= limit,
+                "Update metadata exceeds the size limit"
+            );
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
     })
     .await
-    .context("检查更新超时")?
+    .context("Update check timed out")?
 }
 fn newest(releases: Vec<GithubRelease>, channel: &str) -> Option<GithubRelease> {
     releases
@@ -267,7 +273,7 @@ pub async fn check_for_version(
             .assets
             .iter()
             .find(|a| a.name == name)
-            .with_context(|| format!("发布产物不完整：缺少 {name}"))
+            .with_context(|| format!("Release is incomplete: missing {name}"))
     };
     let bytes = small(
         client,
@@ -279,7 +285,7 @@ pub async fn check_for_version(
     let manifest = verify_manifest(&bytes, &sig, PUBLIC_KEY)?;
     ensure!(
         version(&manifest.version)? == version(&release.tag_name)?,
-        "清单版本与发布标签不符"
+        "Manifest version does not match the release tag"
     );
     let url = find(&manifest.file)?.browser_download_url.clone();
     secure_url(&url)?;
@@ -299,7 +305,7 @@ fn output(command: &mut Command) -> Result<String> {
     let result = command.output()?;
     ensure!(
         result.status.success(),
-        "校验失败：{}",
+        "Verification failed: {}",
         String::from_utf8_lossy(&result.stderr).trim()
     );
     Ok(String::from_utf8(result.stdout)?.trim().to_owned())
@@ -312,15 +318,21 @@ fn plist(app: &Path, key: &str) -> Result<String> {
     )
 }
 pub fn verify_bundle(app: &Path, expected: Option<&str>) -> Result<()> {
-    ensure!(cfg!(target_os = "macos"), "自动安装目前仅支持 macOS");
+    ensure!(
+        cfg!(target_os = "macos"),
+        "Automatic installation currently supports macOS only"
+    );
     ensure!(
         plist(app, "CFBundleIdentifier")? == BUNDLE_ID,
-        "应用 bundle ID 不匹配"
+        "App bundle ID does not match"
     );
     let installed = plist(app, "CFBundleShortVersionString")?;
     version(&installed)?;
     if let Some(expected) = expected {
-        ensure!(installed == expected, "应用版本与更新清单不匹配");
+        ensure!(
+            installed == expected,
+            "App version does not match the update manifest"
+        );
     }
     for name in ["HerdrBridge", "hfb"] {
         let mut header = [0u8; 8];
@@ -333,7 +345,7 @@ pub fn verify_bundle(app: &Path, expected: Option<&str>) -> Result<()> {
         };
         ensure!(
             header[..4] == [0xcf, 0xfa, 0xed, 0xfe] && cpu == expected,
-            "应用可执行文件的架构不匹配"
+            "App executable architecture does not match"
         );
     }
     let requirement =
@@ -376,7 +388,7 @@ async fn download(
         client.get(secure_url(&release.url)?).send(),
     )
     .await
-    .context("下载连接停滞，请重试")??
+    .context("Download connection stalled; try again")??
     .error_for_status()?;
     let mut file = tokio::fs::File::create(path).await?;
     let mut hash = Sha256::new();
@@ -385,12 +397,15 @@ async fn download(
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(45), response.chunk())
             .await
-            .context("下载停滞，可重新检查更新后重试")??;
+            .context("Download stalled; check for updates and try again")??;
         let Some(chunk) = chunk else {
             break;
         };
         count += chunk.len() as u64;
-        ensure!(count <= release.manifest.size, "下载包大小与签名清单不符");
+        ensure!(
+            count <= release.manifest.size,
+            "Download size does not match the signed manifest"
+        );
         hash.update(&chunk);
         file.write_all(&chunk).await?;
         let percent = ((count * 100) / release.manifest.size) as u8;
@@ -400,19 +415,25 @@ async fn download(
         }
     }
     file.sync_all().await?;
-    ensure!(count == release.manifest.size, "安装包下载不完整");
+    ensure!(
+        count == release.manifest.size,
+        "Package download is incomplete"
+    );
     ensure!(
         format!("{:x}", hash.finalize()).eq_ignore_ascii_case(&release.manifest.sha256),
-        "安装包 SHA-256 不符，拒绝安装"
+        "Package SHA-256 does not match; refusing installation"
     );
     Ok(())
 }
 fn safe_entry(name: &str, mode: u32) -> Result<Option<PathBuf>> {
-    ensure!(!name.contains(['\\', '\0']), "压缩包包含不安全路径");
+    ensure!(
+        !name.contains(['\\', '\0']),
+        "Archive contains an unsafe path"
+    );
     let path = Path::new(name);
     ensure!(
         !path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir)),
-        "压缩包路径越界"
+        "Archive path escapes its destination"
     );
     if path
         .components()
@@ -423,13 +444,19 @@ fn safe_entry(name: &str, mode: u32) -> Result<Option<PathBuf>> {
     }
     let relative = path
         .strip_prefix("Dauerbot.app")
-        .context("压缩包包含意外的顶层目录")?;
-    ensure!(mode & 0o170000 != 0o120000, "更新包不接受符号链接");
+        .context("Archive contains an unexpected top-level directory")?;
+    ensure!(
+        mode & 0o170000 != 0o120000,
+        "Update packages cannot contain symlinks"
+    );
     Ok(Some(relative.to_path_buf()))
 }
 fn extract(archive: &Path, payload: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(File::open(archive)?)?;
-    ensure!(archive.len() <= 2048, "更新包文件数量过多");
+    ensure!(
+        archive.len() <= 2048,
+        "Update package contains too many files"
+    );
     fs::create_dir_all(payload)?;
     let mut total = 0;
     for i in 0..archive.len() {
@@ -445,15 +472,15 @@ fn extract(archive: &Path, payload: &Path) -> Result<()> {
         }
         ensure!(
             file.size() <= MAX_EXPANDED - total,
-            "更新包解压大小超过限制"
+            "Expanded update package exceeds the size limit"
         );
-        fs::create_dir_all(destination.parent().context("缺少父目录")?)?;
+        fs::create_dir_all(destination.parent().context("Missing parent directory")?)?;
         let mut target = File::create(&destination)?;
         let copied = std::io::copy(&mut (&mut file).take(MAX_EXPANDED - total + 1), &mut target)?;
         total += copied;
         ensure!(
             total <= MAX_EXPANDED && copied == file.size(),
-            "解压文件大小不符"
+            "Extracted file size does not match"
         );
         #[cfg(unix)]
         {
@@ -469,10 +496,12 @@ fn extract(archive: &Path, payload: &Path) -> Result<()> {
 /// Both renames happen on one filesystem. A failed second rename restores the old app.
 fn swap(payload: &Path, app: &Path, backup: &Path) -> Result<()> {
     fs::rename(app, backup)
-        .context("无法移动旧应用，请将应用移至你有写入权限的 Applications 目录")?;
+        .context("Cannot move the old app. Use a writable Applications directory.")?;
     if let Err(error) = fs::rename(payload, app) {
-        fs::rename(backup, app).context("新应用替换失败且旧应用恢复失败，请从备份目录恢复")?;
-        return Err(error).context("新应用替换失败，已恢复旧版本");
+        fs::rename(backup, app).context(
+            "App replacement and restoration failed. Restore from the backup directory.",
+        )?;
+        return Err(error).context("App replacement failed; the old version is restored");
     }
     Ok(())
 }
@@ -490,23 +519,23 @@ pub async fn install(
     progress: impl Fn(u8),
     automatic: bool,
 ) -> Result<()> {
-    verify_bundle(app, None).context("当前应用不是受信任的签名安装版，开发构建不自动替换")?;
+    verify_bundle(app, None).context("The current app is not a trusted signed installation; development builds cannot replace themselves")?;
     ensure!(
         is_newer(
             release.version(),
             &plist(app, "CFBundleShortVersionString")?
         )?,
-        "此应用已是相同或更高版本"
+        "This app already has the same or a newer version"
     );
     let updates = data.join("updates");
     config::private_dir(&updates)?;
     let lock = File::create(updates.join("update.lock"))?;
     lock.try_lock_exclusive()
-        .context("另一个更新任务正在运行")?;
+        .context("Another update task is running")?;
     let requested_preferences = Preferences::load(data)?;
     ensure!(
         requested_preferences.channel == "preview" || version(release.version())?.pre.is_empty(),
-        "稳定通道不安装预发布版本，请重新检查更新"
+        "The stable channel excludes prereleases; check for updates again"
     );
     let archive = updates.join("download.zip");
     let cached = archive.is_file()
@@ -519,22 +548,24 @@ pub async fn install(
         download(client, release, &partial, &progress).await?;
         fs::rename(partial, &archive)?;
     }
-    let parent = app.parent().context("无效应用目录")?;
+    let parent = app.parent().context("Invalid app directory")?;
     let stage = parent.join(format!(".dauerbot-update-{}", uuid::Uuid::new_v4()));
-    config::private_dir(&stage).context("无法写入应用所在目录，请先把应用移到 Applications")?;
+    config::private_dir(&stage).context(
+        "Cannot write to the app's parent directory; move it to a writable Applications directory",
+    )?;
     let payload = stage.join("payload");
     let prepared = (|| {
         extract(&archive, &payload)?;
         verify_bundle(&payload, Some(release.version()))?;
         ensure!(
             Preferences::load(data)?.channel == requested_preferences.channel,
-            "更新通道已更改，保留当前版本，请重新检查更新"
+            "The update channel changed. Keeping the current version; check again."
         );
         if automatic {
             ensure!(
                 Preferences::load(data)? == requested_preferences
                     && requested_preferences.automatic,
-                "自动升级已关闭，保留当前版本"
+                "Automatic updates are disabled; keeping the current version"
             );
         }
         Ok::<_, anyhow::Error>(())
@@ -554,7 +585,7 @@ pub async fn install(
         .as_ref()
         .map(|bytes| serde_json::from_slice::<InstallRecord>(bytes))
         .transpose()
-        .context("旧升级记录损坏，已保留原应用和记录")?;
+        .context("The previous update record is corrupt; the app and record are preserved")?;
     let record = InstallRecord {
         app: app.to_owned(),
         backup: backup.clone(),
@@ -570,7 +601,10 @@ pub async fn install(
     }
     let executable = app.join("Contents/MacOS/hfb");
     if let Err(error) = output(Command::new(&executable).arg("--version")).and_then(|v| {
-        ensure!(v == format!("hfb {}", release.version()), "新 CLI 版本不符");
+        ensure!(
+            v == format!("hfb {}", release.version()),
+            "New CLI version does not match"
+        );
         Ok(())
     }) {
         let failed = stage.join("failed");
@@ -578,7 +612,7 @@ pub async fn install(
         fs::rename(&backup, app)?;
         restore_record(&record_path, previous.as_deref())?;
         let _ = fs::remove_dir_all(&stage);
-        return Err(error).context("新程序启动检查失败，已恢复旧应用");
+        return Err(error).context("New executable validation failed; the old app is restored");
     }
     if let Some(old) = previous_record
         && old.app == app
@@ -603,17 +637,18 @@ fn restore_record(path: &Path, previous: Option<&[u8]>) -> Result<()> {
 pub fn rollback(data: &Path) -> Result<PathBuf> {
     let lock = File::create(data.join("updates/update.lock"))?;
     lock.try_lock_exclusive()
-        .context("另一个更新任务正在运行")?;
+        .context("Another update task is running")?;
     let path = data.join("updates/installed.json");
-    let record: InstallRecord =
-        serde_json::from_slice(&fs::read(&path).context("没有可回退的安装记录")?)?;
-    let stage = record.backup.parent().context("无效备份目录")?;
+    let record: InstallRecord = serde_json::from_slice(
+        &fs::read(&path).context("No installation record is available for rollback")?,
+    )?;
+    let stage = record.backup.parent().context("Invalid backup directory")?;
     ensure!(
         stage.parent() == record.app.parent()
             && stage
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with(".dauerbot-update-")),
-        "备份不属于此应用"
+        "This backup does not belong to the app"
     );
     verify_bundle(&record.backup, None)?;
     let mut prefs = Preferences::load(data)?;
@@ -716,14 +751,14 @@ pub async fn stop_service(data: &Path, cfg: &config::Config) -> Result<()> {
             .collect::<std::result::Result<_, _>>()?;
         ensure!(
             pids.len() == 1 && pids[0] != std::process::id(),
-            "无法唯一识别旧后台，未停止任何进程"
+            "Cannot uniquely identify the old daemon; no process was stopped"
         );
         let pid = pids[0].to_string();
         let command = output(Command::new("/bin/ps").args(["-p", &pid, "-o", "command="]))?;
         ensure!(
             command.contains("/hfb ")
                 && command.contains(&format!("--data-dir {} serve", data.display())),
-            "端口所属进程不是此应用的后台"
+            "The process listening on this port is not this app's daemon"
         );
         output(Command::new("/bin/kill").args(["-TERM", &pid]))?;
     } else {
@@ -743,7 +778,7 @@ pub async fn stop_service(data: &Path, cfg: &config::Config) -> Result<()> {
         }
     })
     .await
-    .context("旧后台仍在完成请求，已保留原服务和会话，请稍后重新打开桌面")?
+    .context("The old daemon is still completing requests. Its service and sessions are preserved; reopen the desktop later.")?
 }
 
 #[cfg(test)]

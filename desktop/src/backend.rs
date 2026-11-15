@@ -60,7 +60,7 @@ impl Backend {
                 let first_launch = !data.join("config.json").exists();
                 let mut cfg = Config::load(&data)?;
                 if first_launch {
-                    // Avoid conflicting with another bridge instance or the browser preview.
+                    // Avoid conflicting with another Dauerbot instance.
                     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
                     cfg.port = listener.local_addr()?.port();
                     cfg.save(&data)?;
@@ -97,7 +97,7 @@ impl Backend {
                             }
                             if let Some(status) = child.try_wait()? {
                                 bail!(
-                                    "本地后台已退出（{status}），请查看 {}",
+                                    "The local daemon exited ({status}). Check {}",
                                     data.join("desktop-service.log").display()
                                 );
                             }
@@ -105,7 +105,7 @@ impl Backend {
                         }
                     })
                     .await
-                    .context("本地后台启动超时，请查看 desktop-service.log")??;
+                    .context("Local daemon startup timed out. Check desktop-service.log.")??;
                 }
                 let mut connection = ConnectionState::default();
                 let mut last_restart = std::time::Instant::now() - Duration::from_secs(10);
@@ -189,8 +189,8 @@ impl Backend {
                                 }
                                 if request(&probe, &cfg, "GET", "/state", None).await.is_err()
                                     && let Err(error) = spawn_service(&data)
-                                    && let Some(reply) =
-                                        connection.observe(Some(format!("后台重启失败：{error:#}")))
+                                    && let Some(reply) = connection
+                                        .observe(Some(format!("Daemon restart failed: {error:#}")))
                                 {
                                     let _ = replies.send(reply);
                                 }
@@ -242,7 +242,7 @@ fn spawn_service(data: &std::path::Path) -> Result<std::process::Child> {
     let binary = std::env::current_exe()?.with_file_name("hfb");
     anyhow::ensure!(
         binary.is_file(),
-        "缺少随应用打包的 hfb 服务，请重新安装应用"
+        "Bundled hfb executable missing. Reinstall the app."
     );
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -269,7 +269,7 @@ fn spawn_service(data: &std::path::Path) -> Result<std::process::Child> {
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
-        .context("无法启动本地后台")
+        .context("Cannot start the local daemon")
 }
 
 async fn request(
@@ -285,11 +285,17 @@ async fn request(
     if let Some(body) = body {
         req = req.json(&body);
     }
-    let response = req.send().await.context("无法连接本地服务")?;
+    let response = req
+        .send()
+        .await
+        .context("Cannot connect to the local service")?;
     let status = response.status();
-    let value: Value = response.json().await.context("服务未返回有效数据")?;
+    let value: Value = response
+        .json()
+        .await
+        .context("The service returned invalid data")?;
     if !status.is_success() {
-        bail!("{}", value["error"].as_str().unwrap_or("请求失败"));
+        bail!("{}", value["error"].as_str().unwrap_or("Request failed"));
     }
     Ok(value)
 }
@@ -322,17 +328,17 @@ fn environment(cfg: &Config, dir: &std::path::Path) -> Vec<(String, String)> {
         result.push((
             name.into(),
             resolved
-                .map(|p| format!("已找到 · {}（登录状态请在 CLI 内确认）", p.display()))
-                .unwrap_or_else(|| "未找到 · 安装后点击重新检测".into()),
+                .map(|p| format!("Found · {} (check sign-in in the CLI)", p.display()))
+                .unwrap_or_else(|| "Not found · install it and check again".into()),
         ));
     }
     let database = crate::access::database_access(&dir.join("bridge.sqlite3"));
     result.push((
-        "应用数据库".into(),
+        "Application database".into(),
         if database.is_ok() {
-            "可读 · 应用自己的 SQLite 数据库，无需完全磁盘访问权限".into()
+            "Readable · Dauerbot's SQLite database does not need Full Disk Access".into()
         } else {
-            "不可读 · 检查应用数据目录权限".into()
+            "Unreadable · check data-directory permissions".into()
         },
     ));
     result
@@ -345,7 +351,6 @@ pub fn scopes(all_group_replies: bool) -> Value {
         "im:message.group_at_msg:readonly",
         "im:message:readonly",
         "im:resource",
-        "im:chat:readonly",
         "im:chat.members:read",
     ];
     if all_group_replies {

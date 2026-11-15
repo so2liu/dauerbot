@@ -26,18 +26,18 @@ async fn durable_dedup_and_uncertain_recovery() {
     let db = Db::open(&path).unwrap();
     let p = db.create(input(&dir, "一", "oc_test")).await.unwrap();
     let key = db
-        .ingest("oc_test", "om_one", "hello", &json!({}))
+        .ingest_bot("oc_test", "om_one", "hello", &json!({}))
         .unwrap()
         .unwrap();
     assert!(
-        db.ingest("oc_test", "om_one", "hello", &json!({}))
+        db.ingest_bot("oc_test", "om_one", "hello", &json!({}))
             .unwrap()
             .is_none()
     );
     assert!(
-        db.ingest("oc_unbound", "om_two", "hello", &json!({}))
+        db.ingest_bot("oc_unbound", "om_two", "hello", &json!({}))
             .unwrap()
-            .is_none()
+            .is_some()
     );
     assert!(
         db.ack(&p.id, "om_one").await.is_err(),
@@ -81,11 +81,15 @@ async fn one_projects_backlog_cannot_starve_another_project() {
     let b = db.create(input(&dir, "其他项目", "oc_b")).await.unwrap();
     db.pause(&a.id, true).await.unwrap();
     for n in 0..40 {
-        db.ingest("oc_a", &format!("om_a_{n}"), "backlog", &json!({}))
+        db.ingest_bot("oc_a", &format!("om_a_{n}"), "backlog", &json!({}))
             .unwrap();
     }
-    db.ingest("oc_b", "om_b", "new message", &json!({}))
-        .unwrap();
+    // Local projects can receive independent tasks through the authenticated API.
+    let project_id = b.id.clone();
+    db.call(move |c| {
+        c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('local-task',?,'in','om_b','new message','queued',0,0)", [&project_id])?;
+        Ok(())
+    }).await.unwrap();
     let heads = db.pending("in").await.unwrap();
     assert_eq!(heads.len(), 2);
     assert!(heads.iter().any(|m| m.project_id == b.id));

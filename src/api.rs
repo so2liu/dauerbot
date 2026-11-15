@@ -9,22 +9,14 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
-    },
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use rust_embed::Embed;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
-
-#[derive(Embed)]
-#[folder = "frontend/dist"]
-struct Assets;
 
 pub struct ApiError(pub anyhow::Error);
 impl From<anyhow::Error> for ApiError {
@@ -49,12 +41,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/service/shutdown", post(shutdown_service))
         .route("/settings", get(settings).put(save_settings))
         .route("/settings/check", post(check_settings))
-        .route("/onboarding/chats", get(onboarding_chats))
-        .route("/conversations", get(conversations).put(bind_conversation))
-        .route(
-            "/conversations/private-default",
-            axum::routing::put(private_default),
-        )
+        .route("/conversations", get(conversations))
         .route("/projects", post(create_project))
         .route(
             "/projects/{id}",
@@ -79,11 +66,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/messages/{id}/retry", post(retry))
         .route("/messages/{id}/dismiss", post(dismiss))
-        .route("/events", get(events))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .nest("/api", api)
-        .fallback(static_asset)
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn(headers))
         .with_state(app)
@@ -97,7 +82,11 @@ async fn auth(State(app): State<Arc<App>>, req: Request, next: Next) -> Response
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         let origin = origin.to_str().unwrap_or("");
         if origin != cfg.url() && origin != format!("http://localhost:{}", cfg.port) {
-            return (StatusCode::FORBIDDEN, Json(json!({"error":"来源不受信任"}))).into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"Untrusted origin"})),
+            )
+                .into_response();
         }
     }
     let token = req
@@ -132,7 +121,9 @@ async fn auth(State(app): State<Arc<App>>, req: Request, next: Next) -> Response
     }
     (
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error":"需要本机管理令牌或有效的项目会话凭证"})),
+        Json(
+            json!({"error":"A local admin token or valid project-session credential is required"}),
+        ),
     )
         .into_response()
 }
@@ -145,24 +136,6 @@ async fn headers(req: Request, next: Next) -> Response {
     h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     h.insert("content-security-policy","default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'".parse().unwrap());
     response
-}
-async fn static_asset(req: Request) -> Response {
-    let path = req.uri().path().trim_start_matches('/');
-    if path.starts_with("api/") {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let name = if path.is_empty() { "index.html" } else { path };
-    match Assets::get(name) {
-        Some(asset) => {
-            let mime = mime_guess::from_path(name).first_or_octet_stream();
-            (
-                [(header::CONTENT_TYPE, mime.as_ref().to_owned())],
-                asset.data.into_owned(),
-            )
-                .into_response()
-        }
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 async fn shutdown_service(State(app): State<Arc<App>>) -> ApiResult {
     app.shutdown.cancel();
@@ -199,56 +172,18 @@ async fn save_settings(State(app): State<Arc<App>>, Json(input): Json<Settings>)
     let result = feishu::public_config(&cfg);
     drop(cfg);
     app.settings_tx.send_modify(|v| *v += 1);
-    app.changed();
+
     Ok(Json(result))
 }
 async fn check_settings(State(app): State<Arc<App>>) -> ApiResult {
     feishu::token(&app).await?;
     Ok(Json(
-        json!({"ok":true,"message":"应用凭证有效；长连接事件需在飞书后台订阅 im.message.receive_v1"}),
+        json!({"ok":true,"message":"App credentials are valid; subscribe to im.message.receive_v1 in the Feishu console"}),
     ))
-}
-/// List only chats the configured bot can access. Credentials stay in the daemon.
-async fn onboarding_chats(State(app): State<Arc<App>>) -> ApiResult {
-    let cfg = app.config.read().await.clone();
-    let token = feishu::token(&app).await?;
-    let mut items = Vec::new();
-    let mut page_token = String::new();
-    for _ in 0..20 {
-        let mut query = vec![("page_size", "100".to_owned())];
-        if !page_token.is_empty() {
-            query.push(("page_token", page_token.clone()));
-        }
-        let response = app
-            .http
-            .get(format!("{}/open-apis/im/v1/chats", cfg.feishu_base))
-            .bearer_auth(&token)
-            .query(&query)
-            .send()
-            .await
-            .context("获取机器人所在群失败，请检查网络和 im:chat:readonly 权限")?;
-        let value = feishu::api_json(response).await?;
-        if let Some(chats) = value["data"]["items"].as_array() {
-            items.extend(
-                chats
-                    .iter()
-                    .map(|chat| json!({"chat_id":chat["chat_id"], "name":chat["name"]})),
-            );
-        }
-        if value["data"]["has_more"] != true {
-            return Ok(Json(json!({"items":items,"truncated":false})));
-        }
-        page_token = value["data"]["page_token"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-            .context("飞书返回了分页标记但没有下一页 token")?
-            .into();
-    }
-    Ok(Json(json!({"items":items,"truncated":true})))
 }
 async fn create_project(State(app): State<Arc<App>>, Json(input): Json<ProjectInput>) -> ApiResult {
     let p = app.db.create(input).await?;
-    app.changed();
+
     Ok(Json(serde_json::to_value(p).unwrap()))
 }
 async fn update_project(
@@ -257,7 +192,7 @@ async fn update_project(
     Json(input): Json<ProjectInput>,
 ) -> ApiResult {
     let p = app.db.update(&id, input).await?;
-    app.changed();
+
     Ok(Json(serde_json::to_value(p).unwrap()))
 }
 async fn project(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
@@ -286,7 +221,7 @@ async fn switch_agent(
 }
 async fn delete_project(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     app.db.remove_project(&id).await?;
-    app.changed();
+
     Ok(Json(json!({"ok":true})))
 }
 async fn start(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
@@ -314,7 +249,7 @@ async fn pause(
 ) -> ApiResult {
     app.db.pause(&id, input.paused).await?;
     app.notify.notify_one();
-    app.changed();
+
     Ok(Json(json!({"ok":true})))
 }
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
@@ -322,7 +257,7 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult 
 }
 async fn screen(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let p = app.db.project(&id).await?;
-    let t = p.terminal.context("项目没有主会话")?;
+    let t = p.terminal.context("The project has no main session")?;
     let cfg = app.config.read().await.clone();
     let v = herdr::rpc(&cfg, "terminal.read", json!({"terminal":t,"lines":80})).await?;
     Ok(Json(v))
@@ -337,7 +272,7 @@ async fn inject(
     Json(input): Json<Text>,
 ) -> ApiResult {
     if input.content.trim().is_empty() {
-        return Err(anyhow::anyhow!("消息不能为空").into());
+        return Err(anyhow::anyhow!("Message content cannot be empty").into());
     }
     let p = app.db.project(&id).await?;
     let key = db::id();
@@ -346,7 +281,7 @@ async fn inject(
     app.db.call(move|c|{c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?)",
         rusqlite::params![key,p.id,source,input.content,db::now(),db::now()])?;Ok(())}).await?;
     app.notify.notify_one();
-    app.changed();
+
     Ok(Json(
         serde_json::to_value(app.db.message(&out).await?).unwrap(),
     ))
@@ -367,7 +302,7 @@ async fn outbox(
     Json(input): Json<Outbox>,
 ) -> ApiResult {
     if input.content.trim().is_empty() && input.path.is_none() {
-        return Err(anyhow::anyhow!("请提供正文或附件路径").into());
+        return Err(anyhow::anyhow!("Provide message content or a file path").into());
     }
     let attachment = if let Some(path) = input.path {
         let p = app.db.project(&id).await?;
@@ -400,7 +335,7 @@ async fn ready(
 ) -> ApiResult {
     let p = app.db.project(&id).await?;
     if p.terminal.as_deref() != Some(&input.terminal) || p.generation != input.generation {
-        return Err(anyhow::anyhow!("会话身份不匹配").into());
+        return Err(anyhow::anyhow!("Session identity does not match").into());
     }
     let cfg = app.config.read().await.clone();
     let t = herdr::rpc(&cfg, "terminal.get", json!({"terminal":input.terminal})).await?;
@@ -414,7 +349,7 @@ async fn ready(
         )
         .await?;
     app.notify.notify_one();
-    app.changed();
+
     Ok(Json(json!({"ok":true,"project":p.name})))
 }
 #[derive(Deserialize)]
@@ -429,13 +364,13 @@ async fn ack(
     let p = app.db.project(&id).await?;
     app.db.ack(&p.id, &input.message_id).await?;
     app.notify.notify_one();
-    app.changed();
+
     Ok(Json(json!({"ok":true})))
 }
 async fn retry(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let m = app.db.message(&id).await?;
     if !["uncertain", "failed"].contains(&m.status.as_str()) {
-        return Err(anyhow::anyhow!("仅失败或结果不确定的消息可重试").into());
+        return Err(anyhow::anyhow!("Only failed or uncertain messages can be retried").into());
     }
     app.db
         .state(
@@ -449,17 +384,19 @@ async fn retry(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult
         )
         .await?;
     app.notify.notify_one();
-    app.changed();
+
     Ok(Json(json!({"ok":true})))
 }
 async fn dismiss(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let m = app.db.message(&id).await?;
     if !["queued", "submitted", "uncertain", "failed", "pending"].contains(&m.status.as_str()) {
-        return Err(anyhow::anyhow!("当前消息不能忽略").into());
+        return Err(anyhow::anyhow!("This message cannot be dismissed").into());
     }
-    app.db.state(&id, "dismissed", "用户手动忽略").await?;
+    app.db
+        .state(&id, "dismissed", "Dismissed by the user")
+        .await?;
     app.notify.notify_one();
-    app.changed();
+
     Ok(Json(json!({"ok":true})))
 }
 async fn upload(
@@ -472,7 +409,7 @@ async fn upload(
         .next_field()
         .await
         .map_err(anyhow::Error::from)?
-        .context("缺少文件")?;
+        .context("Missing file")?;
     let name = field
         .file_name()
         .and_then(|s| std::path::Path::new(s).file_name())
@@ -487,12 +424,12 @@ async fn upload(
         while let Some(chunk) = field.chunk().await? {
             size += chunk.len() as u64;
             if size > feishu::MAX_FILE {
-                bail!("附件超过 100 MB");
+                bail!("File exceeds 100 MB");
             }
             file.write_all(&chunk).await?;
         }
         if size == 0 {
-            bail!("附件为空");
+            bail!("File is empty");
         }
         file.sync_all().await?;
         Ok::<_, anyhow::Error>(())
@@ -504,82 +441,6 @@ async fn upload(
     result?;
     Ok(Json(json!({"path":path,"name":name})))
 }
-async fn events(State(app): State<Arc<App>>) -> Response {
-    let mut receiver = app.changes.subscribe();
-    let cancel = app.shutdown.clone();
-    let stream = async_stream::stream! {
-        yield Ok::<Event,Infallible>(Event::default().data("refresh"));
-        loop{
-            tokio::select!{
-                _=cancel.cancelled()=>break,
-                event=receiver.recv()=>{
-                    match event{
-                        Ok(())|Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{
-                            yield Ok(Event::default().data("refresh"));
-                        }
-                        Err(_)=>break,
-                    }
-                }
-            }
-        }
-    };
-    Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response()
-}
-
 async fn conversations(State(app): State<Arc<App>>) -> ApiResult {
     Ok(Json(app.db.conversations().await?))
-}
-#[derive(Deserialize)]
-struct ConversationBinding {
-    chat_id: String,
-    project_id: Option<String>,
-    #[serde(default = "unknown_chat_kind")]
-    kind: String,
-    #[serde(default)]
-    name: String,
-}
-fn unknown_chat_kind() -> String {
-    "unknown".into()
-}
-async fn bind_conversation(
-    State(app): State<Arc<App>>,
-    Json(input): Json<ConversationBinding>,
-) -> ApiResult {
-    if input.project_id != app.db.bot_project().await? {
-        return Err(anyhow::anyhow!("机器人固定对应一个项目，私聊和群聊无需单独绑定").into());
-    }
-    if !["unknown", "group", "p2p"].contains(&input.kind.as_str()) || input.name.len() > 1000 {
-        return Err(anyhow::anyhow!("聊天类型或名称无效").into());
-    }
-    app.db
-        .bind_conversation(
-            &input.chat_id,
-            input.project_id.as_deref(),
-            &input.kind,
-            &input.name,
-        )
-        .await?;
-    app.notify.notify_one();
-    app.changed();
-    Ok(Json(json!({"ok":true})))
-}
-#[derive(Deserialize)]
-struct PrivateDefault {
-    project_id: Option<String>,
-}
-async fn private_default(
-    State(app): State<Arc<App>>,
-    Json(input): Json<PrivateDefault>,
-) -> ApiResult {
-    if input.project_id != app.db.bot_project().await? {
-        return Err(anyhow::anyhow!("机器人固定对应一个项目，无需设置私聊路由").into());
-    }
-    app.db
-        .set_private_default(input.project_id.as_deref())
-        .await?;
-    app.notify.notify_one();
-    app.changed();
-    Ok(Json(json!({"ok":true})))
 }

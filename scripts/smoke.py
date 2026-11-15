@@ -1,8 +1,7 @@
 """No external Python dependencies. Exercises real SDK WebSocket, HERDR, MCP and HTTP.
 
-Run after frontend/build and cargo build:
+Run after cargo build:
   python3 scripts/smoke.py
-  python3 scripts/smoke.py --browser
 Only its private HC_SESSION, terminals and fixture processes are cleaned up.
 """
 import argparse
@@ -222,7 +221,6 @@ def message(source, text, kind="text", content=None, chat_type="group", chat_id=
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--browser", action="store_true")
     parser.add_argument("--binary", type=Path, help="use an already built bridge executable")
     parser.add_argument("--real-pi", action="store_true", help="one real model turn using the locally configured Pi account")
     parser.add_argument("--real-agent",choices=["codex","claude","pi"],help="one real CLI/model turn; may incur model charges")
@@ -339,12 +337,6 @@ def main():
         cli = subprocess.run([str(binary), "--data-dir", str(run), "project", "list"], capture_output=True, text=True, timeout=10)
         assert cli.returncode == 0 and "端到端验证项目" in cli.stdout
         checks.append("CLI and UI API share the same project state")
-        if args.browser:
-            browser = results / "e2e.json"
-            browser.write_text(json.dumps({"url": base, "token": config["token"], "workspace": str(workspace), "project_id": key}))
-            browser.chmod(0o600)
-            subprocess.run(["pnpm", "test:e2e"], cwd=ROOT / "frontend", check=True, timeout=120)
-            checks.append("desktop/mobile browser CRUD, queue controls and screenshots")
         # Stopped sessions must retain later messages rather than execute them in a shell.
         api(f"/projects/{key}/stop", {}, "POST")
         FIXTURE.emit(message("om_stopped", "do not deliver to a stopped terminal"))
