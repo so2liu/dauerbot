@@ -74,9 +74,8 @@ pub async fn api_json(response: reqwest::Response) -> Result<Value> {
 pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String> {
     let cfg = app.config.read().await.clone();
     let token = token(app).await?;
-    if p.chat_id.is_empty() {
-        bail!("项目尚未绑定飞书 chat_id");
-    }
+    let to = m.attachment["to"].as_str().unwrap_or(&p.chat_id);
+    let receive_id_type = recipient_type(to)?;
     let (kind, content) = if let Some(path) = m.attachment["path"].as_str() {
         let path = allowed_file(p, Path::new(path), &app.dir)?;
         let metadata = tokio::fs::metadata(&path).await?;
@@ -120,12 +119,11 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String>
             json!({"zh_cn":{"title":"","content":[[{"tag":"md","text":m.content}]]}}),
         )
     };
-    let body =
-        json!({"receive_id":p.chat_id,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
+    let body = json!({"receive_id":to,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
     let v = api_json(
         app.http
             .post(format!("{}/open-apis/im/v1/messages", cfg.feishu_base))
-            .query(&[("receive_id_type", "chat_id")])
+            .query(&[("receive_id_type", receive_id_type)])
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -250,7 +248,7 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
     if kind == "post" {
         collect_text(&content, &mut text);
     }
-    let attachment = if let Some(key) = content["file_key"]
+    let mut attachment = if let Some(key) = content["file_key"]
         .as_str()
         .or(content["image_key"].as_str())
     {
@@ -267,15 +265,9 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
                 .unwrap_or("")
         );
     }
-    let sender = event["sender"]["sender_id"]["open_id"]
-        .as_str()
-        .unwrap_or("unknown");
-    Ok(Some((
-        chat,
-        source,
-        format!("发送者：{sender}\n{text}"),
-        attachment,
-    )))
+    attachment["source"] = json!({"chat_id":chat,"chat_type":msg["chat_type"],"message_type":kind,
+        "sender":event["sender"]["sender_id"],"mentions":msg["mentions"],"root_id":msg["root_id"],"parent_id":msg["parent_id"],"create_time":msg["create_time"]});
+    Ok(Some((chat, source, text, attachment)))
 }
 fn collect_text(v: &Value, out: &mut String) {
     match v {
@@ -353,4 +345,87 @@ pub fn reset_cache(cache: &mut TokenCache) {
 }
 pub fn public_config(cfg: &Config) -> Value {
     json!({"app_id":cfg.app_id,"has_secret":!cfg.app_secret.is_empty(),"core_session":cfg.core_session,"hc":cfg.hc,"port":cfg.port})
+}
+
+/// Both private/group chat IDs and direct user Open IDs are valid destinations.
+pub fn recipient_type(to: &str) -> Result<&'static str> {
+    if to.len() > 200 || to.len() < 4 || !to.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        bail!("to 须为飞书聊天 ID（oc_…）或用户 Open ID（ou_…）");
+    }
+    if to.starts_with("oc_") {
+        Ok("chat_id")
+    } else if to.starts_with("ou_") {
+        Ok("open_id")
+    } else {
+        bail!("to 须为飞书聊天 ID（oc_…）或用户 Open ID（ou_…）")
+    }
+}
+
+/// Cache a bounded, best-effort group snapshot. Missing scopes never invent members.
+pub async fn context(app: &App, m: &db::Message) -> Value {
+    let source = &m.attachment["source"];
+    let chat = source["chat_id"].as_str().unwrap_or("");
+    if source["chat_type"] != "group" {
+        return json!({"members_status":"not_applicable","members":[]});
+    }
+    let cached = app
+        .db
+        .sync(|c| {
+            Ok(c.query_row(
+                "SELECT context FROM conversations WHERE chat_id=?",
+                [chat],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "{}".into()))
+        })
+        .unwrap_or_default();
+    let cached: Value = serde_json::from_str(&cached).unwrap_or_default();
+    let mut result = if cached["fetched_at"]
+        .as_i64()
+        .is_some_and(|t| db::now() - t < 300_000)
+    {
+        cached
+    } else {
+        let fetch = async {
+            let cfg = app.config.read().await.clone();
+            let token = token(app).await?;
+            let base = format!("{}/open-apis/im/v1/chats/{chat}", cfg.feishu_base);
+            let name = api_json(app.http.get(&base).bearer_auth(&token).send().await?)
+                .await
+                .ok()
+                .and_then(|v| v["data"]["name"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let response = api_json(
+                app.http
+                    .get(format!("{base}/members"))
+                    .query(&[("member_id_type", "open_id"), ("page_size", "100")])
+                    .bearer_auth(&token)
+                    .send()
+                    .await?,
+            )
+            .await;
+            Ok::<_, anyhow::Error>(match response {
+                Ok(v) => {
+                    json!({"name":name,"members_status":"snapshot","members":v["data"]["items"],"truncated":v["data"]["has_more"]==true,"fetched_at":db::now()})
+                }
+                Err(_) => {
+                    json!({"name":name,"members_status":"unavailable","members":[],"fetched_at":db::now()})
+                }
+            })
+        };
+        let value = match tokio::time::timeout(Duration::from_secs(6), fetch).await {
+            Ok(Ok(v)) => v,
+            _ => json!({"members_status":"unavailable","members":[],"fetched_at":db::now()}),
+        };
+        let _ = app.db.sync(|c| {c.execute("UPDATE conversations SET context=?,name=CASE WHEN ?='' THEN name ELSE ? END WHERE chat_id=?",rusqlite::params![value.to_string(),value["name"].as_str().unwrap_or(""),value["name"].as_str().unwrap_or(""),chat])?;Ok(())});
+        value
+    };
+    let sender = source["sender"]["open_id"].as_str().unwrap_or("");
+    result["sender_name"] = result["members"]
+        .as_array()
+        .and_then(|ms| ms.iter().find(|v| v["member_id"] == sender))
+        .map(|v| v["name"].clone())
+        .unwrap_or(Value::Null);
+    result
 }

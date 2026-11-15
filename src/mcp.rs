@@ -36,11 +36,15 @@ pub struct Ack {
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct Markdown {
+    /// 飞书聊天 ID oc_…（群聊或私聊）或用户 Open ID ou_…；由 Agent 选择回复目的地。
+    pub to: String,
     pub text: String,
     pub request_id: String,
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct File {
+    /// 飞书聊天 ID oc_…（群聊或私聊）或用户 Open ID ou_…。
+    pub to: String,
     pub path: String,
     pub request_id: String,
 }
@@ -111,7 +115,7 @@ impl BridgeMcp {
         result(self.ready(&native).await, false)
     }
     #[tool(
-        description = "确认收到指定飞书 message_id。每条 [FEISHU_MESSAGE] 到达后先调用，防止重复或乱序。"
+        description = "确认收到指定飞书 message_id。每条 <feishu_message> 到达后先调用，防止重复或乱序。"
     )]
     async fn ack_message(
         &self,
@@ -124,7 +128,7 @@ impl BridgeMcp {
         )
     }
     #[tool(
-        description = "向当前项目绑定的飞书聊天发送 Markdown。request_id 每次新消息唯一，重试同一消息复用；只有 status=sent 才表示发送成功。"
+        description = "向 to 指定的飞书聊天或用户发送 Markdown。to 由你决定，oc_ 开头是群或私聊聊天 ID，ou_ 开头是用户 Open ID，无须回复原聊天。request_id 每次新消息唯一，重试同一内容和目的地复用；只有 status=sent 才表示成功。"
     )]
     async fn send_markdown(
         &self,
@@ -133,14 +137,14 @@ impl BridgeMcp {
         result(
             self.post(
                 "outbox",
-                json!({"content":input.text,"request_id":input.request_id}),
+                json!({"to":input.to,"content":input.text,"request_id":input.request_id}),
             )
             .await,
             true,
         )
     }
     #[tool(
-        description = "向当前项目飞书聊天发送本地附件（最大100MB）。路径须在项目目录或Bridge缓存内。新文件使用新的request_id。"
+        description = "向 to 指定的飞书聊天或用户发送本地附件（最大100MB）。to 为 oc_ 聊天 ID 或 ou_ 用户 Open ID，由你决定。路径须在项目目录或Bridge缓存内。新文件使用新的request_id。"
     )]
     async fn send_file(
         &self,
@@ -149,7 +153,7 @@ impl BridgeMcp {
         result(
             self.post(
                 "outbox",
-                json!({"path":input.path,"request_id":input.request_id}),
+                json!({"to":input.to,"path":input.path,"request_id":input.request_id}),
             )
             .await,
             true,
@@ -160,7 +164,7 @@ impl BridgeMcp {
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("你是飞书项目主会话。先 session_ready，收到用户消息先 ack_message；请使用 send_markdown/send_file 向用户回复，不将仅在终端显示结果当作已送达。")
+            .with_instructions("你是飞书项目主会话。先 session_ready，收到用户消息先 ack_message；请使用 send_markdown/send_file 向用户回复，必填 to 由你决定，填 oc_ 聊天 ID 或 ou_ 用户 Open ID，可以与来源不同。不将仅在终端显示结果当作已送达。")
     }
 }
 pub async fn serve(path: &Path) -> Result<()> {

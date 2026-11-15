@@ -17,7 +17,7 @@ open "dist/Herdr Bridge.app"
 
 首次引导包括创建企业自建应用、启用机器人、填写并验证凭证、复制权限导入 JSON、配置长连接与消息订阅、发布应用和加群、本机权限检测、选择代码目录与 CLI。可以选择「先在本机试用」跳过飞书，稍后补齐。引导进度保存在本机，随时可重新打开；发布和订阅的手动确认不会显示为自动检测成功。
 
-在「添加项目」中通过 macOS 系统选择器选择目录，填写名称并选择 Codex / Claude Code / Pi / Antigravity。机器人所在群可以从飞书 API 获取，也可以手动填写 chat_id。在工作台选中项目后启动主会话；首次 CLI 登录、信任提示需要到 HERDR 处理。项目消息与状态自动刷新，停止会话前会弹出原生确认框。
+在「添加项目」中通过 macOS 系统选择器选择目录，填写名称并选择 Codex / Claude Code / Pi / Antigravity。接收聊天从列表选择，支持搜索群名和最近消息；机器人所在群从飞书 API 获取，私聊在收到首条消息后自动发现。手动 ID 输入仅在高级设置中显示。在工作台选中项目后启动主会话；首次 CLI 登录、信任提示需要到 HERDR 处理。项目消息与状态自动刷新，停止会话前会弹出原生确认框。
 
 本机访问采用按需引导：
 
@@ -60,7 +60,7 @@ open "dist/Herdr Bridge.app" --args --data-dir /absolute/path/to/private-data
 
 ## 项目与主会话
 
-在 UI 新建项目，填写已有的绝对代码目录、Agent 类型和飞书群 `chat_id`。也可通过 CLI：
+在原生工作台新建项目，选择代码目录、Agent 类型和接收聊天。私聊与群聊可以同时进入同一主会话。也可通过 CLI：
 
 ```sh
 hfb project add my-project --path /absolute/path/to/repo --agent codex \
@@ -75,7 +75,7 @@ hfb session stop my-project
 hfb session resume my-project
 ```
 
-一个项目对应一个主会话，一个飞书聊天只能绑定到一个项目。暂未绑定飞书也能创建项目、启动会话并从 UI/CLI 加入本地测试消息：
+一个项目对应一个主会话，可关联多个私聊和群聊；一个接收聊天只进入一个项目。尚未关联的消息先保存在待关联队列，关联后自动送入该项目。可选择一个项目默认接收未关联的私聊，默认关闭；已明确关联其他项目的私聊优先使用其关联。此设置只控制入站，出站由 Agent 的 `to` 决定。暂未绑定飞书也能创建项目、启动会话并从 UI/CLI 加入本地测试消息：
 
 ```sh
 hfb message inject my-project '检查这个项目的目录结构，完成后回复飞书'
@@ -139,12 +139,34 @@ hfb project bind my-project oc_your_project_chat
 |---|---|---|
 | `session_ready` | 可选 `native_session` | 核对终端、进程与会话代次，登记就绪和原生会话 ID |
 | `ack_message` | `message_id` | 确认已接收指定入站消息，解除后续队列阻塞 |
-| `send_markdown` | `text`, `request_id` | 向本项目绑定的聊天发送 Markdown |
-| `send_file` | `path`, `request_id` | 流式发送本地文件，最大 100 MB |
+| `send_markdown` | `to`, `text`, `request_id` | 向 Agent 指定的聊天或用户发送 Markdown |
+| `send_file` | `to`, `path`, `request_id` | 向 Agent 指定的聊天或用户流式发送本地文件，最大 100 MB |
 
-同一发送请求重试复用 `request_id`；不同内容须使用不同 ID。工具只有返回 `status=sent` 才表示 API 已确认接收。MCP 不能管理其他项目、读取管理设置或启动/停止会话。
+`to` 是必填字段：`oc_…` 是聊天 ID（群聊或私聊），`ou_…` 是用户 Open ID。Agent 按用户意图决定目的地，可与来源聊天不同，无须 `reply_to`，后端不自动锁定回复来源；最终可达范围由飞书机器人的权限和应用可用范围决定。CLI 的 `message send` / `message file` 支持 `--to`；旧 CLI 调用省略时兼容项目原有主聊天。
+
+同一发送请求重试复用 `request_id`；不同内容或目的地须使用不同 ID。工具只有返回 `status=sent` 才表示 API 已确认接收。MCP 不能管理其他项目、读取管理设置或启动/停止会话。
 
 附件须位于当前项目目录或 Bridge 缓存内。路径会做 canonicalize 校验，符号链接不能绕出允许范围。入站消息资源和出站文件均使用流式 I/O。
+
+## 入站 XML 上下文
+
+主会话收到统一的 XML 信封，包含平台、聊天类型及 ID、message_id、发送者各类 ID、群名、成员快照、@ 提及、话题根消息/父消息、正文和附件路径。所有字段与正文均做 XML 转义，正文无法闭合信封伪造平台字段。XML 只是上下文格式，用户文本仍按用户输入处理。
+
+```xml
+<feishu_message version="1" message_id="om_example">
+  <source platform="feishu" chat_type="group" chat_id="oc_team"
+          root_id="" parent_id="" create_time=""/>
+  <sender open_id="ou_person" user_id="" union_id="" name="小明"/>
+  <chat name="产品群"/>
+  <members status="snapshot" truncated="false" includes_bots="false">
+    <member id="ou_person" id_type="open_id" name="小明"/>
+  </members>
+  <mentions/>
+  <body type="text" trust="user_input">请把结果私聊给我</body>
+</feishu_message>
+```
+
+Agent 可以据此调用 `send_markdown(to="ou_person", text="结果…", request_id="…")`。私聊使用同样的结构，`chat_type="p2p"`，无需群成员快照。未知姓名和 ID 留空；群成员 API 只返回人类成员，最多获取一页（100 个分页额度，平台可能返回更多同批加入成员），超过时标记 `truncated=true`。快照缓存五分钟，权限不足或超时时标记 `unavailable`，不阻止正文投递，也不虚构成员。首次配置权限时可导入工作台提供的群成员读取权限。
 
 ## 持久化与交付状态
 

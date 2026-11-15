@@ -2,7 +2,7 @@
 import json
 import os
 from pathlib import Path
-import re
+import xml.etree.ElementTree as ET
 import subprocess
 import sys
 import tty
@@ -42,6 +42,7 @@ rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-
 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 proc.stdin.flush()
 tools = rpc("tools/list")
+assert all("to" in t["inputSchema"]["required"] for t in tools["tools"] if t["name"] in {"send_markdown", "send_file"})
 assert {t["name"] for t in tools["tools"]} == {"session_ready", "ack_message", "send_markdown", "send_file"}, tools
 
 
@@ -64,12 +65,16 @@ try:
             continue
         text, buffer = buffer.split(end, 1)
         text = text.removeprefix(b"\x1b[200~").decode()
-        source = re.search(r"\[FEISHU_MESSAGE id=([^\]]+)\]", text).group(1)
+        envelope = ET.fromstring(text)
+        source = envelope.attrib["message_id"]
+        to = envelope.find("source").attrib["chat_id"] or "oc_fixture"
+        if "direct-to-user" in text:
+            to = envelope.find("sender").attrib["open_id"]
         status("working")
         tool("ack_message", {"message_id": source})
-        tool("send_markdown", {"text": f"**收到测试消息**\n\n{source}\n\n中文与 Markdown 均已往返。", "request_id": "reply-" + source})
+        tool("send_markdown", {"to": to, "text": f"**收到测试消息**\n\n{source}\n\n中文与 Markdown 均已往返。", "request_id": "reply-" + source})
         if "send-file" in text:
-            tool("send_file", {"path": str(Path.cwd() / "report.txt"), "request_id": "file-" + source})
+            tool("send_file", {"to": to, "path": str(Path.cwd() / "report.txt"), "request_id": "file-" + source})
         sys.stdout.write("\r\nMOCK_PROCESSED " + json.dumps({"source": source, "pid": os.getpid()}, ensure_ascii=False) + "\r\n")
         status("done")
         status("idle")

@@ -49,6 +49,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/settings", get(settings).put(save_settings))
         .route("/settings/check", post(check_settings))
         .route("/onboarding/chats", get(onboarding_chats))
+        .route("/conversations", get(conversations).put(bind_conversation))
+        .route(
+            "/conversations/private-default",
+            axum::routing::put(private_default),
+        )
         .route("/projects", post(create_project))
         .route(
             "/projects/{id}",
@@ -159,7 +164,7 @@ async fn static_asset(req: Request) -> Response {
 }
 async fn state(State(app): State<Arc<App>>) -> ApiResult {
     Ok(Json(
-        json!({"projects":app.db.projects().await?,"runtime":*app.runtime.read().await,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION")}),
+        json!({"projects":app.db.projects().await?,"conversations":app.db.conversations().await?,"runtime":*app.runtime.read().await,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {
@@ -344,6 +349,8 @@ async fn inject(
 }
 #[derive(Deserialize)]
 struct Outbox {
+    #[serde(default)]
+    to: Option<String>,
     request_id: String,
     #[serde(default)]
     content: String,
@@ -365,7 +372,13 @@ async fn outbox(
         json!({})
     };
     let m = app
-        .outbox(&id, &input.request_id, &input.content, attachment)
+        .outbox_to(
+            &id,
+            &input.request_id,
+            &input.content,
+            attachment,
+            input.to.as_deref(),
+        )
         .await?;
     Ok(Json(serde_json::to_value(m).unwrap()))
 }
@@ -509,4 +522,54 @@ async fn events(State(app): State<Arc<App>>) -> Response {
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+async fn conversations(State(app): State<Arc<App>>) -> ApiResult {
+    Ok(Json(app.db.conversations().await?))
+}
+#[derive(Deserialize)]
+struct ConversationBinding {
+    chat_id: String,
+    project_id: Option<String>,
+    #[serde(default = "unknown_chat_kind")]
+    kind: String,
+    #[serde(default)]
+    name: String,
+}
+fn unknown_chat_kind() -> String {
+    "unknown".into()
+}
+async fn bind_conversation(
+    State(app): State<Arc<App>>,
+    Json(input): Json<ConversationBinding>,
+) -> ApiResult {
+    if !["unknown", "group", "p2p"].contains(&input.kind.as_str()) || input.name.len() > 1000 {
+        return Err(anyhow::anyhow!("聊天类型或名称无效").into());
+    }
+    app.db
+        .bind_conversation(
+            &input.chat_id,
+            input.project_id.as_deref(),
+            &input.kind,
+            &input.name,
+        )
+        .await?;
+    app.notify.notify_one();
+    app.changed();
+    Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+struct PrivateDefault {
+    project_id: Option<String>,
+}
+async fn private_default(
+    State(app): State<Arc<App>>,
+    Json(input): Json<PrivateDefault>,
+) -> ApiResult {
+    app.db
+        .set_private_default(input.project_id.as_deref())
+        .await?;
+    app.notify.notify_one();
+    app.changed();
+    Ok(Json(json!({"ok":true})))
 }

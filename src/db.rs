@@ -130,6 +130,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS message_pending ON messages(direction,status,created_at);
             PRAGMA user_version=1;
         ")?;
+        crate::conversation::migrate(&conn)?;
         conn.execute("UPDATE messages SET status='uncertain',error='服务在操作中退出；请核对后手动重试',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
@@ -178,8 +179,11 @@ impl Db {
         let key = id();
         let out = key.clone();
         self.call(move |c| {
-            c.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
+            let tx = c.unchecked_transaction()?;
+            tx.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
             params![key,input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,now(),id()])?;
+            crate::conversation::primary(&tx, &key, input.chat_id.trim(), "")?;
+            tx.commit()?;
             Ok(())
         }).await?;
         self.project(&out).await
@@ -199,8 +203,13 @@ impl Db {
             bail!("请先停止会话，再修改目录、Agent 或启动参数");
         }
         let out = p.id.clone();
-        self.call(move |c| {c.execute("UPDATE projects SET name=?,path=?,agent=?,chat_id=?,native_session=?,extra_args=? WHERE id=?",
-            params![input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,p.id])?;Ok(())}).await?;
+        self.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            crate::conversation::primary(&tx, &p.id, input.chat_id.trim(), &p.chat_id)?;
+            tx.execute("UPDATE projects SET name=?,path=?,agent=?,chat_id=?,native_session=?,extra_args=? WHERE id=?",
+            params![input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,p.id])?;
+            tx.commit()?; Ok(())
+        }).await?;
         self.project(&out).await
     }
     pub async fn pause(&self, key: &str, value: bool) -> Result<()> {
@@ -258,11 +267,21 @@ impl Db {
         attachment: &serde_json::Value,
     ) -> Result<Option<String>> {
         self.sync(|c|{
-            let project:Option<String>=c.query_row("SELECT id FROM projects WHERE chat_id=?",[chat],|r|r.get(0)).optional()?;
-            let Some(project)=project else {return Ok(None)};
+            let context = &attachment["source"];
+            let kind = context["chat_type"].as_str().unwrap_or("unknown");
+            c.execute("INSERT INTO conversations(chat_id,kind,seen_at,preview) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET seen_at=excluded.seen_at,preview=excluded.preview,kind=CASE WHEN excluded.kind='unknown' THEN conversations.kind ELSE excluded.kind END", params![chat,kind,now(),content.chars().take(96).collect::<String>()])?;
+            if c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE direction='in' AND source_id=?)",[source],|r|r.get::<_,bool>(0))? { return Ok(None); }
+            let legacy:Option<String>=c.query_row("SELECT id FROM projects WHERE chat_id=?",[chat],|r|r.get(0)).optional()?;
+            let bound:Option<String>=c.query_row("SELECT project_id FROM conversations WHERE chat_id=?",[chat],|r|r.get::<_,Option<String>>(0)).optional()?.flatten();
+            let fallback: Option<String> = if kind == "p2p" { c.query_row("SELECT project_id FROM routing_defaults WHERE slot='p2p'",[],|r|r.get(0)).optional()? } else {None};
+            let Some(project)=legacy.or(bound).or(fallback) else {
+                c.execute("INSERT OR IGNORE INTO unrouted_messages(source_id,chat_id,content,attachment,created_at) VALUES(?,?,?,?,?)",params![source,chat,content,serde_json::to_string(attachment)?,now()])?;
+                return Ok(None)
+            };
             let key=id();
             let n=c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
                 params![key,project,source,content,serde_json::to_string(attachment)?,now(),now()])?;
+            if n==1 { c.execute("DELETE FROM unrouted_messages WHERE source_id=?",[source])?; }
             Ok((n==1).then_some(key))
         })
     }

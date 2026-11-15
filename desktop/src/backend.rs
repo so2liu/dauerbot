@@ -206,6 +206,7 @@ pub fn scopes(all_group_replies: bool) -> Value {
         "im:message:readonly",
         "im:resource",
         "im:chat:readonly",
+        "im:chat.members:read",
     ];
     if all_group_replies {
         scopes.push("im:message.group_msg");

@@ -122,11 +122,15 @@ enum Messages {
         project: String,
         text: String,
         #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
         request_id: Option<String>,
     },
     File {
         project: String,
         path: PathBuf,
+        #[arg(long)]
+        to: Option<String>,
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -316,8 +320,8 @@ async fn main() -> Result<()> {
         }
         Commands::Message{command}=>match command{
             Messages::Inject{project,text}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/messages"),Some(json!({"content":text}))).await?}
-            Messages::Send{project,text,request_id}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"content":text,"request_id":request_id.unwrap_or_else(db::id)}))).await?}
-            Messages::File{project,path,request_id}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"path":std::fs::canonicalize(path)?,"request_id":request_id.unwrap_or_else(db::id)}))).await?}
+            Messages::Send{project,text,request_id,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"content":text,"to":to,"request_id":request_id.unwrap_or_else(db::id)}))).await?}
+            Messages::File{project,path,request_id,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"path":std::fs::canonicalize(path)?,"to":to,"request_id":request_id.unwrap_or_else(db::id)}))).await?}
             Messages::Retry{id}=>client.request("POST",&format!("/messages/{id}/retry"),None).await?,
             Messages::Dismiss{id}=>client.request("POST",&format!("/messages/{id}/dismiss"),None).await?,
         },

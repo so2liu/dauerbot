@@ -144,13 +144,17 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/open-apis/im/v1/messages"):
             assert self.headers.get("Authorization") == "Bearer fixture-token"
             value = json.loads(data)
-            assert value["receive_id"] == "oc_fixture", value
+            assert value["receive_id"] in {"oc_fixture", "oc_private", "ou_fixture"}, value
             FIXTURE.messages.append(value)
             self.reply({"code": 0, "data": {"message_id": "om_sent_" + str(len(FIXTURE.messages))}})
         else:
             self.reply({"code": 404, "msg": "unimplemented fixture endpoint"})
 
     def do_GET(self):
+        if self.path.startswith("/open-apis/im/v1/chats/oc_fixture/members"):
+            self.reply({"code":0,"data":{"items":[{"member_id":"ou_fixture","name":"测试用户"}],"has_more":False}}); return
+        if self.path == "/open-apis/im/v1/chats/oc_fixture":
+            self.reply({"code":0,"data":{"name":"端到端测试群"}}); return
         if "/resources/" in self.path:
             data = b"downloaded fixture attachment"
             self.send_response(200); self.send_header("Content-Length", str(len(data)))
@@ -209,21 +213,22 @@ def wait_for(predicate, message, timeout=35):
     raise AssertionError(message)
 
 
-def message(source, text, kind="text", content=None):
+def message(source, text, kind="text", content=None, chat_type="group", chat_id="oc_fixture"):
     return {"schema": "2.0", "header": {"event_type": "im.message.receive_v1", "event_id": str(uuid.uuid4())},
             "event": {"sender": {"sender_type": "user", "sender_id": {"open_id": "ou_fixture"}},
-                      "message": {"chat_id": "oc_fixture", "message_id": source, "message_type": kind,
+                      "message": {"chat_id": chat_id, "chat_type": chat_type, "message_id": source, "message_type": kind,
                                   "content": json.dumps(content if content is not None else {"text": text})}}}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--browser", action="store_true")
+    parser.add_argument("--binary", type=Path, help="use an already built bridge executable")
     parser.add_argument("--real-pi", action="store_true", help="one real model turn using the locally configured Pi account")
     parser.add_argument("--real-agent",choices=["codex","claude","pi"],help="one real CLI/model turn; may incur model charges")
     args = parser.parse_args()
     real_agent=args.real_agent or ("pi" if args.real_pi else None)
-    binary = ROOT / "target/debug/hfb"
+    binary = args.binary or ROOT / "target/debug/hfb"
     assert binary.exists(), "run cargo build first"
     run = ROOT / ".local" / ("smoke-" + uuid.uuid4().hex[:8])
     run.mkdir(parents=True, mode=0o700)
@@ -305,6 +310,13 @@ def main():
         wait_for(lambda: all(any(m["source_id"] == key and m["status"] == "acknowledged" for m in api(f"/projects/{project['id']}")["messages"]) for key in ["om_second", "om_third"]), "queued messages failed")
         assert list((run / "files").glob("*incoming.txt"))
         checks.append("ordered follow-up turns and streamed inbound attachment")
+        FIXTURE.emit(message("om_private", "direct-to-user", chat_type="p2p", chat_id="oc_private"))
+        wait_for(lambda: any(c["chat_id"]=="oc_private" for c in api("/conversations")["items"]), "new private chat was not discovered")
+        assert not any(m["source_id"]=="om_private" for m in api(f"/projects/{key}")["messages"])
+        api("/conversations", {"chat_id":"oc_private","project_id":key,"kind":"p2p"}, "PUT")
+        wait_for(lambda: any(m["receive_id"]=="ou_fixture" for m in FIXTURE.messages), "agent-selected user destination failed")
+        wait_for(lambda: any(m["source_id"]=="om_private" and m["status"]=="acknowledged" for m in api(f"/projects/{key}")["messages"]), "private message did not join the same main session")
+        checks.append("discovered private chat + retained first message + same main session + XML context + MCP explicit user to")
         count = FIXTURE.connects; FIXTURE.disconnect()
         wait_for(lambda: FIXTURE.connects > count, "daemon did not reconnect WebSocket")
         checks.append("daemon supervises SDK and reconnects after forced disconnection")
