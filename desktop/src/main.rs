@@ -828,8 +828,8 @@ fn main() {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![Menu {
-            name: "Herdr Bridge".into(),
-            items: vec![MenuItem::action("退出 Herdr Bridge", Quit)],
+            name: "Dauerbot".into(),
+            items: vec![MenuItem::action("退出 Dauerbot", Quit)],
         }]);
         let bounds = Bounds::centered(None, size(px(1180.), px(860.)), cx);
         cx.open_window(
@@ -837,7 +837,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(980.), px(680.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Herdr Bridge".into()),
+                    title: Some("Dauerbot".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

@@ -1,6 +1,16 @@
-# HERDR Feishu Bridge
+# Dauerbot
 
 原生 macOS 项目工作台，把飞书机器人对话连接到 HERDR 托管的持久 CLI 主会话。桌面界面由 Rust / GPUI 绘制，Rust daemon、CLI 和 MCP 共用同一套业务逻辑。Svelte 页面保留为辅助管理入口。
+
+一个飞书机器人对应一个项目和一个当前智能体，私聊与群聊都能进入同一主会话。支持 Codex、Claude Code、Pi 和 Antigravity；使用本机 CLI 已有账号与模型配置，不代理模型接口。你可以在 Herdr App 里监控和接管真实终端。
+
+## 安装
+
+从 [GitHub Releases](https://github.com/so2liu/dauerbot/releases) 下载 Apple Silicon 安装包，解压后将 `Dauerbot.app` 拖入 Applications。先安装并登录你准备使用的 Agent CLI，以及 HERDR Core 的 `hc`；若需图形化监控，安装 Herdr App。
+
+当前版本提供开发证书签名的预览包，尚未完成 Developer ID 签名与 Apple 公证，macOS 可能阻止直接打开。不要将它视作已通过 Gatekeeper 分发验收的正式安装包。仅验证过 Apple Silicon 构建，尚未验证 Intel 或最低兼容系统版本。
+
+项目采用 MIT 许可证。Dauerbot 是独立项目，与 HERDR、飞书及各 CLI 厂商没有官方隶属关系。
 
 关闭桌面窗口不影响后台工作。重启 Bridge 不重建 Agent 会话；退出桌面应用也不会主动结束 HERDR 中的终端。
 
@@ -10,10 +20,14 @@
 
 ```sh
 ./scripts/build-desktop.sh
-open "dist/Herdr Bridge.app"
+open "dist/Dauerbot.app"
 ```
 
 应用直接打开原生窗口，自动启动或连接本机后台服务，无需浏览器或前端开发服务器。可将 `.app` 拖入 Applications 再运行。构建产物使用 ad-hoc 本地签名；对外分发仍需 Developer ID 签名与 Apple 公证。
+
+已有证书时可运行 `./scripts/build-desktop.sh "签名身份名称"`；独立签名入口为 `scripts/sign-macos.sh`，可选第三个参数指定钥匙串。签名脚本不会读取或导出私钥。证书类型和公证状态须在每次 release 中单独说明。
+
+为兼容早期本机版本，内部可执行文件仍名为 `HerdrBridge`、CLI 仍为 `hfb`，bundle ID 和默认数据目录保留 `dev.herdr.feishu-bridge`。升级沿用原有机器人配置和消息记录。
 
 首次引导包括创建企业自建应用、启用机器人、填写并验证凭证、复制权限导入 JSON、配置长连接与消息订阅、发布应用和加群、本机权限检测、选择代码目录与 CLI。可以选择「先在本机试用」跳过飞书，稍后补齐。引导进度保存在本机，随时可重新打开；发布和订阅的手动确认不会显示为自动检测成功。
 
@@ -29,7 +43,7 @@ open "dist/Herdr Bridge.app"
 默认共享 CLI 的用户数据目录。桌面首次创建配置时选择可用的本机端口，后续固定使用该配置中的端口；CLI 会读取同一份配置。需要隔离预览时：
 
 ```sh
-open "dist/Herdr Bridge.app" --args --data-dir /absolute/path/to/private-data
+open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
 ```
 
 ## 运行
@@ -60,11 +74,10 @@ open "dist/Herdr Bridge.app" --args --data-dir /absolute/path/to/private-data
 
 ## 项目与主会话
 
-在原生工作台新建项目，选择代码目录、Agent 类型和接收聊天。私聊与群聊可以同时进入同一主会话。也可通过 CLI：
+在原生工作台新建项目，选择代码目录和 Agent 类型。私聊与群聊可以同时进入同一主会话，无需手动填写聊天 ID。也可通过 CLI：
 
 ```sh
-hfb project add my-project --path /absolute/path/to/repo --agent codex \
-  --chat-id oc_your_project_chat
+hfb project add my-project --path /absolute/path/to/repo --agent codex
 hfb project list
 hfb session start my-project
 hfb session screen my-project

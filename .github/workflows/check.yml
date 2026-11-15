@@ -1,0 +1,32 @@
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pnpm from packageManager
+        run: npm install --global pnpm@12.6.0
+      - name: Check frontend
+        run: |
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend check
+      - name: Build native application
+        run: ./scripts/build-desktop.sh
+      - name: Backend tests and lint
+        run: |
+          cargo test --locked --release --target-dir desktop/target --tests
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Desktop tests and lint
+        run: |
+          cargo test --locked --manifest-path desktop/Cargo.toml
+          cargo clippy --locked --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
