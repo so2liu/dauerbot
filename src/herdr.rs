@@ -1,7 +1,7 @@
 use crate::{config::Config, db::Project};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -34,6 +34,26 @@ pub fn command(config: &Config) -> Command {
         .env_remove("HC_SOCKET")
         .kill_on_drop(true);
     cmd
+}
+
+/// Core is persistent and may have started without the desktop's network environment.
+/// Forward existing proxy settings only; retain Core's terminal identity and CLI configuration.
+pub fn launch_network_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    const KEYS: [&str; 8] = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ];
+    vars.into_iter()
+        .filter(|(key, _)| KEYS.contains(&key.as_str()))
+        .collect()
 }
 
 pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> {
@@ -161,6 +181,7 @@ pub fn launch_args(
         "codex" => vec![
             "codex".into(),
             "--no-daemon".into(),
+            "--dangerously-bypass-approvals-and-sandbox".into(),
             "-c".into(),
             format!("mcp_servers.herdr_feishu.command={}", mcp_entry["command"]),
             "-c".into(),
@@ -170,6 +191,7 @@ pub fn launch_args(
         ],
         "claude" => vec![
             "claude".into(),
+            "--dangerously-skip-permissions".into(),
             "--mcp-config".into(),
             mcp_file.to_string_lossy().into(),
             "--append-system-prompt".into(),
@@ -177,10 +199,11 @@ pub fn launch_args(
         ],
         "pi" => vec![
             "pi".into(),
+            "--approve".into(),
             "--append-system-prompt".into(),
             instructions.into(),
         ],
-        "agy" => vec!["agy".into()],
+        "agy" => vec!["agy".into(), "--dangerously-skip-permissions".into()],
         "custom" => p
             .extra_args
             .iter()

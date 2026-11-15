@@ -28,6 +28,16 @@
 
 本轮 `cargo test --locked --release --target-dir desktop/target --test invariants` 的 10 项全部通过；后端及 GPUI 的 `clippy --all-targets -- -D warnings` 通过（GPUI 上游 `block` 仍有 future-incompatibility 提示）。两个 release 二进制构建通过，安装包通过 ad-hoc 签名验证，已更新并重新打开 `~/Applications/Herdr Bridge.app`。重启 Bridge 后只读验证 Core 连接成功、项目仍指向同一终端/PID，`ready=false`；没有重启 Herdr Core 或 Agent。自动识别与拒绝条件经过回归测试，真实目录信任由本轮显式按键完成，尚未将未来首次启动的自动按键流程记为实机验收完成。
 
+## 原生模型与代理环境适配追加验证
+
+参考本机 Magpie `67f61bd78` 的 `internal/agent/agent.go`、`agy.go`、`pi.go`、`applied.go` 和 `plugged_launch.go`，确认它把 Agent 配置、原生模型与网关模型分开。Bridge 保留原生账号、默认模型及用户启动参数，不引入其网关、模型目录或 `--settings` 覆盖。新增回归覆盖四个 CLI 不自动注入模型/provider/模式参数，以及用户显式模型参数保持一次且原样传递。
+
+按用户明确要求，Codex 追加 `--dangerously-bypass-approvals-and-sandbox`，Claude Code / Antigravity 追加 `--dangerously-skip-permissions`，Pi 追加用于信任本地项目文件的 `--approve`。桌面单独呈现 Core 的 `error` 状态与 CLI 原始错误。
+
+实机对照：同一「双王」工作目录中，仅运行 `agy`，不带 `-i` 或 MCP 初始化提示，发送“仅回复 OK”仍复现 `plan model not specified`。当前 shell 与 Bridge 含本机代理，但默认 Core 子进程没有标准代理变量。只通过 `terminal.run.env` 补传已有代理后，同样的裸 `agy` 自动选中原有 Gemini 4 Carbon (Medium)，真实模型返回 `OK`，Core 报告 `done`。因此该错误已证实与网络环境传递有关，不能归因为必须手工指定模型。新增代理白名单回归确保包含大小写代理和 NO_PROXY，并排除 HC 身份、模型与无关账号变量。
+
+本轮 invariants 共 12 项通过，后端与桌面 clippy 通过，两个 release 二进制构建及安装签名验证通过，已更新并重新打开桌面应用。GPUI 上游仍有 `block` future-incompatibility 提示。完整 AGY MCP 初始化在隔离测试工作目录中遇到 CLI `Sign in required`，本轮未记为通过；测试用 Core、终端和 daemon 已停止。生产「双王」原终端 t1x4 / PID 46064 保留，仍未 ready；原进程需要重启才能继承修复后的环境。本轮未向真实飞书发信，未改全局模型配置。
+
 ## 私聊、群聊与 Agent 自选目的地追加验证
 
 本轮后端测试增加 3 项，共 12 项通过、1 项真实飞书发送测试默认忽略；桌面权限逻辑 2 项通过。新增场景覆盖：未关联私聊的首条消息持久化及关联后重放、一个主会话接收多个群与私聊、显式关联优先于默认私聊项目、群消息不被私聊默认值接收、重新关联后全局 message_id 去重、旧主聊天接口无法抢占其他项目的接收聊天、XML 闭合注入与非法控制字符，以及 `to` 映射到飞书 `chat_id` / `open_id` 的真实 HTTP 请求和跨目的地幂等校验。

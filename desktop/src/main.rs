@@ -716,6 +716,10 @@ impl Desktop {
                     self.state["runtime"]["terminals"][t]["status"]["state"] == "blocked"
                 }) {
                     "等待交互"
+                } else if project["terminal"].as_str().is_some_and(|t| {
+                    self.state["runtime"]["terminals"][t]["status"]["state"] == "error"
+                }) {
+                    "CLI 运行出错"
                 } else if project["ready"] == true {
                     "已就绪"
                 } else if !project["terminal"].is_null() {
@@ -770,6 +774,14 @@ impl Desktop {
                     .as_str()
                     .unwrap_or("CLI 正在等待交互");
                 body = body.child(Self::card("主会话正在等待交互", &format!("{reason}\n已识别的 Antigravity 项目目录信任会自动确认。其他登录、提问或权限提示可在 Herdr 中查看；排队消息会保留，原进程继续运行。")));
+            }
+            if let Some(t) = project["terminal"].as_str()
+                && self.state["runtime"]["terminals"][t]["status"]["state"] == "error"
+            {
+                let reason = self.state["runtime"]["terminals"][t]["status"]["msg"]
+                    .as_str()
+                    .unwrap_or("CLI 上报运行错误，请在 Herdr 查看详情");
+                body = body.child(Self::card("CLI 运行出错", reason));
             }
 
             body = body

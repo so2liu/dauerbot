@@ -81,6 +81,8 @@ hfb session resume my-project
 hfb message inject my-project '检查这个项目的目录结构，完成后回复飞书'
 ```
 
+Bridge 沿用 CLI 已有的账号、模型、provider、推理强度和执行模式，不自动注入 `--model`、`--provider`、`--settings` 或 `--mode`。用户自填的启动参数原样保留。Herdr Core 是常驻进程，可能早于桌面应用启动；Bridge 会通过 `terminal.run.env` 补传当前已有的标准代理变量（含大小写及 `NO_PROXY`），避免 CLI 在 Core 中丢失网络环境。不会把 Bridge 的终端身份或模型环境变量覆盖到 Agent。按用户要求，Codex 使用 `--dangerously-bypass-approvals-and-sandbox`，Claude Code / Antigravity 使用 `--dangerously-skip-permissions`，Pi 使用 `--approve` 信任当前项目的本地文件；Pi 的这个参数不代表能覆盖扩展自行实现的授权逻辑。MCP 配置、初始化提示和原生恢复参数仍按各 CLI 支持的方式传递；Antigravity 的 `-i` 仅用于提交首次交互提示。
+
 Agent 启动后必须完成当前 CLI 的信任或登录流程。Bridge 自动确认已识别的 Antigravity 项目目录信任：必须匹配当前项目目录、终端 PID/代次、结构化 trust 状态以及屏幕上已选中的 Yes；每代会话最多发送一次确认。其他 blocked 状态在桌面显示“等待交互”，可点击“在 HERDR 监控”查看；队列保留，继续使用原进程。
 
 「启动主会话」会创建一个 HERDR 托管的真实 CLI 进程，后续飞书消息持续进入同一终端。在 Herdr App 中可以查看完整实时输出、处理权限提示和直接输入；Bridge 的「在 HERDR 监控」也可以重新定位到该终端。展示失败会在项目中提示，进程启动后立即退出则返回实际错误，不误报为正在等待就绪。

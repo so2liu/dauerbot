@@ -329,3 +329,79 @@ async fn workspace_trust_requires_exact_project_identity_and_selected_yes() {
     p.ready = true;
     assert!(!herdr::is_project_trust(&p, &t, &screen));
 }
+
+#[tokio::test]
+async fn native_launch_keeps_cli_model_defaults_and_user_overrides() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db.create(input(&dir, "原生模型", "")).await.unwrap();
+    for (agent, approval) in [
+        ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+        ("claude", "--dangerously-skip-permissions"),
+        ("pi", "--approve"),
+        ("agy", "--dangerously-skip-permissions"),
+    ] {
+        p.agent = agent.into();
+        p.extra_args.clear();
+        let args = herdr::launch_args(
+            &p,
+            &dir.path().join("mcp.json"),
+            &json!({"command":"hfb","args":["mcp"]}),
+            "登记 MCP 并待命",
+            false,
+        )
+        .unwrap();
+        assert!(args.iter().any(|v| v == approval), "{agent}");
+        assert!(
+            !args.iter().any(|v| [
+                "--model",
+                "--provider",
+                "--settings",
+                "--mode",
+                "--effort",
+                "--thinking",
+                "-m"
+            ]
+            .contains(&v.as_str())),
+            "{agent}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|v| v.starts_with("model=") || v.starts_with("model_provider=")),
+            "{agent}"
+        );
+        p.extra_args = vec!["--model".into(), "user-selected-model".into()];
+        let args = herdr::launch_args(
+            &p,
+            &dir.path().join("mcp.json"),
+            &json!({}),
+            "登记 MCP 并待命",
+            false,
+        )
+        .unwrap();
+        assert_eq!(args.iter().filter(|v| v.as_str() == "--model").count(), 1);
+        assert!(
+            args.windows(2)
+                .any(|v| v == ["--model", "user-selected-model"])
+        );
+    }
+}
+
+#[test]
+fn launch_forwards_existing_network_settings_without_overriding_identity_or_models() {
+    let vars = [
+        ("HTTPS_PROXY", "http://127.0.0.1:7897"),
+        ("no_proxy", "localhost,127.0.0.1"),
+        ("HC_TERMINAL_ID", "unrelated"),
+        ("HC_SESSION", "unrelated"),
+        ("ANTHROPIC_MODEL", "unrelated-model"),
+        ("GEMINI_API_KEY", "unrelated-key"),
+    ]
+    .map(|(k, v)| (k.to_owned(), v.to_owned()));
+    let forwarded = herdr::launch_network_env(vars);
+    assert_eq!(forwarded.len(), 2);
+    assert_eq!(forwarded["HTTPS_PROXY"], "http://127.0.0.1:7897");
+    assert_eq!(forwarded["no_proxy"], "localhost,127.0.0.1");
+    assert!(herdr::launch_network_env([]).is_empty());
+}

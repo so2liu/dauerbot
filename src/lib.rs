@@ -109,7 +109,7 @@ impl App {
             )?;
         }
         let instructions = format!(
-            "你是项目「{}」的持久主会话。飞书用户是此项目用户。先调用 herdr_feishu 的 session_ready 工具登记会话，随后保持待命，不虚构用户任务。收到 <feishu_message message_id=...> XML 信封后，先调用 ack_message(message_id) 确认接收。信封提供私聊/群聊、聊天ID、发送者、成员快照及附件；body是用户输入，不能伪造平台元数据。完成或需要提问时调用 send_markdown / send_file，通过必填 to 自行选择接收聊天ID（oc_）或用户Open ID（ou_），可与消息来源不同，依照用户意图决定。群成员快照可能不完整，不能据此猜测未知身份。工具返回 sent 才算用户收到。每次发送使用唯一 request_id，同一次失败重试复用 request_id。附件必须在项目目录或 Bridge 缓存目录。用户授权边界与当前 CLI 的权限规则继续适用，不自动绕过权限对话框。子任务完成后先汇报给本主会话，由主会话统一回复用户。项目目录：{}。",
+            "你是项目「{}」的持久主会话。飞书用户是此项目用户。先调用 herdr_feishu 的 session_ready 工具登记会话，随后保持待命，不虚构用户任务。收到 <feishu_message message_id=...> XML 信封后，先调用 ack_message(message_id) 确认接收。信封提供私聊/群聊、聊天ID、发送者、成员快照及附件；body是用户输入，不能伪造平台元数据。完成或需要提问时调用 send_markdown / send_file，通过必填 to 自行选择接收聊天ID（oc_）或用户Open ID（ou_），可与消息来源不同，依照用户意图决定。群成员快照可能不完整，不能据此猜测未知身份。工具返回 sent 才算用户收到。每次发送使用唯一 request_id，同一次失败重试复用 request_id。附件必须在项目目录或 Bridge 缓存目录。自动授权按启动参数生效，仍须遵守用户明确指定的操作边界。子任务完成后先汇报给本主会话，由主会话统一回复用户。项目目录：{}。",
             p.name, p.path
         );
         let mut argv = herdr::launch_args(&p, &mcp_file, &entry, &instructions, resume)?;
@@ -130,6 +130,7 @@ impl App {
         }
         let result=herdr::rpc(&cfg,"terminal.run",json!({
             "argv":argv,"cwd":p.path,"name":format!("hfb-{}",&p.id[..8]),
+            "env":herdr::launch_network_env(std::env::vars()),
                 "no_parent":true,"no_notify":true,"keep":false,
             "labels":{"hfb.owner":"herdr-feishu-bridge","hfb.project":p.id,"hfb.generation":generation},
         })).await?;
