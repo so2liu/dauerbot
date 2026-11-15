@@ -26,88 +26,100 @@ fn source(chat: &str, kind: &str) -> Value {
     json!({"source":{"chat_id":chat,"chat_type":kind,"message_type":"text","sender":{"open_id":"ou_sender"}}})
 }
 #[tokio::test]
-async fn private_and_multiple_groups_route_to_one_session_and_pending_messages_survive() {
+async fn one_bot_keeps_its_project_and_all_chats_enter_its_current_agent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
     let db = Db::open(&path).unwrap();
-    let a = db.create(project(&dir, "项目一")).await.unwrap();
-    let b = db.create(project(&dir, "项目二")).await.unwrap();
-    // A new private chat is discovered without requiring someone to find its ID.
+    // A bot can receive its first private message before project setup finishes.
     assert!(
-        db.ingest("oc_dm", "om_private", "首条私聊", &source("oc_dm", "p2p"))
+        db.ingest_bot("oc_dm", "om_first", "hello", &source("oc_dm", "p2p"))
             .unwrap()
             .is_none()
     );
-    drop(db);
-    let db = Db::open(&path).unwrap();
-    assert_eq!(
-        db.conversations().await.unwrap()["items"][0]["preview"],
-        "首条私聊"
-    );
-    db.bind_conversation("oc_dm", Some(&a.id), "p2p", "")
+    let a = db.create(project(&dir, "机器人项目")).await.unwrap();
+    assert_eq!(db.bot_project().await.unwrap(), Some(a.id.clone()));
+    assert_eq!(db.messages(&a.id).await.unwrap().len(), 1);
+    let b = db.create(project(&dir, "其他本机项目")).await.unwrap();
+    assert_eq!(db.bot_project().await.unwrap(), Some(a.id.clone()));
+    for (chat, kind, message) in [
+        ("oc_dm", "p2p", "om_private"),
+        ("oc_group1", "group", "om_g1"),
+        ("oc_group2", "group", "om_g2"),
+    ] {
+        assert!(
+            db.ingest_bot(chat, message, "消息", &source(chat, kind))
+                .unwrap()
+                .is_some()
+        );
+    }
+    // Legacy chat routes must not override the bot's fixed project.
+    db.bind_conversation("oc_oldroute", Some(&b.id), "group", "旧配置")
         .await
         .unwrap();
-    db.bind_conversation("oc_group1", Some(&a.id), "group", "研发群")
-        .await
-        .unwrap();
-    db.bind_conversation("oc_group2", Some(&a.id), "group", "产品群")
-        .await
-        .unwrap();
-    db.ingest("oc_group1", "om_g1", "群一", &source("oc_group1", "group"))
-        .unwrap();
-    db.ingest("oc_group2", "om_g2", "群二", &source("oc_group2", "group"))
-        .unwrap();
-    assert_eq!(db.messages(&a.id).await.unwrap().len(), 3);
-    let mut conflicting = project(&dir, "抢占已关联的群");
-    conflicting.chat_id = "oc_group1".into();
-    assert!(db.create(conflicting).await.is_err());
-    assert!(
-        db.project("抢占已关联的群").await.is_err(),
-        "claim failure must roll back project creation"
-    );
-    assert!(
-        db.bind_conversation("oc_dm", Some(&b.id), "p2p", "")
-            .await
-            .is_err()
-    );
-    db.set_private_default(Some(&b.id)).await.unwrap();
-    db.ingest("oc_newdm", "om_newdm", "新私聊", &source("oc_newdm", "p2p"))
-        .unwrap();
-    db.ingest(
-        "oc_dm",
-        "om_explicit",
-        "已关联私聊",
-        &source("oc_dm", "p2p"),
+    db.ingest_bot(
+        "oc_oldroute",
+        "om_fixed",
+        "仍进机器人项目",
+        &source("oc_oldroute", "group"),
     )
     .unwrap();
-    assert_eq!(db.messages(&b.id).await.unwrap().len(), 1);
-    assert_eq!(db.messages(&a.id).await.unwrap().len(), 4);
+    assert_eq!(db.messages(&a.id).await.unwrap().len(), 5);
+    assert!(db.messages(&b.id).await.unwrap().is_empty());
     assert!(
-        db.ingest(
-            "oc_unknown_group",
-            "om_unboundgroup",
-            "群消息",
-            &source("oc_unknown_group", "group")
-        )
-        .unwrap()
-        .is_none(),
-        "private defaults must never accept group messages"
+        db.ingest_bot("oc_dm", "om_first", "重复", &source("oc_dm", "p2p"))
+            .unwrap()
+            .is_none()
     );
-    db.bind_conversation("oc_dm", None, "p2p", "")
+    // Switching CLI changes only the project's active agent, never its bot or pending messages.
+    db.set_session(&a.id, Some("t1".into()), Some(123), "old".into())
         .await
         .unwrap();
-    assert!(
-        db.ingest(
-            "oc_dm",
-            "om_private",
-            "重复首条私聊",
-            &source("oc_dm", "p2p")
-        )
-        .unwrap()
-        .is_none(),
-        "re-binding must not replay a processed platform event into another project"
+    assert!(db.switch_agent(&a.id, "agy").await.is_err());
+    db.set_session(&a.id, None, None, String::new())
+        .await
+        .unwrap();
+    db.switch_agent(&a.id, "agy").await.unwrap();
+    assert_eq!(db.project(&a.id).await.unwrap().agent, "agy");
+    assert!(db.project(&a.id).await.unwrap().native_session.is_empty());
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.bot_project().await.unwrap(), Some(a.id.clone()));
+    assert_eq!(db.messages(&a.id).await.unwrap().len(), 5);
+    db.ingest_bot(
+        "oc_new",
+        "om_after_restart",
+        "重启后",
+        &source("oc_new", "p2p"),
+    )
+    .unwrap();
+    assert_eq!(db.messages(&a.id).await.unwrap().len(), 6);
+}
+#[tokio::test]
+async fn upgrade_recovers_pending_messages_without_a_chat_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Db::open(&path).unwrap();
+    let p = db.create(project(&dir, "已有项目")).await.unwrap();
+    db.sync(|c| {
+        c.execute("DELETE FROM bot_project", [])?;
+        Ok(())
+    })
+    .unwrap();
+    db.ingest_bot(
+        "oc_existing",
+        "om_waiting",
+        "hello",
+        &source("oc_existing", "p2p"),
+    )
+    .unwrap();
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.bot_project().await.unwrap(), Some(p.id.clone()));
+    assert_eq!(db.messages(&p.id).await.unwrap().len(), 1);
+    assert_eq!(
+        db.conversations().await.unwrap()["items"][0]["project_id"],
+        p.id
     );
-    assert_eq!(db.messages(&b.id).await.unwrap().len(), 1);
 }
 #[tokio::test]
 async fn xml_preserves_real_source_and_cannot_be_closed_by_user_text() {

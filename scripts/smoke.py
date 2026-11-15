@@ -144,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/open-apis/im/v1/messages"):
             assert self.headers.get("Authorization") == "Bearer fixture-token"
             value = json.loads(data)
-            assert value["receive_id"] in {"oc_fixture", "oc_private", "ou_fixture"}, value
+            assert value["receive_id"] in {"oc_fixture", "oc_private", "ou_fixture", "oc_new_group"}, value
             FIXTURE.messages.append(value)
             self.reply({"code": 0, "data": {"message_id": "om_sent_" + str(len(FIXTURE.messages))}})
         else:
@@ -283,7 +283,7 @@ def main():
             extra_args=[]
         else:
             extra_args=[sys.executable,str(ROOT/"scripts/mock_agent.py"),"{bridge_exe}","{credentials}"]
-        project = api("/projects", {"name": "端到端验证项目", "path": str(workspace), "agent": real_agent or "custom", "chat_id": "oc_fixture",
+        project = api("/projects", {"name": "端到端验证项目", "path": str(workspace), "agent": real_agent or "custom",
                                    "extra_args": extra_args})
         key = project["id"]
         api(f"/projects/{key}/start", {}, "POST")
@@ -312,11 +312,13 @@ def main():
         checks.append("ordered follow-up turns and streamed inbound attachment")
         FIXTURE.emit(message("om_private", "direct-to-user", chat_type="p2p", chat_id="oc_private"))
         wait_for(lambda: any(c["chat_id"]=="oc_private" for c in api("/conversations")["items"]), "new private chat was not discovered")
-        assert not any(m["source_id"]=="om_private" for m in api(f"/projects/{key}")["messages"])
-        api("/conversations", {"chat_id":"oc_private","project_id":key,"kind":"p2p"}, "PUT")
+        assert api("/state")["bot_project"] == key
         wait_for(lambda: any(m["receive_id"]=="ou_fixture" for m in FIXTURE.messages), "agent-selected user destination failed")
         wait_for(lambda: any(m["source_id"]=="om_private" and m["status"]=="acknowledged" for m in api(f"/projects/{key}")["messages"]), "private message did not join the same main session")
-        checks.append("discovered private chat + retained first message + same main session + XML context + MCP explicit user to")
+        checks.append("new private chat enters fixed bot project without chat binding + XML context + MCP explicit user to")
+        FIXTURE.emit(message("om_new_group", "new group without binding", chat_id="oc_new_group"))
+        wait_for(lambda: any(m["source_id"]=="om_new_group" and m["status"]=="acknowledged" for m in api(f"/projects/{key}")["messages"]), "new group did not automatically enter bot project")
+        checks.append("new group automatically enters the same bot project without chat configuration")
         count = FIXTURE.connects; FIXTURE.disconnect()
         wait_for(lambda: FIXTURE.connects > count, "daemon did not reconnect WebSocket")
         checks.append("daemon supervises SDK and reconnects after forced disconnection")

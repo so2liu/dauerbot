@@ -61,6 +61,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/projects/{id}/start", post(start))
         .route("/projects/{id}/resume", post(resume))
+        .route("/projects/{id}/agent", post(switch_agent))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
         .route("/projects/{id}/show", post(show))
@@ -164,7 +165,7 @@ async fn static_asset(req: Request) -> Response {
 }
 async fn state(State(app): State<Arc<App>>) -> ApiResult {
     Ok(Json(
-        json!({"projects":app.db.projects().await?,"conversations":app.db.conversations().await?,"runtime":*app.runtime.read().await,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION")}),
+        json!({"projects":app.db.projects().await?,"bot_project":app.db.bot_project().await?,"conversations":app.db.conversations().await?,"runtime":*app.runtime.read().await,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {
@@ -266,6 +267,17 @@ async fn project(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResu
     Ok(Json(
         json!({"project":p,"messages":messages,"terminal":terminal}),
     ))
+}
+#[derive(Deserialize)]
+struct AgentSelection {
+    agent: String,
+}
+async fn switch_agent(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<AgentSelection>,
+) -> ApiResult {
+    Ok(Json(json!(app.switch_agent(&id, &input.agent).await?)))
 }
 async fn delete_project(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     app.db.remove_project(&id).await?;
@@ -530,6 +542,9 @@ async fn bind_conversation(
     State(app): State<Arc<App>>,
     Json(input): Json<ConversationBinding>,
 ) -> ApiResult {
+    if input.project_id != app.db.bot_project().await? {
+        return Err(anyhow::anyhow!("机器人固定对应一个项目，私聊和群聊无需单独绑定").into());
+    }
     if !["unknown", "group", "p2p"].contains(&input.kind.as_str()) || input.name.len() > 1000 {
         return Err(anyhow::anyhow!("聊天类型或名称无效").into());
     }
@@ -553,6 +568,9 @@ async fn private_default(
     State(app): State<Arc<App>>,
     Json(input): Json<PrivateDefault>,
 ) -> ApiResult {
+    if input.project_id != app.db.bot_project().await? {
+        return Err(anyhow::anyhow!("机器人固定对应一个项目，无需设置私聊路由").into());
+    }
     app.db
         .set_private_default(input.project_id.as_deref())
         .await?;

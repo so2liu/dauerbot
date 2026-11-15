@@ -3,7 +3,7 @@
   type Project = { id:string; name:string; path:string; agent:string; chat_id:string; paused:boolean; terminal:string|null; ready:boolean; native_session:string; extra_args:string[] };
   type Message = { id:string;direction:string;source_id:string;content:string;status:string;error:string;attachment:Record<string,string>;created_at:number };
   type Terminal = { state?:string; status?:{state?:string;kind?:string};foreground?:{name?:string} };
-  type Snapshot = { projects:Project[];runtime:{core:string;core_error:string;feishu:string;feishu_error:string;terminals:Record<string,Terminal>;issues:Record<string,string>};settings:{app_id:string;has_secret:boolean;core_session:string};version:string };
+  type Snapshot = { bot_project:string|null;conversations:{items:{chat_id:string;kind:string;name:string;project_id:string|null}[]};projects:Project[];runtime:{core:string;core_error:string;feishu:string;feishu_error:string;terminals:Record<string,Terminal>;issues:Record<string,string>};settings:{app_id:string;has_secret:boolean;core_session:string};version:string };
   let token = $state(sessionStorage.getItem('hfb-token') || '');
   let loginToken = $state('');
   let snapshot = $state<Snapshot|null>(null);
@@ -21,6 +21,7 @@
   let notice = $state('');
   let localText = $state('');
   let outboundText = $state('');
+  let outboundTo = $state('');
   let screen = $state('');
   let connected = $state(false);
   let alive = true;
@@ -32,6 +33,8 @@
   const words:Record<string,string>={queued:'等待投递',submitting:'正在提交',submitted:'等待 Agent 确认',acknowledged:'已接收',pending:'等待发送',sending:'发送中',sent:'已送达',failed:'失败',uncertain:'结果待核对',dismissed:'已忽略',idle:'待命',done:'已完成',working:'工作中',blocked:'等待处理',error:'异常'};
   let projects = $derived(snapshot?.projects.filter(p=>`${p.name} ${p.path}`.toLowerCase().includes(search.toLowerCase())) ?? []);
   let current = $derived(snapshot?.projects.find(p=>p.id===selected));
+  let destinations = $derived(snapshot?.conversations.items.filter(c=>c.project_id===selected)??[]);
+  let recipient = $derived(destinations.some(c=>c.chat_id===outboundTo)?outboundTo:destinations.length===1?destinations[0].chat_id:'');
   let terminal = $derived(current?.terminal ? snapshot?.runtime.terminals[current.terminal] : undefined);
   let activeCount = $derived(snapshot?.projects.filter(p=>p.terminal && snapshot?.runtime.terminals[p.terminal]?.state==='live').length ?? 0);
   let pendingCount = $derived(detail?.messages.filter(m=>['queued','submitting','submitted','pending','sending','uncertain','failed'].includes(m.status)).length ?? 0);
@@ -111,7 +114,7 @@
     await action('upload',async()=>{
       const form=new FormData();form.append('file',file);
       const uploaded=await request(`/projects/${selected}/upload`,'POST',form);
-      const result=await request(`/projects/${selected}/outbox`,'POST',{path:uploaded.path,request_id:crypto.randomUUID()});
+      const result=await request(`/projects/${selected}/outbox`,'POST',{path:uploaded.path,to:recipient,request_id:crypto.randomUUID()});
       if(result.status!=='sent')throw new Error(result.error||'附件未确认送达，请查看消息记录');
       toast('附件已发送到飞书');
     });input.value='';
@@ -167,7 +170,7 @@
                 <label>App Secret<input type="password" bind:value={credential.app_secret} autocomplete="new-password" placeholder={snapshot?.settings.has_secret?'已保存；留空保留现有密钥':'填写应用密钥'}/></label>
                 <div class="button-row"><button type="submit" class="primary" disabled={!!busy}>保存配置</button><button type="button" class="secondary" disabled={!!busy} onclick={()=>void action('check',async()=>{const v=await request('/settings/check','POST');toast(v.message);})}>检查凭证</button></div>
               </form>
-              <div class="setup-guide"><strong>飞书后台需要配置</strong><ol><li>事件接收方式选择「使用长连接接收事件」。</li><li>订阅 <code>im.message.receive_v1</code>。</li><li>开通发送消息、图片/文件资源权限；群聊全量收件需相应消息权限。</li><li>发布应用，将机器人加入项目群，再填写群的 <code>chat_id</code>。</li></ol></div>
+              <div class="setup-guide"><strong>飞书后台需要配置</strong><ol><li>事件接收方式选择「使用长连接接收事件」。</li><li>订阅 <code>im.message.receive_v1</code>。</li><li>开通发送消息、图片/文件资源权限；群聊全量收件需相应消息权限。</li><li>发布应用。机器人固定对应项目，私聊和群聊自动进入当前智能体，无需填写聊天 ID。</li></ol></div>
             </section>
             <section class="panel status-panel"><h2>运行状态</h2><div class="status-row"><span>HERDR Core</span><span class="badge" class:good={snapshot?.runtime.core==='connected'}>{snapshot?.runtime.core==='connected'?'已连接':'未连接'}</span></div><div class="status-row"><span>Core session</span><code>{snapshot?.settings.core_session??'default'}</code></div><div class="status-row"><span>飞书监听器</span><span class="badge">{connectionNames[snapshot?.runtime.feishu??'']||'等待配置'}</span></div>
               {#if snapshot?.runtime.feishu_error}<p class="muted">{snapshot.runtime.feishu_error}</p>{/if}
@@ -186,7 +189,7 @@
               {#each projects as p}
                 <button class:selected={selected===p.id} class="project-card" onclick={()=>void select(p)}>
                   <div class="project-card-top"><span class="agent-avatar">{p.agent==='claude'?'✳':p.agent==='pi'?'π':p.agent==='agy'?'A':'›_'}</span><span class="badge" class:good={p.ready&&!p.paused}>{p.paused?'已暂停':p.ready?'已就绪':p.terminal?'待就绪':'未启动'}</span></div>
-                  <strong>{p.name}</strong><span class="project-path" title={p.path}>{p.path}</span><div class="project-card-bottom"><span>{names[p.agent]}</span><span>{p.chat_id?'飞书已绑定':'待绑定飞书'} →</span></div>
+                  <strong>{p.name}</strong><span class="project-path" title={p.path}>{p.path}</span><div class="project-card-bottom"><span>{names[p.agent]}</span><span>{snapshot?.bot_project===p.id?'机器人已绑定':'本机项目'} →</span></div>
                 </button>
               {:else}<div class="list-empty">{search?'没有匹配项目':'创建第一个项目，让工作持续进行。'}</div>{/each}
               <button class="new-card" onclick={()=>edit()}>＋ 添加项目</button>
@@ -199,6 +202,7 @@
                 <div class="session-actions">
                   {#if !current.terminal||terminal?.state==='finished'}<button class="primary" disabled={!!busy} onclick={()=>void command('start')}>▷ 启动会话</button><button class="secondary" disabled={!!busy||!current.native_session} onclick={()=>void command('resume')}>恢复原会话</button>{:else}<button class="secondary" disabled={!!busy} onclick={()=>void command('show')}>在 HERDR 打开 ↗</button><button class="secondary" disabled={!!busy} onclick={()=>void action('pause',()=>request(`/projects/${selected}/pause`,'POST',{paused:!current!.paused}))}>{current.paused?'继续投递':'暂停投递'}</button><button class="quiet danger" disabled={!!busy} onclick={()=>void command('stop')}>停止</button>{/if}
                 </div>
+                <div class="session-actions">{#each Object.entries(names).filter(([id])=>id!=='custom') as [agent,label]}<button class="secondary" disabled={!!busy||current.agent===agent} onclick={()=>void action('switch-agent',()=>request(`/projects/${selected}/agent`,'POST',{agent}))}>切换为 {label}</button>{/each}</div>
                 <div class="tabs"><button class:active={tab==='activity'} onclick={()=>tab='activity'}>消息活动 <span>{detail?.messages.length??0}</span></button><button class:active={tab==='terminal'} onclick={()=>{tab='terminal';void action('screen',async()=>{screen=JSON.stringify(await request(`/projects/${selected}/screen`),null,2);});}}>终端快照</button><button class:active={tab==='config'} onclick={()=>tab='config'}>项目配置</button></div>
                 {#if tab==='activity'}
                   <div class="activity">
@@ -207,17 +211,17 @@
                         {#if ['failed','uncertain'].includes(m.status)}<button class="text-button" disabled={!!busy} onclick={()=>void retry(m)}>核对后重试</button>{/if}
                         {#if ['queued','submitted','uncertain','failed','pending'].includes(m.status)}<button class="text-button muted" disabled={!!busy} onclick={()=>void dismiss(m)}>忽略</button>{/if}
                       </article>
-                    {:else}<div class="activity-empty"><span>↔</span><h3>消息会在这里汇合</h3><p>绑定飞书群并启动会话，即可把对话交给 Agent。<br/>也可以先发送一条本地消息验证投递。</p></div>{/each}
+                    {:else}<div class="activity-empty"><span>↔</span><h3>消息会在这里汇合</h3><p>启动会话后，机器人收到的私聊和群聊都会进入当前 Agent。<br/>也可以先发送一条本地消息验证投递。</p></div>{/each}
                   </div>
                   <div class="composer"><form onsubmit={(e)=>{e.preventDefault();void action('inject',async()=>{await request(`/projects/${selected}/messages`,'POST',{content:localText});localText='';toast('已加入主会话收件队列');});}}><label>向主会话发送本地消息<textarea bind:value={localText} placeholder="任务或补充说明…消息会先入队，再投递给主会话。" rows="2" required></textarea></label><div class="compose-footer"><small>本地测试入口 · 与飞书共用投递队列</small><button class="primary small" disabled={!!busy||!localText.trim()}>加入队列 ↑</button></div></form></div>
                 {:else if tab==='terminal'}<div class="terminal-view"><div><span>只读快照 · 实时交互请打开 HERDR</span><button class="text-button" onclick={()=>void action('screen',async()=>screen=JSON.stringify(await request(`/projects/${selected}/screen`),null,2))}>刷新</button></div><pre>{screen||'尚无终端输出'}</pre></div>
                 {:else}
-                  <div class="config-view"><dl><dt>Agent</dt><dd>{names[current.agent]}</dd><dt>飞书聊天</dt><dd>{current.chat_id||'未绑定'}</dd><dt>原生会话 ID</dt><dd>{current.native_session||'启动后由 MCP 登记；也可在编辑中填写'}</dd><dt>项目标识</dt><dd>{current.id}</dd></dl><button class="secondary" onclick={()=>edit(current)}>编辑配置</button>
-                  <div class="send-box"><h3>测试发送到飞书</h3><p class="muted">发送至该项目绑定的聊天，结果会记录在消息活动中。</p><textarea aria-label="飞书测试消息" bind:value={outboundText} placeholder="支持 Markdown，例如 **项目已连接**" rows="3"></textarea><div class="button-row"><button class="primary small" disabled={!!busy||!current.chat_id||!outboundText.trim()} onclick={()=>void action('send',async()=>{const v=await request(`/projects/${selected}/outbox`,'POST',{content:outboundText,request_id:crypto.randomUUID()});if(v.status!=='sent')throw new Error(v.error||'未确认送达');outboundText='';toast('飞书消息已发送');})}>发送 Markdown</button><label class="file-button">发送附件<input type="file" disabled={!!busy||!current.chat_id} onchange={(e)=>void sendFile(e)}/></label></div></div>
+                  <div class="config-view"><dl><dt>Agent</dt><dd>{names[current.agent]}</dd><dt>飞书机器人</dt><dd>{snapshot?.bot_project===current.id?'已绑定项目，自动接收私聊和群聊':'当前为本机项目'}</dd><dt>原生会话 ID</dt><dd>{current.native_session||'启动后由 MCP 登记；也可在编辑中填写'}</dd><dt>项目标识</dt><dd>{current.id}</dd></dl><button class="secondary" onclick={()=>edit(current)}>编辑配置</button>
+                  <div class="send-box"><h3>测试发送到飞书</h3><p class="muted">选择本次发送目标，结果会记录在消息活动中。</p><label>本次发送目标<select bind:value={outboundTo}><option value="">{destinations.length===1?'自动使用唯一聊天':'选择接收聊天'}</option>{#each destinations as chat}<option value={chat.chat_id}>{chat.name||(chat.kind==='p2p'?'私聊':'群聊')}</option>{/each}</select></label><textarea aria-label="飞书测试消息" bind:value={outboundText} placeholder="支持 Markdown，例如 **项目已连接**" rows="3"></textarea><div class="button-row"><button class="primary small" disabled={!!busy||!recipient||!outboundText.trim()} onclick={()=>void action('send',async()=>{const v=await request(`/projects/${selected}/outbox`,'POST',{content:outboundText,to:recipient,request_id:crypto.randomUUID()});if(v.status!=='sent')throw new Error(v.error||'未确认送达');outboundText='';toast('飞书消息已发送');})}>发送 Markdown</button><label class="file-button">发送附件<input type="file" disabled={!!busy||!recipient} onchange={(e)=>void sendFile(e)}/></label></div></div>
                   <div class="delete-area"><button class="text-button danger" onclick={()=>{if(confirm('删除项目及其消息记录？代码目录不会删除。'))void action('delete',()=>request(`/projects/${selected}`,'DELETE'));}}>删除项目</button></div></div>
                 {/if}
               {:else}
-                <div class="empty-project"><div class="empty-symbol">↗</div><p class="eyebrow">YOUR NEXT WORKSPACE</p><h2>给项目一个持续工作的空间</h2><p>选择代码目录与 Agent，绑定飞书群。<br/>工作在后台继续，你随时都能回来。</p><button class="primary" onclick={()=>edit()}>创建第一个项目</button><div class="empty-steps"><span>01 选择项目</span><span>02 连接飞书</span><span>03 启动会话</span></div></div>
+                <div class="empty-project"><div class="empty-symbol">↗</div><p class="eyebrow">YOUR NEXT WORKSPACE</p><h2>给项目一个持续工作的空间</h2><p>选择代码目录与 Agent，机器人自动绑定项目。<br/>工作在后台继续，你随时都能回来。</p><button class="primary" onclick={()=>edit()}>创建第一个项目</button><div class="empty-steps"><span>01 选择项目</span><span>02 连接飞书</span><span>03 启动会话</span></div></div>
               {/if}
             </section>
           </div>
@@ -235,7 +239,6 @@
         <label>项目名称<input bind:value={draft.name} placeholder="例如：支付服务" required maxlength="120"/></label>
         <label>本机代码目录<input bind:value={draft.path} placeholder="/Users/you/code/project" required/><small>使用绝对路径；不会复制或删除代码。</small></label>
         <label>主会话 Agent<select bind:value={draft.agent}>{#each Object.entries(names) as [value,label]}<option {value}>{label}</option>{/each}</select></label>
-        <label>飞书 chat_id <span class="optional">可稍后绑定</span><input bind:value={draft.chat_id} placeholder="oc_…"/></label>
         <details><summary>高级设置</summary><label>原生会话 ID / 路径<input bind:value={draft.native_session} placeholder="用于恢复已有 CLI 对话"/></label><label>{draft.agent==='custom'?'完整 argv':'额外启动参数'}<textarea bind:value={draft.args} rows="2" placeholder='["--model", "模型名"]'></textarea><small>JSON 字符串数组。自定义 CLI 需自行接入生成的 MCP 配置。</small></label></details>
         <div class="modal-footer"><button type="button" class="secondary" onclick={()=>editor=false}>取消</button><button type="submit" class="primary" disabled={!!busy}>{busy==='save'?'保存中…':editing?'保存修改':'创建项目 →'}</button></div>
       </form>

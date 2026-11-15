@@ -213,7 +213,7 @@ impl EventHandler for Inbound {
     fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let v: Value = serde_json::from_slice(payload)?;
         if let Some((chat, source, text, attachment)) = normalize(&v)? {
-            self.0.db.ingest(&chat, &source, &text, &attachment)?;
+            self.0.db.ingest_bot(&chat, &source, &text, &attachment)?;
             if let Ok(mut runtime) = self.0.runtime.try_write() {
                 runtime.feishu = "receiving".into();
                 runtime.feishu_error.clear();

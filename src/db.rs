@@ -131,6 +131,7 @@ impl Db {
             PRAGMA user_version=1;
         ")?;
         crate::conversation::migrate(&conn)?;
+        crate::bot::migrate(&conn)?;
         conn.execute("UPDATE messages SET status='uncertain',error='服务在操作中退出；请核对后手动重试',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
@@ -183,6 +184,7 @@ impl Db {
             tx.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
             params![key,input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,now(),id()])?;
             crate::conversation::primary(&tx, &key, input.chat_id.trim(), "")?;
+            crate::bot::ensure_owner(&tx)?;
             tx.commit()?;
             Ok(())
         }).await?;
@@ -240,6 +242,24 @@ impl Db {
         })
         .await
     }
+    pub async fn switch_agent(&self, key: &str, agent: &str) -> Result<()> {
+        anyhow::ensure!(
+            ["codex", "claude", "pi", "agy"].contains(&agent),
+            "不支持的 Agent"
+        );
+        let key = self.project(key).await?.id;
+        let agent = agent.to_owned();
+        self.call(move |c| {
+            let n = c.execute(
+                "UPDATE projects SET agent=?,native_session='',extra_args='[]',generation='',ready=0
+                 WHERE id=? AND terminal IS NULL",
+                params![agent,key],
+            )?;
+            anyhow::ensure!(n == 1, "请先停止当前智能体，再进行切换");
+            Ok(())
+        })
+        .await
+    }
     pub async fn ready(
         &self,
         key: &str,
@@ -266,6 +286,26 @@ impl Db {
         content: &str,
         attachment: &serde_json::Value,
     ) -> Result<Option<String>> {
+        self.ingest_impl(chat, source, content, attachment, false)
+    }
+    /// All events from the configured bot enter its project, regardless of chat type or ID.
+    pub fn ingest_bot(
+        &self,
+        chat: &str,
+        source: &str,
+        content: &str,
+        attachment: &serde_json::Value,
+    ) -> Result<Option<String>> {
+        self.ingest_impl(chat, source, content, attachment, true)
+    }
+    fn ingest_impl(
+        &self,
+        chat: &str,
+        source: &str,
+        content: &str,
+        attachment: &serde_json::Value,
+        bot_only: bool,
+    ) -> Result<Option<String>> {
         self.sync(|c|{
             let context = &attachment["source"];
             let kind = context["chat_type"].as_str().unwrap_or("unknown");
@@ -274,10 +314,14 @@ impl Db {
             let legacy:Option<String>=c.query_row("SELECT id FROM projects WHERE chat_id=?",[chat],|r|r.get(0)).optional()?;
             let bound:Option<String>=c.query_row("SELECT project_id FROM conversations WHERE chat_id=?",[chat],|r|r.get::<_,Option<String>>(0)).optional()?.flatten();
             let fallback: Option<String> = if kind == "p2p" { c.query_row("SELECT project_id FROM routing_defaults WHERE slot='p2p'",[],|r|r.get(0)).optional()? } else {None};
-            let Some(project)=legacy.or(bound).or(fallback) else {
+            let destination = if bot_only { crate::bot::owner(c)? } else { legacy.or(bound).or(fallback) };
+            let Some(project)=destination else {
                 c.execute("INSERT OR IGNORE INTO unrouted_messages(source_id,chat_id,content,attachment,created_at) VALUES(?,?,?,?,?)",params![source,chat,content,serde_json::to_string(attachment)?,now()])?;
                 return Ok(None)
             };
+            if bot_only {
+                c.execute("UPDATE conversations SET project_id=? WHERE chat_id=?",params![project,chat])?;
+            }
             let key=id();
             let n=c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
                 params![key,project,source,content,serde_json::to_string(attachment)?,now(),now()])?;

@@ -6,7 +6,7 @@ use backend::{Backend, CommandRequest, Reply};
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::*,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputState},
     *,
 };
 use serde::{Deserialize, Serialize};
@@ -42,13 +42,8 @@ struct Desktop {
     detail: Value,
     selected: String,
     picked_path: String,
-    chats: Vec<Value>,
     name: Entity<InputState>,
     path: Entity<InputState>,
-    chat: Entity<InputState>,
-    chat_search: Entity<InputState>,
-    show_advanced_chat: bool,
-    _subscriptions: Vec<Subscription>,
     app_id: Entity<InputState>,
     secret: Entity<InputState>,
     message: Entity<InputState>,
@@ -74,8 +69,6 @@ impl Desktop {
         };
         let name = input("例如：个人网站", cx);
         let path = input("选择项目代码所在的文件夹", cx);
-        let chat = input("高级：oc_…（普通使用请从上方列表选择）", cx);
-        let chat_search = input("搜索群名、私聊或最近消息…", cx);
         let app_id = input("cli_…", cx);
         let secret = cx.new(|cx| {
             InputState::new(window, cx)
@@ -87,11 +80,6 @@ impl Desktop {
                 .placeholder("给这个项目的主会话发送任务…")
                 .multi_line(true)
                 .rows(3)
-        });
-        let search_subscription = cx.subscribe_in(&chat_search, window, |_, _, event, _, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
         });
         let _ = backend.tx.send(CommandRequest::Environment);
         cx.spawn_in(window, async move |entity, cx| {
@@ -119,13 +107,8 @@ impl Desktop {
             detail: Value::Null,
             selected: String::new(),
             picked_path: String::new(),
-            chats: vec![],
             name,
             path,
-            chat,
-            chat_search,
-            show_advanced_chat: false,
-            _subscriptions: vec![search_subscription],
             app_id,
             secret,
             message,
@@ -154,6 +137,12 @@ impl Desktop {
                             self.app_id
                                 .update(cx, |input, cx| input.set_value(id.to_owned(), window, cx));
                         }
+                    }
+                    if self.selected.is_empty()
+                        && let Some(id) = value["bot_project"].as_str()
+                    {
+                        self.selected = id.to_owned();
+                        let _ = self.backend.tx.send(CommandRequest::Watch(id.to_owned()));
                     }
                     self.state = value;
                 }
@@ -214,13 +203,6 @@ impl Desktop {
                         && value["project"]["id"] == self.selected
                     {
                         self.detail = value;
-                    } else if path == "/onboarding/chats" {
-                        self.chats = value["items"].as_array().cloned().unwrap_or_default();
-                        if value["truncated"] == true {
-                            self.notice =
-                                "群列表超过 2000 项，仅显示前 2000 项；可在高级设置中补充聊天"
-                                    .into();
-                        }
                     }
                 }
             }
@@ -458,160 +440,6 @@ impl Desktop {
             .child(self.btn("access-next", "继续添加项目 →", |this, _, _| this.go(5), cx).primary())
             .into_any_element()
     }
-    fn conversation_picker(&mut self, project: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
-        let project = project.map(str::to_owned);
-        let mut choices = std::collections::BTreeMap::new();
-        for chat in &self.chats {
-            if let Some(id) = chat["chat_id"].as_str() {
-                let mut chat = chat.clone();
-                chat["kind"] = json!("group");
-                choices.insert(id.to_owned(), chat);
-            }
-        }
-        if let Some(observed) = self.state["conversations"]["items"].as_array() {
-            for chat in observed {
-                if let Some(id) = chat["chat_id"].as_str() {
-                    let mut merged = chat.clone();
-                    if merged["name"].as_str().unwrap_or("").is_empty()
-                        && let Some(known) = choices.get(id)
-                    {
-                        merged["name"] = known["name"].clone();
-                        if merged["kind"] == "unknown" {
-                            merged["kind"] = known["kind"].clone();
-                        }
-                    }
-                    choices.insert(id.to_owned(), merged);
-                }
-            }
-        }
-        if let Some(projects) = self.state["projects"].as_array() {
-            for existing in projects {
-                if let Some(id) = existing["chat_id"].as_str().filter(|id| !id.is_empty()) {
-                    let chat = choices
-                        .entry(id.to_owned())
-                        .or_insert_with(|| json!({"chat_id":id,"kind":"unknown","name":""}));
-                    chat["project_id"] = existing["id"].clone();
-                }
-            }
-        }
-        let filter = self.chat_search.read(cx).value().to_lowercase();
-        let selected_id = self.chat.read(cx).value().to_string();
-        let mut view = div().flex().flex_col().gap_3().p_5().bg(rgb(0xffffff)).rounded_xl().border_1().border_color(rgb(LINE))
-            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(if project.is_some() { "接收聊天 · 可关联多个私聊和群聊" } else { "接收聊天 · 可稍后设置" }))
-            .child(Self::card("先发一条消息，就能找到私聊", "用飞书给机器人发送一条私聊，这个聊天会自动出现在下面。群聊先把机器人加到群，再更新群列表。选中聊天即可关联，无需查找 ID。"))
-            .child(self.btn("refresh-conversations", "从飞书更新群列表", |this, _, _| this.api("GET", "/onboarding/chats".into(), None, "群列表已更新；私聊会在收到首条消息后自动出现"), cx))
-            .child(Input::new(&self.chat_search));
-        let mut count = 0;
-        for (id, chat) in &choices {
-            let kind = chat["kind"].as_str().unwrap_or("unknown");
-            let label_kind = match kind {
-                "p2p" => "私聊",
-                "group" => "群聊",
-                _ => "聊天",
-            };
-            let name = chat["name"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("名称暂未获取");
-            let preview = chat["preview"]
-                .as_str()
-                .unwrap_or("")
-                .chars()
-                .take(42)
-                .collect::<String>();
-            let label = format!(
-                "{label_kind} · {name}{}",
-                if preview.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {preview}")
-                }
-            );
-            if !label.to_lowercase().contains(&filter) {
-                continue;
-            }
-            count += 1;
-            if count > 50 {
-                continue;
-            }
-            let owner = chat["project_id"].as_str();
-            let owned = project.as_deref().is_some_and(|p| owner == Some(p));
-            let unavailable = owner.is_some() && !owned;
-            let id_copy = id.clone();
-            let kind = kind.to_owned();
-            let name = chat["name"].as_str().unwrap_or("").to_owned();
-            let destination = project.clone();
-            let button = Button::new(SharedString::from(format!("conversation-{id}"))).label(format!("{}{}",if owned { "✓ " } else { "" },label))
-                .selected(owned || (project.is_none() && selected_id==*id)).disabled(self.busy || unavailable || owned)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.chat.update(cx, |input,cx|input.set_value(id_copy.clone(),window,cx));
-                    if let Some(project) = &destination { this.api("PUT", "/conversations".into(), Some(json!({"chat_id":id_copy,"project_id":project,"kind":kind,"name":name})), "聊天已关联；等待中的消息将送入这个项目"); }
-                }));
-            let mut row = div().flex().gap_2().items_center().child(button);
-            if unavailable {
-                row = row.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child("已关联其他项目"),
-                );
-            }
-            if owned {
-                let id = id.clone();
-                row = row.child(
-                    Button::new(SharedString::from(format!("unbind-{id}")))
-                        .label("解除关联")
-                        .disabled(self.busy)
-                        .on_click(cx.listener(move |this, _, _, _| {
-                            this.api(
-                                "PUT",
-                                "/conversations".into(),
-                                Some(json!({"chat_id":id,"project_id":null})),
-                                "聊天已解除关联，消息记录保留",
-                            )
-                        })),
-                );
-            }
-            view = view.child(row);
-        }
-        if count == 0 {
-            view = view.child(Self::card(if choices.is_empty() { "还没有可选择的聊天" } else { "没有匹配聊天" }, if choices.is_empty() { "请先在连接设置保存机器人凭证。私聊发送首条消息后即可出现；群列表读取失败时，检查应用是否发布、机器人是否加群，以及群信息读取权限。" } else { "换一个群名或消息关键词试试。" }));
-        } else if count > 50 {
-            view = view.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("仅显示前 50 个匹配聊天，请输入更具体的名称。"),
-            );
-        }
-        if let Some(project) = &project {
-            let default = self.state["conversations"]["private_default"].as_str();
-            if default == Some(project) {
-                view = view.child(Self::card("本项目正在接收未关联私聊", "机器人收到的、未单独关联其他项目的私聊，会进入本项目。Agent 仍通过 to 选择回复对象。"))
-                    .child(self.btn("disable-private-default","停止默认接收私聊",|this,_,_|this.api("PUT","/conversations/private-default".into(),Some(json!({"project_id":null})),"已停止默认接收私聊"),cx));
-            } else {
-                let project = project.clone();
-                view = view.child(self.btn("enable-private-default","将未关联私聊默认接入本项目…",move |_,window,cx| {
-                    let answer = window.prompt(PromptLevel::Info,"将未关联的私聊接入这个项目？",Some("此机器人可用范围内的用户，其未单独关联其他项目的私聊将进入本项目主会话。已有其他默认项目时会被替换。Agent 仍自行选择 to 发送目标。"),&["取消","接入本项目"],cx);
-                    let project = project.clone();
-                    cx.spawn(async move |entity,cx| { if answer.await.ok()==Some(1) { let _ = entity.update(cx, |this,_|this.api("PUT","/conversations/private-default".into(),Some(json!({"project_id":project})),"本项目已设为未关联私聊的接收项目")); } }).detach();
-                },cx));
-            }
-        }
-        view = view.child(self.btn(
-            "advanced-chat",
-            "高级设置：手动填写聊天 ID",
-            |this, _, _| this.show_advanced_chat = !this.show_advanced_chat,
-            cx,
-        ));
-        if self.show_advanced_chat {
-            view = view.child(Self::field("聊天 ID（可选）", &self.chat));
-            if let Some(project) = project {
-                view = view.child(self.btn("bind-manual","关联手动填写的聊天",move |this,_,cx|this.api("PUT","/conversations".into(),Some(json!({"chat_id":this.chat.read(cx).value().to_string(),"project_id":project})),"聊天已关联"),cx));
-            }
-        }
-        view.into_any_element()
-    }
     fn project_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let picked = self.picked_path.clone();
         let agents = ["Codex", "Claude Code", "Pi", "Antigravity"];
@@ -627,15 +455,14 @@ impl Desktop {
                     })),
             );
         }
-        let picker = self.conversation_picker(None, cx);
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 05", "给第一个项目，一个主会话", "一个代码目录、一种 CLI，可接入多个私聊和群聊。Agent 通过 to 自主选择回复目的地。"))
+            .child(Self::title("SETUP / 05", "给第一个项目，一个主会话", "一个机器人固定对应一个项目，私聊和群聊自动进入当前智能体。智能体可在项目工作台切换。"))
             .child(Self::field("项目名称", &self.name))
             .child(Self::field("项目目录（可手动输入绝对路径）", &self.path))
             .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("已选择：{picked}"))))
             .child(self.btn("pick-project", "用系统选择器选择文件夹…", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
-            .child(picker)
+            .child(Self::card("自动绑定", "首个项目创建后，当前飞书机器人会自动绑定到它。无需选择聊天或填写 ID；机器人收到的私聊和群聊都会进入这个项目。"))
             .child(Self::card("可以先在本机试用", "没有飞书凭证或群聊也能创建项目、启动 Agent，并从工作台发送任务。首次使用 CLI 可能需要在 HERDR 中完成登录或项目目录信任。"))
             .child(self.btn("create-project", "创建项目 →", |this, _, cx| {
                 let manual = this.path.read(cx).value().to_string();
@@ -643,7 +470,7 @@ impl Desktop {
                 let name = this.name.read(cx).value().to_string();
                 if name.trim().is_empty() || path.is_empty() { this.notice = "请填写项目名称并选择目录".into(); this.error = true; return; }
                 let agent = ["codex","claude","pi","agy"][this.agent];
-                this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":this.chat.read(cx).value().to_string()})), "项目已创建。点击「启动主会话」开始工作");
+                this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":""})), "项目已创建。点击「启动主会话」开始工作");
             }, cx).primary())
             .into_any_element()
     }
@@ -670,9 +497,7 @@ impl Desktop {
                         self.btn(
                             "add-project",
                             "＋ 添加项目",
-                            |this, window, cx| {
-                                this.chat
-                                    .update(cx, |input, cx| input.set_value("", window, cx));
+                            |this, _, _| {
                                 this.go(5);
                             },
                             cx,
@@ -702,7 +527,6 @@ impl Desktop {
         }
         for project in &projects {
             let id = project["id"].as_str().unwrap_or_default().to_owned();
-            let chat_id = project["chat_id"].as_str().unwrap_or_default().to_owned();
             let label = format!(
                 "{}  ·  {}  ·  {}",
                 project["name"].as_str().unwrap_or("项目"),
@@ -732,11 +556,9 @@ impl Desktop {
                 Button::new(SharedString::from(format!("project-{id}")))
                     .label(label)
                     .selected(id == self.selected)
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, _, _, _| {
                         this.selected = id.clone();
                         this.detail = Value::Null;
-                        this.chat
-                            .update(cx, |input, cx| input.set_value(chat_id.clone(), window, cx));
                         let _ = this.backend.tx.send(CommandRequest::Watch(id.clone()));
                         this.api("GET", format!("/projects/{id}"), None, "已选择项目");
                     })),
@@ -754,7 +576,32 @@ impl Desktop {
                 .cloned()
                 .unwrap_or_default();
             let terminal = project["terminal"].as_str().unwrap_or("尚未创建");
-            let picker = self.conversation_picker(Some(&id), cx);
+            let mut agent_controls = div().flex().flex_wrap().gap_2();
+            for (index, (agent, label)) in [
+                ("codex", "Codex"),
+                ("claude", "Claude Code"),
+                ("pi", "Pi"),
+                ("agy", "Antigravity"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let project_id = id.clone();
+                agent_controls = agent_controls.child(
+                    Button::new(("switch-agent", index))
+                        .label(label)
+                        .selected(project["agent"] == agent)
+                        .disabled(self.busy || project["agent"] == agent)
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            this.api(
+                                "POST",
+                                format!("/projects/{project_id}/agent"),
+                                Some(json!({"agent":agent})),
+                                "智能体已切换，机器人和项目绑定保持不变",
+                            );
+                        })),
+                );
+            }
             let issue = self.state["runtime"]["view_errors"][&id]
                 .as_str()
                 .unwrap_or("")
@@ -786,6 +633,14 @@ impl Desktop {
 
             body = body
                 .child(Self::card(project["name"].as_str().unwrap_or("项目"), &format!("{}\n终端：{}", project["path"].as_str().unwrap_or(""), terminal)))
+                .child(Self::card("飞书机器人", if self.state["bot_project"] == project["id"] {
+                    "已绑定此项目。机器人收到的所有私聊和群聊都会自动进入当前智能体，无需逐个关联聊天。"
+                } else {
+                    "此项目是本机项目，当前飞书机器人固定绑定到另一个项目。"
+                }))
+                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("当前智能体 · 点击切换"))
+                .child(agent_controls)
+                .child(div().text_xs().text_color(rgb(MUTED)).child("切换会停止当前智能体并启动新的主会话；项目、机器人绑定和消息队列保留。"))
                 .child(div().flex().flex_wrap().gap_2()
                     .child(self.btn("start", "启动主会话", move |this, _, _| this.api("POST", format!("/projects/{id}/start"), None, "启动请求已完成。等待主会话完成登录、信任和 MCP 登记"), cx).primary())
                     .child(self.btn("resume", "恢复会话", move |this, _, _| this.api("POST", format!("/projects/{id2}/resume"), None, "恢复请求已完成"), cx))
@@ -798,15 +653,14 @@ impl Desktop {
                             if answer.await.ok() == Some(1) { let _ = entity.update(cx, |this, _| this.api("POST", format!("/projects/{id}/stop"), None, "会话已停止")); }
                         }).detach();
                     }, cx)))
-                .child(picker)
-                .child(Self::field("本机任务", &self.message))
+                    .child(Self::field("本机任务", &self.message))
                 .child(self.btn("inject", "发送到主会话", move |this, _, cx| {
                     let text = this.message.read(cx).value().to_string();
                     if text.trim().is_empty() { return; }
                     this.pending_message = text.clone();
                     this.api("POST", format!("/projects/{id7}/messages"), Some(json!({"content":text})), "任务已加入队列。请在消息记录中确认处理状态");
                 }, cx).primary())
-                .child(Self::card("验证消息链路", "给机器人发送一条私聊，或在已关联的群中发送消息。确认入站记录、Agent 确认与出站回复。Agent 使用 to 选择接收聊天或用户，不强制回复消息来源。群消息的接收范围由飞书权限决定。"))
+                .child(Self::card("验证消息链路", "给机器人发送私聊，或在机器人所在群中发送消息。确认入站记录、Agent 确认与出站回复。Agent 使用 to 选择接收聊天或用户，不强制回复消息来源。群消息的接收范围由飞书权限决定。"))
                 .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("消息记录"));
             if messages.is_empty() {
                 body = body.child(

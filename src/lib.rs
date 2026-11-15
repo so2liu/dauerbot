@@ -1,4 +1,5 @@
 pub mod api;
+pub mod bot;
 pub mod config;
 pub mod conversation;
 pub mod db;
@@ -289,6 +290,18 @@ impl App {
         self.changed();
         Ok(())
     }
+    pub async fn switch_agent(self: &Arc<Self>, key: &str, agent: &str) -> Result<Project> {
+        if !["codex", "claude", "pi", "agy"].contains(&agent) {
+            bail!("请选择 Codex、Claude Code、Pi 或 Antigravity");
+        }
+        let p = self.db.project(key).await?;
+        if p.agent == agent {
+            return Ok(p);
+        }
+        self.stop(&p.id).await?;
+        self.db.switch_agent(&p.id, agent).await?;
+        self.start(&p.id, false).await
+    }
     pub async fn outbox(
         &self,
         key: &str,
@@ -308,6 +321,9 @@ impl App {
         to: Option<&str>,
     ) -> Result<db::Message> {
         let p = self.db.project(key).await?;
+        if self.db.bot_project().await?.as_deref() != Some(&p.id) {
+            bail!("此项目不属于当前飞书机器人");
+        }
         let to = to.unwrap_or(&p.chat_id);
         feishu::recipient_type(to)?;
         attachment["to"] = json!(to);

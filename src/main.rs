@@ -87,10 +87,6 @@ enum Projects {
     Show {
         project: String,
     },
-    Bind {
-        project: String,
-        chat_id: String,
-    },
     Pause {
         project: String,
     },
@@ -105,12 +101,30 @@ enum Projects {
 }
 #[derive(Subcommand)]
 enum Sessions {
-    Start { project: String },
-    Resume { project: String },
-    Stop { project: String },
-    Screen { project: String },
-    Show { project: String },
-    Attach { project: String },
+    Start {
+        project: String,
+    },
+    Resume {
+        project: String,
+    },
+    Stop {
+        project: String,
+    },
+    Screen {
+        project: String,
+    },
+    Show {
+        project: String,
+    },
+    Attach {
+        project: String,
+    },
+    /// 切换项目的当前智能体，保留机器人、项目和消息队列
+    Switch {
+        project: String,
+        #[arg(long)]
+        agent: String,
+    },
 }
 #[derive(Subcommand)]
 enum Messages {
@@ -283,11 +297,6 @@ async fn main() -> Result<()> {
             Projects::List=>client.request("GET","/state",None).await?["projects"].clone(),
             Projects::Add{name,path,agent,chat_id,native_session,args}=>client.request("POST","/projects",Some(json!({"name":name,"path":path,"agent":agent,"chat_id":chat_id,"native_session":native_session,"extra_args":args}))).await?,
             Projects::Show{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}"),None).await?}
-            Projects::Bind{project,chat_id}=>{
-                let id=client.id(&project).await?;
-                let mut p=client.request("GET",&format!("/projects/{id}"),None).await?["project"].clone();
-                p["chat_id"]=json!(chat_id);client.request("PUT",&format!("/projects/{id}"),Some(p)).await?
-            }
             Projects::Pause{project}=>{
                 let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/pause"),Some(json!({"paused":true}))).await?
             }
@@ -300,6 +309,11 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Session{command}=>{
+            if let Sessions::Switch{project,agent}=command{
+                let id=client.id(&project).await?;
+                print(&client.request("POST",&format!("/projects/{id}/agent"),Some(json!({"agent":agent}))).await?);
+                return Ok(())
+            }
             if let Sessions::Attach{project}=command{
                 let id=client.id(&project).await?;
                 let p=client.request("GET",&format!("/projects/{id}"),None).await?;
@@ -315,6 +329,7 @@ async fn main() -> Result<()> {
                 Sessions::Start{project}=>(project,"start"),Sessions::Resume{project}=>(project,"resume"),
                 Sessions::Stop{project}=>(project,"stop"),Sessions::Screen{project}=>(project,"screen"),Sessions::Show{project}=>(project,"show"),
                 Sessions::Attach{..}=>unreachable!(),
+                Sessions::Switch{..}=>unreachable!(),
             };
             let id=client.id(&project).await?;client.request(if operation=="screen"{"GET"}else{"POST"},&format!("/projects/{id}/{operation}"),None).await?
         }
