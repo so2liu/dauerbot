@@ -18,7 +18,7 @@ env:
 jobs:
   macos-arm64:
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,12 +28,18 @@ jobs:
         env:
           CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           UPDATE_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           git merge-base --is-ancestor HEAD origin/main
           test -n "$CERTIFICATE"
           test -n "$UPDATE_KEY"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_APP_SPECIFIC_PASSWORD"
+          test "$APPLE_TEAM_ID" = "366ADQ28F6"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -51,7 +57,7 @@ jobs:
           cargo test --locked --release --manifest-path desktop/Cargo.toml
           cargo clippy --locked --release --target-dir desktop/target --all-targets -- -D warnings
           cargo clippy --locked --release --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
-      - name: Import existing Apple signing certificate
+      - name: Import Developer ID signing certificate
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -69,9 +75,23 @@ jobs:
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign > /dev/null
           security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
-          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*) \([A-F0-9]\{40\}\) .*/\1/p' | head -n 1)"
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*) \([A-F0-9]\{40\}\) "Developer ID Application:.*(366ADQ28F6)".*/\1/p' | head -n 1)"
           test -n "$identity"
           ./scripts/sign-macos.sh "$PWD/dist/Dauerbot.app" "$identity" "$keychain"
+      - name: Notarize, staple, and verify Gatekeeper acceptance
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python3 scripts/notarize-macos.py --keychain "$RUNNER_TEMP/dauerbot.keychain-db"
+      - name: Retain notarization receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: notarization-receipt
+          path: dist/notarization*.json
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Prepare signed update manifest and package
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}

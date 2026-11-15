@@ -52,6 +52,13 @@ def main():
     team = re.search(r"^TeamIdentifier=(.+)$", signing, re.M)
     if not team or team[1] != "366ADQ28F6":
         raise ValueError("App is not signed by the expected team")
+    if not re.search(r"^Authority=Developer ID Application:", signing, re.M):
+        raise ValueError("Release requires a Developer ID Application certificate")
+    notarization = json.loads((ROOT / "dist/notarization.json").read_text())
+    if notarization.get("status") != "Accepted":
+        raise ValueError("Apple has not accepted this release")
+    subprocess.run(["xcrun", "stapler", "validate", str(app)], check=True)
+    subprocess.run(["spctl", "--assess", "--type", "execute", "--verbose=4", str(app)], check=True)
     key = SigningKey(base64.b64decode(os.environ["UPDATE_SIGNING_KEY"], validate=True))
     expected_key = (ROOT / "packaging/update-public-key.txt").read_text().strip()
     if base64.b64encode(bytes(key.verify_key)).decode() != expected_key:
@@ -74,7 +81,8 @@ def main():
     sig = key.sign(b"Dauerbot update v1\n" + raw).signature
     (output / "update.json.sig").write_text(base64.b64encode(sig).decode() + "\n")
     (output / "signing.txt").write_text(signing.replace(str(app), "Dauerbot.app") +
-                                       "\nNotarization: not performed. Signed macOS preview.\n")
+                                       f"\nNotarization: Accepted ({notarization['id']}).\n"
+                                       "Ticket: stapled and validated.\nGatekeeper: accepted.\n")
     public = [package, output / "update.json", output / "update.json.sig", output / "signing.txt"]
     (output / "SHA256SUMS").write_text("".join(f"{digest(path)}  {path.name}\n" for path in public))
     changelog = (ROOT / "CHANGELOG.md").read_text()
@@ -84,8 +92,8 @@ def main():
         f"Dauerbot {version}\n\n{notes}\n\n"
         "Download the Apple Silicon zip, extract it, and move the app to Applications. "
         "Install HERDR Core (hc) and sign in to your Agent CLI first.\n\n"
-        "This package is signed but not Apple-notarized. macOS may block opening it; "
-        "an Apple Development certificate does not establish Developer ID distribution acceptance.\n\n"
+        "Signed with Developer ID Application, accepted by Apple notarization, "
+        "and verified with Gatekeeper. The app includes its notarization ticket.\n\n"
         "Updater-enabled clients verify the manifest signature, SHA-256, Apple Team, and bundle ID. "
         "The app updates in the background and takes effect on next launch without ending the HERDR session.\n"
     )
