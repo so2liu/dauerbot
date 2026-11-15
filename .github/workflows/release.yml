@@ -40,16 +40,24 @@ jobs:
           test -n "$APPLE_ID"
           test -n "$APPLE_APP_SPECIFIC_PASSWORD"
           test "$APPLE_TEAM_ID" = "366ADQ28F6"
+      - name: Restore a verified local build when available
+        id: prebuilt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/prebuilt-macos.py restore --tag "$RELEASE_TAG"
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.prebuilt.outputs.available != 'true'
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: steps.prebuilt.outputs.available != 'true'
         with:
           shared-key: macos-arm64
           workspaces: |
             . -> desktop/target
             desktop -> target
       - name: Build and verify
+        if: steps.prebuilt.outputs.available != 'true'
         run: |
           set -euo pipefail
           ./scripts/build-desktop.sh

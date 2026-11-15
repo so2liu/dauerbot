@@ -154,6 +154,8 @@ Release tags must reference commits on `main`. Update both crate versions, lockf
 
 The repository's Actions secrets hold `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`, and the Base64 32-byte Ed25519 seed `UPDATE_SIGNING_KEY`. The certificate must include the Developer ID Application private key for Team `366ADQ28F6`. Notarization credentials are stored only in the temporary runner keychain, which CI deletes after the run. A notarization failure prevents publication. The public update key lives in `packaging/update-public-key.txt`. Do not rotate it without a transition release that existing clients can verify. Manifest signing does not replace Apple notarization.
 
+To reuse the local Rust build cache, merge the release source to main and run `python3 scripts/prebuilt-macos.py stage --tag vVERSION` from a clean checkout matching main, then push that main-branch version tag. The script builds and runs the existing Rust checks locally before uploading an ad-hoc package to a private draft release. CI verifies its source tree, version, architecture, size, and SHA-256, then signs and notarizes it without compiling again. The certificate and private key stay in GitHub Secrets. CI removes staging assets before publication. Tagging without a staged build keeps the full CI build path.
+
 ## Repository layout
 
 ```text

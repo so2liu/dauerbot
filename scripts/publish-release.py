@@ -42,6 +42,10 @@ def main():
         expected = "sha256:" + hashlib.sha256((directory / name).read_bytes()).hexdigest()
         if name not in assets or assets[name].get("digest") != expected:
             raise ValueError(f"Uploaded asset is incomplete or checksum differs: {name}")
+    # Local builds are private staging inputs, not installable release assets.
+    for name in ("prebuilt.json", f"Dauerbot-{tag}-macos-arm64-unsigned.zip"):
+        if name in assets:
+            gh("release", "delete-asset", tag, name, "-R", REPO, "--yes")
     prerelease = "-" in manifest["version"]
     gh("release", "edit", tag, "-R", REPO, "--draft=false",
        f"--prerelease={str(prerelease).lower()}", "--latest=false",
