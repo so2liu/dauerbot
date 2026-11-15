@@ -8,7 +8,7 @@ One bot belongs to one project with one active agent. Direct messages and group 
 
 Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. Install HERDR Core (`hc`) and sign in to the Agent CLI you want to use. Install Herdr App to monitor interactive terminals.
 
-Current packages use an Apple Development certificate and have not completed Apple notarization. macOS may block opening them; this is not Developer ID distribution or Gatekeeper acceptance. Intel builds and the minimum supported macOS version have not been verified.
+Starting with 0.3.2, releases require Developer ID Application signing, Apple notarization, a stapled ticket, and Gatekeeper acceptance before publication. Intel builds and the minimum supported macOS version have not been verified.
 
 Dauerbot uses the MIT license. It is an independent project with no official affiliation with HERDR, Feishu, or the CLI vendors.
 
@@ -150,9 +150,11 @@ hfb update rollback
 
 The updater verifies the Ed25519-signed manifest, size, SHA-256, Apple Team, bundle ID, version, and architecture. It rejects unsafe archive paths and symlinks. Same-volume replacement retains one old bundle and restores it if replacement or CLI validation fails. Ad-hoc and development builds cannot silently replace themselves; the installed bundle must already have a trusted signature and a writable parent directory.
 
-Release tags must reference commits on `main`. Update both crate versions, lockfiles, Info.plist, and CHANGELOG before tagging. CI builds, tests, signs, and uploads the zip, `SHA256SUMS`, `signing.txt`, `update.json`, and `update.json.sig` to a draft release. It publishes only after GitHub's uploaded digests match. Public versions cannot be overwritten, and an older release cannot take Latest from a newer version.
+Release tags must reference commits on `main`. Update both crate versions, lockfiles, Info.plist, and CHANGELOG before tagging. CI builds, tests, signs with Developer ID Application, submits to Apple notarization, staples the accepted ticket, verifies Gatekeeper acceptance, and uploads the zip, `SHA256SUMS`, `signing.txt`, `update.json`, and `update.json.sig` to a draft release. It publishes only after GitHub's uploaded digests match. Public versions cannot be overwritten, and an older release cannot take Latest from a newer version.
 
-The repository's Actions secrets hold `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_TEAM_ID`, and the Base64 32-byte Ed25519 seed `UPDATE_SIGNING_KEY`. The public update key lives in `packaging/update-public-key.txt`. Do not rotate it without a transition release that existing clients can verify. Manifest signing does not replace Apple notarization.
+The repository's Actions secrets hold `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`, and the Base64 32-byte Ed25519 seed `UPDATE_SIGNING_KEY`. The certificate must include the Developer ID Application private key for Team `366ADQ28F6`. Notarization credentials are stored only in the temporary runner keychain, which CI deletes after the run. A notarization failure prevents publication. The public update key lives in `packaging/update-public-key.txt`. Do not rotate it without a transition release that existing clients can verify. Manifest signing does not replace Apple notarization.
+
+To reuse the local Rust build cache, merge the release source to main and run `python3 scripts/prebuilt-macos.py stage --tag vVERSION` from a clean checkout matching main, then push that main-branch version tag. The script builds and runs the existing Rust checks locally before uploading an ad-hoc package to a private draft release. CI verifies its source tree, version, architecture, size, and SHA-256, then signs and notarizes it without compiling again. The certificate and private key stay in GitHub Secrets. CI removes staging assets before publication. Tagging without a staged build keeps the full CI build path.
 
 ## Repository layout
 

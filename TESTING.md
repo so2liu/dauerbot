@@ -2,6 +2,14 @@
 
 Date: November 15, 2026. Local environment: macOS on Apple Silicon, Rust 1.96.0, HERDR Core 0.1.20. These are development checks, not a cross-platform or long-running production load test. Evidence lives in ignored `test-results/` and `.local/` directories and must not contain credentials.
 
+## Developer ID and notarization, 0.3.2
+
+The existing ma-agent Developer ID Application certificate and notarization credentials were transferred directly between GitHub Actions secret stores using sealed-box encryption. Only destination-encrypted values left the source runner. The certificate belongs to the existing Apple Team, `366ADQ28F6`. The transfer artifact and temporary source branch were removed; ma-agent main and product source were unchanged.
+
+The native 0.3.2 package builds without Node.js. All 20 backend tests and three desktop tests pass; the optional live Feishu test remains ignored. Both clippy checks pass. The release YAML and Python scripts parse successfully. A local preflight check confirms the notarization script rejects an ad-hoc app before attempting to access notarization credentials.
+
+Release acceptance requires an actual Apple submission, a stapled ticket, and successful `codesign`, `stapler`, and `spctl` checks against the downloaded public package. CI retains the submission receipt for inspection. These checks must complete before closing the Gatekeeper issue.
+
 ## Current native-only cleanup
 
 The native desktop no longer depends on Svelte, Vite, Playwright, Node.js, pnpm, embedded HTML, or a web development server. The daemon retains its authenticated API for the desktop, CLI, and MCP. Browser-only group discovery, manual chat binding, private-default routing, and SSE refresh endpoints have been removed. Existing storage migrations and user data remain compatible.

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 — 2026-11-15
+
+### Fixed
+
+- Sign macOS releases with Developer ID Application and complete Apple notarization so downloaded apps pass Gatekeeper.
+- Staple and validate the notarization ticket before packaging; stop publication if Apple acceptance or Gatekeeper verification fails.
+- Preserve the existing update signing key, application identifier, local project data, and HERDR sessions.
+
+### Added
+
+- Stage a locally built and tested macOS package for CI signing and notarization, avoiding a second Rust compilation without exporting signing credentials.
+
 ## 0.3.1 — 2026-11-15
 
 ### Changed
