@@ -418,3 +418,77 @@ fn launch_forwards_existing_network_settings_without_overriding_identity_or_mode
     assert_eq!(forwarded["no_proxy"], "localhost,127.0.0.1");
     assert!(herdr::launch_network_env([]).is_empty());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn login_shell_loads_profile_and_preserves_literal_cli_arguments() {
+    let home = TempDir::new().unwrap();
+    std::fs::write(
+        home.path().join(".zshrc"),
+        "export HTTPS_PROXY=http://127.0.0.1:7897\n",
+    )
+    .unwrap();
+    let literal = format!(
+        "$(touch {}) 'quoted' ; echo unexpected",
+        home.path().join("injected").display()
+    );
+    let mut args = herdr::login_shell_args(vec![
+        "/usr/bin/printf".into(),
+        "%s\\0".into(),
+        literal.clone(),
+        "Gemini 4 Hydrogen (Medium)".into(),
+    ]);
+    args[0] = "/bin/zsh".into();
+    let output = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("ZDOTDIR", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        format!("{literal}\0Gemini 4 Hydrogen (Medium)\0").as_bytes()
+    );
+    assert!(!home.path().join("injected").exists());
+    let mut args = herdr::login_shell_args(vec!["/usr/bin/printenv".into(), "HTTPS_PROXY".into()]);
+    args[0] = "/bin/zsh".into();
+    let output = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("ZDOTDIR", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"http://127.0.0.1:7897\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn login_wrapper_accepts_running_agent_but_rejects_initializing_or_restored_shell() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db
+        .create(input(&dir, "Login shell identity", ""))
+        .await
+        .unwrap();
+    p.agent = "agy".into();
+    p.generation = "generation".into();
+    p.terminal_pid = Some(123);
+    let mut terminal = json!({
+        "state":"live","pid":123,
+        "argv":herdr::login_shell_args(vec!["agy".into(), "--dangerously-skip-permissions".into()]),
+        "labels":{"hfb.project":p.id,"hfb.generation":p.generation},
+        "foreground":{"pid":123,"argv":["/bin/zsh","-lic","exec \"$@\""]}
+    });
+    assert!(herdr::check_identity(&p, &terminal).is_err());
+    terminal["foreground"]["argv"] = json!(["/Users/example/.local/bin/agy"]);
+    assert!(herdr::check_identity(&p, &terminal).is_ok());
+    terminal["pid"] = json!(999);
+    assert!(herdr::check_identity(&p, &terminal).is_err());
+    terminal["pid"] = json!(123);
+    terminal["foreground"]["argv"] = json!(["/bin/zsh", "-l"]);
+    assert!(herdr::check_identity(&p, &terminal).is_err());
+}

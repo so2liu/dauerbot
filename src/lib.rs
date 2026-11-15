@@ -124,6 +124,9 @@ impl App {
                 })
                 .await?;
         }
+        if p.agent != "custom" {
+            argv = herdr::login_shell_args(argv);
+        }
         let result=herdr::rpc(&cfg,"terminal.run",json!({
             "argv":argv,"cwd":p.path,"name":format!("hfb-{}",&p.id[..8]),
             "env":herdr::launch_network_env(std::env::vars()),

@@ -89,7 +89,7 @@ hfb session resume my-project
 
 `--data-dir` is a global argument. For an isolated daemon, use `hfb --data-dir /absolute/private-data serve --port 49322 --core-session my-bridge`.
 
-Dauerbot preserves native CLI account, model, provider, and reasoning settings. It does not invent model flags. It forwards existing standard proxy variables to HERDR child processes without copying unrelated model or account variables. As configured for this project, Codex uses `--dangerously-bypass-approvals-and-sandbox`, Claude Code and Antigravity use `--dangerously-skip-permissions`, and Pi uses `--approve` for project files. Pi extensions can still enforce their own approval rules.
+Dauerbot preserves native CLI account, model, provider, and reasoning settings. It does not invent model flags. On macOS, native agents start through a login shell inside HERDR, loading the same profile exports and proxy settings as your terminal. CLI arguments are passed literally, including prompts and paths with spaces. As configured for this project, Codex uses `--dangerously-bypass-approvals-and-sandbox`, Claude Code and Antigravity use `--dangerously-skip-permissions`, and Pi uses `--approve` for project files. Pi extensions can still enforce their own approval rules.
 
 A main session is a real CLI process in HERDR. The default Core session can appear in a Herdr App tab; an isolated Core session must use CLI attach to avoid opening an unrelated terminal with the same address. Press `Ctrl+\` to detach. Login and permission prompts remain visible in HERDR. Dauerbot confirms recognized Antigravity project-trust prompts only after matching the project path, PID, generation, structured trust state, and selected Yes option; other blocked states retain the queue.
 

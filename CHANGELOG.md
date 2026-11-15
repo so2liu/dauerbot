@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.3 — 2026-11-16
+
+### Fixed
+
+- Start native agents through a login shell inside HERDR, loading the same environment as a user's terminal. Finder-launched sessions previously missed shell exports, leaving Antigravity with an empty model list and an unspecified plan-model error on networks that require a proxy.
+- Preserve CLI arguments without shell interpolation, native model defaults, and HERDR terminal identity. Refuse delivery while the foreground process is still a shell.
 
 ### Changed
 
