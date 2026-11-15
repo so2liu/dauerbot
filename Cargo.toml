@@ -1,0 +1,43 @@
+[package]
+name = "herdr-feishu-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A local project daemon connecting Feishu to persistent HERDR agent sessions"
+license = "MIT"
+
+[[bin]]
+name = "hfb"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["multipart"] }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+fs2 = "0.4"
+mime_guess = "2"
+openlark = { version = "=0.22.0", default-features = false, features = ["communication", "websocket"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "stream", "rustls"] }
+rmcp = { version = "=3.10.0", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
+rusqlite = { version = "=0.42.0", features = ["bundled"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "io-util", "io-std", "fs", "net", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+webbrowser = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

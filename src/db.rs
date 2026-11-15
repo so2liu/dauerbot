@@ -1,0 +1,363 @@
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use uuid::Uuid;
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+pub fn id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+#[derive(Clone)]
+pub struct Db(Arc<Mutex<Connection>>);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub agent: String,
+    pub chat_id: String,
+    pub paused: bool,
+    pub terminal: Option<String>,
+    pub terminal_pid: Option<i64>,
+    pub generation: String,
+    pub ready: bool,
+    pub native_session: String,
+    pub extra_args: Vec<String>,
+    pub created_at: i64,
+    #[serde(skip_serializing)]
+    pub mcp_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectInput {
+    pub name: String,
+    pub path: String,
+    #[serde(default = "default_agent")]
+    pub agent: String,
+    #[serde(default)]
+    pub chat_id: String,
+    #[serde(default)]
+    pub native_session: String,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+fn default_agent() -> String {
+    "codex".into()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Message {
+    pub id: String,
+    pub project_id: String,
+    pub direction: String,
+    pub source_id: String,
+    pub content: String,
+    pub status: String,
+    pub error: String,
+    pub attempts: i64,
+    pub attachment: serde_json::Value,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        agent: row.get(3)?,
+        chat_id: row.get(4)?,
+        paused: row.get(5)?,
+        terminal: row.get(6)?,
+        terminal_pid: row.get(7)?,
+        generation: row.get(8)?,
+        ready: row.get(9)?,
+        native_session: row.get(10)?,
+        extra_args: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+        created_at: row.get(12)?,
+        mcp_token: row.get(13)?,
+    })
+}
+const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token";
+fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        direction: row.get(2)?,
+        source_id: row.get(3)?,
+        content: row.get(4)?,
+        status: row.get(5)?,
+        error: row.get(6)?,
+        attempts: row.get(7)?,
+        attachment: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+const MESSAGE: &str = "id,project_id,direction,source_id,content,status,error,attempts,attachment,created_at,updated_at";
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("
+            PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS projects (
+              id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL, agent TEXT NOT NULL,
+              chat_id TEXT NOT NULL DEFAULT '', paused INTEGER NOT NULL DEFAULT 0,
+              terminal TEXT, terminal_pid INTEGER, generation TEXT NOT NULL DEFAULT '',
+              ready INTEGER NOT NULL DEFAULT 0, native_session TEXT NOT NULL DEFAULT '',
+              extra_args TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, mcp_token TEXT NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS project_chat ON projects(chat_id) WHERE chat_id <> '';
+            CREATE TABLE IF NOT EXISTS messages (
+              id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+              direction TEXT NOT NULL, source_id TEXT NOT NULL, content TEXT NOT NULL,
+              status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+              attachment TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+              UNIQUE(project_id,direction,source_id));
+            CREATE INDEX IF NOT EXISTS message_pending ON messages(direction,status,created_at);
+            PRAGMA user_version=1;
+        ")?;
+        conn.execute("UPDATE messages SET status='uncertain',error='服务在操作中退出；请核对后手动重试',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
+        Ok(Self(Arc::new(Mutex::new(conn))))
+    }
+    pub fn sync<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁已损坏"))?;
+        f(&conn)
+    }
+    pub async fn call<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || db.sync(f)).await?
+    }
+    pub async fn projects(&self) -> Result<Vec<Project>> {
+        self.call(|c| {
+            Ok(c.prepare(&format!(
+                "SELECT {PROJECT} FROM projects ORDER BY created_at"
+            ))?
+            .query_map([], project)?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+        .await
+    }
+    pub async fn project(&self, key: &str) -> Result<Project> {
+        let key = key.to_owned();
+        self.call(move |c| {
+            c.query_row(
+                &format!("SELECT {PROJECT} FROM projects WHERE id=?1 OR name=?1"),
+                [key],
+                project,
+            )
+            .context("项目不存在")
+        })
+        .await
+    }
+    pub async fn create(&self, input: ProjectInput) -> Result<Project> {
+        validate(&input)?;
+        let path = std::fs::canonicalize(&input.path).context("项目目录不存在")?;
+        if !path.is_dir() {
+            bail!("项目路径必须是目录");
+        }
+        let key = id();
+        let out = key.clone();
+        self.call(move |c| {
+            c.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
+            params![key,input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,now(),id()])?;
+            Ok(())
+        }).await?;
+        self.project(&out).await
+    }
+    pub async fn update(&self, key: &str, input: ProjectInput) -> Result<Project> {
+        validate(&input)?;
+        let p = self.project(key).await?;
+        let path = std::fs::canonicalize(&input.path)?;
+        if !path.is_dir() {
+            bail!("项目路径必须是目录");
+        }
+        if p.terminal.is_some()
+            && (p.path != path.to_string_lossy()
+                || p.agent != input.agent
+                || p.extra_args != input.extra_args)
+        {
+            bail!("请先停止会话，再修改目录、Agent 或启动参数");
+        }
+        let out = p.id.clone();
+        self.call(move |c| {c.execute("UPDATE projects SET name=?,path=?,agent=?,chat_id=?,native_session=?,extra_args=? WHERE id=?",
+            params![input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,p.id])?;Ok(())}).await?;
+        self.project(&out).await
+    }
+    pub async fn pause(&self, key: &str, value: bool) -> Result<()> {
+        let key = self.project(key).await?.id;
+        self.call(move |c| {
+            c.execute(
+                "UPDATE projects SET paused=? WHERE id=?",
+                params![value, key],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn set_session(
+        &self,
+        key: &str,
+        terminal: Option<String>,
+        pid: Option<i64>,
+        generation: String,
+    ) -> Result<()> {
+        let key = key.to_owned();
+        self.call(move |c| {
+            c.execute(
+                "UPDATE projects SET terminal=?,terminal_pid=?,generation=?,ready=0 WHERE id=?",
+                params![terminal, pid, generation, key],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn ready(
+        &self,
+        key: &str,
+        generation: &str,
+        terminal: &str,
+        native: &str,
+    ) -> Result<()> {
+        let (key, generation, terminal, native) = (
+            key.to_owned(),
+            generation.to_owned(),
+            terminal.to_owned(),
+            native.to_owned(),
+        );
+        self.call(move|c|{
+            let n=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END WHERE id=?2 AND generation=?3 AND terminal=?4",
+                params![native,key,generation,terminal])?;
+            if n!=1 {bail!("会话身份已变更，请重新连接 MCP");} Ok(())
+        }).await
+    }
+    pub fn ingest(
+        &self,
+        chat: &str,
+        source: &str,
+        content: &str,
+        attachment: &serde_json::Value,
+    ) -> Result<Option<String>> {
+        self.sync(|c|{
+            let project:Option<String>=c.query_row("SELECT id FROM projects WHERE chat_id=?",[chat],|r|r.get(0)).optional()?;
+            let Some(project)=project else {return Ok(None)};
+            let key=id();
+            let n=c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
+                params![key,project,source,content,serde_json::to_string(attachment)?,now(),now()])?;
+            Ok((n==1).then_some(key))
+        })
+    }
+    pub async fn enqueue_out(
+        &self,
+        key: &str,
+        source: &str,
+        content: &str,
+        attachment: serde_json::Value,
+    ) -> Result<Message> {
+        let (key, source, content) = (key.to_owned(), source.to_owned(), content.to_owned());
+        let (k, s) = (key.clone(), source.clone());
+        self.call(move|c|{c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'out',?,?,'pending',?,?,?)",
+            params![id(),key,source,content,serde_json::to_string(&attachment)?,now(),now()])?; Ok(())}).await?;
+        self.call(move|c|Ok(c.query_row(&format!("SELECT {MESSAGE} FROM messages WHERE project_id=? AND direction='out' AND source_id=?"),params![k,s],message)?)).await
+    }
+    pub async fn messages(&self, key: &str) -> Result<Vec<Message>> {
+        let key = key.to_owned();
+        self.call(move|c|Ok(c.prepare(&format!("SELECT {MESSAGE} FROM messages WHERE project_id=? ORDER BY created_at DESC LIMIT 150"))?
+            .query_map([key],message)?.collect::<rusqlite::Result<_>>()?)).await
+    }
+    pub async fn pending(&self, direction: &str) -> Result<Vec<Message>> {
+        let direction = direction.to_owned();
+        self.call(move|c|{
+            // One head per project: a paused project's backlog must not starve other projects.
+            let sql=if direction=="in"{
+                format!("SELECT {MESSAGE} FROM messages WHERE rowid IN (SELECT MIN(rowid) FROM messages WHERE direction='in' AND status='queued' GROUP BY project_id) ORDER BY rowid")
+            }else{
+                format!("SELECT {MESSAGE} FROM messages WHERE direction='out' AND status='pending' ORDER BY rowid LIMIT 32")
+            };
+            Ok(c.prepare(&sql)?.query_map([],message)?.collect::<rusqlite::Result<_>>()?)
+        }).await
+    }
+    pub async fn message(&self, key: &str) -> Result<Message> {
+        let key = key.to_owned();
+        self.call(move |c| {
+            Ok(c.query_row(
+                &format!("SELECT {MESSAGE} FROM messages WHERE id=?"),
+                [key],
+                message,
+            )?)
+        })
+        .await
+    }
+    pub async fn state(&self, key: &str, status: &str, error: &str) -> Result<()> {
+        let (key, status, error) = (key.to_owned(), status.to_owned(), error.to_owned());
+        self.call(move|c|{c.execute("UPDATE messages SET status=?,error=?,updated_at=?,attempts=attempts+CASE WHEN ? IN ('submitting','sending') THEN 1 ELSE 0 END WHERE id=?",
+            params![status,error,now(),status,key])?;Ok(())}).await
+    }
+    pub async fn ack(&self, key: &str, source: &str) -> Result<()> {
+        let (key, source) = (key.to_owned(), source.to_owned());
+        self.call(move|c|{
+            let n=c.execute("UPDATE messages SET status='acknowledged',error='',updated_at=? WHERE project_id=? AND source_id=? AND direction='in' AND status IN ('submitting','submitted','uncertain','acknowledged')",params![now(),key,source])?;
+            if n!=1 {bail!("消息不属于该项目或尚未投递");} Ok(())
+        }).await
+    }
+    pub async fn remove_project(&self, key: &str) -> Result<()> {
+        let p = self.project(key).await?;
+        if p.terminal.is_some() {
+            bail!("先停止会话再删除项目");
+        }
+        self.call(move |c| {
+            c.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<()> {
+                c.execute("DELETE FROM messages WHERE project_id=?", [&p.id])?;
+                c.execute("DELETE FROM projects WHERE id=?", [&p.id])?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    c.execute_batch("COMMIT")?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = c.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+        .await
+    }
+}
+
+fn validate(p: &ProjectInput) -> Result<()> {
+    if p.name.trim().is_empty() || p.name.len() > 120 {
+        bail!("项目名须为 1–120 字符");
+    }
+    if !["codex", "claude", "pi", "agy", "custom"].contains(&p.agent.as_str()) {
+        bail!("不支持的 Agent");
+    }
+    if p.agent == "custom" && p.extra_args.is_empty() {
+        bail!("自定义 Agent 需要完整 argv");
+    }
+    if !p.chat_id.is_empty() && !p.chat_id.starts_with("oc_") {
+        bail!("请填写飞书 chat_id（oc_ 开头）");
+    }
+    Ok(())
+}
