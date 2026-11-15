@@ -48,6 +48,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/state", get(state))
         .route("/settings", get(settings).put(save_settings))
         .route("/settings/check", post(check_settings))
+        .route("/onboarding/chats", get(onboarding_chats))
         .route("/projects", post(create_project))
         .route(
             "/projects/{id}",
@@ -195,6 +196,44 @@ async fn check_settings(State(app): State<Arc<App>>) -> ApiResult {
     Ok(Json(
         json!({"ok":true,"message":"应用凭证有效；长连接事件需在飞书后台订阅 im.message.receive_v1"}),
     ))
+}
+/// List only chats the configured bot can access. Credentials stay in the daemon.
+async fn onboarding_chats(State(app): State<Arc<App>>) -> ApiResult {
+    let cfg = app.config.read().await.clone();
+    let token = feishu::token(&app).await?;
+    let mut items = Vec::new();
+    let mut page_token = String::new();
+    for _ in 0..20 {
+        let mut query = vec![("page_size", "100".to_owned())];
+        if !page_token.is_empty() {
+            query.push(("page_token", page_token.clone()));
+        }
+        let response = app
+            .http
+            .get(format!("{}/open-apis/im/v1/chats", cfg.feishu_base))
+            .bearer_auth(&token)
+            .query(&query)
+            .send()
+            .await
+            .context("获取机器人所在群失败，请检查网络和 im:chat:readonly 权限")?;
+        let value = feishu::api_json(response).await?;
+        if let Some(chats) = value["data"]["items"].as_array() {
+            items.extend(
+                chats
+                    .iter()
+                    .map(|chat| json!({"chat_id":chat["chat_id"], "name":chat["name"]})),
+            );
+        }
+        if value["data"]["has_more"] != true {
+            return Ok(Json(json!({"items":items,"truncated":false})));
+        }
+        page_token = value["data"]["page_token"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .context("飞书返回了分页标记但没有下一页 token")?
+            .into();
+    }
+    Ok(Json(json!({"items":items,"truncated":true})))
 }
 async fn create_project(State(app): State<Arc<App>>, Json(input): Json<ProjectInput>) -> ApiResult {
     let p = app.db.create(input).await?;

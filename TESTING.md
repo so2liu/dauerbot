@@ -2,6 +2,22 @@
 
 日期：2026-11-15。环境：macOS，Rust 1.96.0，Node.js 22.23.2，pnpm 12.6.0，HERDR Core 0.1.20。这是本机开发验证，不等同于跨平台或长期生产压测。
 
+## GPUI 桌面版追加验证
+
+桌面版本 0.2.0，GPUI 0.2.2、GPUI Component 0.5.1。使用系统 Metal 运行时编译着色器；构建机器无需另行下载离线 Metal Toolchain。桌面与 daemon 分开运行，原生窗口不加载网页或 WebView。
+
+本轮执行：
+
+- `cargo test --locked --release --target-dir desktop/target --tests`：9 项通过，1 项真实飞书发送测试按默认忽略。新增的群列表 HTTP 测试覆盖本机认证、分页合并、上游敏感字段过滤及缺少 scope 时的错误透传。
+- `cargo test --locked --release --manifest-path desktop/Cargo.toml`：2 项通过，覆盖所选目录探测临时文件清理、数据库文件内容保持不变，以及“文件不存在”与实际 OS 权限拒绝的错误区分。
+- daemon 与桌面 crate 的 `cargo clippy --locked --all-targets -- -D warnings` 通过。GPUI 上游 `block 0.1.6` 依赖存在 Rust future-incompatibility 提示，未产生本项目 lint 错误。
+- 前端生产资源重新构建成功；`scripts/build-desktop.sh` 成功生成含 `hfb` sidecar、图标和用途声明的 `.app`，`plutil -lint` 和 `codesign --verify --deep --strict` 通过。
+- 实际启动 `.app`，通过 macOS 窗口快照和截图确认 GPUI 欢迎页完成渲染，CLI 路径检测显示正常。后台 API 确认 HERDR `connected`、飞书 `unconfigured`，没有加载既有生产机器人凭证。
+
+交互验收限制：本轮电脑控制工具可观察原生窗口和截图，但坐标点击返回 `noWindowsAvailable`。因此没有将引导按钮、文件选择器、系统设置跳转及项目工作台操作记为已完成的 GUI 自动化测试。相关 OS 权限拒绝、用户在系统设置开启权限后的恢复，以及 HERDR 外部进程的实际访问权限仍需在用户授权场景中验收。未自动授予完全磁盘访问权限，也未扫描任何隐私数据库。
+
+飞书凭证检查只验证已保存应用身份；事件订阅和应用发布为用户手动确认项。完整双向收发需要用户完成配置并向绑定聊天发出测试消息后才能确认。完整权限 JSON 包含 `im:message.group_msg`，用于接收群内全部用户回复；基础清单仅接收群内 @ 消息。群列表由真实 API 获取，不包含单聊。
+
 ## 结果
 
 | 层级 | 结果 | 证据 |

@@ -1,4 +1,6 @@
 /target
+/desktop/target
+/dist
 /frontend/node_modules
 /frontend/dist
 /test-results
