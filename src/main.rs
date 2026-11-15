@@ -281,6 +281,7 @@ async fn main() -> Result<()> {
     }
     let client = Client {
         http: reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(110))
             .build()?,
         cfg: cfg.clone(),

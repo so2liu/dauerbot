@@ -146,6 +146,16 @@ impl Desktop {
                     }
                     self.state = value;
                 }
+                Reply::Connection(Some(reason)) => {
+                    self.notice = format!("本地服务连接失败：{reason}");
+                    self.error = true;
+                }
+                Reply::Connection(None) => {
+                    if self.notice.starts_with("本地服务连接失败：") {
+                        self.notice = "本地服务已恢复连接".into();
+                        self.error = false;
+                    }
+                }
                 Reply::Environment(value) => self.environment = value,
                 Reply::Detail(value) => {
                     if value["project"]["id"] == self.selected {

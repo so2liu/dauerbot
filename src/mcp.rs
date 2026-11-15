@@ -176,6 +176,7 @@ pub async fn serve(path: &Path) -> Result<()> {
     let server = BridgeMcp {
         credentials,
         http: reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(95))
             .build()?,
         tool_router: BridgeMcp::tool_router(),
