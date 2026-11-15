@@ -56,6 +56,30 @@ pub fn launch_network_env(
         .collect()
 }
 
+const LOGIN_EXEC: &str = r#"exec "$@""#;
+const LOGIN_MARKER: &str = "dauerbot-agent";
+
+/// Start native CLIs with the same profile and environment as a user's terminal.
+/// Positional arguments preserve every CLI argument without shell interpolation.
+pub fn login_shell_args(argv: Vec<String>) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "/bin/zsh"
+            } else {
+                "/bin/sh"
+            }
+            .into()
+        });
+        let mut wrapped = vec![shell, "-lic".into(), LOGIN_EXEC.into(), LOGIN_MARKER.into()];
+        wrapped.extend(argv);
+        wrapped
+    }
+    #[cfg(not(unix))]
+    argv
+}
+
 pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> {
     let mut child = command(config)
         .arg("connect")
@@ -142,7 +166,18 @@ pub fn check_identity(p: &Project, t: &Value) -> Result<()> {
     let argv = t["argv"]
         .as_array()
         .context("Cannot verify the terminal program")?;
-    let program = argv.first().and_then(Value::as_str).unwrap_or("");
+    let wrapped = argv.get(1).and_then(Value::as_str) == Some("-lic")
+        && argv.get(2).and_then(Value::as_str) == Some(LOGIN_EXEC)
+        && argv.get(3).and_then(Value::as_str) == Some(LOGIN_MARKER)
+        && argv.get(4).and_then(Value::as_str) == Some(p.agent.as_str())
+        && ["codex", "claude", "pi", "agy"].contains(&p.agent.as_str());
+    let program = if wrapped {
+        t["foreground"]["argv"][0]
+            .as_str()
+            .context("The main session is still starting")?
+    } else {
+        argv.first().and_then(Value::as_str).unwrap_or("")
+    };
     if matches!(
         Path::new(program).file_name().and_then(|s| s.to_str()),
         Some("sh" | "bash" | "zsh" | "fish" | "nu" | "pwsh")

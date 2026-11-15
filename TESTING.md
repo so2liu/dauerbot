@@ -1,5 +1,15 @@
 # Verification record
 
+## Native CLI environment, 0.3.3
+
+On November 16, 2026, macmini's working Antigravity session had shell proxy exports that its Dauerbot-launched session lacked. Direct requests to Google's OAuth and model-service hosts failed; requests through the existing proxy returned HTTP responses. Under the GUI login context, `agy models` listed 22 models and a real model turn returned `DAUERBOT_AGY_OK` with the proxy. The corresponding turn without proxies timed out. SSH-only processes did not have the GUI keychain unlocked and were not used to infer the user's interactive sign-in state.
+
+The final implementation starts native agents through a login shell in HERDR, with arguments passed positionally to `exec`. A macmini GUI-launched validation daemon inherited no proxy settings, used an independent data directory and Core session, and launched the actual Antigravity CLI 1.5.9. The agent inherited all six existing upper/lowercase HTTP, HTTPS, and bypass proxy settings, completed a real model turn, called the MCP `session_ready` tool, and reached `ready=true`. Neither the constructor error nor the empty model picker appeared. The isolated agent, daemon, and Core were stopped after the check.
+
+Regression checks verify actual profile loading, literal argument forwarding with shell metacharacters, and rejection of an initializing or restored shell even when terminal labels match. The existing checks continue to verify native model defaults and explicit user model arguments.
+
+All 22 backend tests and three desktop tests passed; the opt-in live Feishu test remained ignored. Both release clippy checks passed. The isolated protocol smoke passed all 12 checks, including message delivery and daemon/Core restarts. Evidence: `test-results/cli-network/macmini-agy.json`, `.local/smoke-6adb8f27`, and `test-results/smoke.json`. The package was built locally without starting native Actions checks.
+
 Date: November 15, 2026. Local environment: macOS on Apple Silicon, Rust 1.96.0, HERDR Core 0.1.20. These are development checks, not a cross-platform or long-running production load test. Evidence lives in ignored `test-results/` and `.local/` directories and must not contain credentials.
 
 ## Actions budget policy
