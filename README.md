@@ -20,13 +20,17 @@ Import the permission JSON supplied by the app, select long connections for even
 
 Create a project by choosing a directory and an Agent CLI. The first project becomes the bot's fixed owner. You do not need a chat ID or a separate chat-binding step. Messages received before project creation stay queued. Additional local projects do not share this bot's messages or sending permissions.
 
-Switch the active CLI in the workspace or with `hfb session switch`. This stops the old agent and starts a new main session while preserving the project, bot binding, and queues. You can also try local tasks before connecting Feishu.
+Switch the active CLI in the workspace or with `hfb session switch`. This stops the old agent and starts a new main session while preserving the project, bot binding, and queues. You can also send local tasks through the CLI before connecting Feishu.
 
 Avoid running another long-connection listener for the same Feishu app: the platform distributes events between listeners, so another program may receive the message instead.
 
 ## Native desktop and local data
 
 The desktop renders native GPUI controls. There is no browser interface, WebView, Node.js runtime, or frontend build step. Closing the app leaves its daemon and HERDR agent running.
+
+The workspace shows your projects, connection status, and session controls. Talk to the agent in Feishu; use **Monitor in Herdr App** to watch its execution or take over the terminal. Desktop setup and permission checks have their own navigation entries. Local task input and message history remain available through the CLI rather than the desktop.
+
+Switch between **English** and **简体中文** in the app. The choice takes effect immediately and stays saved on this Mac. Existing projects open directly in the workspace.
 
 Dauerbot checks only the project folders or SQLite files you select. Database checks read schema metadata rather than business records. Full Disk Access is optional and must be granted in System Settings to the application that actually performs the task. Granting access to Dauerbot does not automatically grant it to an existing HERDR or Agent process. Normal operation does not require Accessibility or Screen Recording.
 

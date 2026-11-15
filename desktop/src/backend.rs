@@ -18,7 +18,6 @@ pub enum CommandRequest {
     Folder(PathBuf),
     Database(PathBuf),
     Environment,
-    Watch(String),
     UpdatePreferences {
         automatic: bool,
         channel: String,
@@ -26,7 +25,6 @@ pub enum CommandRequest {
 }
 pub enum Reply {
     State(Value),
-    Detail(Value),
     Done {
         path: String,
         value: Value,
@@ -110,8 +108,6 @@ impl Backend {
                 let mut connection = ConnectionState::default();
                 let mut last_restart = std::time::Instant::now() - Duration::from_secs(10);
                 let mut last_state = Value::Null;
-                let mut watched = String::new();
-                let mut last_detail = Value::Null;
                 loop {
                     match requests.recv_timeout(Duration::from_millis(1200)) {
                         Ok(CommandRequest::Api {
@@ -147,10 +143,6 @@ impl Backend {
                         }
                         Ok(CommandRequest::Environment) => {
                             let _ = replies.send(Reply::Environment(environment(&cfg, &data)));
-                        }
-                        Ok(CommandRequest::Watch(id)) => {
-                            watched = id;
-                            last_detail = Value::Null;
                         }
                         Ok(CommandRequest::UpdatePreferences { automatic, channel }) => {
                             let result =
@@ -196,14 +188,6 @@ impl Backend {
                                 }
                             }
                         }
-                    }
-                    if !watched.is_empty()
-                        && let Ok(detail) =
-                            request(&http, &cfg, "GET", &format!("/projects/{watched}"), None).await
-                        && detail != last_detail
-                    {
-                        last_detail = detail.clone();
-                        let _ = replies.send(Reply::Detail(detail));
                     }
                 }
                 Ok::<_, anyhow::Error>(())
