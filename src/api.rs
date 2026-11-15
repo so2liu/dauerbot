@@ -46,6 +46,7 @@ type ApiResult = std::result::Result<Json<Value>, ApiError>;
 pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()
         .route("/state", get(state))
+        .route("/service/shutdown", post(shutdown_service))
         .route("/settings", get(settings).put(save_settings))
         .route("/settings/check", post(check_settings))
         .route("/onboarding/chats", get(onboarding_chats))
@@ -162,6 +163,10 @@ async fn static_asset(req: Request) -> Response {
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+async fn shutdown_service(State(app): State<Arc<App>>) -> ApiResult {
+    app.shutdown.cancel();
+    Ok(Json(json!({"stopping":true})))
 }
 async fn state(State(app): State<Arc<App>>) -> ApiResult {
     Ok(Json(
