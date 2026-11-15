@@ -14,6 +14,43 @@
 
 关闭桌面窗口不影响后台工作。重启 Bridge 不重建 Agent 会话；退出桌面应用也不会主动结束 HERDR 中的终端。
 
+## 自动升级与发版
+
+从包含升级器的版本开始，原生客户端在启动时及每 6 小时检查 GitHub Releases。默认使用稳定通道，自动下载、校验并替换应用；当前桌面和主会话继续运行，下次打开桌面启用新版，也可在「应用更新」点击「立即重启桌面」。新桌面会等待旧 daemon 完成请求，再启动同一数据目录的新 daemon，不结束 HERDR 中的 Agent 或现有 MCP 进程。
+
+「应用更新」提供手动检查、下载并安装、关闭自动升级、切换稳定/预览通道及回退上一版。关闭自动升级不妨碍手动更新。预览通道也接受预发布版本；按语义版本选择最高版本，不依赖 GitHub 的发布时间或 Latest 标记。关闭桌面后 daemon 仍工作，下次打开时再检查应用更新。
+
+升级器验证内置 Ed25519 公钥签署的 `update.json`、安装包大小和 SHA-256、Apple Team、bundle ID、应用版本与架构。解压拒绝路径越界及符号链接。通过全部检查后，在应用同一磁盘上替换并保留一份旧应用；替换或新 CLI 启动校验失败会恢复旧版本。开发构建、ad-hoc 签名和不可写目录不会被悄悄替换。安装目录不可写时，请手动将应用移至自己的 Applications 目录。
+
+`v0.2.0` 没有升级器，需手动安装带升级器的新版本一次。CLI 也可管理升级：
+
+```sh
+hfb update status
+hfb update check
+hfb update install --app "/Applications/Dauerbot.app"
+hfb update auto off
+hfb update auto on
+hfb update channel preview
+hfb update channel stable
+hfb update rollback
+```
+
+发版采用 tag 触发，参考 Magpie 的校验、替换和回滚流程；当前无需单独的 releases 仓库或更新服务器。更新来自 `so2liu/dauerbot`，CI 凭证留在该仓库的 Actions secrets：
+
+- `APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_TEAM_ID`：现有 Apple 签名配置。
+- `UPDATE_SIGNING_KEY`：32 字节 Ed25519 seed 的 Base64，只供 CI 签署清单；对应公钥位于 `packaging/update-public-key.txt`。
+
+发布时统一修改根 crate、desktop crate、前端、Info.plist 和 lockfile 的版本，更新 CHANGELOG，将完整改动合入 main，然后：
+
+```sh
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+`Release` workflow 会拒绝 main 之外的提交，运行构建、测试和 lint，签名应用，生成 zip、`SHA256SUMS`、`signing.txt`、`update.json` 及 `update.json.sig`。先创建不可见的草稿 Release，上传并核对服务器记录的文件摘要，再公开；数字版本进入稳定通道，带 `-beta.1` 等后缀的版本进入预览通道。已公开版本不能覆盖，失败的草稿可重新运行。延迟发布的旧版不会抢走较新版的 Latest 标记。
+
+现在的 Apple Development 证书支持现有签名流程，尚未完成 Apple 公证。清单签名与 Apple 公证是两项独立检查。不要直接替换更新公钥或私钥；轮换时应先发布兼容旧、新公钥的过渡版，否则旧客户端无法验证新发布。
+
 ## 桌面应用
 
 在 macOS 上安装 Xcode 和 Rust 后构建：

@@ -67,6 +67,29 @@ enum Commands {
     },
     /// 打印本机用户服务配置
     Service,
+    /// 检查、安装或配置签名桌面更新
+    Update {
+        #[command(subcommand)]
+        command: Updates,
+    },
+}
+#[derive(Subcommand)]
+enum Updates {
+    Status,
+    Check,
+    Install {
+        #[arg(long)]
+        app: Option<PathBuf>,
+    },
+    Auto {
+        #[arg(value_parser = ["on", "off"])]
+        mode: String,
+    },
+    Channel {
+        #[arg(value_parser = ["stable", "preview"])]
+        channel: String,
+    },
+    Rollback,
 }
 #[derive(Subcommand)]
 enum Projects {
@@ -219,6 +242,78 @@ async fn main() -> Result<()> {
     let dir = cli.data_dir.unwrap_or_else(config::default_dir);
     config::private_dir(&dir)?;
     let dir = std::fs::canonicalize(dir).context("无法解析数据目录")?;
+    if let Commands::Update { command } = cli.command {
+        use herdr_feishu_bridge::update::{self, Preferences, Status};
+        let mut prefs = Preferences::load(&dir)?;
+        let value = match command {
+            Updates::Auto { mode } => {
+                prefs.automatic = mode == "on";
+                prefs.save(&dir)?;
+                json!(prefs)
+            }
+            Updates::Channel { channel } => {
+                prefs.channel = channel;
+                prefs.save(&dir)?;
+                json!(prefs)
+            }
+            Updates::Status => {
+                let file = dir.join("updates/status.json");
+                if file.exists() {
+                    {
+                        let mut status: Value = serde_json::from_slice(&std::fs::read(file)?)?;
+                        status["preferences"] = json!(prefs);
+                        status["current"] = json!(update::CURRENT);
+                        status["rollback_available"] =
+                            json!(dir.join("updates/installed.json").exists());
+                        status
+                    }
+                } else {
+                    json!(Status::new(prefs))
+                }
+            }
+            Updates::Rollback => {
+                update::rollback_and_restart(&dir).await?;
+                json!({"rolled_back":true,"restart_required":true})
+            }
+            command => {
+                let client = update::client()?;
+                let target = if let Updates::Install { app } = &command {
+                    app.clone().or_else(update::bundle)
+                } else {
+                    None
+                };
+                let current = target
+                    .as_ref()
+                    .map(|app| update::bundle_version(app))
+                    .transpose()?
+                    .unwrap_or_else(|| update::CURRENT.into());
+                let latest = update::check_for_version(&client, &prefs, &current).await?;
+                if let Some(release) = latest {
+                    if let Updates::Install { app } = command {
+                        let app = app
+                            .or_else(update::bundle)
+                            .context("请通过 --app 指定已安装的 Dauerbot.app")?;
+                        update::install(
+                            &client,
+                            &dir,
+                            &app,
+                            &release,
+                            |p| eprintln!("下载更新：{p}%"),
+                            false,
+                        )
+                        .await?;
+                        json!({"installed":release.version(),"restart_required":true})
+                    } else {
+                        json!({"current":update::CURRENT,"latest":release.version(),"notes":release.notes,"url":release.page})
+                    }
+                } else {
+                    json!({"current":update::CURRENT,"up_to_date":true})
+                }
+            }
+        };
+        print(&value);
+        return Ok(());
+    }
     let mut cfg = Config::load(&dir)?;
     if let Commands::Serve {
         port,
@@ -260,6 +355,7 @@ async fn main() -> Result<()> {
         );
         eprintln!("运行 hfb --data-dir '{}' ui 打开管理界面", dir.display());
         let shutdown = app.shutdown.clone();
+        let stop = app.shutdown.clone();
         let signal = async move {
             #[cfg(unix)]
             {
@@ -274,7 +370,9 @@ async fn main() -> Result<()> {
             shutdown.cancel();
         };
         axum::serve(listener, api::router(app))
-            .with_graceful_shutdown(signal)
+            .with_graceful_shutdown(async move {
+                tokio::select! { _ = signal => {}, _ = stop.cancelled() => {} }
+            })
             .await?;
         drop(lock);
         return Ok(());
@@ -358,7 +456,7 @@ async fn main() -> Result<()> {
             println!("[Unit]\nDescription=HERDR Feishu Bridge\nAfter=network-online.target\n\n[Service]\nExecStart=\"{}\" --data-dir \"{}\" serve\nRestart=on-failure\n\n[Install]\nWantedBy=default.target",exe.display(),dir.display());
             return Ok(())
         }
-        Commands::Serve{..}|Commands::Mcp{..}=>unreachable!(),
+        Commands::Serve{..}|Commands::Mcp{..}|Commands::Update{..}=>unreachable!(),
     };
     print(&value);
     Ok(())

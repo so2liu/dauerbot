@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 mod access;
 mod backend;
+mod updater;
 
 use backend::{Backend, CommandRequest, Reply};
 use gpui::{prelude::*, *};
@@ -17,7 +18,7 @@ const INK: u32 = 0x202a35;
 const MUTED: u32 = 0x74808c;
 const LINE: u32 = 0xe6e9ec;
 const ACCENT: u32 = 0x1c796c;
-const STEPS: [&str; 7] = [
+const STEPS: [&str; 8] = [
     "欢迎使用",
     "创建飞书机器人",
     "连接机器人",
@@ -25,8 +26,9 @@ const STEPS: [&str; 7] = [
     "本机访问权限",
     "添加首个项目",
     "项目工作台",
+    "应用更新",
 ];
-actions!(bridge, [Quit]);
+actions!(bridge, [Quit, ShowUpdates]);
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,6 +58,7 @@ struct Desktop {
     credentials_checked: bool,
     pending_message: String,
     pending_secret: String,
+    update_status: Value,
 }
 impl Desktop {
     fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -63,7 +66,7 @@ impl Desktop {
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
-        setup.page = setup.page.min(6);
+        setup.page = setup.page.min(7);
         let mut input = |placeholder: &'static str, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
@@ -121,6 +124,7 @@ impl Desktop {
             credentials_checked: false,
             pending_message: String::new(),
             pending_secret: String::new(),
+            update_status: Value::Null,
         }
     }
     fn receive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -128,6 +132,8 @@ impl Desktop {
         while let Ok(reply) = self.backend.rx.try_recv() {
             changed = true;
             match reply {
+                Reply::Update(status) => self.update_status = status,
+                Reply::Restart => cx.quit(),
                 Reply::State(value) => {
                     if self.state.is_null() {
                         self.notice = "本地服务已就绪，可以开始设置，也可以先创建本机项目".into();
@@ -220,7 +226,7 @@ impl Desktop {
         changed
     }
     fn go(&mut self, page: usize) {
-        self.setup.page = page.min(6);
+        self.setup.page = page.min(7);
         if let Ok(bytes) = serde_json::to_vec(&self.setup) {
             let _ = herdr_feishu_bridge::config::write_private(
                 &self.backend.dir.join("desktop.json"),
@@ -697,6 +703,50 @@ impl Desktop {
         }
         body.into_any_element()
     }
+    fn updates_page(&self, cx: &mut Context<Self>) -> Div {
+        let phase = self.update_status["phase"].as_str().unwrap_or("idle");
+        let running = matches!(phase, "checking" | "downloading" | "installing");
+        let automatic = self.update_status["preferences"]["automatic"]
+            .as_bool()
+            .unwrap_or(true);
+        let channel = self.update_status["preferences"]["channel"]
+            .as_str()
+            .unwrap_or("stable");
+        let message = self.update_status["message"]
+            .as_str()
+            .unwrap_or("正在初始化更新服务…");
+        div().flex().flex_col().gap_5()
+            .child(Self::title("UPDATES", "应用更新", "自动检查并下载签名更新，下次打开生效。项目文件、机器人配置和正在运行的主会话保留。"))
+            .child(Self::card("当前版本", &format!("Dauerbot {} · {}通道", env!("CARGO_PKG_VERSION"), if channel == "preview" { "预览" } else { "稳定" })))
+            .child(Self::card("更新状态", message))
+            .child(div().flex().gap_3().flex_wrap()
+                .child(Button::new("update-check").label("检查更新").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                    let _ = this.backend.updates.send(updater::Action::Check); cx.notify();
+                })))
+                .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").label("下载并安装").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                    let _ = this.backend.updates.send(updater::Action::Install); cx.notify();
+                }))))
+                .when(phase == "installed", |row| row.child(Button::new("update-restart").label("立即重启桌面").on_click(cx.listener(|this, _, _, cx| {
+                    let _ = this.backend.updates.send(updater::Action::Restart); cx.notify();
+                }))))
+                .when(self.update_status["rollback_available"].as_bool().unwrap_or(false), |row| row.child(Button::new("update-rollback").label("回退上一版").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                    let _ = this.backend.updates.send(updater::Action::Rollback); cx.notify();
+                }))))
+            )
+            .child(div().flex().gap_3()
+                .child(Button::new("update-auto").label(if automatic { "关闭自动升级" } else { "开启自动升级" }).on_click(cx.listener(move |this, _, _, cx| {
+                    let channel = this.update_status["preferences"]["channel"].as_str().unwrap_or("stable").to_owned();
+                    let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic: !automatic, channel }); cx.notify();
+                })))
+                .child(Button::new("update-channel").label(if channel == "stable" { "切换到预览通道" } else { "切换到稳定通道" }).on_click(cx.listener(|this, _, _, cx| {
+                    let channel = if this.update_status["preferences"]["channel"] == "preview" { "stable" } else { "preview" }.into();
+                    let automatic = this.update_status["preferences"]["automatic"].as_bool().unwrap_or(true);
+                    let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic, channel }); cx.notify();
+                })))
+            )
+            .child(Self::card("自动升级", "默认每 6 小时检查。关闭后仍可手动检查和安装；稳定通道只接收正式版本，预览通道也接收预发布版本。只有校验通过的同一开发者签名应用才会被安装。"))
+            .when(!self.update_status["notes"].as_str().unwrap_or("").is_empty(), |page| page.child(Self::card("版本说明", self.update_status["notes"].as_str().unwrap_or(""))))
+    }
 }
 impl Render for Desktop {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -718,7 +768,7 @@ impl Render for Desktop {
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
                     .mb_1()
-                    .child("herdr / bridge"),
+                    .child("Dauerbot"),
             )
             .child(
                 div()
@@ -727,7 +777,7 @@ impl Render for Desktop {
                     .mb_8()
                     .child("你的项目，始终在线"),
             );
-        for (i, step) in STEPS.iter().enumerate() {
+        for (i, step) in STEPS.iter().enumerate().take(7) {
             sidebar = sidebar.child(
                 div()
                     .id(("step", i))
@@ -753,13 +803,39 @@ impl Render for Desktop {
                     })),
             );
         }
-        sidebar = sidebar.child(div().flex_1()).child(
-            div()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .line_height(relative(1.8))
-                .child("NATIVE ON YOUR MAC\nRust · GPUI\n0.2.0 / 本地预览"),
-        );
+        sidebar = sidebar
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("updates-navigation")
+                    .px_3()
+                    .py_3()
+                    .mb_4()
+                    .rounded_lg()
+                    .text_sm()
+                    .cursor_pointer()
+                    .bg(rgb(if page == 7 { 0xe0ebe6 } else { 0xf1f3f2 }))
+                    .text_color(rgb(ACCENT))
+                    .child(if self.update_status["phase"] == "installed" {
+                        "应用更新 · 重启生效"
+                    } else {
+                        "应用更新"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.go(7);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .line_height(relative(1.8))
+                    .child(format!(
+                        "NATIVE ON YOUR MAC\nRust · GPUI\n{}",
+                        env!("CARGO_PKG_VERSION")
+                    )),
+            );
         let content = match page {
             0 => self.welcome(cx),
             1 => self.bot(cx),
@@ -767,7 +843,8 @@ impl Render for Desktop {
             3 => self.events(cx),
             4 => self.permissions(cx),
             5 => self.project_form(cx),
-            _ => self.workspace(cx),
+            6 => self.workspace(cx),
+            _ => self.updates_page(cx).into_any_element(),
         };
         div()
             .size_full()
@@ -835,11 +912,17 @@ fn main() {
         Theme::change(ThemeMode::Light, None, cx);
         Theme::global_mut(cx).colors.primary = rgb(ACCENT).into();
         Theme::global_mut(cx).colors.primary_hover = rgb(0x23685e).into();
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", ShowUpdates, None),
+        ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![Menu {
             name: "Dauerbot".into(),
-            items: vec![MenuItem::action("退出 Dauerbot", Quit)],
+            items: vec![
+                MenuItem::action("应用更新…", ShowUpdates),
+                MenuItem::action("退出 Dauerbot", Quit),
+            ],
         }]);
         let bounds = Bounds::centered(None, size(px(1180.), px(860.)), cx);
         cx.open_window(
@@ -854,6 +937,13 @@ fn main() {
             },
             |window, cx| {
                 let view = cx.new(|cx| Desktop::new(backend, window, cx));
+                let updates_view = view.clone();
+                cx.on_action(move |_: &ShowUpdates, cx| {
+                    updates_view.update(cx, |this, cx| {
+                        this.go(7);
+                        cx.notify();
+                    });
+                });
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )

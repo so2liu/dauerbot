@@ -19,6 +19,10 @@ pub enum CommandRequest {
     Database(PathBuf),
     Environment,
     Watch(String),
+    UpdatePreferences {
+        automatic: bool,
+        channel: String,
+    },
 }
 pub enum Reply {
     State(Value),
@@ -32,17 +36,22 @@ pub enum Reply {
     Environment(Vec<(String, String)>),
     Error(String),
     Connection(Option<String>),
+    Update(Value),
+    Restart,
 }
 
 pub struct Backend {
     pub tx: mpsc::Sender<CommandRequest>,
     pub rx: mpsc::Receiver<Reply>,
     pub dir: PathBuf,
+    pub updates: mpsc::Sender<crate::updater::Action>,
 }
 impl Backend {
     pub fn start(dir: PathBuf) -> Self {
         let (tx, requests) = mpsc::channel();
         let (replies, rx) = mpsc::channel();
+        let updates = crate::updater::start(dir.clone(), replies.clone());
+        let updater = updates.clone();
         let data = dir.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -67,6 +76,15 @@ impl Backend {
                     .connect_timeout(Duration::from_secs(1))
                     .timeout(Duration::from_secs(3))
                     .build()?;
+                if let Ok(state) = request(&probe, &cfg, "GET", "/state", None).await
+                    && state["version"]
+                        .as_str()
+                        .is_some_and(|v| v != herdr_feishu_bridge::update::CURRENT)
+                    && let Some(bundle) = herdr_feishu_bridge::update::bundle()
+                    && herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok()
+                {
+                    herdr_feishu_bridge::update::stop_service(&data, &cfg).await?;
+                }
                 if let Err(e) = request(&probe, &cfg, "GET", "/state", None).await {
                     if !connection_refused(&e) {
                         return Err(e);
@@ -134,6 +152,16 @@ impl Backend {
                             watched = id;
                             last_detail = Value::Null;
                         }
+                        Ok(CommandRequest::UpdatePreferences { automatic, channel }) => {
+                            let result =
+                                herdr_feishu_bridge::update::Preferences { automatic, channel }
+                                    .save(&data);
+                            if let Err(error) = result {
+                                let _ = replies.send(Reply::Error(format!("{error:#}")));
+                            } else {
+                                let _ = updater.send(crate::updater::Action::PreferencesChanged);
+                            }
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
@@ -184,7 +212,12 @@ impl Backend {
                 let _ = replies.send(Reply::Error(e.to_string()));
             }
         });
-        Self { tx, rx, dir }
+        Self {
+            tx,
+            rx,
+            dir,
+            updates,
+        }
     }
 }
 #[derive(Default)]

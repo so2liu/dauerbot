@@ -7,6 +7,7 @@ pub mod envelope;
 pub mod feishu;
 pub mod herdr;
 pub mod mcp;
+pub mod update;
 
 use anyhow::{Context, Result, bail};
 use config::Config;

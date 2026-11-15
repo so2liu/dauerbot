@@ -1,0 +1,97 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing main-branch release tag, e.g. v0.3.0"
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: dauerbot-release
+  cancel-in-progress: false
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Validate release tag and credentials
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          UPDATE_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          git merge-base --is-ancestor HEAD origin/main
+          test -n "$CERTIFICATE"
+          test -n "$UPDATE_KEY"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-arm64
+          workspaces: |
+            . -> desktop/target
+            desktop -> target
+      - name: Install pnpm
+        run: npm install --global pnpm@12.6.0
+      - name: Build and verify
+        run: |
+          set -euo pipefail
+          ./scripts/build-desktop.sh
+          pnpm --dir frontend check
+          cargo test --locked --release --target-dir desktop/target --tests
+          cargo test --locked --release --manifest-path desktop/Cargo.toml
+          cargo clippy --locked --release --target-dir desktop/target --all-targets -- -D warnings
+          cargo clippy --locked --release --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
+      - name: Import existing Apple signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain="$RUNNER_TEMP/dauerbot.keychain-db"
+          password="$(uuidgen)"
+          echo "::add-mask::$password"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign > /dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*) \([A-F0-9]\{40\}\) .*/\1/p' | head -n 1)"
+          test -n "$identity"
+          ./scripts/sign-macos.sh "$PWD/dist/Dauerbot.app" "$identity" "$keychain"
+      - name: Prepare signed update manifest and package
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/release-python"
+          "$RUNNER_TEMP/release-python/bin/pip" install 'PyNaCl==1.6.0'
+          "$RUNNER_TEMP/release-python/bin/python" scripts/prepare-release.py --tag "$RELEASE_TAG"
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/publish-release.py --tag "$RELEASE_TAG"
+      - name: Remove private signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/dauerbot.keychain-db" || true
+          rm -f "$RUNNER_TEMP/signing.p12"

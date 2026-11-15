@@ -221,6 +221,7 @@ async fn local_api_auth_origin_and_project_scope() {
         .await
         .unwrap();
     for (path, generation) in [
+        ("/service/shutdown".into(), "current"),
         (format!("/projects/{}/stop", p.id), "current"),
         (format!("/projects/{}/outbox", q.id), "current"),
         (format!("/projects/{}/ready", p.id), "stale"),
@@ -254,6 +255,14 @@ async fn local_api_auth_origin_and_project_scope() {
         .await
         .unwrap();
     assert_eq!(result.status(), 400);
+    let result = http
+        .post(format!("{url}/api/service/shutdown"))
+        .bearer_auth(&cfg.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), 200);
+    assert!(app.shutdown.is_cancelled());
     server.abort();
 }
 
