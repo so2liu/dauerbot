@@ -153,6 +153,73 @@ pub async fn subscribe(
     Ok((child, lines))
 }
 
+#[derive(Debug)]
+pub struct SessionStarting;
+impl std::fmt::Display for SessionStarting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The main session is still starting")
+    }
+}
+impl std::error::Error for SessionStarting {}
+
+/// Stable local placement survives App restarts and never inherits a mirrored space.
+pub fn view_labels(p: &Project, record: &Value) -> Value {
+    let existing = |key: &str| {
+        record["labels"][key]
+            .as_str()
+            .filter(|value| !value.is_empty() && !value.contains('/'))
+    };
+    let suffix = p.id.replace('-', "");
+    json!({
+        "herdr.space": existing("herdr.space").map(str::to_owned).unwrap_or_else(|| format!("spdauerbot{suffix}")),
+        "herdr.tab": existing("herdr.tab").map(str::to_owned).unwrap_or_else(|| format!("tbdauerbot{suffix}")),
+    })
+}
+
+/// Read only local panes; a mirrored terminal with the same short ID is unrelated.
+pub fn view_pane(layout: &Value, terminal: &str) -> Option<(String, Value)> {
+    for space in layout["spaces"].as_array()? {
+        let id = space["id"].as_str()?;
+        if id.contains('/') || space["machine"].as_str().is_some_and(|m| !m.is_empty()) {
+            continue;
+        }
+        for tab in space["tabs"].as_array().into_iter().flatten() {
+            if let Some(pane) = tab["terminals"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|pane| pane["terminal"] == terminal)
+                && let Some(id) = tab["id"].as_str()
+            {
+                return Some((id.to_owned(), pane["pane"].clone()));
+            }
+        }
+    }
+    None
+}
+
+pub async fn app_command(args: &[&str]) -> Result<Value> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new("herdr-app")
+            .kill_on_drop(true)
+            .args(args)
+            .output(),
+    )
+    .await
+    .context("Herdr App request timed out")?
+    .context("Cannot call herdr-app; install and open Herdr App first")?;
+    let result: Value =
+        serde_json::from_slice(&output.stdout).context("Herdr App returned invalid output")?;
+    if !output.status.success() || !result.is_object() {
+        bail!("Cannot reach Herdr App; open it and try Monitor again");
+    }
+    if let Some(error) = result["error"].as_str().filter(|e| !e.is_empty()) {
+        bail!("Cannot show the main session in Herdr App: {error}");
+    }
+    Ok(result)
+}
+
 pub fn check_identity(p: &Project, t: &Value) -> Result<()> {
     if t["state"] != "live" {
         bail!("The main session exited; resume it before continuing");
@@ -171,10 +238,11 @@ pub fn check_identity(p: &Project, t: &Value) -> Result<()> {
         && argv.get(3).and_then(Value::as_str) == Some(LOGIN_MARKER)
         && argv.get(4).and_then(Value::as_str) == Some(p.agent.as_str())
         && ["codex", "claude", "pi", "agy"].contains(&p.agent.as_str());
+    if wrapped && t["foreground"]["pid"] == t["pid"] && t["foreground"]["argv"] == t["argv"] {
+        return Err(SessionStarting.into());
+    }
     let program = if wrapped {
-        t["foreground"]["argv"][0]
-            .as_str()
-            .context("The main session is still starting")?
+        t["foreground"]["argv"][0].as_str().ok_or(SessionStarting)?
     } else {
         argv.first().and_then(Value::as_str).unwrap_or("")
     };
@@ -185,6 +253,18 @@ pub fn check_identity(p: &Project, t: &Value) -> Result<()> {
         bail!("The terminal returned to a shell; refusing automatic delivery");
     }
     Ok(())
+}
+
+/// App adoption temporarily enables restoration. Dauerbot retains its own sessions.
+/// A pending owned wrapper is safe to retain differently, but restored shells are not.
+pub fn should_disable_restoration(p: &Project, record: &Value) -> bool {
+    if record["keep"] != true || record["labels"]["hfb.owner"] != "herdr-feishu-bridge" {
+        return false;
+    }
+    match check_identity(p, record) {
+        Ok(()) => true,
+        Err(error) => error.is::<SessionStarting>(),
+    }
 }
 
 /// Only recognize the known workspace-trust dialog, never an arbitrary permission.
