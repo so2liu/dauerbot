@@ -29,6 +29,7 @@ pub struct Runtime {
     pub core_error: String,
     pub terminals: HashMap<String, Value>,
     pub issues: HashMap<String, String>,
+    pub view_errors: HashMap<String, String>,
 }
 
 pub struct App {
@@ -140,12 +141,135 @@ impl App {
         let terminal = herdr::rpc(&cfg, "terminal.get", json!({"terminal":address})).await?;
         let pid = terminal["pid"].as_i64().context("终端没有运行中的进程")?;
         self.db
-            .set_session(&p.id, Some(address), Some(pid), generation)
+            .set_session(&p.id, Some(address.clone()), Some(pid), generation)
             .await?;
         self.changed();
         self.notify.notify_one();
         self.runtime.write().await.issues.remove(&p.id);
+        if terminal["state"] != "live" {
+            let output = herdr::rpc(
+                &cfg,
+                "terminal.read",
+                json!({"terminal":address,"lines":20}),
+            )
+            .await
+            .ok();
+            bail!(
+                "{} 启动后已退出：{}",
+                p.agent,
+                output
+                    .as_ref()
+                    .and_then(|v| v["text"].as_str())
+                    .unwrap_or("请查看终端输出")
+            );
+        }
+        if cfg.core_session == "default"
+            && let Err(error) = self.show(&p.id).await
+        {
+            self.runtime
+                .write()
+                .await
+                .view_errors
+                .insert(p.id.clone(), error.to_string());
+        }
+        self.changed();
         self.db.project(&p.id).await
+    }
+    pub async fn show(&self, key: &str) -> Result<Value> {
+        let cfg = self.config.read().await.clone();
+        if cfg.core_session != "default" {
+            bail!(
+                "此项目位于独立 Core session，请使用 hfb session attach 接管，避免打开其它 Core 的同号终端"
+            );
+        }
+        let p = self.db.project(key).await?;
+        let t = p.terminal.as_deref().context("项目没有主会话，请先启动")?;
+        let record = herdr::rpc(&cfg, "terminal.get", json!({"terminal":t})).await?;
+        if record["state"] != "live" {
+            bail!("主会话已经退出，请先重新启动；可用 hfb session screen 查看退出输出");
+        }
+        herdr::check_identity(&p, &record)?;
+        // Herdr App may need a frame to observe the newly created Core terminal.
+        for attempt in 0..15 {
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::process::Command::new("herdr-app")
+                    .kill_on_drop(true)
+                    .args(["do", "terminal.keep", "--terminal", t, "--place", "tab"])
+                    .output(),
+            )
+            .await
+            .context("Herdr App 响应超时")?
+            .context("无法调用 herdr-app，请先安装并打开 Herdr App")?;
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+            let error = result["error"].as_str().unwrap_or("");
+            if output.status.success() && result.is_object() && error.is_empty() {
+                // Wait for the App's asynchronous pane adoption, not for the agent's turn.
+                for _ in 0..20 {
+                    let layout = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        tokio::process::Command::new("herdr-app").arg("ls").output(),
+                    )
+                    .await;
+                    if let Ok(Ok(layout)) = layout
+                        && let Ok(value) = serde_json::from_slice::<Value>(&layout.stdout)
+                        && let Some(spaces) = value["spaces"].as_array()
+                    {
+                        for space in spaces {
+                            if let Some(tabs) = space["tabs"].as_array() {
+                                for tab in tabs {
+                                    if tab["terminals"]
+                                        .as_array()
+                                        .is_some_and(|ts| ts.iter().any(|v| v["terminal"] == t))
+                                    {
+                                        if let Some(tab) = tab["id"].as_str() {
+                                            let _ = tokio::process::Command::new("herdr-app")
+                                                .args([
+                                                    "do",
+                                                    "tab.rename",
+                                                    "--id",
+                                                    tab,
+                                                    "--name",
+                                                    &format!("{} · 主会话", p.name),
+                                                ])
+                                                .output()
+                                                .await;
+                                        }
+                                        // A pane is for viewing; do not turn an exited CLI into an auto-restored shell.
+                                        herdr::rpc(
+                                            &cfg,
+                                            "terminal.keep",
+                                            json!({"terminal":t,"keep":false}),
+                                        )
+                                        .await?;
+                                        self.runtime.write().await.view_errors.remove(&p.id);
+                                        self.changed();
+                                        return Ok(
+                                            json!({"ok":true,"terminal":t,"pane":result["pane"]}),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                bail!("Herdr App 已接受展示请求，但未确认终端标签页；请点击「在 HERDR 监控」重试");
+            }
+            if error.contains("no running terminal") && attempt < 14 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            bail!(
+                "无法在 Herdr App 展示主会话：{}；请确认 Herdr App 已打开",
+                if error.is_empty() {
+                    "命令失败或返回格式无效"
+                } else {
+                    error
+                }
+            );
+        }
+        bail!("Herdr App 尚未发现主会话，请重试")
     }
     pub async fn stop(&self, key: &str) -> Result<()> {
         let _guard = self.session_lock.lock().await;
@@ -316,6 +440,79 @@ impl App {
     }
     pub fn workers(self: &Arc<Self>) {
         tokio::spawn(feishu::websocket(self.clone()));
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut attempted = HashSet::new();
+            loop {
+                tokio::select! {
+                    _ = app.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+                let Ok(projects) = app.db.projects().await else {
+                    continue;
+                };
+                // Keep only current generations; a running project gets at most one keypress.
+                attempted.retain(|key| projects.iter().any(|p| &p.generation == key));
+                for p in projects {
+                    if p.paused || p.ready || p.agent != "agy" || attempted.contains(&p.generation)
+                    {
+                        continue;
+                    }
+                    let Some(t) = &p.terminal else { continue };
+                    let observed = app.runtime.read().await.terminals.get(t).cloned();
+                    if !observed.is_some_and(|v| v["status"]["state"] == "blocked") {
+                        continue;
+                    }
+                    let _guard = app.session_lock.lock().await;
+                    let cfg = app.config.read().await.clone();
+                    let Ok(record) = herdr::rpc(&cfg, "terminal.get", json!({"terminal":t})).await
+                    else {
+                        continue;
+                    };
+                    if herdr::check_identity(&p, &record).is_err() {
+                        continue;
+                    }
+                    let Ok(screen) =
+                        herdr::rpc(&cfg, "terminal.read", json!({"terminal":t,"lines":0})).await
+                    else {
+                        continue;
+                    };
+                    if !herdr::is_project_trust(&p, &record, screen["text"].as_str().unwrap_or(""))
+                    {
+                        continue;
+                    }
+                    let Ok(current) = herdr::rpc(&cfg, "terminal.get", json!({"terminal":t})).await
+                    else {
+                        continue;
+                    };
+                    if current["status_ms"] != record["status_ms"]
+                        || !herdr::is_project_trust(
+                            &p,
+                            &current,
+                            screen["text"].as_str().unwrap_or(""),
+                        )
+                    {
+                        continue;
+                    }
+                    // Choosing a project authorizes trusting that exact directory.
+                    // Mark before sending: an uncertain response must not cause repeated Enter.
+                    attempted.insert(p.generation.clone());
+                    if let Err(error) = herdr::rpc(
+                        &cfg,
+                        "terminal.keys",
+                        json!({"terminal":t,"keys":["enter"]}),
+                    )
+                    .await
+                    {
+                        app.runtime.write().await.issues.insert(
+                            p.id,
+                            format!("目录信任确认结果不确定，请在 Herdr 查看：{error}"),
+                        );
+                        app.changed();
+                    }
+                }
+            }
+        });
         let app = self.clone();
         tokio::spawn(async move {
             loop {

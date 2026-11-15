@@ -18,6 +18,16 @@
 
 飞书凭证检查只验证已保存应用身份；事件订阅和应用发布为用户手动确认项。完整双向收发需要用户完成配置并向绑定聊天发出测试消息后才能确认。完整权限 JSON 包含 `im:message.group_msg`，用于接收群内全部用户回复；基础清单仅接收群内 @ 消息。群列表由真实 API 获取，不包含单聊。
 
+## HERDR 监控与目录信任追加验证
+
+修复 Antigravity 的启动提示必须通过 `-i` 传递、恢复使用 `--conversation`。默认 Core 中启动的主会话自动展示到 Herdr App 的“项目名 · 主会话”标签页；展示失败单独保留提示，Agent 继续运行。实机确认「双王 · 主会话」展示的是 Bridge 创建的原终端 `t1x4`，PID 46064。
+
+用户明确要求代为确认目录信任后，通过 `hc keys t1x4 enter` 确认了 `/Users/yangliu35/ai-videos/双王`。之后同一 PID 仍运行，状态从 `blocked / permission` 变为 `idle`。终端显示 Antigravity 1.5.9 的 `plan model not specified` 错误，因此该结果仅证明目录信任和原进程继续运行，不能算 MCP 已就绪或飞书已完成收发。
+
+自动目录信任实现限定为已识别的 Antigravity 对话框：同时核对项目目录、PID、代次、结构化 permission/trust 状态及当前选中的 Yes；确认前重新读取终端状态，每代进程最多发一次确认。回归测试覆盖其他目录、未选 Yes、普通工具权限、旧代次、PID 更换、退出进程和 MCP 已就绪后的拒绝路径。其他阻塞在 GPUI 显示“等待交互”，排队消息保留。
+
+本轮 `cargo test --locked --release --target-dir desktop/target --test invariants` 的 10 项全部通过；后端及 GPUI 的 `clippy --all-targets -- -D warnings` 通过（GPUI 上游 `block` 仍有 future-incompatibility 提示）。两个 release 二进制构建通过，安装包通过 ad-hoc 签名验证，已更新并重新打开 `~/Applications/Herdr Bridge.app`。重启 Bridge 后只读验证 Core 连接成功、项目仍指向同一终端/PID，`ready=false`；没有重启 Herdr Core 或 Agent。自动识别与拒绝条件经过回归测试，真实目录信任由本轮显式按键完成，尚未将未来首次启动的自动按键流程记为实机验收完成。
+
 ## 私聊、群聊与 Agent 自选目的地追加验证
 
 本轮后端测试增加 3 项，共 12 项通过、1 项真实飞书发送测试默认忽略；桌面权限逻辑 2 项通过。新增场景覆盖：未关联私聊的首条消息持久化及关联后重放、一个主会话接收多个群与私聊、显式关联优先于默认私聊项目、群消息不被私聊默认值接收、重新关联后全局 message_id 去重、旧主聊天接口无法抢占其他项目的接收聊天、XML 闭合注入与非法控制字符，以及 `to` 映射到飞书 `chat_id` / `open_id` 的真实 HTTP 请求和跨目的地幂等校验。
@@ -107,7 +117,7 @@ release 可执行文件为 **11,528,688 字节，约 11.0 MiB**，包括前端�
 
 ## 未验证
 
-- Antigravity `agy` 本机未安装，尚无实机结果。
+- Antigravity 1.5.9 已实机启动并通过项目目录信任；当前账号运行时报 `plan model not specified`，尚未完成真实 MCP 模型回合。
 - 用户真实飞书入站事件的权限和生产路由，未通过启动第二个监听器进行验证。
 - 原生会话恢复参数与 ID 登记已实现；每种厂商 CLI 的退出后恢复、授权窗口、上下文压缩尚未覆盖所有组合。
 - Linux/Windows 构建、整机重启、数小时运行和接近 100 MB 附件的压力场景。

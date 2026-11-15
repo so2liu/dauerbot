@@ -707,7 +707,16 @@ impl Desktop {
                 "{}  ·  {}  ·  {}",
                 project["name"].as_str().unwrap_or("项目"),
                 project["agent"].as_str().unwrap_or(""),
-                if project["ready"] == true {
+                if project["terminal"]
+                    .as_str()
+                    .is_some_and(|t| self.state["runtime"]["terminals"][t]["state"] == "finished")
+                {
+                    "已退出"
+                } else if project["terminal"].as_str().is_some_and(|t| {
+                    self.state["runtime"]["terminals"][t]["status"]["state"] == "blocked"
+                }) {
+                    "等待交互"
+                } else if project["ready"] == true {
                     "已就绪"
                 } else if !project["terminal"].is_null() {
                     "会话待就绪"
@@ -742,12 +751,33 @@ impl Desktop {
                 .unwrap_or_default();
             let terminal = project["terminal"].as_str().unwrap_or("尚未创建");
             let picker = self.conversation_picker(Some(&id), cx);
+            let issue = self.state["runtime"]["view_errors"][&id]
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            if !issue.is_empty() {
+                body = body.child(Self::card("Herdr App 展示提示", &issue));
+            }
+            if let Some(t) = project["terminal"].as_str()
+                && self.state["runtime"]["terminals"][t]["state"] == "finished"
+            {
+                body = body.child(Self::card("主会话已经退出", "点击「启动主会话」重新启动。启动成功后会自动在 Herdr App 展示；首次登录、项目信任和权限确认也会显示在那里。"));
+            }
+            if let Some(t) = project["terminal"].as_str()
+                && self.state["runtime"]["terminals"][t]["status"]["state"] == "blocked"
+            {
+                let reason = self.state["runtime"]["terminals"][t]["status"]["msg"]
+                    .as_str()
+                    .unwrap_or("CLI 正在等待交互");
+                body = body.child(Self::card("主会话正在等待交互", &format!("{reason}\n已识别的 Antigravity 项目目录信任会自动确认。其他登录、提问或权限提示可在 Herdr 中查看；排队消息会保留，原进程继续运行。")));
+            }
+
             body = body
                 .child(Self::card(project["name"].as_str().unwrap_or("项目"), &format!("{}\n终端：{}", project["path"].as_str().unwrap_or(""), terminal)))
                 .child(div().flex().flex_wrap().gap_2()
                     .child(self.btn("start", "启动主会话", move |this, _, _| this.api("POST", format!("/projects/{id}/start"), None, "启动请求已完成。等待主会话完成登录、信任和 MCP 登记"), cx).primary())
                     .child(self.btn("resume", "恢复会话", move |this, _, _| this.api("POST", format!("/projects/{id2}/resume"), None, "恢复请求已完成"), cx))
-                    .child(self.btn("show", "在 HERDR 打开", move |this, _, _| this.api("POST", format!("/projects/{id3}/show"), None, "已请求 HERDR 打开主会话"), cx))
+                    .child(self.btn("show", "在 HERDR 监控", move |this, _, _| this.api("POST", format!("/projects/{id3}/show"), None, "主会话已在 Herdr App 标签页中展示"), cx))
                     .child(self.btn("refresh-project", "刷新消息", move |this, _, _| this.api("GET", format!("/projects/{id4}"), None, "消息已刷新"), cx))
                     .child(self.btn("stop", "停止会话…", move |_this, window, cx| {
                         let answer = window.prompt(PromptLevel::Warning, "停止这个项目的主会话？", Some("将结束 Agent 及关联子终端。项目配置和消息记录会保留。"), &["取消", "停止"], cx);

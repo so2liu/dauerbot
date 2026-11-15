@@ -256,3 +256,76 @@ async fn local_api_auth_origin_and_project_scope() {
     assert_eq!(result.status(), 400);
     server.abort();
 }
+
+#[tokio::test]
+async fn antigravity_uses_interactive_prompt_flag_instead_of_a_positional_prompt() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut input = input(&dir, "交互式 AGY", "");
+    input.agent = "agy".into();
+    let mut p = db.create(input).await.unwrap();
+    let args = herdr::launch_args(
+        &p,
+        &dir.path().join("mcp.json"),
+        &json!({}),
+        "等待飞书任务",
+        false,
+    )
+    .unwrap();
+    assert_eq!(&args[args.len() - 2..], &["-i", "等待飞书任务"]);
+    assert!(!args.iter().any(|v| v == "-p" || v == "--print"));
+    p.native_session = "conversation-id".into();
+    let args = herdr::launch_args(
+        &p,
+        &dir.path().join("mcp.json"),
+        &json!({}),
+        "继续待命",
+        true,
+    )
+    .unwrap();
+    assert!(
+        args.windows(2)
+            .any(|v| v == ["--conversation", "conversation-id"])
+    );
+    assert_eq!(&args[args.len() - 2..], &["-i", "继续待命"]);
+}
+
+#[tokio::test]
+async fn workspace_trust_requires_exact_project_identity_and_selected_yes() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db.create(input(&dir, "信任边界", "")).await.unwrap();
+    p.agent = "agy".into();
+    p.generation = "generation".into();
+    p.terminal_pid = Some(123);
+    let t = json!({
+        "state":"live","pid":123,"cwd":p.path,"argv":["agy","-i","prompt"],
+        "labels":{"hfb.project":p.id,"hfb.generation":p.generation},
+        "status":{"app":"antigravity","state":"blocked","kind":"permission","msg":"Trust this folder?"}
+    });
+    let screen = format!(
+        "Accessing workspace:\n\n{}\n\nDo you trust the contents of this project?\n\n> Yes, I trust this folder\n  No, exit\n",
+        p.path
+    );
+    assert!(herdr::is_project_trust(&p, &t, &screen));
+    for invalid in [
+        screen.replace(&p.path, "/another/project"),
+        screen.replace("> Yes, I trust this folder", "  Yes, I trust this folder"),
+        "Allow shell command execution?".into(),
+    ] {
+        assert!(!herdr::is_project_trust(&p, &t, &invalid));
+    }
+    for (field, replacement) in [
+        ("/status/msg", json!("Allow this tool?")),
+        ("/labels/hfb.generation", json!("old")),
+        ("/pid", json!(999)),
+        ("/state", json!("finished")),
+        ("/cwd", json!("/another/project")),
+    ] {
+        let mut invalid = t.clone();
+        *invalid.pointer_mut(field).unwrap() = replacement;
+        assert!(!herdr::is_project_trust(&p, &invalid, &screen));
+    }
+    p.ready = true;
+    assert!(!herdr::is_project_trust(&p, &t, &screen));
+}

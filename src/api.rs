@@ -301,20 +301,7 @@ async fn pause(
     Ok(Json(json!({"ok":true})))
 }
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
-    if app.config.read().await.core_session != "default" {
-        return Err(anyhow::anyhow!("此项目位于独立 Core session，请使用 hfb session attach 接管，避免打开其它 Core 的同号终端").into());
-    }
-    let p = app.db.project(&id).await?;
-    let t = p.terminal.context("项目没有主会话")?;
-    let result = tokio::process::Command::new("herdr-app")
-        .args(["do", "terminal.keep", "--terminal", &t, "--place", "tab"])
-        .output()
-        .await
-        .context("请先打开 Herdr App")?;
-    if !result.status.success() {
-        return Err(anyhow::anyhow!("无法显示终端，请确认 Herdr App 已打开").into());
-    }
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(app.show(&id).await?))
 }
 async fn screen(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let p = app.db.project(&id).await?;

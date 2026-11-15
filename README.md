@@ -17,7 +17,7 @@ open "dist/Herdr Bridge.app"
 
 首次引导包括创建企业自建应用、启用机器人、填写并验证凭证、复制权限导入 JSON、配置长连接与消息订阅、发布应用和加群、本机权限检测、选择代码目录与 CLI。可以选择「先在本机试用」跳过飞书，稍后补齐。引导进度保存在本机，随时可重新打开；发布和订阅的手动确认不会显示为自动检测成功。
 
-在「添加项目」中通过 macOS 系统选择器选择目录，填写名称并选择 Codex / Claude Code / Pi / Antigravity。接收聊天从列表选择，支持搜索群名和最近消息；机器人所在群从飞书 API 获取，私聊在收到首条消息后自动发现。手动 ID 输入仅在高级设置中显示。在工作台选中项目后启动主会话；首次 CLI 登录、信任提示需要到 HERDR 处理。项目消息与状态自动刷新，停止会话前会弹出原生确认框。
+在「添加项目」中通过 macOS 系统选择器选择目录，填写名称并选择 Codex / Claude Code / Pi / Antigravity。接收聊天从列表选择，支持搜索群名和最近消息；机器人所在群从飞书 API 获取，私聊在收到首条消息后自动发现。手动 ID 输入仅在高级设置中显示。在工作台选中项目后启动主会话；默认 Core 的主会话会自动展示在 Herdr App 的「项目名 · 主会话」标签页。用户选择目录并启动，即授权信任该项目目录；当前会自动确认已识别的 Antigravity 目录信任提示，登录及其他交互仍在该终端中显示。项目消息与状态自动刷新，停止会话前会弹出原生确认框。
 
 本机访问采用按需引导：
 
@@ -81,7 +81,9 @@ hfb session resume my-project
 hfb message inject my-project '检查这个项目的目录结构，完成后回复飞书'
 ```
 
-Agent 启动后必须完成当前 CLI 的信任或登录流程。遇到权限问题，在 HERDR 中接管处理；Bridge 不强制回答 blocked 对话框。
+Agent 启动后必须完成当前 CLI 的信任或登录流程。Bridge 自动确认已识别的 Antigravity 项目目录信任：必须匹配当前项目目录、终端 PID/代次、结构化 trust 状态以及屏幕上已选中的 Yes；每代会话最多发送一次确认。其他 blocked 状态在桌面显示“等待交互”，可点击“在 HERDR 监控”查看；队列保留，继续使用原进程。
+
+「启动主会话」会创建一个 HERDR 托管的真实 CLI 进程，后续飞书消息持续进入同一终端。在 Herdr App 中可以查看完整实时输出、处理权限提示和直接输入；Bridge 的「在 HERDR 监控」也可以重新定位到该终端。展示失败会在项目中提示，进程启动后立即退出则返回实际错误，不误报为正在等待就绪。
 
 `session attach` 使用项目所属的 Core session 交互接管，按 `Ctrl+\` 脱离。使用独立 Core session 时，「在 HERDR 打开」会拒绝向默认 App 发送同号终端地址，以免打开其它会话；此时使用 CLI 接管。
 
@@ -92,12 +94,12 @@ Agent 启动后必须完成当前 CLI 的信任或登录流程。遇到权限问
 | Codex | 启动参数注入独立 MCP 配置，强制 `--no-daemon`；向 MCP 显式转发 `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` | 从 `session_ready` 的 MCP `threadId` 元信息登记；也可手动填写，然后使用 `codex resume` |
 | Claude Code | `--mcp-config` 加项目专用配置 | 新会话指定 UUID，恢复时使用 `--resume` |
 | Pi | 合并项目 `.pi/mcp.json` 中的 `herdr_feishu` 项 | 新会话指定 UUID，恢复时使用 `--session` |
-| Antigravity `agy` | 合并项目 `.agents/mcp_config.json` | 暂未提供专用恢复参数；可用自定义 argv |
+| Antigravity `agy` | 合并项目 `.agents/mcp_config.json`，使用 `-i` 传入交互启动提示 | `--conversation <原生会话 ID>` |
 | 自定义 CLI | 用生成的 stdio MCP 配置接入 | 通过自定义 argv 指定 CLI 自己的恢复方式 |
 
 Pi/Antigravity 的配置写入保留其他 MCP 项；遇到非法 JSON 或不属于本项目的同名项会拒绝覆盖。将这些本机配置加入对应项目的忽略规则，避免提交个人路径。
 
-自动投递要求终端报告 OSC 7501 的 `idle` 或 `done` 状态，并且 MCP 已确认会话身份。无法报告状态的 CLI 会保留消息，不按屏幕文字猜测是否能输入。Antigravity 启动配置已实现，本机未安装该 CLI，状态与恢复行为尚待实机验证。
+自动投递要求终端报告 OSC 7501 的 `idle` 或 `done` 状态，并且 MCP 已确认会话身份。无法报告状态的 CLI 会保留消息，不按屏幕文字猜测是否能输入。Antigravity 使用本机 `agy --help` 核对过的 `-i` 交互启动形式。模型登录、项目授权及恢复行为仍受当前安装版本约束。
 
 可在项目高级设置中填写额外启动参数。例如 CLI 的 `--model` 参数通过字符串数组保存。自定义 Agent 的数组则是完整 argv，不经过 shell，支持以下占位符：
 
@@ -184,7 +186,7 @@ SQLite 保存项目和收发队列。入站事件在返回 SDK ACK 前先入库�
 
 程序重启会将操作中的记录转为 `uncertain`，不盲目重发。PTY 和飞书之间没有原子提交，因此不承诺严格 exactly-once。`hc send` 的 started 也不作为某条业务消息的最终确认。
 
-Bridge 核对 Core 标签、会话代次、PID 和程序类型；程序返回 shell 或更换进程后拒绝自动投递。主终端不启用 `hc keep`，因为它恢复的是 shell。主机重启或 Agent 退出后，需按原生会话 ID 恢复。
+Bridge 核对 Core 标签、会话代次、PID 和程序类型；程序返回 shell 或更换进程后拒绝自动投递。通过 Herdr App 接入标签页时，App 会临时启用 keep；Bridge 在确认标签页已出现后将其关闭，避免 Agent 退出时自动恢复成 shell。主机重启或 Agent 退出后，需按原生会话 ID 恢复。
 
 ## 用户服务
 

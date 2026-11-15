@@ -129,6 +129,27 @@ pub fn check_identity(p: &Project, t: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Only recognize the known workspace-trust dialog, never an arbitrary permission.
+pub fn is_project_trust(p: &Project, t: &Value, screen: &str) -> bool {
+    if p.ready
+        || p.agent != "agy"
+        || check_identity(p, t).is_err()
+        || t["cwd"] != p.path
+        || t["status"]["state"] != "blocked"
+        || t["status"]["app"] != "antigravity"
+        || t["status"]["kind"] != "permission"
+        || t["status"]["msg"] != "Trust this folder?"
+    {
+        return false;
+    }
+    let lines: Vec<_> = screen.lines().map(str::trim).collect();
+    lines.contains(&p.path.as_str())
+        && lines.contains(&"Accessing workspace:")
+        && lines.contains(&"Do you trust the contents of this project?")
+        && lines.contains(&"> Yes, I trust this folder")
+        && lines.contains(&"No, exit")
+}
+
 pub fn launch_args(
     p: &Project,
     mcp_file: &Path,
@@ -193,10 +214,14 @@ pub fn launch_args(
             "codex" => argv.extend(["resume".into(), p.native_session.clone()]),
             "claude" => argv.extend(["--resume".into(), p.native_session.clone()]),
             "pi" => argv.extend(["--session".into(), p.native_session.clone()]),
+            "agy" => argv.extend(["--conversation".into(), p.native_session.clone()]),
             _ => bail!("该 Agent 请通过自定义 argv 指定恢复参数，或重新绑定已有终端"),
         }
     }
     if p.agent != "custom" {
+        if p.agent == "agy" {
+            argv.push("-i".into());
+        }
         argv.push(instructions.into());
     }
     Ok(argv)
