@@ -1,6 +1,6 @@
 # Project conventions
 
-Dauerbot is an open-source project for a global audience. English is the project language. Use English for repository descriptions, README and other documentation, code comments, user-facing UI and CLI text, release notes, commit messages, issue titles, and pull request titles and descriptions. This project-specific rule overrides the parent's default of Chinese commits and PRs. Preserve user content, proper names, and multilingual test fixtures in their original language. Do not rewrite published Git history to translate old commits.
+Dauerbot is an open-source project for a global audience. English is the project language. Use English for repository descriptions, README and other documentation, code comments, default UI and CLI text, release notes, commit messages, issue titles, and pull request titles and descriptions. This project-specific rule overrides the parent's default of Chinese commits and PRs. Desktop localization resources may provide English and Simplified Chinese UI, with a persistent user language preference. Keep English as the default and repository language. Preserve user content, proper names, and multilingual test fixtures in their original language. Do not rewrite published Git history to translate old commits.
 
 The user-facing client is the native Rust/GPUI macOS application in `desktop/`. Do not add a web interface, WebView, Svelte, or a JavaScript build toolchain. Desktop, CLI, and MCP share the independent Rust daemon's API. Network requests and file access checks must never block GPUI's main thread.
 

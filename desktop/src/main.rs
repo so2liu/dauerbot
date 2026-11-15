@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 mod access;
 mod backend;
+mod locale;
 mod updater;
 
 use backend::{Backend, CommandRequest, Reply};
@@ -10,6 +11,7 @@ use gpui_component::{
     input::{Input, InputState},
     *,
 };
+use locale::Language;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
@@ -18,7 +20,7 @@ const INK: u32 = 0x202a35;
 const MUTED: u32 = 0x74808c;
 const LINE: u32 = 0xe6e9ec;
 const ACCENT: u32 = 0x1c796c;
-const STEPS: [&str; 8] = [
+const STEPS: [&str; 9] = [
     "Welcome",
     "Create a Feishu bot",
     "Connect your bot",
@@ -27,6 +29,7 @@ const STEPS: [&str; 8] = [
     "Add your first project",
     "Workspace",
     "App Updates",
+    "Environment",
 ];
 actions!(bridge, [Quit, ShowUpdates]);
 
@@ -36,20 +39,19 @@ struct Setup {
     page: usize,
     events_confirmed: bool,
     published: bool,
+    language: Language,
 }
 struct Desktop {
     backend: Backend,
     independent_data: bool,
     setup: Setup,
     state: Value,
-    detail: Value,
     selected: String,
     picked_path: String,
     name: Entity<InputState>,
     path: Entity<InputState>,
     app_id: Entity<InputState>,
     secret: Entity<InputState>,
-    message: Entity<InputState>,
     agent: usize,
     notice: String,
     error: bool,
@@ -57,34 +59,31 @@ struct Desktop {
     access_result: String,
     environment: Vec<(String, String)>,
     credentials_checked: bool,
-    pending_message: String,
+    connection_error: Option<String>,
     pending_secret: String,
     update_status: Value,
 }
 impl Desktop {
+    fn tr(&self, text: &str) -> String {
+        self.setup.language.text(text)
+    }
     fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let independent_data = independent_data_dir(&backend.dir);
         let mut setup: Setup = std::fs::read(backend.dir.join("desktop.json"))
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
-        setup.page = setup.page.min(7);
+        setup.page = setup.page.min(8);
         let mut input = |placeholder: &'static str, cx: &mut Context<Self>| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+            cx.new(|cx| InputState::new(window, cx).placeholder(setup.language.text(placeholder)))
         };
         let name = input("For example: personal website", cx);
         let path = input("Choose the project folder", cx);
         let app_id = input("cli_…", cx);
         let secret = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Stored only on this Mac")
+                .placeholder(setup.language.text("Stored only on this Mac"))
                 .masked(true)
-        });
-        let message = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Send a task to the main session...")
-                .multi_line(true)
-                .rows(3)
         });
         let _ = backend.tx.send(CommandRequest::Environment);
         cx.spawn_in(window, async move |entity, cx| {
@@ -110,14 +109,12 @@ impl Desktop {
             independent_data,
             setup,
             state: Value::Null,
-            detail: Value::Null,
             selected: String::new(),
             picked_path: String::new(),
             name,
             path,
             app_id,
             secret,
-            message,
             agent: 0,
             notice: "Starting the local service...".into(),
             error: false,
@@ -125,7 +122,7 @@ impl Desktop {
             access_result: String::new(),
             environment: vec![],
             credentials_checked: false,
-            pending_message: String::new(),
+            connection_error: None,
             pending_secret: String::new(),
             update_status: Value::Null,
         }
@@ -152,26 +149,32 @@ impl Desktop {
                         && let Some(id) = value["bot_project"].as_str()
                     {
                         self.selected = id.to_owned();
-                        let _ = self.backend.tx.send(CommandRequest::Watch(id.to_owned()));
+                    }
+                    if self.state.is_null()
+                        && value["projects"]
+                            .as_array()
+                            .is_some_and(|projects| !projects.is_empty())
+                    {
+                        self.go(6);
+                    }
+                    if self.selected.is_empty()
+                        && let Some(id) = value["projects"]
+                            .as_array()
+                            .and_then(|projects| projects.first())
+                            .and_then(|project| project["id"].as_str())
+                    {
+                        self.selected = id.to_owned();
                     }
                     self.state = value;
                 }
-                Reply::Connection(Some(reason)) => {
-                    self.notice = format!("Local service connection failed: {reason}");
-                    self.error = true;
-                }
-                Reply::Connection(None) => {
-                    if self.notice.starts_with("Local service connection failed: ") {
+                Reply::Connection(reason) => {
+                    self.connection_error = reason;
+                    if self.connection_error.is_none() {
                         self.notice = "Local service connection restored".into();
                         self.error = false;
                     }
                 }
                 Reply::Environment(value) => self.environment = value,
-                Reply::Detail(value) => {
-                    if value["project"]["id"] == self.selected {
-                        self.detail = value;
-                    }
-                }
                 Reply::Access(text) => {
                     self.access_result = text;
                     self.busy = false;
@@ -195,13 +198,6 @@ impl Desktop {
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         self.pending_secret.clear();
                     }
-                    if path.ends_with("/messages")
-                        && self.message.read(cx).value().as_ref() == self.pending_message
-                    {
-                        self.message
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                        self.pending_message.clear();
-                    }
                     if !message.is_empty() {
                         self.notice = message;
                     }
@@ -210,19 +206,7 @@ impl Desktop {
                     }
                     if path == "/projects" {
                         self.selected = value["id"].as_str().unwrap_or_default().into();
-                        let _ = self
-                            .backend
-                            .tx
-                            .send(CommandRequest::Watch(self.selected.clone()));
                         self.go(6);
-                    } else if path.starts_with("/projects/")
-                        && !path.ends_with("/start")
-                        && !path.ends_with("/stop")
-                        && !path.ends_with("/resume")
-                        && value.get("project").is_some()
-                        && value["project"]["id"] == self.selected
-                    {
-                        self.detail = value;
                     }
                 }
             }
@@ -230,7 +214,7 @@ impl Desktop {
         changed
     }
     fn go(&mut self, page: usize) {
-        self.setup.page = page.min(7);
+        self.setup.page = page.min(8);
         if let Ok(bytes) = serde_json::to_vec(&self.setup) {
             let _ = herdr_feishu_bridge::config::write_private(
                 &self.backend.dir.join("desktop.json"),
@@ -267,11 +251,11 @@ impl Desktop {
             directories: !database,
             multiple: false,
             prompt: Some(
-                if database {
+                self.tr(if database {
                     "Choose a SQLite file to check"
                 } else {
                     "Choose a project folder"
-                }
+                })
                 .into(),
             ),
         });
@@ -310,14 +294,14 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) -> Button {
         Button::new(id)
-            .label(label)
+            .label(self.tr(label))
             .disabled(self.busy)
             .on_click(cx.listener(move |this, _, window, cx| {
                 action(this, window, cx);
                 cx.notify();
             }))
     }
-    fn title(kicker: &str, title: &str, description: &str) -> Div {
+    fn title(&self, kicker: &str, title: &str, description: &str) -> Div {
         div()
             .flex()
             .flex_col()
@@ -328,23 +312,26 @@ impl Desktop {
                     .text_xs()
                     .text_color(rgb(ACCENT))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(kicker.to_owned()),
+                    .child(self.tr(kicker)),
             )
             .child(
                 div()
                     .text_3xl()
                     .font_weight(FontWeight::BOLD)
-                    .child(title.to_owned()),
+                    .child(self.tr(title)),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(rgb(MUTED))
                     .line_height(relative(1.7))
-                    .child(description.to_owned()),
+                    .child(self.tr(description)),
             )
     }
-    fn card(title: &str, text: &str) -> Div {
+    fn card(&self, title: &str, text: &str) -> Div {
+        self.card_detail(title, &self.tr(text))
+    }
+    fn card_detail(&self, title: &str, text: &str) -> Div {
         div()
             .min_w_0()
             .p_5()
@@ -359,7 +346,7 @@ impl Desktop {
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_sm()
-                    .child(title.to_owned()),
+                    .child(self.tr(title)),
             )
             .child(
                 div()
@@ -369,7 +356,7 @@ impl Desktop {
                     .child(text.to_owned()),
             )
     }
-    fn field(label: &str, input: &Entity<InputState>) -> Div {
+    fn field(&self, label: &str, input: &Entity<InputState>) -> Div {
         div()
             .flex()
             .flex_col()
@@ -378,41 +365,38 @@ impl Desktop {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .child(label.to_owned()),
+                    .child(self.tr(label)),
             )
             .child(Input::new(input))
     }
     fn welcome(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("YOUR AGENTS, A LITTLE CLOSER", "Keep working.\nTake the conversation with you.", "Talk to your project's main session in Feishu, then continue on your Mac. Connect your first bot to get started."))
+            .child(self.title("YOUR AGENTS, A LITTLE CLOSER", "Keep working.\nTake the conversation with you.", "Talk to your project's main session in Feishu, then continue on your Mac. Connect your first bot to get started."))
             .child(div().flex().gap_4()
-                .child(Self::card("01  Connect Feishu", "Create an enterprise app bot. Credentials stay on your Mac." ).flex_1())
-                .child(Self::card("02  Choose a project", "Connect an installed CLI to a persistent HERDR session.").flex_1())
-                .child(Self::card("03  Continue the conversation", "Messages, tasks, and files reach the same main session.").flex_1()))
-            .child(Self::card("You control access", "Choose the project folder yourself. Protected files may require additional access; ordinary projects do not need Full Disk Access, Accessibility, or Screen Recording."))
+                .child(self.card("01  Connect Feishu", "Create an enterprise app bot. Credentials stay on your Mac." ).flex_1())
+                .child(self.card("02  Choose a project", "Connect an installed CLI to a persistent HERDR session.").flex_1())
+                .child(self.card("03  Continue the conversation", "Messages, tasks, and files reach the same main session.").flex_1()))
+            .child(self.card("You control access", "Choose the project folder yourself. Protected files may require additional access; ordinary projects do not need Full Disk Access, Accessibility, or Screen Recording."))
             .child(self.btn("begin", "Start setup →", |this, _, _| this.go(1), cx).primary())
             .child(self.btn("local-first", "Try locally and connect Feishu later", |this, _, _| this.go(5), cx))
-            .child(div().mt_6().text_sm().font_weight(FontWeight::SEMIBOLD).child("Local environment"))
-            .children(self.environment.iter().map(|(name, status)| div().flex().gap_4().text_sm().child(div().w_32().child(name.clone())).child(div().text_color(rgb(MUTED)).child(status.clone()))))
-            .child(self.btn("rescan", "Check environment again", |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Environment); }, cx))
             .into_any_element()
     }
     fn bot(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 01", "Create your Feishu bot", "Use an enterprise custom app with bot capability. Group Webhook bots cannot receive the messages needed for two-way conversations."))
-            .child(Self::card("1. Create an app", "Open the Feishu developer console and create an enterprise custom app. Give it a name and description. Your organization must allow you to create apps."))
+            .child(self.title("SETUP / 01", "Create your Feishu bot", "Use an enterprise custom app with bot capability. Group Webhook bots cannot receive the messages needed for two-way conversations."))
+            .child(self.card("1. Create an app", "Open the Feishu developer console and create an enterprise custom app. Give it a name and description. Your organization must allow you to create apps."))
             .child(self.btn("console", "Open Feishu developer console ↗", |_, _, cx| cx.open_url("https://open.feishu.cn/app"), cx).primary())
-            .child(Self::card("2. Enable bot capability", "Open the app and enable Bot under Add App Capabilities. You do not need a Webhook or a public server."))
-            .child(Self::card("3. Find the credentials", "Copy the App ID and App Secret from Credentials and Basic Information. Paste them into the next step on your Mac; do not send them in a chat."))
-            .child(Self::card("Already have a bot?", "Use a dedicated app for Dauerbot. If another program listens to the same bot, Feishu may deliver messages to that program instead."))
+            .child(self.card("2. Enable bot capability", "Open the app and enable Bot under Add App Capabilities. You do not need a Webhook or a public server."))
+            .child(self.card("3. Find the credentials", "Copy the App ID and App Secret from Credentials and Basic Information. Paste them into the next step on your Mac; do not send them in a chat."))
+            .child(self.card("Already have a bot?", "Use a dedicated app for Dauerbot. If another program listens to the same bot, Feishu may deliver messages to that program instead."))
             .child(self.btn("bot-next", "Bot enabled. Add credentials →", |this, _, _| this.go(2), cx).primary()).into_any_element()
     }
     fn credentials(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 02", "Connect the bot to this Mac", "The local service connects after you save. Credential validation checks app identity; message permissions and subscriptions come next."))
-            .child(Self::field("App ID", &self.app_id))
-            .child(Self::field("App Secret", &self.secret))
-            .child(div().text_xs().text_color(rgb(MUTED)).child("The secret stays masked and saved values are never shown. Leave it blank to keep the current secret; enter a new one when changing App ID. Credentials stay in a local file readable only by your user."))
+            .child(self.title("SETUP / 02", "Connect the bot to this Mac", "The local service connects after you save. Credential validation checks app identity; message permissions and subscriptions come next."))
+            .child(self.field("App ID", &self.app_id))
+            .child(self.field("App Secret", &self.secret))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr("The secret stays masked and saved values are never shown. Leave it blank to keep the current secret; enter a new one when changing App ID. Credentials stay in a local file readable only by your user.")))
             .child(self.btn("save-credentials", "Save and connect", |this, _, cx| {
                 let id = this.app_id.read(cx).value().to_string();
                 if !id.starts_with("cli_") { this.notice = "Enter an App ID starting with cli_".into(); this.error = true; return; }
@@ -422,19 +406,19 @@ impl Desktop {
                 this.api("PUT", "/settings".into(), Some(json!({"app_id":id,"app_secret":secret})), "Credentials saved. Validate them to continue.");
             }, cx).primary())
             .child(self.btn("check-credentials", "Validate credentials", |this, _, _| this.api("POST", "/settings/check".into(), None, "App identity verified. Configure message events next."), cx))
-            .child(Self::card("Connection status", &format!("{} · {}", self.state["runtime"]["feishu"].as_str().unwrap_or("Waiting for service"), self.state["runtime"]["feishu_error"].as_str().unwrap_or(""))))
+            .child(self.card("Connection status", &format!("{} · {}", self.tr(connection_status(self.state["runtime"]["feishu"].as_str().unwrap_or("Waiting for service"))), self.state["runtime"]["feishu_error"].as_str().unwrap_or(""))))
             .child(self.btn("credentials-next", "Configure message permissions →", |this, _, _| this.go(3), cx).primary().disabled(!self.credentials_checked || self.busy))
             .into_any_element()
     }
     fn events(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 03", "Receive messages and send replies", "Complete these steps in the Feishu developer console. Manual confirmations are separate from automatic checks."))
-            .child(Self::card("1. Import app permissions", "In Permissions, import the JSON below to send bot messages, receive direct messages and group mentions, read message resources, upload files, and read group context."))
+            .child(self.title("SETUP / 03", "Receive messages and send replies", "Complete these steps in the Feishu developer console. Manual confirmations are separate from automatic checks."))
+            .child(self.card("1. Import app permissions", "In Permissions, import the JSON below to send bot messages, receive direct messages and group mentions, read message resources, upload files, and read group context."))
             .child(self.btn("copy-scopes-full", "Copy full permission JSON (all group messages)", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(true)).unwrap())), cx).primary())
             .child(self.btn("copy-scopes", "Copy basic permission JSON (group mentions)", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(false)).unwrap())), cx))
-            .child(Self::card("2. Receive events over a long connection", "Under Events and Callbacks, choose long connections. Save valid credentials in Dauerbot and keep it running before saving the subscription. Add im.message.receive_v1 to receive messages."))
-            .child(Self::card("Need every group reply?", "The full JSON includes im:message.group_msg for all user messages in groups; your administrator may need to approve it. The basic set only receives bot mentions. All messages this bot receives reach its fixed project."))
-            .child(Self::card("3. Publish the app and add the bot", "Create a version in Version Management and Release, choose its availability, and publish it. Wait for administrator approval if required. Add the bot to a group or use direct messages. Publish a new version after changing permissions or subscriptions."))
+            .child(self.card("2. Receive events over a long connection", "Under Events and Callbacks, choose long connections. Save valid credentials in Dauerbot and keep it running before saving the subscription. Add im.message.receive_v1 to receive messages."))
+            .child(self.card("Need every group reply?", "The full JSON includes im:message.group_msg for all user messages in groups; your administrator may need to approve it. The basic set only receives bot mentions. All messages this bot receives reach its fixed project."))
+            .child(self.card("3. Publish the app and add the bot", "Create a version in Version Management and Release, choose its availability, and publish it. Wait for administrator approval if required. Add the bot to a group or use direct messages. Publish a new version after changing permissions or subscriptions."))
             .child(self.btn("confirmed-events", if self.setup.events_confirmed { "✓ Events and permissions confirmed manually" } else { "I configured permissions and event subscriptions" }, |this, _, _| { this.setup.events_confirmed = !this.setup.events_confirmed; this.go(3); }, cx))
             .child(self.btn("confirmed-release", if self.setup.published { "✓ Publishing and bot access confirmed manually" } else { "I published the app and made the bot available" }, |this, _, _| { this.setup.published = !this.setup.published; this.go(3); }, cx))
             .child(self.btn("events-next", "Check local permissions →", |this, _, _| this.go(4), cx).primary().disabled(!self.setup.events_confirmed || !self.setup.published))
@@ -442,12 +426,12 @@ impl Desktop {
     }
     fn permissions(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 04", "Grant access where you need it", "Checks reflect this process's actual access. The desktop, daemon, and HERDR agent may have different permissions."))
-            .child(Self::card("Project folder · required for project work", "Select a folder with the macOS picker to check reading and temporary-file creation. macOS may request access to Desktop, Documents, or Downloads. You can decline and choose another folder."))
+            .child(self.title("SETUP / 04", "Grant access where you need it", "Checks reflect this process's actual access. The desktop, daemon, and HERDR agent may have different permissions."))
+            .child(self.card("Project folder · required for project work", "Select a folder with the macOS picker to check reading and temporary-file creation. macOS may request access to Desktop, Documents, or Downloads. You can decline and choose another folder."))
             .child(self.btn("choose-access-folder", "Choose and check a project folder...", |this, window, cx| this.pick(false, window, cx), cx).primary())
-            .child(Self::card("Databases · when a task needs them", "Dauerbot's SQLite database lives in its private data directory. Select another database only when a task needs it. Checks read schema metadata without reading business records or scanning private app databases."))
+            .child(self.card("Databases · when a task needs them", "Dauerbot's SQLite database lives in its private data directory. Select another database only when a task needs it. Checks read schema metadata without reading business records or scanning private app databases."))
             .child(self.btn("choose-db", "Choose and check a SQLite database...", |this, window, cx| this.pick(true, window, cx), cx))
-            .child(Self::card("Full Disk Access · optional", "Protected app data may require Full Disk Access. In System Settings, add the app that actually runs the task, such as HERDR. Granting Dauerbot access does not grant it to existing HERDR processes. Reopen the relevant app and check again after granting access."))
+            .child(self.card("Full Disk Access · optional", "Protected app data may require Full Disk Access. In System Settings, add the app that actually runs the task, such as HERDR. Granting Dauerbot access does not grant it to existing HERDR processes. Reopen the relevant app and check again after granting access."))
             .child(div().flex().gap_3()
                 .child(self.btn("files-settings", "Open Files and Folders ↗", |_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"), cx))
                 .child(self.btn("disk-settings", "Open Full Disk Access ↗", |_, _, cx| cx.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"), cx)))
@@ -456,8 +440,8 @@ impl Desktop {
                     && let Some(bundle) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
                 { cx.reveal_path(bundle); }
             }, cx))
-            .child(Self::card("Accessibility, Screen Recording, and Automation", "Dauerbot manages sessions through HERDR's protocol, without screen capture or system input simulation. These permissions are not required."))
-            .when(!self.access_result.is_empty(), |view| view.child(Self::card("Access check result", &self.access_result)))
+            .child(self.card("Accessibility, Screen Recording, and Automation", "Dauerbot manages sessions through HERDR's protocol, without screen capture or system input simulation. These permissions are not required."))
+            .when(!self.access_result.is_empty(), |view| view.child(self.card("Access check result", &self.access_result)))
             .child(self.btn("access-next", "Add a project →", |this, _, _| this.go(5), cx).primary())
             .into_any_element()
     }
@@ -477,14 +461,14 @@ impl Desktop {
             );
         }
         div().flex().flex_col().gap_4()
-            .child(Self::title("SETUP / 05", "Create your first main session", "One bot belongs to one project. Direct and group messages reach its active agent, which you can switch in the workspace."))
-            .child(Self::field("Project name", &self.name))
-            .child(Self::field("Project folder (or enter an absolute path)", &self.path))
-            .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("Selected: {picked}"))))
+            .child(self.title("ADD PROJECT", "Add project", "One bot belongs to one project. Direct and group messages reach its active agent, which you can switch in the workspace."))
+            .child(self.field("Project name", &self.name))
+            .child(self.field("Project folder (or enter an absolute path)", &self.path))
+            .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("{} {picked}", self.tr("Selected:")))))
             .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
-            .child(Self::card("Automatic binding", "Your first project becomes this bot's fixed owner. You do not need to select chats or enter IDs. Direct and group messages both reach this project."))
-            .child(Self::card("Try it locally first", "Create a project, start an agent, and send local tasks before connecting Feishu. The CLI may require sign-in or project trust in HERDR on first use."))
+            .child(self.card("Automatic binding", "Your first project becomes this bot's fixed owner. You do not need to select chats or enter IDs. Direct and group messages both reach this project."))
+            .child(self.card("Continue in Herdr App", "Start a session and open it in Herdr App. Conversations happen in Feishu; the live CLI stays in Herdr."))
             .child(self.btn("create-project", "Create project →", |this, _, cx| {
                 let manual = this.path.read(cx).value().to_string();
                 let path = if manual.trim().is_empty() { this.picked_path.clone() } else { manual };
@@ -505,208 +489,338 @@ impl Desktop {
             .flex()
             .flex_col()
             .gap_4()
-            .child(Self::title(
+            .child(self.title(
                 "WORKSPACE",
-                "Your projects, within reach",
-                "Feishu conversations and local tasks meet here. Closing this window leaves the daemon and main session running.",
+                "Projects",
+                "Talk in Feishu. Follow the live session in Herdr App.",
             ))
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_3()
                     .child(
+                        self.connection_pill(
+                            "HERDR",
+                            self.state["runtime"]["core"]
+                                .as_str()
+                                .unwrap_or("Disconnected"),
+                        ),
+                    )
+                    .child(
+                        self.connection_pill(
+                            "Feishu",
+                            if self.state["settings"]["app_id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .is_empty()
+                            {
+                                "Not configured"
+                            } else {
+                                self.state["runtime"]["feishu"]
+                                    .as_str()
+                                    .unwrap_or("Disconnected")
+                            },
+                        ),
+                    ),
+            );
+        let mut project_actions = div().flex().flex_wrap().gap_2().child(self.btn(
+            "add-project",
+            "＋ Add project",
+            |this, _, _| this.go(5),
+            cx,
+        ));
+        let bot_error = self.state["runtime"]["feishu_error"].as_str().unwrap_or("");
+        if !bot_error.is_empty() {
+            body = body.child(self.card_detail("Feishu connection needs attention", bot_error));
+        }
+        if self.state["settings"]["app_id"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+            || !bot_error.is_empty()
+        {
+            project_actions = project_actions.child(self.btn(
+                "configure-bot",
+                "Configure bot",
+                |this, _, _| this.go(2),
+                cx,
+            ));
+        }
+        body = body.child(project_actions);
+        if projects.is_empty() {
+            body = body.child(self.card(
+                "No projects yet",
+                "Add a project, choose an agent, and start your main session.",
+            ));
+        }
+        for project in &projects {
+            let id = project["id"].as_str().unwrap_or_default().to_owned();
+            let terminal = project["terminal"]
+                .as_str()
+                .map(|t| &self.state["runtime"]["terminals"][t]);
+            let status = if project["paused"] == true {
+                "Delivery paused"
+            } else if terminal.is_some_and(|t| t["state"] == "finished") {
+                "Exited"
+            } else if terminal.is_some_and(|t| t["status"]["state"] == "blocked") {
+                "Needs input"
+            } else if terminal.is_some_and(|t| t["status"]["state"] == "error") {
+                "CLI error"
+            } else if project["ready"] == true {
+                "Ready"
+            } else if terminal.is_some() {
+                "Starting"
+            } else {
+                "Stopped"
+            };
+            body = body.child(
+                Button::new(SharedString::from(format!("project-{id}")))
+                    .label(format!(
+                        "{}  ·  {}  ·  {}",
+                        project["name"].as_str().unwrap_or("Project"),
+                        agent_name(project["agent"].as_str().unwrap_or("")),
+                        self.tr(status)
+                    ))
+                    .selected(id == self.selected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = id.clone();
+                        cx.notify();
+                    })),
+            );
+        }
+        if let Some(project) = selected {
+            let id = self.selected.clone();
+            let terminal = project["terminal"]
+                .as_str()
+                .map(|t| &self.state["runtime"]["terminals"][t]);
+            let live = terminal.is_some_and(|t| t["state"] != "finished");
+            body = body
+                .child(
+                    div()
+                        .p_5()
+                        .rounded_xl()
+                        .bg(rgb(0xffffff))
+                        .border_1()
+                        .border_color(rgb(LINE))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(project["name"].as_str().unwrap_or("Project").to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child(project["path"].as_str().unwrap_or("").to_owned()),
+                        ),
+                )
+                .child(div().text_sm().text_color(rgb(ACCENT)).child(self.tr(
+                    if self.state["bot_project"] == project["id"] {
+                        "Feishu bot bound · Direct and group messages reach this project"
+                    } else {
+                        "Local project"
+                    },
+                )));
+            if let Some(issue) = self.state["runtime"]["view_errors"][&id]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                body = body.child(self.card_detail("Could not open Herdr App", issue));
+            }
+            if terminal.is_some_and(|t| t["status"]["state"] == "blocked") {
+                body = body.child(self.card(
+                    "The main session needs input",
+                    "Open Herdr App to continue sign-in or answer the CLI prompt.",
+                ));
+            }
+            if terminal.is_some_and(|t| t["status"]["state"] == "error") {
+                body = body
+                    .child(self.card("CLI error", "Open Herdr App to see the error and continue."));
+            }
+            let mut controls = div().flex().flex_wrap().gap_2();
+            if live {
+                let show_id = id.clone();
+                let stop_id = id.clone();
+                controls = controls
+                    .child(
                         self.btn(
-                            "add-project",
-                            "＋ Add project",
-                            |this, _, _| {
-                                this.go(5);
+                            "show",
+                            "Monitor in Herdr App",
+                            move |this, _, _| {
+                                this.api(
+                                    "POST",
+                                    format!("/projects/{show_id}/show"),
+                                    None,
+                                    "Main session opened in a Herdr App tab",
+                                )
                             },
                             cx,
                         )
                         .primary(),
                     )
                     .child(self.btn(
-                        "return-setup",
-                        "Reopen setup guide",
-                        |this, _, _| this.go(0),
+                        "stop",
+                        "Stop session...",
+                        move |this, window, cx| {
+                            let answer = window.prompt(
+                                PromptLevel::Warning,
+                                &this.tr("Stop this project's main session?"),
+                                Some(&this.tr(
+                                    "This ends the CLI process. Project settings stay intact.",
+                                )),
+                                &[this.tr("Cancel").as_str(), this.tr("Stop").as_str()],
+                                cx,
+                            );
+                            let id = stop_id.clone();
+                            cx.spawn(async move |entity, cx| {
+                                if answer.await.ok() == Some(1) {
+                                    let _ = entity.update(cx, |this, _| {
+                                        this.api(
+                                            "POST",
+                                            format!("/projects/{id}/stop"),
+                                            None,
+                                            "Session stopped",
+                                        )
+                                    });
+                                }
+                            })
+                            .detach();
+                        },
                         cx,
-                    )),
-            )
-            .child(Self::card(
-                "Live connections",
-                &format!(
-                    "HERDR: {}    Feishu: {}",
-                    self.state["runtime"]["core"].as_str().unwrap_or("Waiting for service"),
-                    self.state["runtime"]["feishu"].as_str().unwrap_or("Disconnected")
-                ),
-            ));
-        if projects.is_empty() {
-            body = body.child(Self::card(
-                "No projects yet",
-                "Add a project to get started. You can try a local main session before connecting Feishu.",
-            ));
-        }
-        for project in &projects {
-            let id = project["id"].as_str().unwrap_or_default().to_owned();
-            let label = format!(
-                "{}  ·  {}  ·  {}",
-                project["name"].as_str().unwrap_or("Project"),
-                project["agent"].as_str().unwrap_or(""),
-                if project["terminal"]
-                    .as_str()
-                    .is_some_and(|t| self.state["runtime"]["terminals"][t]["state"] == "finished")
-                {
-                    "Exited"
-                } else if project["terminal"].as_str().is_some_and(|t| {
-                    self.state["runtime"]["terminals"][t]["status"]["state"] == "blocked"
-                }) {
-                    "Needs input"
-                } else if project["terminal"].as_str().is_some_and(|t| {
-                    self.state["runtime"]["terminals"][t]["status"]["state"] == "error"
-                }) {
-                    "CLI error"
-                } else if project["ready"] == true {
-                    "Ready"
-                } else if !project["terminal"].is_null() {
-                    "Waiting for session"
+                    ));
+            } else {
+                let start_id = id.clone();
+                let resume_id = id.clone();
+                controls = controls
+                    .child(
+                        self.btn(
+                            "start",
+                            "Start main session",
+                            move |this, _, _| {
+                                this.api(
+                                    "POST",
+                                    format!("/projects/{start_id}/start"),
+                                    None,
+                                    "Starting the main session...",
+                                )
+                            },
+                            cx,
+                        )
+                        .primary(),
+                    )
+                    .child(self.btn(
+                        "resume",
+                        "Resume session",
+                        move |this, _, _| {
+                            this.api(
+                                "POST",
+                                format!("/projects/{resume_id}/resume"),
+                                None,
+                                "Resume requested",
+                            )
+                        },
+                        cx,
+                    ));
+            }
+            let paused = project["paused"].as_bool().unwrap_or(false);
+            let pause_id = id.clone();
+            controls = controls.child(self.btn(
+                "pause",
+                if paused {
+                    "Resume Feishu delivery"
                 } else {
-                    "Stopped"
-                }
+                    "Pause Feishu delivery"
+                },
+                move |this, _, _| {
+                    this.api(
+                        "POST",
+                        format!("/projects/{pause_id}/pause"),
+                        Some(json!({"paused": !paused})),
+                        if paused {
+                            "Feishu delivery resumed"
+                        } else {
+                            "Feishu delivery paused"
+                        },
+                    )
+                },
+                cx,
+            ));
+            body = body.child(controls).child(
+                div()
+                    .mt_4()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.tr("Active agent")),
             );
-            body = body.child(
-                Button::new(SharedString::from(format!("project-{id}")))
-                    .label(label)
-                    .selected(id == self.selected)
-                    .on_click(cx.listener(move |this, _, _, _| {
-                        this.selected = id.clone();
-                        this.detail = Value::Null;
-                        let _ = this.backend.tx.send(CommandRequest::Watch(id.clone()));
-                        this.api("GET", format!("/projects/{id}"), None, "Project selected");
-                    })),
-            );
-        }
-        if let Some(project) = selected {
-            let id = self.selected.clone();
-            let id2 = id.clone();
-            let id3 = id.clone();
-            let id4 = id.clone();
-            let id5 = id.clone();
-            let id7 = id.clone();
-            let messages = self.detail["messages"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let terminal = project["terminal"].as_str().unwrap_or("Not created");
-            let mut agent_controls = div().flex().flex_wrap().gap_2();
-            for (index, (agent, label)) in [
-                ("codex", "Codex"),
-                ("claude", "Claude Code"),
-                ("pi", "Pi"),
-                ("agy", "Antigravity"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            let mut choices = div().flex().flex_wrap().gap_2();
+            for (index, agent) in ["codex", "claude", "pi", "agy"].into_iter().enumerate() {
                 let project_id = id.clone();
-                agent_controls = agent_controls.child(
+                choices = choices.child(
                     Button::new(("switch-agent", index))
-                        .label(label)
+                        .label(agent_name(agent))
                         .selected(project["agent"] == agent)
                         .disabled(self.busy || project["agent"] == agent)
-                        .on_click(cx.listener(move |this, _, _, _| {
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             this.api(
                                 "POST",
                                 format!("/projects/{project_id}/agent"),
                                 Some(json!({"agent":agent})),
                                 "Agent switched. The bot and project binding are preserved.",
                             );
+                            cx.notify();
                         })),
                 );
             }
-            let issue = self.state["runtime"]["view_errors"][&id]
-                .as_str()
-                .unwrap_or("")
-                .to_owned();
-            if !issue.is_empty() {
-                body = body.child(Self::card("Herdr App notice", &issue));
-            }
-            if let Some(t) = project["terminal"].as_str()
-                && self.state["runtime"]["terminals"][t]["state"] == "finished"
-            {
-                body = body.child(Self::card("The main session exited", "Start the main session again. Its terminal will appear in Herdr App, including sign-in, project trust, and approval prompts."));
-            }
-            if let Some(t) = project["terminal"].as_str()
-                && self.state["runtime"]["terminals"][t]["status"]["state"] == "blocked"
-            {
-                let reason = self.state["runtime"]["terminals"][t]["status"]["msg"]
-                    .as_str()
-                    .unwrap_or("The CLI needs input");
-                body = body.child(Self::card("The main session needs input", &format!("{reason}\nRecognized Antigravity project-trust prompts are confirmed automatically. Handle other sign-in, question, or approval prompts in Herdr. Queued messages and the current process remain intact.")));
-            }
-            if let Some(t) = project["terminal"].as_str()
-                && self.state["runtime"]["terminals"][t]["status"]["state"] == "error"
-            {
-                let reason = self.state["runtime"]["terminals"][t]["status"]["msg"]
-                    .as_str()
-                    .unwrap_or("The CLI reported an error. Check Herdr for details.");
-                body = body.child(Self::card("CLI error", reason));
-            }
-
             body = body
-                .child(Self::card(project["name"].as_str().unwrap_or("Project"), &format!("{}\nTerminal: {}", project["path"].as_str().unwrap_or(""), terminal)))
-                .child(Self::card("Feishu bot", if self.state["bot_project"] == project["id"] {
-                    "Bound to this project. All direct and group messages this bot receives reach the active agent without per-chat binding."
-                } else {
-                    "This is a local project. The current Feishu bot belongs to another project."
-                }))
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Active agent · click to switch"))
-                .child(agent_controls)
-                .child(div().text_xs().text_color(rgb(MUTED)).child("Switching stops the current agent and starts a new main session. The project, bot binding, and message queue stay intact."))
-                .child(div().flex().flex_wrap().gap_2()
-                    .child(self.btn("start", "Start main session", move |this, _, _| this.api("POST", format!("/projects/{id}/start"), None, "Start requested. Waiting for sign-in, project trust, and MCP registration."), cx).primary())
-                    .child(self.btn("resume", "Resume session", move |this, _, _| this.api("POST", format!("/projects/{id2}/resume"), None, "Resume requested"), cx))
-                    .child(self.btn("show", "Monitor in HERDR", move |this, _, _| this.api("POST", format!("/projects/{id3}/show"), None, "Main session opened in a Herdr App tab"), cx))
-                    .child(self.btn("refresh-project", "Refresh messages", move |this, _, _| this.api("GET", format!("/projects/{id4}"), None, "Messages refreshed"), cx))
-                    .child(self.btn("stop", "Stop session...", move |_this, window, cx| {
-                        let answer = window.prompt(PromptLevel::Warning, "Stop this project's main session?", Some("This ends the agent and its child terminals. Project settings and message history stay intact."), &["Cancel", "Stop"], cx);
-                        let id = id5.clone();
-                        cx.spawn(async move |entity, cx| {
-                            if answer.await.ok() == Some(1) { let _ = entity.update(cx, |this, _| this.api("POST", format!("/projects/{id}/stop"), None, "Session stopped")); }
-                        }).detach();
-                    }, cx)))
-                    .child(Self::field("Local task", &self.message))
-                .child(self.btn("inject", "Send to main session", move |this, _, cx| {
-                    let text = this.message.read(cx).value().to_string();
-                    if text.trim().is_empty() { return; }
-                    this.pending_message = text.clone();
-                    this.api("POST", format!("/projects/{id7}/messages"), Some(json!({"content":text})), "Task queued. Check message history for acknowledgment and replies.");
-                }, cx).primary())
-                .child(Self::card("Check message delivery", "Send a direct message to the bot or post in its group. Check the incoming record, agent acknowledgment, and outgoing reply. The agent uses to to select a chat or user; Feishu permissions determine which group messages arrive."))
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Message history"));
-            if messages.is_empty() {
-                body = body.child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child("No messages yet. Refresh to check again."),
-                );
-            }
-            for item in messages.iter().rev().take(30) {
-                body = body.child(Self::card(
-                    &format!(
-                        "{} · {}",
-                        item["direction"].as_str().unwrap_or(""),
-                        item["status"].as_str().unwrap_or("")
-                    ),
-                    &format!(
-                        "{}\n{}",
-                        item["content"].as_str().unwrap_or(""),
-                        item["error"].as_str().unwrap_or("")
-                    ),
-                ));
-            }
+                .child(choices)
+                .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr(
+                    "Switching restarts the main session. Project and bot bindings stay intact.",
+                )));
         }
         body.into_any_element()
+    }
+    fn connection_pill(&self, name: &str, status: &str) -> Div {
+        let status = connection_status(status);
+        div()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .bg(rgb(0xe8eeeb))
+            .text_sm()
+            .child(format!("{} · {}", self.tr(name), self.tr(status)))
+    }
+    fn environment_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(self.title(
+                "ENVIRONMENT",
+                "Local environment",
+                "Installed command-line tools. Check sign-in inside each CLI.",
+            ))
+            .children(self.environment.iter().map(|(name, status)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_sm()
+                    .child(self.tr(name))
+                    .child(div().text_color(rgb(MUTED)).child(self.tr(status)))
+            }))
+            .child(self.btn(
+                "rescan",
+                "Check environment again",
+                |this, _, _| {
+                    let _ = this.backend.tx.send(CommandRequest::Environment);
+                },
+                cx,
+            ))
+            .into_any_element()
     }
     fn updates_page(&self, cx: &mut Context<Self>) -> Div {
         let phase = self.update_status["phase"].as_str().unwrap_or("idle");
@@ -717,47 +831,65 @@ impl Desktop {
         let channel = self.update_status["preferences"]["channel"]
             .as_str()
             .unwrap_or("stable");
-        let message = self.update_status["message"]
-            .as_str()
-            .unwrap_or("Starting the update service...");
+        let message = match phase {
+            "checking" => self.tr("Checking for updates..."),
+            "available" => format!(
+                "{} {}",
+                self.tr("New version available:"),
+                self.update_status["latest"].as_str().unwrap_or("")
+            ),
+            "downloading" | "installing" => format!(
+                "{} {}%",
+                self.tr("Downloading and verifying update"),
+                self.update_status["progress"].as_u64().unwrap_or(0)
+            ),
+            "installed" => self.tr("Update installed. Restart the desktop to apply."),
+            "current" => self.tr("You have the latest version on this channel"),
+            "error" => format!(
+                "{}\n{}",
+                self.tr("Update failed"),
+                self.update_status["message"].as_str().unwrap_or("")
+            ),
+            _ => self.tr("Automatic checks run every six hours when enabled."),
+        };
         div().flex().flex_col().gap_5()
-            .child(Self::title("UPDATES", "App Updates", "Signed updates download in the background and take effect next time you open the app. Project files, bot settings, and active sessions stay intact."))
-            .child(Self::card("Current version", &format!("Dauerbot {} · {} channel", env!("CARGO_PKG_VERSION"), if channel == "preview" { "preview" } else { "stable" })))
-            .child(Self::card("Update status", message))
+            .child(self.title("UPDATES", "App Updates", "Signed updates download in the background and take effect next time you open the app. Project files, bot settings, and active sessions stay intact."))
+            .child(self.card("Current version", &format!("Dauerbot {} · {}", env!("CARGO_PKG_VERSION"), self.tr(if channel == "preview" { "Preview channel" } else { "Stable channel" }))))
+            .child(self.card("Update status", &message))
             .child(div().flex().gap_3().flex_wrap()
-                .child(Button::new("update-check").label("Check for updates").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .child(Button::new("update-check").label(self.tr("Check for updates")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Check); cx.notify();
                 })))
-                .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").label("Download and install").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").label(self.tr("Download and install")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Install); cx.notify();
                 }))))
-                .when(phase == "installed", |row| row.child(Button::new("update-restart").label("Restart desktop now").on_click(cx.listener(|this, _, _, cx| {
+                .when(phase == "installed", |row| row.child(Button::new("update-restart").label(self.tr("Restart desktop now")).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Restart); cx.notify();
                 }))))
-                .when(self.update_status["rollback_available"].as_bool().unwrap_or(false), |row| row.child(Button::new("update-rollback").label("Roll back").disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .when(self.update_status["rollback_available"].as_bool().unwrap_or(false), |row| row.child(Button::new("update-rollback").label(self.tr("Roll back")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.updates.send(updater::Action::Rollback); cx.notify();
                 }))))
             )
             .child(div().flex().gap_3()
-                .child(Button::new("update-auto").label(if automatic { "Disable automatic updates" } else { "Enable automatic updates" }).on_click(cx.listener(move |this, _, _, cx| {
+                .child(Button::new("update-auto").label(self.tr(if automatic { "Disable automatic updates" } else { "Enable automatic updates" })).on_click(cx.listener(move |this, _, _, cx| {
                     let channel = this.update_status["preferences"]["channel"].as_str().unwrap_or("stable").to_owned();
                     let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic: !automatic, channel }); cx.notify();
                 })))
-                .child(Button::new("update-channel").label(if channel == "stable" { "Switch to preview channel" } else { "Switch to stable channel" }).on_click(cx.listener(|this, _, _, cx| {
+                .child(Button::new("update-channel").label(self.tr(if channel == "stable" { "Switch to preview channel" } else { "Switch to stable channel" })).on_click(cx.listener(|this, _, _, cx| {
                     let channel = if this.update_status["preferences"]["channel"] == "preview" { "stable" } else { "preview" }.into();
                     let automatic = this.update_status["preferences"]["automatic"].as_bool().unwrap_or(true);
                     let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic, channel }); cx.notify();
                 })))
             )
-            .child(Self::card("Automatic updates", "Checks run every six hours by default. Manual updates remain available when automatic updates are off. Stable excludes prereleases; preview includes them. Installation requires a verified signature from the same developer."))
-            .when(!self.update_status["notes"].as_str().unwrap_or("").is_empty(), |page| page.child(Self::card("Release notes", self.update_status["notes"].as_str().unwrap_or(""))))
+            .child(self.card("Automatic updates", "Checks run every six hours by default. Manual updates remain available when automatic updates are off. Stable excludes prereleases; preview includes them. Installation requires a verified signature from the same developer."))
+            .when(!self.update_status["notes"].as_str().unwrap_or("").is_empty(), |page| page.child(self.card("Release notes", self.update_status["notes"].as_str().unwrap_or(""))))
     }
 }
 impl Render for Desktop {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let page = self.setup.page;
         let mut sidebar = div()
-            .w(px(226.))
+            .w(px(206.))
             .flex_shrink_0()
             .h_full()
             .flex()
@@ -765,7 +897,7 @@ impl Render for Desktop {
             .bg(rgb(0xf1f3f2))
             .border_r_1()
             .border_color(rgb(LINE))
-            .px_5()
+            .px_4()
             .py_8()
             .gap_2()
             .child(
@@ -773,37 +905,39 @@ impl Render for Desktop {
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
                     .mb_1()
-                    .child("Dauerbot"),
+                    .child(self.tr("Dauerbot")),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .mb_8()
-                    .child("Your projects, always available"),
+                    .child(self.tr("Project & Bot Manager")),
             );
-        for (i, step) in STEPS.iter().enumerate().take(7) {
+        for (index, label) in [
+            (6, "Workspace"),
+            (5, "Add project"),
+            (1, "Feishu bot setup"),
+            (4, "macOS permissions"),
+            (8, "Environment"),
+        ] {
+            if index == 1 {
+                sidebar = sidebar.child(div().mt_4().mb_2().border_t_1().border_color(rgb(LINE)));
+            }
+            let active = page == index || (index == 1 && matches!(page, 0..=3));
             sidebar = sidebar.child(
                 div()
-                    .id(("step", i))
+                    .id(("navigation", index))
                     .px_3()
                     .py_3()
                     .rounded_lg()
                     .text_sm()
                     .cursor_pointer()
-                    .bg(rgb(if i == page { 0xe0ebe6 } else { 0xf1f3f2 }))
-                    .text_color(rgb(if i == page { ACCENT } else { MUTED }))
-                    .child(format!(
-                        "{}   {}",
-                        if i == 6 {
-                            "↗".into()
-                        } else {
-                            format!("{:02}", i + 1)
-                        },
-                        step
-                    ))
+                    .bg(rgb(if active { 0xe0ebe6 } else { 0xf1f3f2 }))
+                    .text_color(rgb(if active { ACCENT } else { MUTED }))
+                    .child(self.tr(label))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.go(i);
+                        this.go(index);
                         cx.notify();
                     })),
             );
@@ -815,17 +949,15 @@ impl Render for Desktop {
                     .id("updates-navigation")
                     .px_3()
                     .py_3()
-                    .mb_4()
                     .rounded_lg()
                     .text_sm()
                     .cursor_pointer()
-                    .bg(rgb(if page == 7 { 0xe0ebe6 } else { 0xf1f3f2 }))
                     .text_color(rgb(ACCENT))
-                    .child(if self.update_status["phase"] == "installed" {
+                    .child(self.tr(if self.update_status["phase"] == "installed" {
                         "App Updates · restart to apply"
                     } else {
                         "App Updates"
-                    })
+                    }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.go(7);
                         cx.notify();
@@ -833,13 +965,10 @@ impl Render for Desktop {
             )
             .child(
                 div()
+                    .px_3()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .line_height(relative(1.8))
-                    .child(format!(
-                        "NATIVE ON YOUR MAC\nRust · GPUI\n{}",
-                        env!("CARGO_PKG_VERSION")
-                    )),
+                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
             );
         let content = match page {
             0 => self.welcome(cx),
@@ -849,7 +978,8 @@ impl Render for Desktop {
             4 => self.permissions(cx),
             5 => self.project_form(cx),
             6 => self.workspace(cx),
-            _ => self.updates_page(cx).into_any_element(),
+            7 => self.updates_page(cx).into_any_element(),
+            _ => self.environment_page(cx),
         };
         div()
             .size_full()
@@ -876,18 +1006,20 @@ impl Render for Desktop {
                             .border_color(rgb(LINE))
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(format!("Workspace  /  {}", STEPS[page]))
-                            .child(if self.independent_data {
-                                "●  Independent data directory"
-                            } else if self.busy {
-                                "●  Working"
-                            } else {
-                                "●  Private local workspace"
-                            }),
+                            .child(self.tr(STEPS[page]))
+                            .child(Button::new("language").label(if self.setup.language == Language::En { "简体中文" } else { "English" }).on_click(cx.listener(|this, _, window, cx| {
+                                this.setup.language = this.setup.language.other();
+                                this.go(this.setup.page);
+                                this.name.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("For example: personal website"), window, cx));
+                                this.path.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Choose the project folder"), window, cx));
+                                this.secret.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Stored only on this Mac"), window, cx));
+                                set_menus(this.setup.language, cx);
+                                cx.notify();
+                            }))),
                     )
                     .child(
                         div()
-                            .id("content-scroll")
+                            .id(("content-scroll", page))
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
@@ -903,11 +1035,18 @@ impl Render for Desktop {
                                                 .rounded_lg()
                                                 .bg(rgb(0xfff1ce))
                                                 .text_sm()
-                                                .child("Independent instance · This window uses separate data from your everyday workspace.")
+                                                .child(self.tr("Independent instance · This window uses separate data from your everyday workspace."))
                                                 .child(div().mt_2().text_xs().child(
                                                     self.backend.dir.display().to_string(),
                                                 )),
                                         )
+                                    })
+                                    .when(matches!(page, 1..=3), |view| {
+                                        let mut steps = div().flex().flex_wrap().gap_2().mb_6();
+                                        for (index, label) in [(1, "Create bot"), (2, "Connect bot"), (3, "Permissions & events")] {
+                                            steps = steps.child(Button::new(("setup-stage", index)).label(format!("{}  {}", index, self.tr(label))).selected(page == index).on_click(cx.listener(move |this, _, _, cx| { this.go(index); cx.notify(); })));
+                                        }
+                                        view.child(steps)
                                     })
                                     .child(content),
                             ),
@@ -920,10 +1059,38 @@ impl Render for Desktop {
                             .border_color(rgb(LINE))
                             .text_xs()
                             .text_color(rgb(if self.error { 0xb44343 } else { MUTED }))
-                            .child(self.notice.clone()),
+                            .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
                     ),
             )
     }
+}
+fn connection_status(status: &str) -> &str {
+    match status {
+        "connected" | "receiving" => "Connected",
+        "connecting" => "Connecting",
+        "awaiting_events" => "Connected · Waiting for messages",
+        "unconfigured" | "not_configured" => "Not configured",
+        "disconnected" | "" => "Disconnected",
+        other => other,
+    }
+}
+fn agent_name(agent: &str) -> &'static str {
+    match agent {
+        "codex" => "Codex",
+        "claude" => "Claude Code",
+        "pi" => "Pi",
+        "agy" => "Antigravity",
+        _ => "Agent",
+    }
+}
+fn set_menus(language: Language, cx: &mut App) {
+    cx.set_menus(vec![Menu {
+        name: "Dauerbot".into(),
+        items: vec![
+            MenuItem::action(language.text("App Updates…"), ShowUpdates),
+            MenuItem::action(language.text("Quit Dauerbot"), Quit),
+        ],
+    }]);
 }
 fn independent_data_dir(dir: &std::path::Path) -> bool {
     let default = herdr_feishu_bridge::config::default_dir();
@@ -952,13 +1119,12 @@ fn main() {
             KeyBinding::new("cmd-,", ShowUpdates, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.set_menus(vec![Menu {
-            name: "Dauerbot".into(),
-            items: vec![
-                MenuItem::action("App Updates…", ShowUpdates),
-                MenuItem::action("Quit Dauerbot", Quit),
-            ],
-        }]);
+        let language = std::fs::read(backend.dir.join("desktop.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Setup>(&bytes).ok())
+            .map(|setup| setup.language)
+            .unwrap_or_default();
+        set_menus(language, cx);
         let bounds = Bounds::centered(None, size(px(1180.), px(860.)), cx);
         cx.open_window(
             WindowOptions {
@@ -991,4 +1157,24 @@ fn main() {
         })
         .detach();
     });
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::{Language, Setup};
+
+    #[test]
+    fn existing_preferences_keep_setup_progress_and_language_round_trips() {
+        let old = r#"{"page":3,"events_confirmed":true,"published":false}"#;
+        let mut setup: Setup = serde_json::from_str(old).unwrap();
+        assert_eq!(setup.language, Language::En);
+        assert_eq!(setup.page, 3);
+        assert!(setup.events_confirmed);
+        setup.language = Language::Zh;
+        let encoded = serde_json::to_vec(&setup).unwrap();
+        let reloaded: Setup = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(reloaded.language, Language::Zh);
+        assert_eq!(reloaded.page, 3);
+        assert!(reloaded.events_confirmed);
+    }
 }
