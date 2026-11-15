@@ -367,7 +367,7 @@ pub async fn context(app: &App, m: &db::Message) -> Value {
     let source = &m.attachment["source"];
     let chat = source["chat_id"].as_str().unwrap_or("");
     if source["chat_type"] != "group" {
-        return json!({"members_status":"not_applicable","members":[]});
+        return json!({});
     }
     let cached = app
         .db

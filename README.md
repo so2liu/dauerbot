@@ -165,12 +165,11 @@ hfb session switch my-project --agent agy
   <members status="snapshot" truncated="false" includes_bots="false">
     <member id="ou_person" id_type="open_id" name="小明"/>
   </members>
-  <mentions/>
   <body type="text" trust="user_input">请把结果私聊给我</body>
 </feishu_message>
 ```
 
-Agent 可以据此调用 `send_markdown(to="ou_person", text="结果…", request_id="…")`。私聊使用同样的结构，`chat_type="p2p"`，无需群成员快照。未知姓名和 ID 留空；群成员 API 只返回人类成员，最多获取一页（100 个分页额度，平台可能返回更多同批加入成员），超过时标记 `truncated=true`。快照缓存五分钟，权限不足或超时时标记 `unavailable`，不阻止正文投递，也不虚构成员。首次配置权限时可导入工作台提供的群成员读取权限。
+Agent 可以据此调用 `send_markdown(to="ou_person", text="结果…", request_id="…")`。私聊使用 `chat_type="p2p"`，直接省略群聊的 `<chat>` 和 `<members>` 元数据，不输出 `not_applicable` 占位。没有 @ 提及时省略 `<mentions>`。群聊适用但未能读取成员时仍保留 `status="unavailable"`，与“不适用”区分。未知姓名和 ID 留空；群成员 API 只返回人类成员，最多获取一页（100 个分页额度，平台可能返回更多同批加入成员），超过时标记 `truncated=true`。快照缓存五分钟，权限不足或超时时标记 `unavailable`，不阻止正文投递，也不虚构成员。首次配置权限时可导入工作台提供的群成员读取权限。
 
 ## 持久化与交付状态
 

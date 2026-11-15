@@ -147,6 +147,21 @@ async fn xml_preserves_real_source_and_cannot_be_closed_by_user_text() {
     assert!(xml.contains("&lt;/body&gt;"));
     assert!(xml.contains("members status=\"unavailable\""));
     assert_eq!(message.content, body);
+    let mut private = message.clone();
+    private.attachment["source"]["chat_type"] = json!("p2p");
+    let xml = envelope::render(
+        &private,
+        &json!({"name":"旧群名","members_status":"not_applicable","members":[{"member_id":"ou_other","name":"旧群成员"}]}),
+        None,
+    );
+    assert!(xml.contains("chat_type=\"p2p\""));
+    assert!(xml.contains("<sender "));
+    assert!(xml.contains("&lt;/body&gt;"));
+    assert!(!xml.contains("<chat "));
+    assert!(!xml.contains("<members"));
+    assert!(!xml.contains("<mentions"));
+    assert!(!xml.contains("not_applicable"));
+    assert!(!xml.contains("旧群成员"));
 }
 
 #[derive(Clone, Default)]

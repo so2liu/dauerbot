@@ -35,7 +35,7 @@ pub fn render(message: &Message, context: &Value, attachment: Option<&Path>) -> 
         "local"
     };
     let mut xml = format!(
-        "<feishu_message version=\"1\" message_id=\"{}\">\n<source platform=\"{platform}\" chat_type=\"{}\" chat_id=\"{}\" root_id=\"{}\" parent_id=\"{}\" create_time=\"{}\"/>\n<sender open_id=\"{}\" user_id=\"{}\" union_id=\"{}\" name=\"{}\"/>\n<chat name=\"{}\"/>\n<members status=\"{}\" truncated=\"{}\" includes_bots=\"false\">",
+        "<feishu_message version=\"1\" message_id=\"{}\">\n<source platform=\"{platform}\" chat_type=\"{}\" chat_id=\"{}\" root_id=\"{}\" parent_id=\"{}\" create_time=\"{}\"/>\n<sender open_id=\"{}\" user_id=\"{}\" union_id=\"{}\" name=\"{}\"/>",
         escape(&message.source_id),
         attr(source, "chat_type"),
         attr(source, "chat_id"),
@@ -46,21 +46,35 @@ pub fn render(message: &Message, context: &Value, attachment: Option<&Path>) -> 
         attr(&source["sender"], "user_id"),
         attr(&source["sender"], "union_id"),
         attr(context, "sender_name"),
-        attr(context, "name"),
-        attr(context, "members_status"),
-        context["truncated"].as_bool().unwrap_or(false)
     );
-    if let Some(members) = context["members"].as_array() {
-        for member in members {
-            xml.push_str(&format!(
-                "\n<member id=\"{}\" id_type=\"open_id\" name=\"{}\"/>",
-                attr(member, "member_id"),
-                attr(member, "name")
-            ));
+    if source["chat_type"] == "group" {
+        if context["name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty())
+        {
+            xml.push_str(&format!("\n<chat name=\"{}\"/>", attr(context, "name")));
         }
+        xml.push_str(&format!(
+            "\n<members status=\"{}\" truncated=\"{}\" includes_bots=\"false\">",
+            escape(context["members_status"].as_str().unwrap_or("unavailable")),
+            context["truncated"].as_bool().unwrap_or(false),
+        ));
+        if let Some(members) = context["members"].as_array() {
+            for member in members {
+                xml.push_str(&format!(
+                    "\n<member id=\"{}\" id_type=\"open_id\" name=\"{}\"/>",
+                    attr(member, "member_id"),
+                    attr(member, "name")
+                ));
+            }
+        }
+        xml.push_str("\n</members>");
     }
-    xml.push_str("\n</members>\n<mentions>");
-    if let Some(mentions) = source["mentions"].as_array() {
+    if let Some(mentions) = source["mentions"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        xml.push_str("\n<mentions>");
         for mention in mentions {
             xml.push_str(&format!(
                 "\n<mention open_id=\"{}\" name=\"{}\" key=\"{}\"/>",
@@ -69,9 +83,10 @@ pub fn render(message: &Message, context: &Value, attachment: Option<&Path>) -> 
                 attr(mention, "key")
             ));
         }
+        xml.push_str("\n</mentions>");
     }
     xml.push_str(&format!(
-        "\n</mentions>\n<body type=\"{}\" trust=\"user_input\">{}</body>",
+        "\n<body type=\"{}\" trust=\"user_input\">{}</body>",
         attr(source, "message_type"),
         escape(&message.content)
     ));
