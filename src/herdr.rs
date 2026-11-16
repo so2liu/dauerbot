@@ -283,15 +283,16 @@ pub fn managed_name(generation: &str) -> Result<String> {
 }
 
 /// Probe through the same login shell and cwd used by the actual native launch.
-/// Older Codex builds do not recognize this flag; their normal PTY is already
-/// dedicated. Newer builds need it to avoid reusing a daemon's terminal context.
+/// Older Codex builds lack no-daemon; their normal PTY is already dedicated.
+/// Advertised hook-trust bypass applies the user's automatic permission choice
+/// to the managed native hook without writing global hook-trust settings.
 async fn compatible_launch_args(
     config: &Config,
     p: &Project,
     argv: &[String],
 ) -> Result<Vec<String>> {
     let mut effective = argv.to_vec();
-    if p.agent != "codex" || argv.iter().any(|arg| arg == "--no-daemon") {
+    if p.agent != "codex" {
         return Ok(effective);
     }
     let probe = login_shell_args(vec!["codex".into(), "--help".into()]);
@@ -307,10 +308,14 @@ async fn compatible_launch_args(
             "The selected Codex CLI could not show its capabilities; run codex --help in your terminal"
         );
     }
-    let advertised = String::from_utf8_lossy(&output.stdout).contains("--no-daemon")
-        || String::from_utf8_lossy(&output.stderr).contains("--no-daemon");
-    if advertised {
-        effective.insert(1, "--no-daemon".into());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for flag in ["--no-daemon", "--dangerously-bypass-hook-trust"] {
+        if (stdout.contains(flag) || stderr.contains(flag))
+            && !effective.iter().any(|arg| arg == flag)
+        {
+            effective.insert(1, flag.into());
+        }
     }
     Ok(effective)
 }
@@ -997,36 +1002,58 @@ pub fn launch_network_env(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustSelection {
+    Yes,
+    No,
+}
+
 /// Recognize only the native workspace trust screen already authorized by the user.
 pub fn is_project_trust(p: &Project, t: &Value, screen: &str) -> bool {
+    project_trust_selection(p, t, screen).is_some()
+}
+
+fn project_trust_selection(p: &Project, t: &Value, screen: &str) -> Option<TrustSelection> {
     if p.ready
         || !matches!(p.agent.as_str(), "agy" | "claude")
         || t["cwd"] != p.path
         || t["status"]["state"] != "blocked"
         || check_execution_identity(p, t).is_err()
     {
-        return false;
+        return None;
     }
     let lines: Vec<_> = screen.lines().map(str::trim).collect();
     if !lines.contains(&p.path.as_str()) {
-        return false;
+        return None;
     }
     match p.agent.as_str() {
-        "agy" => {
-            lines.contains(&"Accessing workspace:")
+        "agy"
+            if lines.contains(&"Accessing workspace:")
                 && lines.contains(&"Do you trust the contents of this project?")
                 && lines.contains(&"> Yes, I trust this folder")
-                && lines.contains(&"No, exit")
+                && lines.contains(&"No, exit") =>
+        {
+            Some(TrustSelection::Yes)
         }
-        "claude" => {
-            lines.iter().any(|line| {
+        "claude"
+            if lines.iter().any(|line| {
                 line.starts_with(
                     "Quick safety check: Is this a project you created or one you trust?",
                 )
-            }) && lines.contains(&"❯ 1. Yes, I trust this folder")
-                && lines.contains(&"2. No, exit")
+            }) =>
+        {
+            if (lines.contains(&"❯ 1. Yes, I trust this folder") && lines.contains(&"2. No, exit"))
+                || (lines.contains(&"❯ Yes, I trust this folder") && lines.contains(&"No, exit"))
+            {
+                Some(TrustSelection::Yes)
+            } else if lines.contains(&"❯ No, exit") && lines.contains(&"Yes, I trust this folder")
+            {
+                Some(TrustSelection::No)
+            } else {
+                None
+            }
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -1054,9 +1081,31 @@ pub async fn confirm_project_trust(config: &Config, p: &Project) -> Result<()> {
     // A recorded attempt is never repeated after a transport failure or restart.
     // Recheck the exact screen and generation after committing that decision.
     let latest = observe(config, p).await?;
-    let screen = screen(config, p, 0).await?;
-    if !is_project_trust(p, &latest, &screen) {
-        bail!("The workspace trust prompt changed before confirmation");
+    let text = screen(config, p, 0).await?;
+    let selected = project_trust_selection(p, &latest, &text)
+        .context("The workspace trust prompt changed before confirmation")?;
+    if selected == TrustSelection::No {
+        rpc(
+            config,
+            "pane.send_keys",
+            json!({"pane_id":execution.pane_id,"keys":["Down"]}),
+        )
+        .await?;
+        // Send one navigation key, then prove the affirmative selection appeared.
+        // A delayed redraw is allowed, but uncertainty never triggers Enter.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let latest = observe(config, p).await?;
+                let text = screen(config, p, 0).await?;
+                match project_trust_selection(p, &latest, &text) {
+                    Some(TrustSelection::Yes) => return Ok::<(), anyhow::Error>(()),
+                    Some(TrustSelection::No) => tokio::time::sleep(Duration::from_millis(40)).await,
+                    None => bail!("The workspace trust prompt changed during navigation"),
+                }
+            }
+        })
+        .await
+        .context("The workspace trust selection did not update; continue in the terminal")??;
     }
     rpc(
         config,
@@ -1239,6 +1288,112 @@ mod tests {
                 definitely_not_sent(&error),
                 "A failed socket connection wrote no request bytes"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_trust_moves_once_and_verifies_yes_before_enter() {
+        for changed_after_navigation in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cfg = Config {
+                herdr_session: dir.path().to_string_lossy().into_owned(),
+                ..Config::default()
+            };
+            let db = crate::db::Db::open(&dir.path().join("db")).unwrap();
+            let mut p = db
+                .create(crate::db::ProjectInput {
+                    name: "Trust navigation".into(),
+                    path: dir.path().to_string_lossy().into_owned(),
+                    agent: "claude".into(),
+                    chat_id: String::new(),
+                    native_session: String::new(),
+                    extra_args: vec![],
+                })
+                .await
+                .unwrap();
+            p.generation = uuid::Uuid::new_v4().to_string();
+            p.terminal = Some("term_uuid".into());
+            p.terminal_pid = Some(100);
+            let name = managed_name(&p.generation).unwrap();
+            p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_uuid","managed_name":name,"generation":p.generation,"shell_pid":100,"launch_permit":dir.path().join("launch.permit")});
+            let pane = json!({"pane_id":"w1:p1","workspace_id":"w1","terminal_id":"term_uuid","agent":"claude","agent_status":"blocked","cwd":p.path,"tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":p.generation,"hfb_execution":name}});
+            let no = format!(
+                "Quick safety check: Is this a project you created or one you trust? (Like your own code\n{}\n❯ No, exit\nYes, I trust this folder",
+                p.path
+            );
+            let yes = no.replace("❯ No, exit\nYes,", "No, exit\n❯ Yes,");
+            let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
+            let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = keys.clone();
+            let worker = tokio::spawn(async move {
+                let mut selected_yes = false;
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (input, mut output) = stream.into_split();
+                    let request: Value = serde_json::from_str(
+                        &BufReader::new(input)
+                            .lines()
+                            .next_line()
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let mut finish = false;
+                    let result = match request["method"].as_str().unwrap() {
+                        "pane.get" => json!({"pane":pane}),
+                        "agent.get" => json!({"agent":pane}),
+                        "pane.process_info" => {
+                            json!({"process_info":{"shell_pid":100,"foreground_processes":[{"pid":100,"name":"Claude.exe","argv":["claude"]}]}})
+                        }
+                        "pane.read" => {
+                            assert!(request["params"].get("lines").is_none());
+                            let text = if selected_yes && changed_after_navigation {
+                                "Unrelated permission prompt"
+                            } else if selected_yes {
+                                &yes
+                            } else {
+                                &no
+                            };
+                            json!({"read":{"text":text}})
+                        }
+                        "pane.send_keys" => {
+                            let key = request["params"]["keys"][0].as_str().unwrap();
+                            observed.lock().unwrap().push(key.to_owned());
+                            if key == "Down" {
+                                assert!(!selected_yes);
+                                selected_yes = true;
+                            } else {
+                                assert_eq!(key, "Enter");
+                                assert!(selected_yes && !changed_after_navigation);
+                                finish = true;
+                            }
+                            json!({})
+                        }
+                        method => panic!("Unexpected request {method}"),
+                    };
+                    output
+                        .write_all(
+                            format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    if finish {
+                        break;
+                    }
+                }
+            });
+            let result = confirm_project_trust(&cfg, &p).await;
+            if changed_after_navigation {
+                assert!(result.is_err());
+                assert_eq!(*keys.lock().unwrap(), ["Down"]);
+                worker.abort();
+            } else {
+                result.unwrap();
+                worker.await.unwrap();
+                assert_eq!(*keys.lock().unwrap(), ["Down", "Enter"]);
+            }
+            assert!(dir.path().join("trust.attempted").exists());
         }
     }
 
