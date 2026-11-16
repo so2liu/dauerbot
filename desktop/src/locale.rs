@@ -42,6 +42,12 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "Background service" => "后台服务",
+            "Service update available" => "后台服务可更新",
+            "Update background service" => "更新后台服务",
+            "The compatible background service keeps running when the desktop updates. Updating it briefly reconnects messages and tools; Agent sessions keep running." => {
+                "桌面更新时兼容的后台服务会继续运行。更新后台服务会短暂重连消息和工具；智能体会话继续运行。"
+            }
             "FEISHU BOT" => "飞书机器人",
             "Bot connection" => "机器人连接",
             "Connection lost or authentication failed; check this project's bot credentials and event subscriptions" => {
