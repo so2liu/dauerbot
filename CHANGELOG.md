@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 — 2026-11-16
+
+### Fixed
+
+- Start the background HERDR server directly instead of loading an interactive login shell. A Mac mini migration exposed shell initialization blocking server startup indefinitely. Native Agent sessions still load their login shell and existing settings.
+- Keep task instructions on separate readable lines in Agent prompts, with formatted metadata and ordinary quotation marks instead of escaped JSON strings.
+- Exclude imported message history from everyday task controls.
+
 ## 0.4.0 — 2026-11-16
 
 ### Changed

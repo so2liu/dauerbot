@@ -120,15 +120,10 @@ pub fn command(config: &Config) -> Command {
 }
 
 fn server_command(config: &Config) -> Command {
-    let argv = login_shell_args(vec![
-        config.herdr.clone(),
-        "--session".into(),
-        config.herdr_session.clone(),
-        "server".into(),
-    ]);
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    command_environment(config, &mut cmd);
+    // The background server needs no interactive shell initialization. Native
+    // Agent launches still use the login shell to load their PATH and settings.
+    let mut cmd = command(config);
+    cmd.arg("server");
     cmd
 }
 
