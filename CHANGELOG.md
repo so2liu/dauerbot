@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.4 — 2026-11-16
+
+### Fixed
+
+- Automatically wake projects for incoming messages after their previous Agent process stops. Remove the persistent stopped-project switch and migrate existing stopped projects without losing bot bindings, native conversations or explicit pauses.
+- Remove routine Start/Resume/Stop buttons from the everyday workspace. Show standby and automatic wakeup clearly in English and Simplified Chinese; retain an explicit pause control.
+- Explain that interrupted old work does not block new conversation messages. Stop and remove projects under the same wakeup lock so deletion cannot race automatic startup.
+- Keep interrupted history recorded without pinning a new execution awake or blocking independent scheduled work.
+
 ## 0.4.3 — 2026-11-16
 
 ### Fixed

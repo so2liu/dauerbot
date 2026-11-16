@@ -369,7 +369,7 @@ fn managed_credentials_path(dir: &Path, pane: &str) -> Result<Option<std::path::
     let identity: Option<(String, String)> = connection
         .query_row(
             "SELECT id,generation FROM projects
-             WHERE terminal IS NOT NULL AND enabled=1
+             WHERE terminal IS NOT NULL
                AND json_extract(execution,'$.backend')='legacy'
                AND json_extract(execution,'$.pane_id')=?1
                AND json_extract(execution,'$.generation')=generation
@@ -433,15 +433,17 @@ mod managed_tests {
     fn global_entry_resolves_current_generation_without_running_database_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let connection = rusqlite::Connection::open(dir.path().join("bridge.sqlite3")).unwrap();
-        connection.execute_batch(
-            "CREATE TABLE projects(id TEXT,generation TEXT,terminal TEXT,enabled INTEGER,execution TEXT);
+        connection
+            .execute_batch(
+                "CREATE TABLE projects(id TEXT,generation TEXT,terminal TEXT,execution TEXT);
              CREATE TABLE messages(status TEXT);
              INSERT INTO messages VALUES('sending');",
-        ).unwrap();
+            )
+            .unwrap();
         let execution = json!({"backend":"legacy","pane_id":"w1:p2","terminal_id":"terminal-1","generation":"generation-1"});
         connection
             .execute(
-                "INSERT INTO projects VALUES('project-1','generation-1','terminal-1',1,?)",
+                "INSERT INTO projects VALUES('project-1','generation-1','terminal-1',?)",
                 [execution.to_string()],
             )
             .unwrap();

@@ -661,6 +661,17 @@ pub fn active_run(c: &Connection, project: &str) -> Result<Option<Run>> {
       [project],run_row).optional()?)
 }
 
+pub fn active_execution_run(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+) -> Result<Option<Run>> {
+    Ok(c.query_row(
+        &format!("SELECT {RUN} FROM work_runs WHERE project_id=? AND generation=? AND status IN ('submitting','submitted','running','uncertain') ORDER BY started_at LIMIT 1"),
+        params![project,generation],run_row,
+    ).optional()?)
+}
+
 /// Claim and state changes share the same transaction; receipt remains a separate operation.
 pub fn claim_next(
     c: &Connection,
@@ -700,14 +711,15 @@ fn claim(
         let next = if message.is_some() {
             message
         } else {
-            if steering_only || active_run(c, project)?.is_some() {
+            if steering_only || active_execution_run(c, project, generation)?.is_some() {
                 return Ok(None);
             }
             let blocked:bool=c.query_row(
-          "SELECT EXISTS(SELECT 1 FROM work_events e WHERE project_id=? AND (
+          "SELECT EXISTS(SELECT 1 FROM work_events e WHERE project_id=? AND EXISTS(
+            SELECT 1 FROM work_runs current WHERE current.event_id=e.id AND current.generation=?) AND (
             status IN ('submitting','submitted','uncertain') OR
             (status='failed' AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.event_id=e.id AND r.outcome='failed' AND r.finished_at IS NOT NULL))))",
-          [project],|r|r.get(0))?;
+          params![project,generation],|r|r.get(0))?;
             if blocked {
                 return Ok(None);
             }
@@ -1560,12 +1572,14 @@ pub fn execution_idle(c: &Connection, project: &str, generation: &str, now: i64)
         if ["sleeping", "stopped", "exited", "error"].contains(&record.status.as_str()) {
             return Ok(false);
         }
+        // Old uncertain receipts stay durable. Only this execution's unfinished
+        // runs require its process to remain alive; tracked child jobs still do.
         let pending:bool=c.query_row(
-          "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status IN ('queued','submitting','submitted','uncertain'))
-           OR EXISTS(SELECT 1 FROM work_runs WHERE project_id=? AND status IN ('submitting','submitted','running','uncertain'))
-           OR EXISTS(SELECT 1 FROM work_jobs WHERE project_id=? AND status IN ('active','uncertain'))
-           OR EXISTS(SELECT 1 FROM work_attention WHERE project_id=? AND generation=? AND status='open')",
-          params![project,project,project,project,generation],|r|r.get(0))?;
+          "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status='queued')
+           OR EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND status IN ('submitting','submitted','running','uncertain'))
+           OR EXISTS(SELECT 1 FROM work_jobs WHERE project_id=?1 AND status IN ('active','uncertain'))
+           OR EXISTS(SELECT 1 FROM work_attention WHERE project_id=?1 AND generation=?2 AND status='open')",
+          params![project,generation],|r|r.get(0))?;
         if pending || has_takeover(c, project, generation)? {
             c.execute("UPDATE work_executions SET idle_since=NULL,warm_until=NULL,updated_at=? WHERE project_id=? AND generation=?",
               params![now,project,generation])?;

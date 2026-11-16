@@ -19,7 +19,7 @@ impl Language {
     pub fn text(self, source: &str) -> String {
         if self == Self::En {
             return match source {
-                "sleeping" => "Sleeping",
+                "sleeping" => "Standby",
                 "starting" => "Starting",
                 "ready" => "Ready",
                 "busy" | "running" => "Working",
@@ -99,8 +99,8 @@ impl Language {
                 "当前数据目录正在由旧版或不兼容的 Dauerbot 服务使用。请先退出旧服务，或用 --data-dir 打开独立实例。"
             }
             "Startup output" => "启动信息",
-            "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check, then choose Start or Resume. Automatic retry waits thirty seconds." => {
-                "CLI 在接收任务前退出了。请在“环境检查”中确认安装和登录状态，再点击“启动”或“恢复”。系统会等待三十秒后自动重试。"
+            "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check. Dauerbot retries automatically after thirty seconds." => {
+                "CLI 在接收任务前退出了。请在“环境检查”中确认安装和登录状态，Dauerbot 会在三十秒后自动重试。"
             }
             "The Agent stopped working without completing its task record. Continue in the terminal and ask it to call finish_run, or review the saved result before retrying or dismissing the task." => {
                 "智能体已停止执行，但还没有登记任务完成。请在终端中让它调用 finish_run，或先检查结果，再重试或忽略这个任务。"
@@ -119,9 +119,6 @@ impl Language {
             }
             "The Agent has not connected to Dauerbot yet. Check login and MCP setup in its terminal." => {
                 "智能体还没有连接 Dauerbot，请在右侧终端中检查登录和 MCP 设置。"
-            }
-            "An interrupted task may have performed work. Review its result and retry or dismiss it before continuing." => {
-                "中断的任务可能已经完成了部分操作。请先检查结果，再选择重试或忽略。"
             }
             "The Agent exited during a task. Check the saved result before retrying uncertain work." => {
                 "智能体在任务执行期间退出了。请先检查已保存的结果，再决定是否重试。"
@@ -170,12 +167,8 @@ impl Language {
             "Enable" => "启用",
             "Remove project…" => "移除项目…",
             "Remove this project?" => "移除这个项目？",
-            "Stop its session first. Project files remain on disk." => {
-                "请先停止会话。项目文件仍会保留在磁盘上。"
-            }
             "Project removed" => "项目已移除",
             "Connecting to the live terminal…" => "正在连接实时终端…",
-            "Project is stopped. Start it to run tasks." => "项目已停止，启动后即可执行任务。",
             "Agent needs attention. Review the project notice." => {
                 "智能体需要处理，请查看项目提示。"
             }
@@ -201,16 +194,22 @@ impl Language {
                 "只读查看 · 接管后可输入及滚动历史"
             }
             "Choose a project to view its agent" => "选择项目，查看智能体",
-            "Agent is sleeping. Tasks and schedules will wake it automatically." => {
-                "智能体正在休眠，任务和定时计划会自动唤醒它。"
+            "Ready for messages. The Agent starts automatically when needed." => {
+                "正在待命。收到消息或定时任务触发时，智能体会自动启动。"
             }
+            "Messages start the Agent automatically." => "收到消息后会自动启动智能体。",
+            "Automatic activity is paused. Messages stay saved until you resume." => {
+                "自动运行已暂停。消息会保留，恢复后继续投递。"
+            }
+            "Pause automatic activity" => "暂停自动运行",
+            "Resume automatic activity" => "恢复自动运行",
+            "An earlier task was interrupted. New messages continue automatically; retry this task only if you want it repeated." => {
+                "之前有一项任务中断了。新消息会自动继续处理；仅在需要重新执行旧任务时重试。"
+            }
+            "The Agent will stop. Project files remain on disk." => "智能体会停止，项目文件会保留。",
             "Needs attention" => "需要处理",
-            "Start / resume" => "启动 / 继续",
-            "Resume delivery" => "恢复消息投递",
-            "Pause delivery" => "暂停消息投递",
             "Delivery settings saved" => "消息投递设置已保存",
             "Stop" => "停止",
-            "Session stopped" => "会话已停止",
             "Model" => "模型",
             "Model follows the CLI's own settings" => "模型沿用 CLI 中的设置",
             "Tasks & schedules" => "任务与计划",
@@ -237,7 +236,7 @@ impl Language {
             "Task cancelled" => "任务已取消",
             "Schedule removed" => "计划已移除",
             "Sleeping" => "休眠中",
-            "sleeping" => "休眠中",
+            "sleeping" => "待命",
             "starting" => "启动中",
             "ready" => "已就绪",
             "busy" => "执行中",

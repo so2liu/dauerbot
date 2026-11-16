@@ -537,15 +537,41 @@ def main():
                     "command": [sys.executable, "-c", "import time; time.sleep(120)"], "label": "Unrelated fixture terminal"}})
         user_pane = user_tab["layout"]["root"]["pane_id"]
         user_identity = legacy_rpc("pane.get", {"pane_id": user_pane})["pane"]["terminal_id"]
-        # Stopped sessions must retain later messages rather than execute them in a shell.
+        # Interrupt an acknowledged run, then prove fresh input still wakes the
+        # same native conversation without replaying the interrupted event.
+        FIXTURE.emit(message("om_interrupted", "fixture-hold-for-steer"))
+        wait_for(lambda: any(e["source_id"] == "om_interrupted" and e["status"] == "acknowledged" for e in api(f"/projects/{key}/work")["events"]), "fixture did not begin the interrupted run")
+        stopped_generation = project_state()["generation"]
+        stopped_native = project_state()["native_session"]
         api(f"/projects/{key}/stop", {}, "POST")
         assert legacy_rpc("pane.get", {"pane_id": user_pane})["pane"]["terminal_id"] == user_identity
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1
         checks.append("project stop preserves unrelated user-added terminals in its workspace")
         legacy_rpc("pane.close", {"pane_id": user_pane})
-        FIXTURE.emit(message("om_stopped", "do not deliver to a stopped terminal"))
-        wait_for(lambda: any(m["source_id"] == "om_stopped" and m["status"] == "queued" for m in api(f"/projects/{key}")["messages"]), "stopped-session message was not queued")
-        checks.append("stopped agent does not consume later messages")
+        wait_for(lambda: next(p for p in api("/state")["projects"] if p["id"] == key)["lifecycle"] == "sleeping", "interrupted history incorrectly made a dormant project require manual startup")
+        FIXTURE.emit(message("om_after_stop", "wake automatically after stop"))
+        wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "completed" for e in api(f"/projects/{key}/work")["events"]), "stopped execution did not automatically wake for new input")
+        assert project_state()["generation"] != stopped_generation
+        assert project_state()["native_session"] == stopped_native
+        assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
+        checks.append("new messages automatically resume a stopped execution without replaying its uncertain interrupted work")
+        api(f"/projects/{key}/pause", {"paused": True})
+        api(f"/projects/{key}/stop", {}, "POST")
+        FIXTURE.emit(message("om_explicit_pause", "preserve an explicit pause"))
+        wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "queued" for e in api(f"/projects/{key}/work")["events"]), "explicitly paused message did not persist")
+        assert project_state()["terminal"] is None
+        api(f"/projects/{key}/pause", {"paused": False})
+        wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "completed" for e in api(f"/projects/{key}/work")["events"]), "unpause did not automatically resume delivery")
+        checks.append("only an explicit pause holds new messages; resuming activity automatically wakes the Agent")
+        wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "old uncertain work pinned the new execution")
+        age_idle_execution()
+        wait_for(lambda: project_state()["terminal"] is None, "new execution could not retire with old uncertain history")
+        due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
+        api(f"/projects/{key}/timers", {"name":"Independent scheduled work","prompt":"independent-after-stop","kind":"once","at":due.isoformat(),"timezone":"UTC","to":"oc_fixture"})
+        wait_for(lambda: "independent-after-stop" in str(FIXTURE.messages), "old uncertain history blocked independent scheduled wakeup")
+        assert project_state()["native_session"] == stopped_native
+        assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
+        checks.append("old uncertain history stays recorded without pinning a new execution or blocking independent timer wakeup")
         (results / "smoke.json").write_text(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))
         print(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))
     except Exception:

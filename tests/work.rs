@@ -45,6 +45,27 @@ fn finish(c: &Connection, run: &Run, now: i64) {
 }
 
 #[test]
+fn an_interrupted_old_execution_does_not_pin_new_work_or_its_idle_retirement() {
+    let c = store();
+    begin_execution(&c, "p", "old", 0).unwrap();
+    let old_event = submit(&c, "interrupted", 1);
+    let old = claim_next(&c, "p", "old", 2).unwrap().unwrap();
+    ack_event(&c, "p", "old", &old_event.id, 3).unwrap();
+    finish_execution(&c, "p", "old", "stopped", "Stopped", 4).unwrap();
+    begin_execution(&c, "p", "new", 5).unwrap();
+    let fresh_event = submit(&c, "independent-timer", 6);
+    let fresh = claim_next(&c, "p", "new", 7).unwrap().unwrap();
+    assert_eq!(fresh.event_id, fresh_event.id);
+    ack_event(&c, "p", "new", &fresh_event.id, 8).unwrap();
+    finish(&c, &fresh, 9);
+    assert!(active_execution_run(&c, "p", "new").unwrap().is_none());
+    assert!(!execution_idle(&c, "p", "new", 10).unwrap());
+    assert!(execution_idle(&c, "p", "new", 10 + WARM_MS).unwrap());
+    assert_eq!(run(&c, "p", &old.id).unwrap().status, "uncertain");
+    assert_eq!(event_status(&c, &old_event.id), "uncertain");
+}
+
+#[test]
 fn conversation_messages_steer_unfinished_work_without_replaying_uncertain_input() {
     let c = store();
     begin_execution(&c, "p", "g", 0).unwrap();

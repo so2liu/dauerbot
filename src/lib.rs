@@ -96,7 +96,6 @@ impl App {
             match herdr::observe(&cfg, &p).await {
                 Ok(record) if record["state"] == "live" => {
                     herdr::check_identity(&p, &record)?;
-                    self.db.enabled(&p.id, true).await?;
                     return self.db.project(&p.id).await;
                 }
                 Ok(_) => {}
@@ -206,10 +205,12 @@ impl App {
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
         let p = self.db.project(&p.id).await?;
-        self.db.enabled(&p.id, false).await?;
+        self.stop_inner(&p).await
+    }
+    pub(crate) async fn stop_inner(&self, p: &Project) -> Result<()> {
         if p.terminal.is_some() {
             let cfg = self.config.read().await.clone();
-            herdr::stop(&cfg, &p).await?;
+            herdr::stop(&cfg, p).await?;
         }
         let id = p.id.clone();
         let generation_id = p.generation.clone();
@@ -242,13 +243,14 @@ impl App {
             return Ok(p);
         }
         let id = p.id.clone();
+        let generation = p.generation.clone();
         if self
             .db
             .call(move |c| {
                 let jobs:bool=c.query_row(
                     "SELECT EXISTS(SELECT 1 FROM work_jobs WHERE project_id=? AND status IN ('active','uncertain'))",
                     [&id], |r|r.get(0))?;
-                Ok(work::active_run(c, &id)?.is_some() || jobs)
+                Ok(work::active_execution_run(c, &id, &generation)?.is_some() || jobs)
             })
             .await?
         {
@@ -484,28 +486,22 @@ impl App {
         let id = p.id.clone();
         let state = self.db.call(move |c| work::snapshot(c, &id)).await?;
         let project_id = p.id.clone();
-        let (queued,uncertain,queued_messages)=self.db.call(move|c|Ok((
-            c.query_row("SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued')",[&project_id],|r|r.get::<_,bool>(0))?,
-            c.query_row("SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='uncertain') OR EXISTS(SELECT 1 FROM work_jobs WHERE project_id=? AND status='uncertain')",rusqlite::params![project_id,project_id],|r|r.get::<_,bool>(0))?,
-            c.query_row("SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued' AND message_id IS NOT NULL)",[&project_id],|r|r.get::<_,bool>(0))?
-        ))).await?;
-        if !p.enabled {
-            self.set_phase(&p, "stopped", Value::Null).await;
-            return Ok(());
-        }
+        let queued = self
+            .db
+            .call(move |c| {
+                Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued')",
+            [&project_id], |r| r.get::<_,bool>(0),
+        )?)
+            })
+            .await?;
         if p.terminal.is_none() {
-            if uncertain && !queued_messages {
-                self.set_phase(&p, "needs_attention", Value::Null).await;
-                self.attention(&p,"uncertain_input","An interrupted task may have performed work. Review its result and retry or dismiss it before continuing.").await?;
+            if p.paused {
+                self.set_phase(&p, "paused", Value::Null).await;
                 return Ok(());
             }
-            if !queued || p.paused {
-                self.set_phase(
-                    &p,
-                    if p.paused { "paused" } else { "sleeping" },
-                    Value::Null,
-                )
-                .await;
+            if !queued {
+                self.set_phase(&p, "sleeping", Value::Null).await;
                 return Ok(());
             }
             if state.attention.iter().any(|item| {
@@ -573,15 +569,18 @@ impl App {
                 })
                 .await?;
             let project_id = p.id.clone();
+            let generation = p.generation.clone();
             let interrupted = self
                 .db
-                .call(move |c| Ok(work::active_run(c, &project_id)?.is_some()))
+                .call(move |c| {
+                    Ok(work::active_execution_run(c, &project_id, &generation)?.is_some())
+                })
                 .await?;
             if interrupted {
                 self.attention(&p,"execution_lost","The Agent exited during a task. Check the saved result before retrying uncertain work.").await?;
             } else if queued || !p.ready {
                 self.attention(&p,"startup",
-                    "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check, then choose Start or Resume. Automatic retry waits thirty seconds.").await?;
+                    "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check. Dauerbot retries automatically after thirty seconds.").await?;
             }
             self.db
                 .set_session(&p.id, None, None, String::new())
@@ -754,8 +753,9 @@ impl App {
             return Ok(());
         }
         let id = p.id.clone();
+        let generation = p.generation.clone();
         let unfinished = self.db.call(move |c| {
-            let active = work::active_run(c, &id)?;
+            let active = work::active_execution_run(c, &id, &generation)?;
             let jobs:bool = c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM work_jobs WHERE project_id=? AND status IN ('active','uncertain'))",
                 [&id], |r| r.get(0))?;

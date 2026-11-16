@@ -35,7 +35,7 @@ impl IntoResponse for ApiError {
     }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
-pub const PROTOCOL: u64 = 3;
+pub const PROTOCOL: u64 = 4;
 
 pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()
@@ -235,8 +235,8 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         if let Some(phase) = runtime["projects"].get(&p.id).and_then(Value::as_object) {
             record.as_object_mut().unwrap().extend(phase.clone());
         } else {
-            record["lifecycle"] = json!(if !p.enabled {
-                "stopped"
+            record["lifecycle"] = json!(if p.paused {
+                "paused"
             } else if p.terminal.is_none() {
                 "sleeping"
             } else {
@@ -366,6 +366,10 @@ async fn delete_project(State(app): State<Arc<App>>, Path(id): Path<String>) -> 
     let p = app.db.project(&id).await?;
     let lock = app.project_lock(&p.id).await;
     let _guard = lock.lock().await;
+    // Removal and process cleanup share the wakeup lock so pending input cannot
+    // recreate an execution between two separate stop/delete requests.
+    let p = app.db.project(&p.id).await?;
+    app.stop_inner(&p).await?;
     app.db.remove_project(&p.id).await?;
     app.token.lock().await.remove(&p.id);
     app.settings_tx.send_modify(|v| *v += 1);
