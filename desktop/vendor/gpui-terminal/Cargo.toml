@@ -40,4 +40,3 @@ version = "0.2.2"
 
 [dependencies.parking_lot]
 version = "0.12"
-

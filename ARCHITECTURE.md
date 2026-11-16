@@ -1,6 +1,6 @@
 # Dauerbot architecture
 
-Status: implementation approved following the initial independent agy source review, 2026-11-16. Final review and acceptance checks continue during implementation.
+Status: implemented, 2026-11-16. Backend and terminal transport checks pass. Real CLI acceptance covers task completion, retirement and same-session resume; the full four-CLI matrix and graphical IME acceptance remain tracked in #23 and #25. Source review and runtime acceptance are separate evidence.
 
 Dauerbot connects one Feishu bot to one project and its main native Agent session. The desktop manages projects and tasks on the left, with the selected Agent's interactive terminal on the right. An independent Rust daemon keeps receiving events and managing schedules while Agent processes sleep.
 
