@@ -45,6 +45,60 @@ fn finish(c: &Connection, run: &Run, now: i64) {
 }
 
 #[test]
+fn conversation_messages_steer_unfinished_work_without_replaying_uncertain_input() {
+    let c = store();
+    begin_execution(&c, "p", "g", 0).unwrap();
+    submit(&c, "long-task", 1);
+    let original = claim_next(&c, "p", "g", 2).unwrap().unwrap();
+    delivery(&c, &original.id, "submitted", "", 3).unwrap();
+    let scheduled = submit(&c, "later-task", 4);
+    for id in ["correction", "stop", "clarification"] {
+        c.execute(
+            "INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at)
+             VALUES(?,'p','in',?,'Latest user direction','queued',5,5)",
+            params![id, id],
+        ).unwrap();
+    }
+    sync_inbound(&c).unwrap();
+    let first = claim_steering(&c, "p", "g", 6).unwrap().unwrap();
+    assert_eq!(first.event_id, "correction");
+    delivery(
+        &c,
+        &first.id,
+        "uncertain",
+        "Connection closed after write",
+        7,
+    )
+    .unwrap();
+    let second = claim_steering(&c, "p", "g", 8).unwrap().unwrap();
+    assert_eq!(second.event_id, "stop");
+    delivery(&c, &second.id, "submitted", "", 9).unwrap();
+    let third = claim_next(&c, "p", "g", 10).unwrap().unwrap();
+    assert_eq!(third.event_id, "clarification");
+    ack_event(&c, "p", "g", &third.event_id, 11).unwrap();
+    finish(&c, &third, 12);
+    assert!(claim_steering(&c, "p", "g", 13).unwrap().is_none());
+    assert!(claim_next(&c, "p", "g", 13).unwrap().is_none());
+    assert_eq!(event_status(&c, &first.event_id), "uncertain");
+    assert_eq!(event_status(&c, &scheduled.id), "queued");
+    assert_eq!(run(&c, "p", &original.id).unwrap().status, "submitted");
+    assert!(!execution_idle(&c, "p", "g", WARM_MS * 10).unwrap());
+
+    c.execute(
+        "INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at)
+         VALUES('takeover','p','in','takeover','Keep the draft','queued',14,14)", [],
+    ).unwrap();
+    sync_inbound(&c).unwrap();
+    set_takeover(&c, "p", "g", true, 15).unwrap();
+    assert!(claim_steering(&c, "p", "g", 16).unwrap().is_none());
+    set_takeover(&c, "p", "g", false, 17).unwrap();
+    assert_eq!(
+        claim_steering(&c, "p", "g", 18).unwrap().unwrap().event_id,
+        "takeover"
+    );
+}
+
+#[test]
 fn a_large_backlog_cannot_hide_the_event_that_needs_recovery() {
     let c = store();
     let blocked = submit(&c, "blocked", 1);
@@ -89,7 +143,10 @@ fn migration_preserves_receipt_and_uncertainty_without_replaying_old_work() {
     assert_eq!(event(&c, "p", "m3").unwrap().status, "acknowledged");
     assert_eq!(task(&c, "p", "m3").unwrap().status, "imported");
     assert!(active_run(&c, "p").unwrap().is_none());
-    assert!(claim_next(&c, "p", "g", 5).unwrap().is_none());
+    // An uncertain older input is never replayed, but must not block a new message.
+    let fresh = claim_steering(&c, "p", "g", 5).unwrap().unwrap();
+    assert_eq!(fresh.event_id, "m0");
+    delivery(&c, &fresh.id, "submitted", "", 6).unwrap();
     let original: String = c
         .query_row("SELECT status FROM messages WHERE id='m1'", [], |r| {
             r.get(0)

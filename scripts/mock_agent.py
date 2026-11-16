@@ -77,6 +77,7 @@ tool("session_ready", {"native_session": marker.read_text()})
 sys.stdout.write("\r\nMOCK_AGENT_READY\r\n")
 sys.stdout.flush()
 buffer = b""
+held = None
 try:
     while True:
         buffer += os.read(0, 65536)
@@ -87,6 +88,15 @@ try:
             event = ET.fromstring(text)
             assert event.tag == "dauerbot_event", event.tag
             status("working")
+            body = event.findtext("feishu_message/body") or event.findtext("body") or ""
+            if body in ("fixture-hold-unacknowledged", "fixture-hold-for-steer"):
+                assert held is None
+                held = event
+                if body == "fixture-hold-for-steer":
+                    tool("ack_event", {"event_id": event.attrib["event_id"]})
+                sys.stdout.write("\r\nMOCK_HOLDING_FOR_STEER\r\n")
+                sys.stdout.flush()
+                continue
             tool("ack_event", {"event_id": event.attrib["event_id"]})
             envelope = event.find("feishu_message")
             if envelope is not None:
@@ -103,8 +113,13 @@ try:
                 tool("send_file", {"to": to, "path": str(Path.cwd() / "report.txt"), "request_id": "file-" + source})
             tool("checkpoint", {"task_id": event.attrib["task_id"], "summary": "Fixture task reached its verified completion point."})
             tool("finish_run", {"run_id": event.attrib["run_id"], "outcome": "completed", "summary": "Fixture completed the task and delivered its result."})
+            if body == "fixture-steer-release":
+                assert held is not None, "Steering arrived without a live original run"
+                tool("ack_event", {"event_id": held.attrib["event_id"]})
+                tool("finish_run", {"run_id": held.attrib["run_id"], "outcome": "completed", "summary": "Original run completed after receiving steering."})
+                held = None
             sys.stdout.write("\r\nMOCK_PROCESSED " + json.dumps({"source": source, "pid": os.getpid()}, ensure_ascii=False) + "\r\n")
             sys.stdout.flush()
-            status("idle")
+            status("working" if held is not None else "idle")
 finally:
     proc.terminate()

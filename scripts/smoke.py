@@ -238,8 +238,10 @@ def main():
     parser.add_argument("--binary", type=Path, help="use an already built bridge executable")
     parser.add_argument("--real-pi", action="store_true", help="one real model turn using the locally configured Pi account")
     parser.add_argument("--real-agent",choices=["codex","claude","pi","agy"],help="one real CLI/model turn; may incur model charges")
+    parser.add_argument("--real-steering", action="store_true", help="verify busy-turn steering with --real-agent; may incur model charges")
     args = parser.parse_args()
     real_agent=args.real_agent or ("pi" if args.real_pi else None)
+    assert not args.real_steering or real_agent, "--real-steering requires a native Agent"
     binary = args.binary or ROOT / "target/debug/hfb"
     assert binary.exists(), "run cargo build first"
     run = ROOT / ".local" / ("smoke-" + uuid.uuid4().hex[:8])
@@ -324,6 +326,42 @@ def main():
         api(f"/projects/{key}/start", {}, "POST")
         wait_for(lambda: api(f"/projects/{key}")["project"]["ready"], "real MCP did not register readiness",timeout=100 if real_agent else 35)
         checks.append("isolated real HERDR terminal + real MCP initialize/tools/list/session_ready")
+        if args.real_steering:
+            FIXTURE.emit(message("om_native_hold",
+                "Local steering acceptance check. Do not send Feishu messages or edit files. "
+                "Call native MCP ack_event for this event, then run one foreground shell command: sleep 20. "
+                "Do not finish this run yet; a second live user message will arrive to change direction. "
+                "After the sleep, obey that message instead of inventing further work."))
+            def native_hold():
+                work = api(f"/projects/{key}/work")
+                event = next((e for e in work["events"] if e["source_id"] == "om_native_hold"), None)
+                pane = legacy_rpc("pane.get", {"pane_id": api(f"/projects/{key}")["project"]["execution"]["pane_id"]})["pane"]
+                return event if event and event["status"] == "acknowledged" and pane["agent_status"] == "working" else None
+            original = wait_for(native_hold, "native Agent did not start the held turn", timeout=120)
+            generation = api(f"/projects/{key}")["project"]["generation"]
+            FIXTURE.emit(message("om_native_steer",
+                "Change of direction: stop the earlier acceptance task after its current tool returns. "
+                "Do not send Feishu messages or edit files. Call native MCP ack_event for this new event now. "
+                "Then finish_run with outcome noop for BOTH the earlier held run and this run. "
+                "Use the run IDs in the actual event envelopes; no HTTP or Python tool substitutes."))
+            def native_steer():
+                return next((e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_native_steer" and e["status"] in ("submitted","acknowledged","completed")), None)
+            steer = wait_for(native_steer, "new message was not submitted during the live native turn", timeout=8)
+            submitted = time.time_ns() // 1_000_000
+            work = api(f"/projects/{key}/work")
+            original_run = next(r for r in work["runs"] if r["event_id"] == original["id"])
+            assert original_run["finished_at"] is None, "original run finished before steering submission"
+            def completed_native():
+                work = api(f"/projects/{key}/work")
+                return work if all(any(r["event_id"] == event_id and r["status"] == "noop" for r in work["runs"]) for event_id in (original["id"], steer["id"])) else None
+            final = wait_for(completed_native, "native Agent did not incorporate steering and settle both runs", timeout=180)
+            assert api(f"/projects/{key}")["project"]["generation"] == generation
+            assert not FIXTURE.messages, "steering acceptance sent an unintended Feishu message"
+            checks.append("native working turn receives steering before original finish_run; both runs settle through native MCP without process restart")
+            receipt = {"passed":True,"agent":real_agent,"checks":checks,"steering_submitted_ms":submitted,"original_run_unfinished_at_submission":True,"same_generation":True,"runs":[r for r in final["runs"] if r["event_id"] in (original["id"],steer["id"])],"run_dir":str(run)}
+            (results / f"native-{real_agent}-steering.json").write_text(json.dumps(receipt, indent=2))
+            print(f"Real {real_agent} busy-turn steering passed.")
+            return
         FIXTURE.emit(message("om_first", "请先确认本消息，调用 send_markdown 发送一条带 **测试** 的消息，再调用 send_file 发送项目目录的 report.txt（send-file）。这是开发验证，只需完成这两项。"))
         wait_for(lambda: len(FIXTURE.messages) >= 2, "agent did not send Markdown and file",timeout=120 if real_agent else 35)
         assert FIXTURE.uploads and b"Fixture report" in FIXTURE.uploads[0]
@@ -406,6 +444,28 @@ def main():
         assert len([m for m in api(f"/projects/{key}")["messages"] if m["source_id"] == "om_first"]) == 1
         assert len(FIXTURE.messages) == before
         checks.append("duplicate Feishu message is acknowledged without duplicate execution")
+        for hold in ("fixture-hold-for-steer", "fixture-hold-unacknowledged"):
+            wait_for(settled, "previous run did not settle before steering check")
+            original_generation = project_state()["generation"]
+            FIXTURE.emit(message("om_" + hold, hold))
+            def held_run():
+                work = api(f"/projects/{key}/work")
+                original = next((e for e in work["events"] if e["source_id"] == "om_" + hold), None)
+                native = legacy_rpc("pane.get", {"pane_id": project_state()["execution"]["pane_id"]})["pane"]
+                return original and original["status"] == ("acknowledged" if hold == "fixture-hold-for-steer" else "submitted") and native["agent_status"] == "working"
+            wait_for(held_run, "fixture did not hold the original run while working")
+            for suffix, text in (("one", "Change course now"), ("two", "fixture-steer-release")):
+                FIXTURE.emit(message("om_steer_" + hold + suffix, text))
+            wait_for(lambda: all(any(e["source_id"] == "om_steer_" + hold + suffix and e["status"] == "completed" for e in api(f"/projects/{key}/work")["events"]) for suffix in ("one", "two")), "steering waited for the unfinished original run")
+            wait_for(settled, "original run did not settle after steering")
+            work = api(f"/projects/{key}/work")
+            held_event = next(e for e in work["events"] if e["source_id"] == "om_" + hold)
+            held = next(r for r in work["runs"] if r["event_id"] == held_event["id"])
+            for suffix in ("one", "two"):
+                steer = next(e for e in work["events"] if e["source_id"] == "om_steer_" + hold + suffix)
+                assert steer["received_at"] <= held["finished_at"], "message did not steer the original run"
+            assert project_state()["generation"] == original_generation
+        checks.append("busy Agent receives a message burst before its original run finishes, even before its original receipt")
         FIXTURE.emit(message("om_second", "second message"))
         FIXTURE.emit(message("om_third", "", kind="file", content={"file_key": "fixture-inbound", "file_name": "incoming.txt"}))
         wait_for(lambda: all(any(m["source_id"] == key and m["status"] == "acknowledged" for m in api(f"/projects/{project['id']}")["messages"]) for key in ["om_second", "om_third"]), "queued messages failed")
