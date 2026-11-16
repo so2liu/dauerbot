@@ -1399,6 +1399,10 @@ pub fn complete_job_with_status(
             "Child job belongs to a different execution"
         );
         ensure!(
+            job.status != "abandoned",
+            "The user abandoned this child result; it cannot be completed afterward"
+        );
+        ensure!(
             !["completed", "failed"].contains(&job.status.as_str())
                 || (job.result == result && job.status == status),
             "Child job already completed with a different result"
@@ -1637,6 +1641,58 @@ pub fn resolve_attention_reason(
       params![now,now,project,generation,reason])?)
 }
 
+/// Result recovery clears warnings only after every unresolved effect was reviewed.
+pub fn resolve_recovery_attention(c: &Connection, project: &str, now: i64) -> Result<usize> {
+    let unresolved:bool=c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('submitting','submitted','uncertain'))
+         OR EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND finished_at IS NULL AND status IN ('submitting','submitted','running','uncertain'))
+         OR EXISTS(SELECT 1 FROM work_jobs WHERE project_id=?1 AND status IN ('active','uncertain'))",
+        [project],|r|r.get(0))?;
+    if unresolved {
+        return Ok(0);
+    }
+    Ok(c.execute(
+        "UPDATE work_attention SET status='resolved',resolved_at=?1,last_seen=?1
+         WHERE project_id=?2 AND status='open' AND reason IN ('uncertain_input','execution_lost','unfinished_run')",
+        params![now,project])?)
+}
+
+/// An administrator records reviewed, interrupted child work without inventing success.
+pub fn abandon_job(c: &Connection, project: &str, id: &str, reason: &str, now: i64) -> Result<Job> {
+    ensure!(
+        !reason.trim().is_empty(),
+        "Explain the reviewed child result before abandoning it"
+    );
+    transaction(c, |c| {
+        let job = c.query_row(
+            &format!("SELECT {JOB} FROM work_jobs WHERE project_id=? AND id=?"),
+            params![project, id],
+            job_row,
+        )?;
+        ensure!(
+            ["active", "uncertain"].contains(&job.status.as_str()),
+            "Only active or uncertain child work can be abandoned"
+        );
+        let live:bool=c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_executions WHERE project_id=? AND generation=? AND status IN ('starting','running','idle'))",
+            params![project,job.generation],|r|r.get(0))?;
+        ensure!(
+            !live,
+            "Stop the child execution's parent session before abandoning its result"
+        );
+        c.execute(
+            "UPDATE work_jobs SET status='abandoned',result=?,completed_at=? WHERE id=?",
+            params![reason, now, id],
+        )?;
+        resolve_recovery_attention(c, project, now)?;
+        Ok(c.query_row(
+            &format!("SELECT {JOB} FROM work_jobs WHERE id=?"),
+            [id],
+            job_row,
+        )?)
+    })
+}
+
 /// Explicit user recovery applies to one event; uncertain effects are never replayed automatically.
 pub fn resolve_event(
     c: &Connection,
@@ -1651,6 +1707,13 @@ pub fn resolve_event(
             ["uncertain", "failed", "queued", "submitted", "acknowledged"]
                 .contains(&current.status.as_str()),
             "This event cannot be resolved"
+        );
+        let children:bool=c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_jobs WHERE run_id IN(SELECT id FROM work_runs WHERE event_id=?) AND status IN ('active','uncertain'))",
+            [id],|r|r.get(0))?;
+        ensure!(
+            !children,
+            "Review and explicitly abandon unfinished child jobs before recovering this event"
         );
         let status = if retry { "queued" } else { "dismissed" };
         c.execute(
@@ -1672,6 +1735,7 @@ pub fn resolve_event(
                 params![status, now, message],
             )?;
         }
+        resolve_recovery_attention(c, project, now)?;
         event(c, project, id)
     })
 }

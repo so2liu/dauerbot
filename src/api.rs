@@ -75,6 +75,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/timers/{id}/pause", post(pause_timer))
         .route("/events/{id}/resolve", post(resolve_event))
         .route("/decisions/{id}/answer", post(answer_decision_admin))
+        .route("/jobs/{id}/abandon", post(abandon_job))
         .route("/projects/{id}/messages", post(inject))
         .route("/projects/{id}/outbox", post(outbox))
         .route("/projects/{id}/ready", post(ready))
@@ -469,8 +470,23 @@ async fn ready(
         return Err(anyhow::anyhow!("Session identity does not match").into());
     }
     let cfg = app.config.read().await.clone();
-    let t = herdr::observe(&cfg, &p).await?;
-    herdr::check_identity(&p, &t)?;
+    // MCP can be ready just before HERDR's native-agent detection tick.
+    // Keep this request alive briefly rather than requiring a model to recover
+    // from a transient first-tool error. No project lock is held here.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let t = herdr::observe(&cfg, &p).await?;
+        match herdr::check_identity(&p, &t) {
+            Ok(()) => break,
+            Err(error)
+                if error.is::<herdr::SessionStarting>()
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     let authority = authority(session);
     let name = p.name.clone();
     app.db.call(move|c|{
@@ -534,35 +550,57 @@ async fn ack(
 }
 async fn retry(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let m = app.db.message(&id).await?;
+    let lock = app.project_lock(&m.project_id).await;
+    let _guard = lock.lock().await;
+    let m = app.db.message(&id).await?;
     if !["uncertain", "failed"].contains(&m.status.as_str()) {
         return Err(anyhow::anyhow!("Only failed or uncertain messages can be retried").into());
     }
-    app.db
-        .state(
-            &id,
-            if m.direction == "in" {
-                "queued"
-            } else {
-                "pending"
-            },
-            "",
-        )
-        .await?;
+    recover_message(&app, m, true).await?;
     app.notify.notify_one();
 
     Ok(Json(json!({"ok":true})))
 }
 async fn dismiss(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let m = app.db.message(&id).await?;
+    let lock = app.project_lock(&m.project_id).await;
+    let _guard = lock.lock().await;
+    let m = app.db.message(&id).await?;
     if !["queued", "submitted", "uncertain", "failed", "pending"].contains(&m.status.as_str()) {
         return Err(anyhow::anyhow!("This message cannot be dismissed").into());
     }
-    app.db
-        .state(&id, "dismissed", "Dismissed by the user")
-        .await?;
+    recover_message(&app, m, false).await?;
     app.notify.notify_one();
 
     Ok(Json(json!({"ok":true})))
+}
+async fn recover_message(app: &App, m: db::Message, retry: bool) -> anyhow::Result<()> {
+    app.db
+        .call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            if m.direction == "in" {
+                work::sync_inbound(c)?;
+                let event_id: Option<String> = c
+                    .query_row(
+                        "SELECT id FROM work_events WHERE project_id=? AND message_id=?",
+                        rusqlite::params![m.project_id, m.id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(event_id) = event_id {
+                    work::resolve_event(c, &m.project_id, &event_id, retry, db::now())?;
+                    tx.commit()?;
+                    return Ok(());
+                }
+            }
+            c.execute(
+                "UPDATE messages SET status=?,error='',updated_at=? WHERE id=?",
+                rusqlite::params![if retry { "pending" } else { "dismissed" }, db::now(), m.id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
 }
 async fn upload(
     State(app): State<Arc<App>>,
@@ -975,10 +1013,31 @@ async fn resolve_event(
         return Err(anyhow::anyhow!("Choose retry or dismiss").into());
     }
     let project = project_for_record(&app, "work_events", &id).await?;
+    let lock = app.project_lock(&project).await;
+    let _guard = lock.lock().await;
     let result = app
         .db
         .call(move |c| work::resolve_event(c, &project, &id, input.action == "retry", db::now()))
         .await?;
     app.notify.notify_one();
     Ok(Json(json!(result)))
+}
+#[derive(Deserialize)]
+struct JobAbandon {
+    reason: String,
+}
+async fn abandon_job(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<JobAbandon>,
+) -> ApiResult {
+    let project = project_for_record(&app, "work_jobs", &id).await?;
+    let lock = app.project_lock(&project).await;
+    let _guard = lock.lock().await;
+    let job = app
+        .db
+        .call(move |c| work::abandon_job(c, &project, &id, &input.reason, db::now()))
+        .await?;
+    app.notify.notify_one();
+    Ok(Json(json!(job)))
 }

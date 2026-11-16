@@ -492,3 +492,104 @@ async fn message_ack_receives_the_linked_run_without_completing_it() {
         .unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn compatibility_recovery_requires_reviewed_children_and_keeps_other_attention() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::new(dir.path().into(), Config::default()).unwrap();
+    let project = app.db.create(input(dir.path())).await.unwrap();
+    let id = project.id.clone();
+    let (run, job) = app.db.call(move|c| {
+        work::begin_execution(c,&id,"interrupted",0)?;
+        for (message,source,status) in [("recovery-one","im_one","queued"),("recovery-two","im_two","uncertain")] {
+            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES(?,?,'in',?,'Review effects',?,1,1)",rusqlite::params![message,id,source,status])?;
+        }
+        work::sync_inbound(c)?;
+        // Resolve the second uncertainty temporarily so the first run can be claimed.
+        c.execute("UPDATE work_events SET status='dismissed' WHERE id='recovery-two'",[])?;
+        let run=work::claim_next(c,&id,"interrupted",2)?.unwrap();
+        let job=work::register_job(c,&id,"interrupted",&run.id,"Interrupted child",3)?;
+        work::finish_execution(c,&id,"interrupted","exited","Lost process",4)?;
+        c.execute("UPDATE work_events SET status='uncertain' WHERE id='recovery-two'",[])?;
+        work::upsert_attention(c,&id,"interrupted","execution_lost","Review both results","",5)?;
+        Ok((run,job))
+    }).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/api", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, api::router(app.clone())).into_future());
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let token = app.config.read().await.token.clone();
+    let response = client
+        .post(format!("{base}/messages/recovery-one/retry"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    let response = client
+        .post(format!("{base}/jobs/{}/abandon", job.id))
+        .bearer_auth(&token)
+        .json(&json!({"reason":"Reviewed the child's partial output; discard it"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let response = client
+        .post(format!("{base}/messages/recovery-one/retry"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let id = project.id.clone();
+    app.db
+        .call(move |c| {
+            assert_eq!(work::event(c, &id, &run.event_id)?.status, "queued");
+            assert_eq!(work::run(c, &id, &run.id)?.status, "interrupted");
+            assert_eq!(
+                work::snapshot(c, &id)?
+                    .attention
+                    .iter()
+                    .filter(|a| a.status == "open")
+                    .count(),
+                1
+            );
+            assert!(
+                work::complete_job(c, &id, "interrupted", &job.id, "Late success", 10).is_err()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let response = client
+        .post(format!("{base}/messages/recovery-two/dismiss"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let id = project.id;
+    app.db
+        .call(move |c| {
+            let state = work::snapshot(c, &id)?;
+            assert!(state.attention.iter().all(|a| a.status == "resolved"));
+            assert_eq!(state.jobs[0].status, "abandoned");
+            assert!(state.events.iter().all(|e| e.source != "child"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    server.abort();
+}
