@@ -54,6 +54,8 @@ A business decision persists its question and pauses the task. Answering it inse
 
 ## Compatibility and delivery
 
-Keep the bundle identifier, data directory, update signing key, credentials and bot/project binding. Archive old Core execution references during migration and never use them to control a legacy terminal. Preserve message history and uncertain operations. Source, documentation, default UI and commits use English; desktop preference supports persistent English and Simplified Chinese.
+The pre-refactor transition covers only the owner's MacBook Pro and Mac mini. Preserve their credentials, bot/project binding, projects, history and uncertain operations through a one-time migration. Keep the existing bundle identifier, data directory and update signing key for that transition. There is no hc/Core runtime adapter or dual-backend support. After both devices are migrated and verified, remove the old Core execution archive, migration notices and transition-only paths. This does not retire the selected `herdr` 0.9.5 runtime or ordinary protocol, identity and storage version checks.
+
+Source, documentation, default UI and commits use English; desktop preference supports persistent English and Simplified Chinese.
 
 Implementation issues: #23 legacy execution and adapters, #24 durable tasks/scheduling/supervision, #25 native embedded workspace. Parent #22 closes only after all acceptance checks pass. Version 0.3.4 publishes the pre-refactor main; this implementation does not publish another version automatically.

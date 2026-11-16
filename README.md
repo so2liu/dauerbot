@@ -6,7 +6,7 @@ One bot belongs to one project with one active agent. Direct messages and group 
 
 ## Install
 
-Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. The published 0.3.4 release uses HERDR Core (`hc`) and Herdr App. The architecture on this branch instead requires legacy **`herdr` 0.9.5** and embeds its terminal directly. These backends are incompatible. Sign in to the native Agent CLI you want to use; Dauerbot keeps its existing login and model settings.
+Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. The published 0.3.4 release uses HERDR Core (`hc`) and Herdr App. The current source requires **`herdr` 0.9.5** and embeds its terminal directly; it does not support the former execution backend. Sign in to the native Agent CLI you want to use; Dauerbot keeps its existing login and model settings.
 
 Starting with 0.3.2, releases require Developer ID Application signing, Apple notarization, a stapled ticket, and Gatekeeper acceptance before publication. Intel builds and the minimum supported macOS version have not been verified.
 
@@ -44,7 +44,7 @@ Use `--data-dir` for an independent instance. Its window shows an independent-in
 open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
 ```
 
-Each data directory derives its own dedicated legacy HERDR session. Migration archives old Core execution addresses without controlling or terminating those processes; projects, credentials, native history references and messages remain intact. Projects with a previous live Core execution stay stopped until you explicitly start or resume them, so the two backends cannot automatically write to the same native conversation.
+Each data directory derives its own dedicated HERDR session. A one-time transition preserves existing projects, credentials, native history references and messages, and clears old Core execution addresses. Projects with a previous live Core execution stay stopped until you explicitly start or resume them. This transition does not provide ongoing support for the former backend.
 
 ## Build and develop
 
