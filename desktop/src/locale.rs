@@ -120,9 +120,6 @@ impl Language {
             "The Agent has not connected to Dauerbot yet. Check login and MCP setup in its terminal." => {
                 "智能体还没有连接 Dauerbot，请在右侧终端中检查登录和 MCP 设置。"
             }
-            "An earlier task has an unconfirmed result. New messages continue automatically; review the result before retrying that earlier task." => {
-                "之前有一项任务的结果尚未确认。新消息仍会自动处理；仅在重试旧任务前需要核对结果。"
-            }
             "The Agent exited during a task. Check the saved result before retrying uncertain work." => {
                 "智能体在任务执行期间退出了。请先检查已保存的结果，再决定是否重试。"
             }

@@ -548,6 +548,7 @@ def main():
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1
         checks.append("project stop preserves unrelated user-added terminals in its workspace")
         legacy_rpc("pane.close", {"pane_id": user_pane})
+        wait_for(lambda: next(p for p in api("/state")["projects"] if p["id"] == key)["lifecycle"] == "sleeping", "interrupted history incorrectly made a dormant project require manual startup")
         FIXTURE.emit(message("om_after_stop", "wake automatically after stop"))
         wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "completed" for e in api(f"/projects/{key}/work")["events"]), "stopped execution did not automatically wake for new input")
         assert project_state()["generation"] != stopped_generation

@@ -486,18 +486,18 @@ impl App {
         let id = p.id.clone();
         let state = self.db.call(move |c| work::snapshot(c, &id)).await?;
         let project_id = p.id.clone();
-        let (queued,uncertain)=self.db.call(move|c|Ok((
-            c.query_row("SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued')",[&project_id],|r|r.get::<_,bool>(0))?,
-            c.query_row("SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='uncertain') OR EXISTS(SELECT 1 FROM work_jobs WHERE project_id=? AND status='uncertain')",rusqlite::params![project_id,project_id],|r|r.get::<_,bool>(0))?
-        ))).await?;
+        let queued = self
+            .db
+            .call(move |c| {
+                Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued')",
+            [&project_id], |r| r.get::<_,bool>(0),
+        )?)
+            })
+            .await?;
         if p.terminal.is_none() {
             if p.paused {
                 self.set_phase(&p, "paused", Value::Null).await;
-                return Ok(());
-            }
-            if uncertain && !queued {
-                self.set_phase(&p, "needs_attention", Value::Null).await;
-                self.attention(&p,"uncertain_input","An earlier task has an unconfirmed result. New messages continue automatically; review the result before retrying that earlier task.").await?;
                 return Ok(());
             }
             if !queued {
