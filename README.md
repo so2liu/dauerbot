@@ -168,6 +168,8 @@ An interrupted child can keep a task uncertain. Stop the project's execution, re
 
 The native app checks GitHub Releases at startup and every six hours while open. The stable channel accepts stable versions; preview also accepts prereleases. Selection uses semantic version order, not upload time or the Latest badge. Automatic updates download and replace the app in the background; the current desktop and HERDR agent keep running until you restart the desktop. The new desktop safely reconnects to a daemon using the same data directory.
 
+Reopening or updating the desktop reuses an authenticated daemon with the same API protocol, even when its version differs. The Updates view shows both versions. Choose **Update background service** to switch the daemon to the bundled version when ready; this briefly reconnects Feishu and local tools while HERDR and Agent sessions keep running. A protocol-incompatible daemon still requires a trusted installed app to replace it. This is service reuse, not zero-downtime daemon replacement; unknown delivery results remain uncertain instead of being retried.
+
 App Updates supports manual checks, installation, disabling automatic updates, channel selection, and rollback. Rollback pauses automatic updates so the reverted version stays installed. Version 0.2.0 requires one manual installation of an updater-enabled version.
 
 ```sh

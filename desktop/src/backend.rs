@@ -34,6 +34,7 @@ pub enum CommandRequest {
     Folder(PathBuf),
     Database(PathBuf),
     Environment,
+    RestartService,
     UpdatePreferences {
         automatic: bool,
         channel: String,
@@ -120,41 +121,7 @@ impl Backend {
                     .connect_timeout(Duration::from_secs(1))
                     .timeout(Duration::from_secs(3))
                     .build()?;
-                if let Ok(state) = request(&probe, &cfg, "GET", "/state", None).await
-                    && (state["version"]
-                        .as_str()
-                        .is_some_and(|v| v != herdr_feishu_bridge::update::CURRENT)
-                        || state["api_protocol"].as_u64() != Some(herdr_feishu_bridge::api::PROTOCOL))
-                {
-                    let signed = herdr_feishu_bridge::update::bundle()
-                        .is_some_and(|bundle| herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok());
-                    if !signed {
-                        bail!("An older or incompatible Dauerbot daemon is using this data directory. Quit that daemon before starting this build, or use --data-dir for an independent instance.");
-                    }
-                    herdr_feishu_bridge::update::stop_service(&data, &cfg).await?;
-                }
-                if let Err(e) = request(&probe, &cfg, "GET", "/state", None).await {
-                    if !connection_refused(&e) {
-                        return Err(e);
-                    }
-                    let mut child = spawn_service(&data)?;
-                    tokio::time::timeout(Duration::from_secs(15), async {
-                        loop {
-                            if request(&probe, &cfg, "GET", "/state", None).await.is_ok() {
-                                break Ok::<_, anyhow::Error>(());
-                            }
-                            if let Some(status) = child.try_wait()? {
-                                bail!(
-                                    "The local daemon exited ({status}). Check {}",
-                                    data.join("desktop-service.log").display()
-                                );
-                            }
-                            tokio::time::sleep(Duration::from_millis(150)).await;
-                        }
-                    })
-                    .await
-                    .context("Local daemon startup timed out. Check desktop-service.log.")??;
-                }
+                ensure_service(&data, &cfg, &probe, false).await?;
                 let mut connection = ConnectionState::default();
                 let mut last_restart = std::time::Instant::now() - Duration::from_secs(10);
                 let mut last_state = Value::Null;
@@ -222,6 +189,19 @@ impl Backend {
                         }
                         Ok(CommandRequest::Environment) => {
                             let _ = replies.send(Reply::Environment(environment(&cfg, &data)));
+                        }
+                        Ok(CommandRequest::RestartService) => {
+                            match ensure_service(&data, &cfg, &probe, true).await {
+                                Ok(()) => {
+                                    last_state = Value::Null;
+                                    let _ = replies.send(Reply::Done {
+                                        path: "/service/restart".into(),
+                                        value: Value::Null,
+                                        message: "Background service updated. Agent sessions were preserved.".into(),
+                                    });
+                                }
+                                Err(error) => { let _ = replies.send(Reply::Error(format!("{error:#}"))); }
+                            }
                         }
                         Ok(CommandRequest::UpdatePreferences { automatic, channel }) => {
                             let result =
@@ -321,6 +301,71 @@ fn connection_refused(error: &anyhow::Error) -> bool {
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_connect)
 }
+// Reopening the desktop must not interrupt an authenticated, compatible daemon.
+// An explicit service update opts into a bounded stop/start and its reconnection gap.
+async fn ensure_service(
+    data: &std::path::Path,
+    cfg: &Config,
+    probe: &reqwest::Client,
+    restart: bool,
+) -> Result<()> {
+    match request(probe, cfg, "GET", "/state", None).await {
+        Ok(state) => {
+            if !restart
+                && state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL)
+            {
+                return Ok(());
+            }
+            if restart && let Some(version) = state["version"].as_str() {
+                anyhow::ensure!(
+                    !herdr_feishu_bridge::update::is_newer(
+                        version,
+                        herdr_feishu_bridge::update::CURRENT
+                    )?,
+                    "The running background service is newer than this app. Use the newer app instead of downgrading its service."
+                );
+                if version == herdr_feishu_bridge::update::CURRENT
+                    && state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL)
+                {
+                    return Ok(());
+                }
+            }
+            let signed = herdr_feishu_bridge::update::bundle().is_some_and(|bundle| {
+                herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok()
+            });
+            if !signed {
+                bail!(
+                    "Updating the background service requires a trusted installed Dauerbot app. Quit an incompatible daemon before starting this build, or use --data-dir for an independent instance."
+                );
+            }
+            herdr_feishu_bridge::update::stop_service(data, cfg).await?;
+        }
+        Err(error) if connection_refused(&error) => {}
+        Err(error) => return Err(error),
+    }
+    let mut child = spawn_service(data)?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(state) = request(probe, cfg, "GET", "/state", None).await {
+                anyhow::ensure!(
+                    state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL),
+                    "The local daemon uses an incompatible API protocol"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+            if let Some(status) = child.try_wait()? {
+                bail!(
+                    "The local daemon exited ({status}). Check {}",
+                    data.join("desktop-service.log").display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await
+    .context("Local daemon startup timed out. Check desktop-service.log.")?
+}
+
 fn spawn_service(data: &std::path::Path) -> Result<std::process::Child> {
     let binary = std::env::current_exe()?.with_file_name("hfb");
     anyhow::ensure!(
@@ -445,6 +490,105 @@ pub fn scopes(all_group_replies: bool) -> Value {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+    fn service_fixture(status: &str, state: Value) -> (Config, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let config = Config {
+            port: listener.local_addr().unwrap().port(),
+            token: "private-test-token".into(),
+            ..Config::default()
+        };
+        let status = status.to_owned();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /api/state HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer private-test-token")
+            );
+            let body = state.to_string();
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        (config, worker)
+    }
+
+    #[tokio::test]
+    async fn reopening_a_compatible_daemon_never_restarts_it_for_a_version_difference() {
+        let data = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for version in ["0.0.1", "99.0.0"] {
+            let (config, worker) = service_fixture(
+                "200 OK",
+                json!({
+                    "version": version, "api_protocol": herdr_feishu_bridge::api::PROTOCOL
+                }),
+            );
+            // No bundled executable, daemon lock, or install exists here. Any
+            // attempted stop/start would fail instead of silently passing.
+            ensure_service(data.path(), &config, &client, false)
+                .await
+                .unwrap();
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_service_updates_do_not_downgrade_a_newer_daemon() {
+        let (config, worker) = service_fixture(
+            "200 OK",
+            json!({
+                "version": "99.0.0", "api_protocol": herdr_feishu_bridge::api::PROTOCOL
+            }),
+        );
+        let data = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = ensure_service(data.path(), &config, &client, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("newer than this app"));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_does_not_replace_the_running_service() {
+        let (config, worker) = service_fixture("401 Unauthorized", json!({"error":"Unauthorized"}));
+        let data = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = ensure_service(data.path(), &config, &client, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Unauthorized");
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_updates_and_incompatible_protocols_keep_the_trusted_install_gate() {
+        let data = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (restart, protocol) in [
+            (true, Some(herdr_feishu_bridge::api::PROTOCOL)),
+            (false, None),
+        ] {
+            let (config, worker) = service_fixture("200 OK", json!({"api_protocol":protocol}));
+            let error = ensure_service(data.path(), &config, &client, restart)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("trusted installed Dauerbot app"));
+            worker.join().unwrap();
+        }
+    }
+
     #[test]
     fn recovery_is_emitted_even_when_the_api_state_has_not_changed() {
         let mut state = ConnectionState::default();

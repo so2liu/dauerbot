@@ -1694,6 +1694,13 @@ impl Desktop {
         div().flex().flex_col().gap_5()
             .child(self.title("UPDATES", "App Updates", "Signed updates download in the background and take effect next time you open the app. Project files, bot settings, and active sessions stay intact."))
             .child(self.card("Current version", &format!("Dauerbot {} · {}", env!("CARGO_PKG_VERSION"), self.tr(if channel == "preview" { "Preview channel" } else { "Stable channel" }))))
+            .child(self.card("Background service", &format!("Dauerbot {}", self.state["version"].as_str().unwrap_or("Connecting..."))))
+            .when(self.state["version"].as_str().is_some_and(|version| herdr_feishu_bridge::update::is_newer(env!("CARGO_PKG_VERSION"), version).unwrap_or(false)), |page| {
+                page.child(self.card("Service update available", "The compatible background service keeps running when the desktop updates. Updating it briefly reconnects messages and tools; Agent sessions keep running."))
+                    .child(Button::new("update-service").label(self.tr("Update background service")).on_click(cx.listener(|this, _, _, cx| {
+                        let _ = this.backend.tx.send(CommandRequest::RestartService); cx.notify();
+                    })))
+            })
             .child(self.card("Update status", &message))
             .child(div().flex().gap_3().flex_wrap()
                 .child(Button::new("update-check").label(self.tr("Check for updates")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
