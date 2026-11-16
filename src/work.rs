@@ -634,14 +634,16 @@ pub fn event(c: &Connection, project: &str, id: &str) -> Result<Event> {
 }
 pub fn tasks(c: &Connection, project: &str) -> Result<Vec<Task>> {
     Ok(c.prepare(&format!(
-        "SELECT {TASK} FROM work_tasks WHERE project_id=? ORDER BY created_at DESC LIMIT 200"
+        "SELECT {TASK} FROM work_tasks WHERE project_id=?
+         ORDER BY CASE WHEN status IN ('running','uncertain','waiting') THEN 0 WHEN status='queued' THEN 1 ELSE 2 END, created_at DESC LIMIT 200"
     ))?
     .query_map([project], task_row)?
     .collect::<rusqlite::Result<_>>()?)
 }
 pub fn events(c: &Connection, project: &str) -> Result<Vec<Event>> {
     Ok(c.prepare(&format!(
-        "SELECT {EVENT} FROM work_events WHERE project_id=? ORDER BY created_at DESC LIMIT 200"
+        "SELECT {EVENT} FROM work_events WHERE project_id=?
+         ORDER BY CASE WHEN status IN ('uncertain','failed') THEN 0 WHEN status IN ('submitting','submitted') THEN 1 WHEN status='acknowledged' THEN 2 ELSE 3 END, created_at DESC LIMIT 200"
     ))?
     .query_map([project], event_row)?
     .collect::<rusqlite::Result<_>>()?)
@@ -1775,11 +1777,11 @@ pub fn snapshot(c: &Connection, project: &str) -> Result<WorkState> {
         tasks:tasks(c,project)?,events:events(c,project)?,runs,execution,lease,
         timers:c.prepare(&format!("SELECT {TIMER} FROM work_timers WHERE project_id=? ORDER BY created_at DESC"))?
           .query_map([project],timer_row)?.collect::<rusqlite::Result<_>>()?,
-        decisions:c.prepare(&format!("SELECT {DECISION} FROM work_decisions WHERE project_id=? ORDER BY created_at DESC LIMIT 100"))?
+        decisions:c.prepare(&format!("SELECT {DECISION} FROM work_decisions WHERE project_id=? ORDER BY (status='pending') DESC,created_at DESC LIMIT 100"))?
           .query_map([project],decision_row)?.collect::<rusqlite::Result<_>>()?,
-        jobs:c.prepare(&format!("SELECT {JOB} FROM work_jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 100"))?
+        jobs:c.prepare(&format!("SELECT {JOB} FROM work_jobs WHERE project_id=? ORDER BY (status IN ('active','uncertain')) DESC,created_at DESC LIMIT 100"))?
           .query_map([project],job_row)?.collect::<rusqlite::Result<_>>()?,
-        attention:c.prepare(&format!("SELECT {ATTENTION} FROM work_attention WHERE project_id=? ORDER BY last_seen DESC LIMIT 100"))?
+        attention:c.prepare(&format!("SELECT {ATTENTION} FROM work_attention WHERE project_id=? ORDER BY (status='open') DESC,last_seen DESC LIMIT 100"))?
           .query_map([project],attention_row)?.collect::<rusqlite::Result<_>>()?,
     })
 }

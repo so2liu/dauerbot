@@ -35,6 +35,7 @@ impl IntoResponse for ApiError {
     }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
+pub const PROTOCOL: u64 = 2;
 
 pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()
@@ -251,7 +252,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         records.push(record);
     }
     Ok(Json(
-        json!({"projects":records,"work":work_states,"bot_project":app.db.bot_project().await?,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION")}),
+        json!({"projects":records,"work":work_states,"bot_project":app.db.bot_project().await?,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {

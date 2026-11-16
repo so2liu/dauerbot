@@ -509,6 +509,14 @@ async fn main() -> Result<()> {
             .build()?,
         cfg: cfg.clone(),
     };
+    if !matches!(&cli.command, Commands::Init | Commands::Service) {
+        let state = client.request("GET", "/state", None).await?;
+        if state["api_protocol"].as_u64() != Some(api::PROTOCOL) {
+            bail!(
+                "An incompatible Dauerbot daemon is using this data directory. Stop the old daemon and run this build's hfb serve, or use --data-dir for an independent instance."
+            );
+        }
+    }
     let value=match cli.command{
         Commands::Init=>json!({"data_dir":dir,"url":cfg.url()}),
         Commands::Status=>client.request("GET","/state",None).await?,

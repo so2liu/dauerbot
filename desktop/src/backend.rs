@@ -121,12 +121,16 @@ impl Backend {
                     .timeout(Duration::from_secs(3))
                     .build()?;
                 if let Ok(state) = request(&probe, &cfg, "GET", "/state", None).await
-                    && state["version"]
+                    && (state["version"]
                         .as_str()
                         .is_some_and(|v| v != herdr_feishu_bridge::update::CURRENT)
-                    && let Some(bundle) = herdr_feishu_bridge::update::bundle()
-                    && herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok()
+                        || state["api_protocol"].as_u64() != Some(herdr_feishu_bridge::api::PROTOCOL))
                 {
+                    let signed = herdr_feishu_bridge::update::bundle()
+                        .is_some_and(|bundle| herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok());
+                    if !signed {
+                        bail!("An older or incompatible Dauerbot daemon is using this data directory. Quit that daemon before starting this build, or use --data-dir for an independent instance.");
+                    }
                     herdr_feishu_bridge::update::stop_service(&data, &cfg).await?;
                 }
                 if let Err(e) = request(&probe, &cfg, "GET", "/state", None).await {

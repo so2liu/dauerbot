@@ -45,6 +45,22 @@ fn finish(c: &Connection, run: &Run, now: i64) {
 }
 
 #[test]
+fn a_large_backlog_cannot_hide_the_event_that_needs_recovery() {
+    let c = store();
+    let blocked = submit(&c, "blocked", 1);
+    let run = claim_next(&c, "p", "g", 2).unwrap().unwrap();
+    delivery(&c, &run.id, "uncertain", "Socket closed after input", 3).unwrap();
+    for index in 0..205 {
+        submit(&c, &format!("queued-{index}"), 10 + index);
+    }
+    let state = snapshot(&c, "p").unwrap();
+    assert_eq!(state.events.len(), 200);
+    assert_eq!(state.events[0].id, blocked.id);
+    assert_eq!(state.tasks[0].id, blocked.task_id);
+    assert_eq!(state.events[0].status, "uncertain");
+}
+
+#[test]
 fn migration_preserves_receipt_and_uncertainty_without_replaying_old_work() {
     let c = store();
     for (index, status) in [

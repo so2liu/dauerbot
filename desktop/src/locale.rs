@@ -42,6 +42,40 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "An older or incompatible Dauerbot daemon is using this data directory. Quit that daemon before starting this build, or use --data-dir for an independent instance." => {
+                "当前数据目录正在由旧版或不兼容的 Dauerbot 服务使用。请先退出旧服务，或用 --data-dir 打开独立实例。"
+            }
+            "Startup output" => "启动信息",
+            "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check, then choose Start or Resume. Automatic retry waits thirty seconds." => {
+                "CLI 在接收任务前退出了。请在“环境检查”中确认安装和登录状态，再点击“启动”或“恢复”。系统会等待三十秒后自动重试。"
+            }
+            "The Agent stopped working without completing its task record. Continue in the terminal and ask it to call finish_run, or review the saved result before retrying or dismissing the task." => {
+                "智能体已停止执行，但还没有登记任务完成。请在终端中让它调用 finish_run，或先检查结果，再重试或忽略这个任务。"
+            }
+            "Sign in to the Agent CLI in this project's terminal. Saved tasks will continue after login." => {
+                "请在项目右侧终端中登录智能体。已保存的任务会在登录后继续。"
+            }
+            "The Agent needs a permission decision. Continue in this project's terminal." => {
+                "智能体正在等待权限确认，请在项目右侧终端中处理。"
+            }
+            "The Agent is waiting for input. Continue in this project's terminal." => {
+                "智能体正在等待输入，请在项目右侧终端中继续。"
+            }
+            "The Agent reported an error. Open its terminal to see the cause and continue." => {
+                "智能体遇到了错误，请在右侧终端中查看原因并继续。"
+            }
+            "The Agent has not connected to Dauerbot yet. Check login and MCP setup in its terminal." => {
+                "智能体还没有连接 Dauerbot，请在右侧终端中检查登录和 MCP 设置。"
+            }
+            "An interrupted task may have performed work. Review its result and retry or dismiss it before continuing." => {
+                "中断的任务可能已经完成了部分操作。请先检查结果，再选择重试或忽略。"
+            }
+            "The Agent exited during a task. Check the saved result before retrying uncertain work." => {
+                "智能体在任务执行期间退出了。请先检查已保存的结果，再决定是否重试。"
+            }
+            "Task input may have reached the Agent. Verify its terminal before retrying this task." => {
+                "任务可能已经发送给智能体。请先检查终端，再决定是否重试。"
+            }
             "Paste is larger than 1 MiB" => "粘贴内容超过 1 MiB",
             "Terminal input is busy; try again." => "终端输入繁忙，请重试。",
             "Terminal frame exceeded the size limit" => "终端画面超过大小限制",

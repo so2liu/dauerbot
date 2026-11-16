@@ -845,7 +845,7 @@ impl Desktop {
             {
                 let project_id = id.clone();
                 body = body
-                    .child(self.card_detail("Session preserved", message))
+                    .child(self.card("Session preserved", message))
                     .child(self.btn(
                         "dismiss-migration",
                         "Got it",
@@ -863,6 +863,14 @@ impl Desktop {
                 body = body.child(self.card_detail("Needs attention", issue));
             }
             let work = self.state["work"][&id].clone();
+            if project["terminal"].is_null()
+                && work["execution"]["status"] == "exited"
+                && let Some(error) = work["execution"]["error"]
+                    .as_str()
+                    .filter(|error| error.contains("\n\n"))
+            {
+                body = body.child(self.card_detail("Startup output", error));
+            }
             for attention in work["attention"]
                 .as_array()
                 .into_iter()
@@ -871,7 +879,7 @@ impl Desktop {
                 .take(2)
             {
                 if let Some(message) = attention["message"].as_str() {
-                    body = body.child(self.card_detail("Needs attention", message));
+                    body = body.child(self.card("Needs attention", message));
                 }
             }
             let unfinished = work["attention"]

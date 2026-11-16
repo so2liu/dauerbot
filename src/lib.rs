@@ -132,7 +132,9 @@ impl App {
             &serde_json::to_vec_pretty(&json!({"mcpServers":{"herdr_feishu":entry}}))?,
         )?;
         if p.agent == "pi" {
-            herdr::merge_mcp(&PathBuf::from(&p.path).join(".pi/mcp.json"), &entry)?;
+            let mut pi_entry = entry.clone();
+            pi_entry["exposure"] = json!("direct");
+            herdr::merge_mcp(&PathBuf::from(&p.path).join(".pi/mcp.json"), &pi_entry)?;
         }
         if p.agent == "agy" {
             herdr::merge_mcp(
@@ -463,6 +465,8 @@ impl App {
     async fn reconcile(self: &Arc<Self>, key: &str) -> Result<()> {
         let lock = self.project_lock(key).await;
         let Ok(_guard) = lock.try_lock() else {
+            // Notifications are level-triggered: the durable inbox is checked
+            // again by the two-second sweep. Do not queue unbounded lock waiters.
             return Ok(());
         };
         let mut p = self.db.project(key).await?;
@@ -492,6 +496,14 @@ impl App {
                 .await;
                 return Ok(());
             }
+            if state.attention.iter().any(|item| {
+                item.status == "open"
+                    && item.reason == "startup"
+                    && db::now() - item.last_seen < 30_000
+            }) {
+                self.set_phase(&p, "needs_attention", Value::Null).await;
+                return Ok(());
+            }
             self.set_phase(&p, "starting", Value::Null).await;
             let resume = !p.native_session.is_empty();
             match self.start_inner(&p.id, resume).await {
@@ -516,6 +528,23 @@ impl App {
             rt.core_error.clear();
         }
         if record["state"] != "live" {
+            let exit_error = if !p.ready {
+                let output = herdr::screen(&cfg, &p, 30).await.unwrap_or_default();
+                let start = output
+                    .char_indices()
+                    .rev()
+                    .nth(3999)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let output = &output[start..];
+                if output.trim().is_empty() {
+                    "The Agent execution exited before connecting".to_owned()
+                } else {
+                    format!("The Agent execution exited before connecting\n\n{output}")
+                }
+            } else {
+                "The Agent execution exited".to_owned()
+            };
             // HERDR retains an exited pane until it is closed. Remove only this
             // generation's pane before forgetting its durable identity.
             herdr::stop(&cfg, &p).await?;
@@ -523,14 +552,7 @@ impl App {
             let generation_id = p.generation.clone();
             self.db
                 .call(move |c| {
-                    work::finish_execution(
-                        c,
-                        &id,
-                        &generation_id,
-                        "exited",
-                        "The Agent execution exited",
-                        db::now(),
-                    )
+                    work::finish_execution(c, &id, &generation_id, "exited", &exit_error, db::now())
                 })
                 .await?;
             let project_id = p.id.clone();
@@ -540,13 +562,16 @@ impl App {
                 .await?;
             if interrupted {
                 self.attention(&p,"execution_lost","The Agent exited during a task. Check the saved result before retrying uncertain work.").await?;
+            } else if queued || !p.ready {
+                self.attention(&p,"startup",
+                    "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check, then choose Start or Resume. Automatic retry waits thirty seconds.").await?;
             }
             self.db
                 .set_session(&p.id, None, None, String::new())
                 .await?;
             self.set_phase(
                 &p,
-                if interrupted {
+                if interrupted || queued || !p.ready {
                     "needs_attention"
                 } else {
                     "exited"
@@ -592,7 +617,9 @@ impl App {
             return Ok(());
         }
         if native_status == "blocked" {
-            if p.agent == "agy" && herdr::confirm_project_trust(&cfg, &p).await.is_ok() {
+            if matches!(p.agent.as_str(), "agy" | "claude")
+                && herdr::confirm_project_trust(&cfg, &p).await.is_ok()
+            {
                 self.set_phase(&p, "starting", record).await;
                 return Ok(());
             }
