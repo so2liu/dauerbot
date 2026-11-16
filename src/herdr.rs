@@ -282,6 +282,39 @@ pub fn managed_name(generation: &str) -> Result<String> {
     Ok(format!("db-{}", String::from_utf8(digits)?))
 }
 
+/// Probe through the same login shell and cwd used by the actual native launch.
+/// Older Codex builds do not recognize this flag; their normal PTY is already
+/// dedicated. Newer builds need it to avoid reusing a daemon's terminal context.
+async fn compatible_launch_args(
+    config: &Config,
+    p: &Project,
+    argv: &[String],
+) -> Result<Vec<String>> {
+    let mut effective = argv.to_vec();
+    if p.agent != "codex" || argv.iter().any(|arg| arg == "--no-daemon") {
+        return Ok(effective);
+    }
+    let probe = login_shell_args(vec!["codex".into(), "--help".into()]);
+    let mut cmd = Command::new(&probe[0]);
+    cmd.args(&probe[1..]).current_dir(&p.path);
+    command_environment(config, &mut cmd);
+    let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
+        .await
+        .context("Codex capability check timed out; check codex --help in your terminal")?
+        .context("Cannot inspect the Codex CLI selected by your login shell")?;
+    if !output.status.success() {
+        bail!(
+            "The selected Codex CLI could not show its capabilities; run codex --help in your terminal"
+        );
+    }
+    let advertised = String::from_utf8_lossy(&output.stdout).contains("--no-daemon")
+        || String::from_utf8_lossy(&output.stderr).contains("--no-daemon");
+    if advertised {
+        effective.insert(1, "--no-daemon".into());
+    }
+    Ok(effective)
+}
+
 /// Create the identity before launch so an early MCP registration can validate it.
 pub async fn prepare_execution(
     config: &Config,
@@ -293,6 +326,7 @@ pub async fn prepare_execution(
     if argv.is_empty() {
         bail!("The Agent launch plan is empty");
     }
+    let argv = compatible_launch_args(config, p, argv).await?;
     let permit_root = if config.herdr_config.is_empty() {
         socket_path(config)?
             .parent()

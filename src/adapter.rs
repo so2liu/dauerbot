@@ -14,7 +14,6 @@ pub fn launch_args(
     let mut argv: Vec<String> = match p.agent.as_str() {
         "codex" => vec![
             "codex".into(),
-            "--no-daemon".into(),
             "--dangerously-bypass-approvals-and-sandbox".into(),
             "-c".into(),
             format!("mcp_servers.herdr_feishu.command={}", mcp_entry["command"]),
