@@ -411,10 +411,21 @@ fn attention_row(r: &Row<'_>) -> rusqlite::Result<Attention> {
 const ATTENTION: &str = "id,project_id,generation,reason,message,to_id,status,actions,occurrences,first_seen,last_seen,resolved_at";
 
 fn transaction<T>(c: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let tx = c.unchecked_transaction()?;
-    let result = f(&tx)?;
-    tx.commit()?;
-    Ok(result)
+    // Savepoints also work inside the atomic database migration transaction.
+    let name = format!("dauerbot_work_{}", crate::db::id().replace('-', ""));
+    c.execute_batch(&format!("SAVEPOINT {name}"))?;
+    match f(c) {
+        Ok(result) => {
+            c.execute_batch(&format!("RELEASE SAVEPOINT {name}"))?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = c.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+            ));
+            Err(error)
+        }
+    }
 }
 
 /// Import only missing records. Existing receipts never imply successful task completion.
@@ -606,20 +617,20 @@ pub fn submit_task(
     })
 }
 pub fn task(c: &Connection, project: &str, id: &str) -> Result<Task> {
-    Ok(c.query_row(
+    c.query_row(
         &format!("SELECT {TASK} FROM work_tasks WHERE project_id=? AND id=?"),
         params![project, id],
         task_row,
     )
-    .context("Task not found")?)
+    .context("Task not found")
 }
 pub fn event(c: &Connection, project: &str, id: &str) -> Result<Event> {
-    Ok(c.query_row(
+    c.query_row(
         &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND id=?"),
         params![project, id],
         event_row,
     )
-    .context("Event not found")?)
+    .context("Event not found")
 }
 pub fn tasks(c: &Connection, project: &str) -> Result<Vec<Task>> {
     Ok(c.prepare(&format!(
@@ -636,12 +647,12 @@ pub fn events(c: &Connection, project: &str) -> Result<Vec<Event>> {
     .collect::<rusqlite::Result<_>>()?)
 }
 pub fn run(c: &Connection, project: &str, id: &str) -> Result<Run> {
-    Ok(c.query_row(
+    c.query_row(
         &format!("SELECT {RUN} FROM work_runs WHERE project_id=? AND id=?"),
         params![project, id],
         run_row,
     )
-    .context("Run not found")?)
+    .context("Run not found")
 }
 pub fn active_run(c: &Connection, project: &str) -> Result<Option<Run>> {
     Ok(c.query_row(&format!("SELECT {RUN} FROM work_runs WHERE project_id=? AND status IN ('submitting','submitted','running','uncertain') ORDER BY started_at LIMIT 1"),
@@ -823,14 +834,11 @@ pub fn finish_run(
         );
         if outcome == "deferred" {
             let waiting: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM work_decisions WHERE run_id=? AND status='pending')",
+                "SELECT EXISTS(SELECT 1 FROM work_decisions WHERE run_id=? AND status IN ('pending','answered'))",
                 [run_id],
                 |r| r.get(0),
             )?;
-            ensure!(
-                waiting,
-                "A deferred run requires a pending durable decision"
-            );
+            ensure!(waiting, "A deferred run requires a durable decision");
         }
         c.execute("UPDATE work_runs SET status=?,outcome=?,summary=?,updated_at=?,finished_at=? WHERE id=?",
           params![outcome,outcome,summary,now,now,run_id])?;
@@ -848,10 +856,17 @@ pub fn finish_run(
         )?;
         c.execute("UPDATE messages SET status='acknowledged',error='',updated_at=? WHERE id=(SELECT message_id FROM work_events WHERE id=?)",
           params![now,current.event_id])?;
+        let continuation: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_events WHERE task_id=? AND status='queued')",
+            [&current.task_id],
+            |r| r.get(0),
+        )?;
         c.execute(
             "UPDATE work_tasks SET status=?,checkpoint=?,updated_at=? WHERE id=?",
             params![
-                if outcome == "deferred" {
+                if continuation {
+                    "queued"
+                } else if outcome == "deferred" {
                     "waiting"
                 } else if outcome == "failed" {
                     "failed"
@@ -982,10 +997,8 @@ fn parse_at(value: &Value) -> Result<i64> {
         _ => bail!("Start time must be RFC3339 text or milliseconds since Unix epoch"),
     }
 }
-fn timer_fields(
-    input: &TimerInput,
-    now: i64,
-) -> Result<(Option<i64>, Option<i64>, String, Option<i64>)> {
+type TimerFields = (Option<i64>, Option<i64>, String, Option<i64>);
+fn timer_fields(input: &TimerInput, now: i64) -> Result<TimerFields> {
     ensure!(
         !input.name.trim().is_empty() && input.name.len() <= 240,
         "Schedule name must contain 1 to 240 bytes"
@@ -1039,12 +1052,12 @@ fn timer_fields(
     }
 }
 pub fn timer(c: &Connection, project: &str, id: &str) -> Result<Timer> {
-    Ok(c.query_row(
+    c.query_row(
         &format!("SELECT {TIMER} FROM work_timers WHERE project_id=? AND id=?"),
         params![project, id],
         timer_row,
     )
-    .context("Schedule not found")?)
+    .context("Schedule not found")
 }
 pub fn create_timer(c: &Connection, project: &str, input: TimerInput, now: i64) -> Result<Timer> {
     let (at, interval, cron, next) = timer_fields(&input, now)?;
@@ -1261,7 +1274,7 @@ pub fn request_decision(
             run.generation == generation && run.finished_at.is_none(),
             "Decision must belong to the current active run"
         );
-        if let Some(existing)=c.query_row(&format!("SELECT {DECISION} FROM work_decisions WHERE run_id=? AND question=? AND status='pending' ORDER BY created_at LIMIT 1"),
+        if let Some(existing)=c.query_row(&format!("SELECT {DECISION} FROM work_decisions WHERE run_id=? AND question=? AND status IN ('pending','answered') ORDER BY created_at LIMIT 1"),
           params![run_id,question],decision_row).optional()?{
             ensure!(existing.to==to&&existing.options==options,"Decision question already exists with different options or recipient");
             return Ok(existing)
@@ -1358,6 +1371,21 @@ pub fn complete_job(
     result: &str,
     now: i64,
 ) -> Result<Event> {
+    complete_job_with_status(c, project, generation, id, "completed", result, now)
+}
+pub fn complete_job_with_status(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+    id: &str,
+    status: &str,
+    result: &str,
+    now: i64,
+) -> Result<Event> {
+    ensure!(
+        ["completed", "failed"].contains(&status),
+        "Child job status must be completed or failed"
+    );
     transaction(c, |c| {
         let job = c
             .query_row(
@@ -1371,18 +1399,19 @@ pub fn complete_job(
             "Child job belongs to a different execution"
         );
         ensure!(
-            job.status != "completed" || job.result == result,
+            !["completed", "failed"].contains(&job.status.as_str())
+                || (job.result == result && job.status == status),
             "Child job already completed with a different result"
         );
-        c.execute("UPDATE work_jobs SET status='completed',result=?,completed_at=COALESCE(completed_at,?) WHERE id=?",
-          params![result,now,id])?;
+        c.execute("UPDATE work_jobs SET status=?,result=?,completed_at=COALESCE(completed_at,?) WHERE id=?",
+          params![status,result,now,id])?;
         let event = insert_event(
             c,
             project,
             &job.task_id,
             "child",
             id,
-            json!({"job_id":id,"name":job.name,"result":result,"instructions":result,"parent_generation":generation}),
+            json!({"job_id":id,"name":job.name,"status":status,"result":result,"instructions":result,"parent_generation":generation}),
             now,
         )?;
         if event.status == "queued" {
