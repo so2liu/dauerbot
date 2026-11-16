@@ -1,4 +1,4 @@
-//! Durable work and scheduling, independent of a particular Agent CLI or process.
+//! Message delivery journal and schedules, independent of an Agent CLI or process.
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, TimeZone};
 use chrono_tz::Tz;
@@ -9,16 +9,6 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 
 pub const WARM_MS: i64 = 10 * 60 * 1000;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TaskInput {
-    pub title: String,
-    pub instructions: String,
-    #[serde(default)]
-    pub to: Option<String>,
-    #[serde(default)]
-    pub request_id: Option<String>,
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TimerInput {
@@ -43,22 +33,10 @@ fn utc() -> String {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Task {
-    pub id: String,
-    pub project_id: String,
-    pub title: String,
-    pub instructions: String,
-    pub to: String,
-    pub status: String,
-    pub checkpoint: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Event {
     pub id: String,
     pub project_id: String,
+    #[serde(skip_serializing)]
     pub task_id: String,
     pub source: String,
     pub source_id: String,
@@ -75,12 +53,11 @@ pub struct Event {
 pub struct Run {
     pub id: String,
     pub project_id: String,
+    #[serde(skip_serializing)]
     pub task_id: String,
     pub event_id: String,
     pub generation: String,
     pub status: String,
-    pub outcome: String,
-    pub summary: String,
     pub error: String,
     pub started_at: i64,
     pub updated_at: i64,
@@ -107,6 +84,7 @@ pub struct Execution {
 pub struct Timer {
     pub id: String,
     pub project_id: String,
+    #[serde(skip_serializing)]
     pub task_id: String,
     pub name: String,
     pub prompt: String,
@@ -121,35 +99,6 @@ pub struct Timer {
     pub revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Decision {
-    pub id: String,
-    pub project_id: String,
-    pub task_id: String,
-    pub run_id: String,
-    pub question: String,
-    pub to: String,
-    pub options: Value,
-    pub status: String,
-    pub answer: String,
-    pub created_at: i64,
-    pub answered_at: Option<i64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Job {
-    pub id: String,
-    pub project_id: String,
-    pub task_id: String,
-    pub run_id: String,
-    pub generation: String,
-    pub name: String,
-    pub status: String,
-    pub result: String,
-    pub created_at: i64,
-    pub completed_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -178,13 +127,10 @@ pub struct Lease {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkState {
-    pub tasks: Vec<Task>,
     pub events: Vec<Event>,
     pub runs: Vec<Run>,
     pub execution: Option<Execution>,
     pub timers: Vec<Timer>,
-    pub decisions: Vec<Decision>,
-    pub jobs: Vec<Job>,
     pub attention: Vec<Attention>,
     pub lease: Option<Lease>,
 }
@@ -236,19 +182,6 @@ pub fn migrate(c: &Connection) -> Result<()> {
           revision INTEGER NOT NULL, scheduled_at INTEGER NOT NULL,
           event_id TEXT REFERENCES work_events(id) ON DELETE SET NULL, status TEXT NOT NULL,
           PRIMARY KEY(timer_id,revision,scheduled_at));
-        CREATE TABLE IF NOT EXISTS work_decisions(
-          id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          task_id TEXT NOT NULL REFERENCES work_tasks(id) ON DELETE CASCADE,
-          run_id TEXT NOT NULL REFERENCES work_runs(id) ON DELETE CASCADE,
-          question TEXT NOT NULL, to_id TEXT NOT NULL DEFAULT '', options TEXT NOT NULL DEFAULT '[]',
-          status TEXT NOT NULL DEFAULT 'pending', answer TEXT NOT NULL DEFAULT '',
-          created_at INTEGER NOT NULL, answered_at INTEGER);
-        CREATE TABLE IF NOT EXISTS work_jobs(
-          id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          task_id TEXT NOT NULL REFERENCES work_tasks(id) ON DELETE CASCADE,
-          run_id TEXT NOT NULL REFERENCES work_runs(id) ON DELETE CASCADE, generation TEXT NOT NULL,
-          name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', result TEXT NOT NULL DEFAULT '',
-          created_at INTEGER NOT NULL, completed_at INTEGER);
         CREATE TABLE IF NOT EXISTS work_attention(
           id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
           generation TEXT NOT NULL, reason TEXT NOT NULL, message TEXT NOT NULL, to_id TEXT NOT NULL DEFAULT '',
@@ -263,24 +196,22 @@ pub fn migrate(c: &Connection) -> Result<()> {
           PRIMARY KEY(project_id,generation));
         ",
     )?;
+    let has_sequence: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_runs') WHERE name='native_seq')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_sequence {
+        c.execute("ALTER TABLE work_runs ADD COLUMN native_seq INTEGER", [])?;
+    }
+    // Removed bookkeeping must never gate an upgraded session. Keep the journal,
+    // messages, schedule IDs and occurrences; do not requeue submitted input.
+    c.execute_batch("DROP TABLE IF EXISTS work_jobs; DROP TABLE IF EXISTS work_decisions;
+        UPDATE work_attention SET status='resolved' WHERE reason IN ('unfinished_run','not_ready');")?;
     sync_inbound(c)?;
     Ok(())
 }
 
-fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
-    Ok(Task {
-        id: r.get(0)?,
-        project_id: r.get(1)?,
-        title: r.get(2)?,
-        instructions: r.get(3)?,
-        to: r.get(4)?,
-        status: r.get(5)?,
-        checkpoint: r.get(6)?,
-        created_at: r.get(7)?,
-        updated_at: r.get(8)?,
-    })
-}
-const TASK: &str = "id,project_id,title,instructions,to_id,status,checkpoint,created_at,updated_at";
 fn json_column(r: &Row<'_>, index: usize) -> rusqlite::Result<Value> {
     let text: String = r.get(index)?;
     serde_json::from_str(&text).map_err(|e| {
@@ -312,15 +243,14 @@ fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
         event_id: r.get(3)?,
         generation: r.get(4)?,
         status: r.get(5)?,
-        outcome: r.get(6)?,
-        summary: r.get(7)?,
-        error: r.get(8)?,
-        started_at: r.get(9)?,
-        updated_at: r.get(10)?,
-        finished_at: r.get(11)?,
+        error: r.get(6)?,
+        started_at: r.get(7)?,
+        updated_at: r.get(8)?,
+        finished_at: r.get(9)?,
     })
 }
-const RUN: &str = "id,project_id,task_id,event_id,generation,status,outcome,summary,error,started_at,updated_at,finished_at";
+const RUN: &str =
+    "id,project_id,task_id,event_id,generation,status,error,started_at,updated_at,finished_at";
 fn execution_row(r: &Row<'_>) -> rusqlite::Result<Execution> {
     Ok(Execution {
         generation: r.get(0)?,
@@ -359,39 +289,6 @@ fn timer_row(r: &Row<'_>) -> rusqlite::Result<Timer> {
     })
 }
 const TIMER: &str = "id,project_id,task_id,name,prompt,kind,at_ms,interval_seconds,cron,timezone,to_id,next_fire,enabled,revision,created_at,updated_at";
-fn decision_row(r: &Row<'_>) -> rusqlite::Result<Decision> {
-    Ok(Decision {
-        id: r.get(0)?,
-        project_id: r.get(1)?,
-        task_id: r.get(2)?,
-        run_id: r.get(3)?,
-        question: r.get(4)?,
-        to: r.get(5)?,
-        options: json_column(r, 6)?,
-        status: r.get(7)?,
-        answer: r.get(8)?,
-        created_at: r.get(9)?,
-        answered_at: r.get(10)?,
-    })
-}
-const DECISION: &str =
-    "id,project_id,task_id,run_id,question,to_id,options,status,answer,created_at,answered_at";
-fn job_row(r: &Row<'_>) -> rusqlite::Result<Job> {
-    Ok(Job {
-        id: r.get(0)?,
-        project_id: r.get(1)?,
-        task_id: r.get(2)?,
-        run_id: r.get(3)?,
-        generation: r.get(4)?,
-        name: r.get(5)?,
-        status: r.get(6)?,
-        result: r.get(7)?,
-        created_at: r.get(8)?,
-        completed_at: r.get(9)?,
-    })
-}
-const JOB: &str =
-    "id,project_id,task_id,run_id,generation,name,status,result,created_at,completed_at";
 fn attention_row(r: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
         id: r.get(0)?,
@@ -434,7 +331,7 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
         // Legacy retry/dismiss/receipt endpoints remain authoritative for message delivery.
         let changes=c.prepare(
           "SELECT e.id,m.status,m.error,m.updated_at FROM work_events e JOIN messages m ON m.id=e.message_id
-           WHERE e.status NOT IN ('completed','cancelled','dismissed') AND m.status!=e.status
+           WHERE e.status NOT IN ('delivered','completed','cancelled','dismissed') AND m.status!=e.status
            AND NOT (m.status='submitting' AND e.status='uncertain')
            AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.event_id=e.id AND r.finished_at IS NOT NULL AND r.outcome!='')")?
           .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?
@@ -522,18 +419,6 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
     })
 }
 
-fn valid_task(input: &TaskInput) -> Result<()> {
-    ensure!(
-        !input.title.trim().is_empty() && input.title.len() <= 240,
-        "Task title must contain 1 to 240 bytes"
-    );
-    ensure!(
-        !input.instructions.trim().is_empty(),
-        "Task instructions cannot be empty"
-    );
-    valid_request(input.request_id.as_deref())?;
-    valid_to(input.to.as_deref())
-}
 fn valid_request(request: Option<&str>) -> Result<()> {
     if let Some(request) = request {
         ensure!(
@@ -551,19 +436,6 @@ fn valid_to(to: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
-}
-fn insert_task(
-    c: &Connection,
-    project: &str,
-    input: &TaskInput,
-    status: &str,
-    now: i64,
-) -> Result<String> {
-    valid_task(input)?;
-    let id = crate::db::id();
-    c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,to_id,status,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?)",params![id,project,input.title.trim(),input.instructions,input.to.as_deref().unwrap_or(""),status,now,now])?;
-    Ok(id)
 }
 fn insert_event(
     c: &Connection,
@@ -586,44 +458,6 @@ fn insert_event(
         event_row,
     )?)
 }
-pub fn submit_task(
-    c: &Connection,
-    project: &str,
-    input: TaskInput,
-    source: &str,
-    source_id: &str,
-    now: i64,
-) -> Result<Event> {
-    valid_task(&input)?;
-    let source_id = input.request_id.as_deref().unwrap_or(source_id);
-    transaction(c, |c| {
-        if let Some(existing)=c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND source=? AND source_id=?"),
-          params![project,source,source_id],event_row).optional()?{
-            let task=task(c,project,&existing.task_id)?;
-            ensure!(task.title==input.title.trim()&&task.instructions==input.instructions&&task.to==input.to.as_deref().unwrap_or(""),
-              "Event identity was already used for a different task");
-            return Ok(existing)
-        }
-        let task = insert_task(c, project, &input, "queued", now)?;
-        insert_event(
-            c,
-            project,
-            &task,
-            source,
-            source_id,
-            json!({"instructions":input.instructions,"to":input.to}),
-            now,
-        )
-    })
-}
-pub fn task(c: &Connection, project: &str, id: &str) -> Result<Task> {
-    c.query_row(
-        &format!("SELECT {TASK} FROM work_tasks WHERE project_id=? AND id=?"),
-        params![project, id],
-        task_row,
-    )
-    .context("Task not found")
-}
 pub fn event(c: &Connection, project: &str, id: &str) -> Result<Event> {
     c.query_row(
         &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND id=?"),
@@ -631,14 +465,6 @@ pub fn event(c: &Connection, project: &str, id: &str) -> Result<Event> {
         event_row,
     )
     .context("Event not found")
-}
-pub fn tasks(c: &Connection, project: &str) -> Result<Vec<Task>> {
-    Ok(c.prepare(&format!(
-        "SELECT {TASK} FROM work_tasks WHERE project_id=?
-         ORDER BY CASE WHEN status IN ('running','uncertain','waiting') THEN 0 WHEN status='queued' THEN 1 ELSE 2 END, created_at DESC LIMIT 200"
-    ))?
-    .query_map([project], task_row)?
-    .collect::<rusqlite::Result<_>>()?)
 }
 pub fn events(c: &Connection, project: &str) -> Result<Vec<Event>> {
     Ok(c.prepare(&format!(
@@ -711,16 +537,7 @@ fn claim(
         let next = if message.is_some() {
             message
         } else {
-            if steering_only || active_execution_run(c, project, generation)?.is_some() {
-                return Ok(None);
-            }
-            let blocked:bool=c.query_row(
-          "SELECT EXISTS(SELECT 1 FROM work_events e WHERE project_id=? AND EXISTS(
-            SELECT 1 FROM work_runs current WHERE current.event_id=e.id AND current.generation=?) AND (
-            status IN ('submitting','submitted','uncertain') OR
-            (status='failed' AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.event_id=e.id AND r.outcome='failed' AND r.finished_at IS NOT NULL))))",
-          params![project,generation],|r|r.get(0))?;
-            if blocked {
+            if steering_only {
                 return Ok(None);
             }
             c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' ORDER BY created_at,rowid LIMIT 1"),
@@ -791,144 +608,6 @@ pub fn delivery(c: &Connection, run_id: &str, status: &str, error: &str, now: i6
         Ok(())
     })
 }
-pub fn ack_event(
-    c: &Connection,
-    project: &str,
-    generation: &str,
-    event_id: &str,
-    now: i64,
-) -> Result<()> {
-    transaction(c, |c| {
-        let run=c.query_row(&format!("SELECT {RUN} FROM work_runs WHERE project_id=? AND generation=? AND event_id=? ORDER BY started_at DESC LIMIT 1"),
-          params![project,generation,event_id],run_row).context("No matching run in this execution")?;
-        if run.finished_at.is_some() {
-            return Ok(());
-        }
-        ensure!(
-            ["submitting", "submitted", "running", "uncertain"].contains(&run.status.as_str()),
-            "Run cannot accept a receipt"
-        );
-        c.execute("UPDATE work_events SET status='acknowledged',received_at=COALESCE(received_at,?),error='',updated_at=? WHERE id=?",params![now,now,event_id])?;
-        c.execute("UPDATE messages SET status='acknowledged',error='',updated_at=? WHERE id=(SELECT message_id FROM work_events WHERE id=?)",
-          params![now,event_id])?;
-        c.execute(
-            "UPDATE work_runs SET status='running',error='',updated_at=? WHERE id=?",
-            params![now, run.id],
-        )?;
-        c.execute(
-            "UPDATE work_tasks SET status='running',updated_at=? WHERE id=?",
-            params![now, run.task_id],
-        )?;
-        activity(c, project, generation, now)
-    })
-}
-pub fn checkpoint(
-    c: &Connection,
-    project: &str,
-    task_id: &str,
-    summary: &str,
-    now: i64,
-) -> Result<Task> {
-    ensure!(
-        c.execute(
-            "UPDATE work_tasks SET checkpoint=?,updated_at=? WHERE project_id=? AND id=?",
-            params![summary, now, project, task_id]
-        )? == 1,
-        "Task not found"
-    );
-    task(c, project, task_id)
-}
-pub fn finish_run(
-    c: &Connection,
-    project: &str,
-    generation: &str,
-    run_id: &str,
-    outcome: &str,
-    summary: &str,
-    now: i64,
-) -> Result<Run> {
-    ensure!(
-        ["completed", "noop", "deferred", "failed"].contains(&outcome),
-        "Outcome must be completed, noop, deferred, or failed"
-    );
-    transaction(c, |c| {
-        let current = run(c, project, run_id)?;
-        ensure!(
-            current.generation == generation,
-            "Execution changed; reconnect before completing this run"
-        );
-        if current.finished_at.is_some() {
-            ensure!(
-                current.outcome == outcome && current.summary == summary,
-                "Run already finished with a different result"
-            );
-            return Ok(current);
-        }
-        ensure!(
-            current.status != "uncertain",
-            "Resolve uncertain delivery before completing the run"
-        );
-        ensure!(
-            ["submitting", "submitted", "running"].contains(&current.status.as_str()),
-            "Run cannot be completed"
-        );
-        let children:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM work_jobs WHERE run_id=? AND status IN ('active','uncertain'))",
-          [run_id],|r|r.get(0))?;
-        ensure!(
-            !children,
-            "Tracked child jobs must finish or be explicitly resolved before completing the run"
-        );
-        if outcome == "deferred" {
-            let waiting: bool = c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM work_decisions WHERE run_id=? AND status IN ('pending','answered'))",
-                [run_id],
-                |r| r.get(0),
-            )?;
-            ensure!(waiting, "A deferred run requires a durable decision");
-        }
-        c.execute("UPDATE work_runs SET status=?,outcome=?,summary=?,updated_at=?,finished_at=? WHERE id=?",
-          params![outcome,outcome,summary,now,now,run_id])?;
-        c.execute(
-            "UPDATE work_events SET status=?,updated_at=? WHERE id=?",
-            params![
-                if outcome == "failed" {
-                    "failed"
-                } else {
-                    "completed"
-                },
-                now,
-                current.event_id
-            ],
-        )?;
-        c.execute("UPDATE messages SET status='acknowledged',error='',updated_at=? WHERE id=(SELECT message_id FROM work_events WHERE id=?)",
-          params![now,current.event_id])?;
-        let continuation: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_events WHERE task_id=? AND status='queued')",
-            [&current.task_id],
-            |r| r.get(0),
-        )?;
-        c.execute(
-            "UPDATE work_tasks SET status=?,checkpoint=?,updated_at=? WHERE id=?",
-            params![
-                if continuation {
-                    "queued"
-                } else if outcome == "deferred" {
-                    "waiting"
-                } else if outcome == "failed" {
-                    "failed"
-                } else {
-                    "completed"
-                },
-                summary,
-                now,
-                current.task_id
-            ],
-        )?;
-        activity(c, project, generation, now)?;
-        run(c, project, run_id)
-    })
-}
-
 fn cron_weekday(field: &str) -> Result<String> {
     const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
     if field == "*" {
@@ -1115,18 +794,9 @@ pub fn create_timer(c: &Connection, project: &str, input: TimerInput, now: i64) 
             ensure!(payload==request_payload,"Request ID was already used for a different schedule");
             return timer(c,project,&id)
         }
-        let task = insert_task(
-            c,
-            project,
-            &TaskInput {
-                title: input.name.clone(),
-                instructions: input.prompt.clone(),
-                to: input.to.clone(),
-                request_id: None,
-            },
-            "scheduled",
-            now,
-        )?;
+        let task = crate::db::id();
+        c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,to_id,status,created_at,updated_at)
+            VALUES(?,?,?,?,?,'scheduled',?,?)", params![task,project,input.name.trim(),input.prompt,input.to.as_deref().unwrap_or(""),now,now])?;
         let id = crate::db::id();
         c.execute("INSERT INTO work_timers(id,project_id,task_id,name,prompt,kind,at_ms,interval_seconds,cron,timezone,to_id,next_fire,request_id,request_payload,created_at,updated_at)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![id,project,task,input.name.trim(),input.prompt,input.kind,at,interval,cron,input.timezone,
@@ -1264,9 +934,8 @@ pub fn fire_due(c: &Connection, now: i64) -> Result<Vec<Event>> {
             let pending:bool=c.query_row(
               "SELECT EXISTS(SELECT 1 FROM work_events WHERE task_id=? AND status IN ('queued','submitting','submitted','uncertain'))
                OR EXISTS(SELECT 1 FROM work_runs WHERE task_id=? AND status IN ('submitting','submitted','running','uncertain'))
-               OR EXISTS(SELECT 1 FROM work_decisions WHERE task_id=? AND status='pending')
-               OR EXISTS(SELECT 1 FROM work_jobs WHERE task_id=? AND status='active')",
-              params![timer.task_id,timer.task_id,timer.task_id,timer.task_id],|r|r.get(0))?;
+",
+              params![timer.task_id,timer.task_id],|r|r.get(0))?;
             if pending {
                 c.execute("UPDATE work_occurrences SET status='skipped_pending' WHERE timer_id=? AND revision=? AND scheduled_at=?",
                   params![timer.id,timer.revision,due])?;
@@ -1295,183 +964,6 @@ pub fn fire_due(c: &Connection, now: i64) -> Result<Vec<Event>> {
               params![next,next.is_some(),now,timer.id,timer.revision])?;
         }
         Ok(events)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn request_decision(
-    c: &Connection,
-    project: &str,
-    generation: &str,
-    run_id: &str,
-    question: &str,
-    to: &str,
-    options: Value,
-    now: i64,
-) -> Result<Decision> {
-    ensure!(
-        !question.trim().is_empty(),
-        "Decision question cannot be empty"
-    );
-    valid_to(Some(to))?;
-    transaction(c, |c| {
-        let run = run(c, project, run_id)?;
-        ensure!(
-            run.generation == generation && run.finished_at.is_none(),
-            "Decision must belong to the current active run"
-        );
-        if let Some(existing)=c.query_row(&format!("SELECT {DECISION} FROM work_decisions WHERE run_id=? AND question=? AND status IN ('pending','answered') ORDER BY created_at LIMIT 1"),
-          params![run_id,question],decision_row).optional()?{
-            ensure!(existing.to==to&&existing.options==options,"Decision question already exists with different options or recipient");
-            return Ok(existing)
-        }
-        let id = crate::db::id();
-        c.execute("INSERT INTO work_decisions(id,project_id,task_id,run_id,question,to_id,options,created_at)
-          VALUES(?,?,?,?,?,?,?,?)",params![id,project,run.task_id,run_id,question,to,options.to_string(),now])?;
-        Ok(c.query_row(
-            &format!("SELECT {DECISION} FROM work_decisions WHERE id=?"),
-            [id],
-            decision_row,
-        )?)
-    })
-}
-pub fn answer_decision(
-    c: &Connection,
-    project: &str,
-    id: &str,
-    answer: &str,
-    now: i64,
-) -> Result<Event> {
-    ensure!(!answer.trim().is_empty(), "Decision answer cannot be empty");
-    transaction(c, |c| {
-        let decision = c
-            .query_row(
-                &format!("SELECT {DECISION} FROM work_decisions WHERE project_id=? AND id=?"),
-                params![project, id],
-                decision_row,
-            )
-            .context("Decision not found")?;
-        ensure!(
-            decision.status == "pending" || decision.answer == answer,
-            "Decision already has a different answer"
-        );
-        c.execute("UPDATE work_decisions SET status='answered',answer=?,answered_at=COALESCE(answered_at,?) WHERE id=?",
-          params![answer,now,id])?;
-        let event = insert_event(
-            c,
-            project,
-            &decision.task_id,
-            "decision",
-            id,
-            json!({"decision_id":id,"question":decision.question,"answer":answer,"instructions":answer,"to":decision.to}),
-            now,
-        )?;
-        if event.status == "queued" {
-            c.execute(
-                "UPDATE work_tasks SET status='queued',updated_at=? WHERE id=?",
-                params![now, decision.task_id],
-            )?;
-        }
-        Ok(event)
-    })
-}
-pub fn register_job(
-    c: &Connection,
-    project: &str,
-    generation: &str,
-    run_id: &str,
-    name: &str,
-    now: i64,
-) -> Result<Job> {
-    ensure!(
-        !name.trim().is_empty() && name.len() <= 240,
-        "Child job name must contain 1 to 240 bytes"
-    );
-    transaction(c, |c| {
-        let run = run(c, project, run_id)?;
-        ensure!(
-            run.generation == generation && run.finished_at.is_none(),
-            "Child job must belong to the current active run"
-        );
-        if let Some(existing)=c.query_row(&format!("SELECT {JOB} FROM work_jobs WHERE run_id=? AND name=? ORDER BY created_at LIMIT 1"),
-          params![run_id,name],job_row).optional()?{return Ok(existing)}
-        let id = crate::db::id();
-        c.execute(
-            "INSERT INTO work_jobs(id,project_id,task_id,run_id,generation,name,created_at)
-          VALUES(?,?,?,?,?,?,?)",
-            params![id, project, run.task_id, run_id, generation, name, now],
-        )?;
-        activity(c, project, generation, now)?;
-        Ok(c.query_row(
-            &format!("SELECT {JOB} FROM work_jobs WHERE id=?"),
-            [id],
-            job_row,
-        )?)
-    })
-}
-pub fn complete_job(
-    c: &Connection,
-    project: &str,
-    generation: &str,
-    id: &str,
-    result: &str,
-    now: i64,
-) -> Result<Event> {
-    complete_job_with_status(c, project, generation, id, "completed", result, now)
-}
-pub fn complete_job_with_status(
-    c: &Connection,
-    project: &str,
-    generation: &str,
-    id: &str,
-    status: &str,
-    result: &str,
-    now: i64,
-) -> Result<Event> {
-    ensure!(
-        ["completed", "failed"].contains(&status),
-        "Child job status must be completed or failed"
-    );
-    transaction(c, |c| {
-        let job = c
-            .query_row(
-                &format!("SELECT {JOB} FROM work_jobs WHERE project_id=? AND id=?"),
-                params![project, id],
-                job_row,
-            )
-            .context("Child job not found")?;
-        ensure!(
-            job.generation == generation,
-            "Child job belongs to a different execution"
-        );
-        ensure!(
-            job.status != "abandoned",
-            "The user abandoned this child result; it cannot be completed afterward"
-        );
-        ensure!(
-            !["completed", "failed"].contains(&job.status.as_str())
-                || (job.result == result && job.status == status),
-            "Child job already completed with a different result"
-        );
-        c.execute("UPDATE work_jobs SET status=?,result=?,completed_at=COALESCE(completed_at,?) WHERE id=?",
-          params![status,result,now,id])?;
-        let event = insert_event(
-            c,
-            project,
-            &job.task_id,
-            "child",
-            id,
-            json!({"job_id":id,"name":job.name,"status":status,"result":result,"instructions":result,"parent_generation":generation}),
-            now,
-        )?;
-        if event.status == "queued" {
-            c.execute(
-                "UPDATE work_tasks SET status='queued',updated_at=? WHERE id=?",
-                params![now, job.task_id],
-            )?;
-        }
-        activity(c, project, generation, now)?;
-        Ok(event)
     })
 }
 
@@ -1563,7 +1055,7 @@ pub fn has_takeover(c: &Connection, project: &str, generation: &str) -> Result<b
 }
 
 /// Call only after the execution adapter has independently established native idle.
-/// A clean observation starts the warm period; it never completes a run.
+/// A clean observation starts the warm period. The journal never proves business success.
 pub fn execution_idle(c: &Connection, project: &str, generation: &str, now: i64) -> Result<bool> {
     transaction(c, |c| {
         let Some(record) = execution(c, project, generation)? else {
@@ -1572,14 +1064,11 @@ pub fn execution_idle(c: &Connection, project: &str, generation: &str, now: i64)
         if ["sleeping", "stopped", "exited", "error"].contains(&record.status.as_str()) {
             return Ok(false);
         }
-        // Old uncertain receipts stay durable. Only this execution's unfinished
-        // runs require its process to remain alive; tracked child jobs still do.
-        let pending:bool=c.query_row(
-          "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status='queued')
-           OR EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND status IN ('submitting','submitted','running','uncertain'))
-           OR EXISTS(SELECT 1 FROM work_jobs WHERE project_id=?1 AND status IN ('active','uncertain'))
-           OR EXISTS(SELECT 1 FROM work_attention WHERE project_id=?1 AND generation=?2 AND status='open')",
-          params![project,generation],|r|r.get(0))?;
+        let pending: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued')",
+            [project],
+            |r| r.get(0),
+        )?;
         if pending || has_takeover(c, project, generation)? {
             c.execute("UPDATE work_executions SET idle_since=NULL,warm_until=NULL,updated_at=? WHERE project_id=? AND generation=?",
               params![now,project,generation])?;
@@ -1626,7 +1115,6 @@ pub fn finish_execution(
         )?;
         c.execute("UPDATE work_tasks SET status='uncertain',updated_at=? WHERE id IN(
           SELECT task_id FROM work_runs WHERE project_id=? AND generation=? AND status='uncertain')",params![now,project,generation])?;
-        c.execute("UPDATE work_jobs SET status='uncertain' WHERE project_id=? AND generation=? AND status='active'",params![project,generation])?;
         Ok(())
     })
 }
@@ -1693,8 +1181,7 @@ pub fn resolve_attention_reason(
 pub fn resolve_recovery_attention(c: &Connection, project: &str, now: i64) -> Result<usize> {
     let unresolved:bool=c.query_row(
         "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('submitting','submitted','uncertain'))
-         OR EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND finished_at IS NULL AND status IN ('submitting','submitted','running','uncertain'))
-         OR EXISTS(SELECT 1 FROM work_jobs WHERE project_id=?1 AND status IN ('active','uncertain'))",
+         OR EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND finished_at IS NULL AND status IN ('submitting','submitted','running','uncertain'))",
         [project],|r|r.get(0))?;
     if unresolved {
         return Ok(0);
@@ -1703,42 +1190,6 @@ pub fn resolve_recovery_attention(c: &Connection, project: &str, now: i64) -> Re
         "UPDATE work_attention SET status='resolved',resolved_at=?1,last_seen=?1
          WHERE project_id=?2 AND status='open' AND reason IN ('uncertain_input','execution_lost','unfinished_run')",
         params![now,project])?)
-}
-
-/// An administrator records reviewed, interrupted child work without inventing success.
-pub fn abandon_job(c: &Connection, project: &str, id: &str, reason: &str, now: i64) -> Result<Job> {
-    ensure!(
-        !reason.trim().is_empty(),
-        "Explain the reviewed child result before abandoning it"
-    );
-    transaction(c, |c| {
-        let job = c.query_row(
-            &format!("SELECT {JOB} FROM work_jobs WHERE project_id=? AND id=?"),
-            params![project, id],
-            job_row,
-        )?;
-        ensure!(
-            ["active", "uncertain"].contains(&job.status.as_str()),
-            "Only active or uncertain child work can be abandoned"
-        );
-        let live:bool=c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_executions WHERE project_id=? AND generation=? AND status IN ('starting','running','idle'))",
-            params![project,job.generation],|r|r.get(0))?;
-        ensure!(
-            !live,
-            "Stop the child execution's parent session before abandoning its result"
-        );
-        c.execute(
-            "UPDATE work_jobs SET status='abandoned',result=?,completed_at=? WHERE id=?",
-            params![reason, now, id],
-        )?;
-        resolve_recovery_attention(c, project, now)?;
-        Ok(c.query_row(
-            &format!("SELECT {JOB} FROM work_jobs WHERE id=?"),
-            [id],
-            job_row,
-        )?)
-    })
 }
 
 /// Explicit user recovery applies to one event; uncertain effects are never replayed automatically.
@@ -1755,13 +1206,6 @@ pub fn resolve_event(
             ["uncertain", "failed", "queued", "submitted", "acknowledged"]
                 .contains(&current.status.as_str()),
             "This event cannot be resolved"
-        );
-        let children:bool=c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_jobs WHERE run_id IN(SELECT id FROM work_runs WHERE event_id=?) AND status IN ('active','uncertain'))",
-            [id],|r|r.get(0))?;
-        ensure!(
-            !children,
-            "Review and explicitly abandon unfinished child jobs before recovering this event"
         );
         let status = if retry { "queued" } else { "dismissed" };
         c.execute(
@@ -1787,23 +1231,6 @@ pub fn resolve_event(
         event(c, project, id)
     })
 }
-pub fn cancel_task(c: &Connection, project: &str, id: &str, now: i64) -> Result<Task> {
-    transaction(c, |c| {
-        task(c, project, id)?;
-        let active:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE task_id=? AND status IN ('submitting','submitted','running','uncertain'))",[id],|r|r.get(0))?;
-        ensure!(
-            !active,
-            "This task has an active or uncertain run; cancel execution or resolve its result first"
-        );
-        c.execute("UPDATE work_events SET status='cancelled',updated_at=? WHERE task_id=? AND status='queued'",params![now,id])?;
-        c.execute(
-            "UPDATE work_tasks SET status='cancelled',updated_at=? WHERE id=?",
-            params![now, id],
-        )?;
-        c.execute("UPDATE work_timers SET enabled=0,next_fire=NULL,revision=revision+1,updated_at=? WHERE task_id=?",params![now,id])?;
-        task(c, project, id)
-    })
-}
 pub fn snapshot(c: &Connection, project: &str) -> Result<WorkState> {
     let runs = c
         .prepare(&format!(
@@ -1820,14 +1247,43 @@ pub fn snapshot(c: &Connection, project: &str) -> Result<WorkState> {
         None
     };
     Ok(WorkState{
-        tasks:tasks(c,project)?,events:events(c,project)?,runs,execution,lease,
+        events:events(c,project)?,runs,execution,lease,
         timers:c.prepare(&format!("SELECT {TIMER} FROM work_timers WHERE project_id=? ORDER BY created_at DESC"))?
           .query_map([project],timer_row)?.collect::<rusqlite::Result<_>>()?,
-        decisions:c.prepare(&format!("SELECT {DECISION} FROM work_decisions WHERE project_id=? ORDER BY (status='pending') DESC,created_at DESC LIMIT 100"))?
-          .query_map([project],decision_row)?.collect::<rusqlite::Result<_>>()?,
-        jobs:c.prepare(&format!("SELECT {JOB} FROM work_jobs WHERE project_id=? ORDER BY (status IN ('active','uncertain')) DESC,created_at DESC LIMIT 100"))?
-          .query_map([project],job_row)?.collect::<rusqlite::Result<_>>()?,
         attention:c.prepare(&format!("SELECT {ATTENTION} FROM work_attention WHERE project_id=? ORDER BY (status='open') DESC,last_seen DESC LIMIT 100"))?
           .query_map([project],attention_row)?.collect::<rusqlite::Result<_>>()?,
     })
+}
+
+/// Record the native transition after prompt submission, without an Agent receipt.
+/// A stale idle snapshot cannot settle a newly submitted prompt. Uncertain input
+/// remains uncertain even if the CLI later becomes idle; it is never replayed.
+pub fn observe_idle(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+    sequence: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    transaction(c, |c| {
+        c.execute(
+            "UPDATE work_runs SET status='settled',finished_at=?,updated_at=?
+            WHERE project_id=? AND generation=? AND status IN ('submitted','running')
+            AND (native_seq IS NULL OR native_seq<?
+                 OR (? IS NULL AND updated_at<=?-2000))",
+            params![now, now, project, generation, sequence, sequence, now],
+        )?;
+        c.execute("UPDATE work_events SET status='delivered',updated_at=? WHERE id IN
+            (SELECT event_id FROM work_runs WHERE project_id=? AND generation=? AND status='settled')
+            AND status IN ('submitted','acknowledged')",params![now,project,generation])?;
+        Ok(())
+    })
+}
+
+pub fn submission_sequence(c: &Connection, run: &str, sequence: Option<i64>) -> Result<()> {
+    c.execute(
+        "UPDATE work_runs SET native_seq=? WHERE id=?",
+        params![sequence, run],
+    )?;
+    Ok(())
 }

@@ -1,6 +1,6 @@
 # Dauerbot
 
-A native macOS workspace that connects Feishu, durable tasks, and schedules to native CLI agents running on demand in HERDR. Built with Rust and GPUI, with an independent daemon shared by the desktop app, CLI, and MCP server.
+A native macOS workspace that connects Feishu messages and scheduled runs to native CLI agents running on demand in HERDR. Built with Rust and GPUI, with an independent daemon shared by the desktop app, CLI, and MCP server.
 
 One bot belongs to one project with one active agent. Direct messages and group messages reach the same main session; the agent chooses where to send its replies. Dauerbot supports Codex, Claude Code, Pi, and Antigravity through their installed CLIs and existing account and model settings. Watch and take over the real terminal directly in Dauerbot. The lightweight daemon stays online; an idle Agent sleeps after ten minutes and wakes for new work. Dauerbot does not proxy model APIs.
 
@@ -22,7 +22,7 @@ Each project has its own App ID, App Secret, event connection and connection sta
 
 From the CLI, bind and validate a project's bot with `hfb feishu set <project> --app-id cli_...` (the secret is read from stdin) and `hfb feishu check <project>`. `hfb feishu disconnect <project>` disconnects only that project. Existing singleton installations keep their bot on its recorded project when upgrading; other projects remain unbound.
 
-Switch the active CLI in project settings or with `hfb session switch`. Switching requires the current task to finish or be resolved, then closes the old execution and preserves the project, bot binding, progress and queues. The next task starts the selected CLI with continuity summaries. You can also send local tasks through the CLI before connecting Feishu.
+Switch the active CLI in project settings or with `hfb session switch`. Switching closes the old execution and preserves the project files, bot binding, schedules and message history. The next input starts a new native conversation in the selected CLI. You can also inject a local message with `hfb message inject` before connecting Feishu.
 
 Avoid running another long-connection listener for the same Feishu app: the platform distributes events between listeners, so another program may receive the message instead.
 
@@ -30,7 +30,7 @@ Avoid running another long-connection listener for the same Feishu app: the plat
 
 The desktop renders native GPUI controls. There is no browser interface, WebView, Node.js runtime, or frontend build step. Dauerbot starts in the macOS menu bar: click its icon to see project states, add a project, or open the full app. Selecting a project opens its details. Closing the window returns to the menu bar and leaves the daemon and HERDR Agent running; Quit exits the desktop.
 
-The full window has projects on the left and real scheduled tasks in the center. The selected Agent's native terminal is a debugging tool on the right, collapsed by default. Expand it to observe; **Take control** enables direct input, login, model selection, and native prompts. **Release control** returns the session to automatic dispatch. Viewing does not prevent idle sleep. Explicit control pins the execution until released, protecting unsent input even if the desktop crashes. Hiding the terminal or closing the window releases control and disconnects the terminal bridge. Send instructions and ask the Agent to schedule work in Feishu; the desktop lists schedules and lets you pause or enable them. Agent execution steps and manual task/schedule forms are not part of the main view. Settings contains bot setup, permissions, updates, and occasional session/recovery controls.
+The full window has projects on the left and scheduled runs in the center. The selected Agent's native terminal is a debugging tool on the right, collapsed by default. Expand it to observe; **Take control** enables direct input, login, model selection, and native prompts. **Release control** returns the session to automatic dispatch. Viewing does not prevent idle sleep. Explicit control pins the execution until released, protecting unsent input even if the desktop crashes. Hiding the terminal or closing the window releases control and disconnects the terminal bridge. Send instructions and ask the Agent to schedule work in Feishu; the desktop lists schedules and lets you pause or enable them. Agent execution steps and manual schedule forms are not part of the main view. Settings contains bot setup, permissions, updates, and occasional session/recovery controls.
 
 Switch between **English** and **简体中文** in the app. The choice takes effect immediately and stays saved on this Mac. Project state changes also appear in the menu-bar panel.
 
@@ -73,7 +73,7 @@ cargo clippy --locked --release --manifest-path desktop/Cargo.toml --all-targets
 python3 scripts/smoke.py --binary "$PWD/desktop/target/release/hfb"
 ```
 
-The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, daemon restarts, embedded terminal connections, warm retirement and task/timer wakeup. It uses private XDG configuration and HERDR sessions, with no real bot or model account. Test artifacts stay in ignored directories.
+The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, daemon restarts, embedded terminal connections, warm retirement and message/timer wakeup. It uses private XDG configuration and HERDR sessions, with no real bot or model account. The custom fixture uses its persisted resume marker as test-only continuity metadata; it does not prove native CLI hooks or real-model acceptance. Test artifacts stay in ignored directories.
 
 Live sending is opt-in: `tests/live_feishu.rs` reads `.local/live.json` with `app_id`, `app_secret`, and `chat_id`. Run `cargo test --test live_feishu -- --ignored` only for an explicitly selected bot and recipient, then remove the temporary credentials. It sends a test Markdown message and a small file without opening a competing event listener.
 
@@ -99,11 +99,11 @@ Dauerbot preserves native CLI account, model, provider, and reasoning settings. 
 
 A main session is a native CLI process owned by the legacy HERDR server. Desktop terminal observation connects to that exact execution; CLI attach remains available for terminal users. Login and permission prompts remain in place, with an actionable attention notice. Dauerbot confirms recognized Claude Code and Antigravity project-trust prompts after verifying the exact project and execution identity. It attempts this once per execution and leaves other prompts for the user.
 
-Use the same CLI's verified native session ID to resume history. Native hooks supply session identity where supported. Cross-CLI switching carries task summaries and files rather than claiming native transcript portability. Model selection stays native unless you explicitly supply an override; the terminal shows native model information, while unconfirmed metadata stays labeled unconfirmed.
+Use the same CLI's verified native session ID to resume history. Native hooks supply session identity where supported. Cross-CLI switching preserves project files rather than claiming native transcript portability. Model selection stays native unless you explicitly supply an override; the terminal shows native model information, while unconfirmed metadata stays labeled unconfirmed.
 
 | CLI | MCP configuration | Native resume |
 | --- | --- | --- |
-| Codex | Dedicated launch configuration; enables `--no-daemon` and `--dangerously-bypass-hook-trust` when the installed CLI advertises each flag, and forwards HERDR terminal identity | `codex resume`, using the session registered through MCP metadata or a supplied ID |
+| Codex | Dedicated launch configuration; enables `--no-daemon` and `--dangerously-bypass-hook-trust` when the installed CLI advertises each flag, and forwards HERDR terminal identity | `codex resume`, using the session observed through native HERDR metadata or a supplied ID |
 | Claude Code | Project-specific `--mcp-config` | A new UUID for a new session; `--resume` for recovery |
 | Pi | Merges `herdr_feishu` into `.pi/mcp.json` | `--session` |
 | Antigravity (`agy`) | Registers `herdr_feishu` in `~/.gemini/config/mcp_config.json`; the server resolves the current execution from verified HERDR identity. `-i` submits the initial interactive prompt | `--conversation` |
@@ -116,53 +116,49 @@ The managed CLI starts `hfb mcp --credentials <private-file>` automatically.
 
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
-| `session_ready` | Optional `native_session` | Verify the terminal and process generation, then register readiness |
-| `ack_message` | `message_id` | Confirm receipt of the nested Feishu message and its linked event |
-| `send_markdown` | `to`, `text`, `request_id` | Send Markdown to the chosen chat or user |
+| `send_md` | `to`, `text`, `request_id` | Send Markdown to the chosen chat or user |
 | `send_file` | `to`, `path`, `request_id` | Stream a local file, up to 100 MB |
+| `schedule_run` | `request_id`, `name`, `prompt`, `kind`, `timezone`, schedule fields, optional `to` | Persist a once, interval, or cron run |
 
 `to` is mandatory for MCP sends: `oc_…` identifies a chat and `ou_…` a user Open ID. The agent follows user intent and may reply somewhere other than the source chat. Reuse `request_id` only when retrying the same content and destination. Only `status=sent` means the API confirmed the send. Files must resolve inside the project or Dauerbot cache; symlinks cannot escape those directories.
 
 Incoming messages use an escaped XML envelope with source IDs, sender, body, attachments, mentions, and thread context. Group messages include a bounded member snapshot when available. Direct messages omit group-only `<chat>` and `<members>` elements; they do not emit `not_applicable` placeholders. Missing group permissions produce `status="unavailable"` without blocking the message. User text remains untrusted input, even inside XML.
 
-SQLite stores incoming and outgoing messages. Incoming events persist before SDK acknowledgment and deduplicate by project and platform message ID. Conversation messages immediately steer the same main Agent, including while it is working or an earlier run is unfinished. Dauerbot submits them through the native CLI's normal paste-and-Enter path; it does not wait for `finish_run`, select a follow-up queue key, or interrupt tools with Ctrl-C. Standalone tasks and timers remain serialized. Acknowledgment confirms receipt, and `finish_run` settles each run independently.
+SQLite stores incoming and outgoing messages. Incoming messages persist before SDK acknowledgment and deduplicate by project and platform message ID. Conversation messages immediately steer the same main Agent, including while it is working. Dauerbot submits them through the native CLI's paste-and-Enter path. The Agent calls no readiness, acknowledgment, progress, decision, job, or completion tools. Questions and replies are ordinary Feishu messages. Native HERDR working/idle state drives session activity; terminal output alone never sends a Feishu reply.
 
 | Status | Meaning |
 | --- | --- |
 | `queued` | Persisted but not yet delivered (starting, paused, taken over, or blocked); live conversation messages do not wait for idle |
-| `submitting` / `submitted` | Writing to the terminal / waiting for acknowledgment |
-| `acknowledged` | The agent confirmed receipt; the task may still be running |
+| `submitting` / `submitted` | Writing to the terminal / submitted to its input stream |
+| `acknowledged` | Receipt recorded by an earlier version; never automatically replayed |
 | `pending` / `sending` / `sent` | Outbound waiting / sending / API-confirmed |
 | `failed` | A definite failure allows an informed retry |
 | `uncertain` | Verify the result before retrying |
 | `dismissed` | Manually excluded from blocking delivery |
 
-Restarts preserve uncertain operations instead of blindly resending. PTY input and Feishu have no atomic transaction, so Dauerbot does not promise exactly-once delivery. It checks legacy metadata, root PID, generation, and foreground program identity before typing; exited agents and replacement shells do not receive queued tasks.
+Restarts preserve uncertain operations instead of blindly resending. PTY input and Feishu have no atomic transaction, so Dauerbot does not promise exactly-once delivery. It checks legacy metadata, root PID, generation, and foreground program identity before typing; exited agents and replacement shells do not receive queued input.
 
-## Tasks, schedules, and Agent tools
+## Sessions and scheduled runs
 
-Tasks, events, runs and timers live in SQLite independently of Agent processes. Once a native run has finished, the supervisor verifies idle state, queue emptiness, background jobs, session continuity and human takeover before beginning a ten-minute warm period. New work reuses a warm Agent or resumes a sleeping one. Every project starts or resumes its Agent automatically when a message arrives. Stopping a session ends only its current process; later messages wake a fresh execution of the same native conversation. Explicitly pausing automatic activity is the only persistent user control that holds new input. Interrupted work retains its uncertain receipt without blocking fresh conversation messages.
+The supervisor observes native HERDR identity, activity, foreground processes and manual control. A verified idle session starts a ten-minute warm period. New messages reuse a warm Agent or resume a sleeping one. Stopping a session ends its current process; later messages wake a fresh execution of the same native conversation. Explicitly pausing automatic activity holds new input. An uncertain delivery stays recorded without blocking fresh messages, independent schedules or native idle retirement. Native idle describes execution state, not proof of successful business work or a completed external effect.
 
 ```sh
-hfb task add my-project "Review dependencies" "Check for useful dependency updates"
-hfb task list my-project
-hfb timer add my-project "Daily review" "Review open tasks" --kind cron --cron '0 9 * * 1-5' --timezone Asia/Shanghai
+hfb timer add my-project "Daily review" "Review project changes" --kind cron --cron '0 9 * * 1-5' --timezone Asia/Shanghai
 hfb timer add my-project "Follow up" "Check the build result" --kind once --at '2026-12-01T09:00:00+08:00' --timezone Asia/Shanghai
 hfb timer list my-project
-hfb work my-project
-hfb decision DECISION_ID "Proceed with the proposed approach"
-hfb event dismiss EVENT_ID
-# Retry only after checking whether the previous attempt already performed work.
+hfb timer pause TIMER_ID
+hfb timer resume TIMER_ID
+hfb timer remove TIMER_ID
+# Retry only after checking whether the previous input already performed work.
 hfb event retry EVENT_ID
+hfb event dismiss EVENT_ID
 ```
 
-Schedules support once, interval and UNIX five-field cron expressions with IANA timezones. Recurring work coalesces missed occurrences after downtime and avoids piling up another occurrence while one remains pending. Editing or cancelling a timer removes unsubmitted occurrences of its old revision. Active work requires execution cancellation or explicit uncertain-result recovery.
+Schedules support once, interval and UNIX five-field cron expressions with IANA timezones. Recurring schedules coalesce missed occurrences after downtime and avoid overlap while their own input remains pending. Editing, disabling or deleting a timer cancels unsubmitted occurrences of its old revision. The native timer view retains enable/disable/delete controls.
 
-The MCP server exposes `session_ready`, `ack_message`, `ack_event`, `send_markdown`, `send_file`, `create_task`, `list_work`, `checkpoint`, `finish_run`, `schedule_task`, `request_decision`, `answer_decision`, `register_job`, and `complete_job`. Creation tools require stable request IDs for safe retries. Markdown/file recipients remain mandatory and Agent-selected. A checkpoint also writes readable task progress under the selected project's `.dauerbot/tasks/` directory.
+Managed MCP exposes exactly `send_md`, `send_file`, and `schedule_run`; unmanaged sessions expose no project tools. MCP privately authenticates the project, generation and HERDR pane at startup. Stable request IDs deduplicate sends and schedule creation. Background execution belongs to HERDR and the Agent. There is no separate Dauerbot task or job registry.
 
-Register background commands and subagents before launching them; report their completion so retirement can proceed. `hfb job register` and `hfb job complete` support external child reporting. Native hidden background activity still needs adapter evidence: silence and an answer on screen never prove quiescence. If an idle Agent omits `finish_run`, Dauerbot shows an unfinished-task notice after a grace period; review the result before retrying or dismissing its event. A deferred business decision can release the process; a native login or permission prompt retains its live terminal. Decisions and resolved child jobs create events through the same inbox.
-
-An interrupted child can keep a task uncertain. Stop the project's execution, review the child result, and record your decision with `hfb job abandon JOB_ID "Reason for abandoning the reviewed work"`. Then retry or dismiss the parent event. Abandonment records the review without inventing a successful result; late completion reports cannot overwrite it.
+Normal database upgrades preserve messages, schedule IDs, occurrence history and uncertain outcomes. Legacy journal containers remain internal for their foreign-key relationships. Previously submitted or uncertain input is never requeued by this upgrade. API protocol 5 and application version 0.4.5 identify the changed contract; incompatible desktop/daemon combinations must reconnect using matching builds.
 
 ## Updates and releases
 

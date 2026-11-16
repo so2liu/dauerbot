@@ -62,17 +62,17 @@ async fn durable_dedup_and_uncertain_recovery() {
         .unwrap()
         .is_some()
     );
-    assert!(
-        db.ack(&p.id, "om_one").await.is_err(),
-        "queued is not acknowledged before delivery"
-    );
     db.state(&key, "submitting", "").await.unwrap();
     drop(db);
     let db = Db::open(&path).unwrap();
     assert_eq!(db.message(&key).await.unwrap().status, "uncertain");
-    assert!(db.ack("another-project", "om_one").await.is_err());
-    db.ack(&p.id, "om_one").await.unwrap();
-    assert_eq!(db.message(&key).await.unwrap().status, "acknowledged");
+    assert!(
+        db.message(&key)
+            .await
+            .unwrap()
+            .error
+            .contains("verify the result")
+    );
 }
 
 #[tokio::test]
@@ -362,7 +362,7 @@ async fn local_api_auth_origin_and_project_scope() {
         ("/service/shutdown".into(), "current"),
         (format!("/projects/{}/stop", p.id), "current"),
         (format!("/projects/{}/outbox", q.id), "current"),
-        (format!("/projects/{}/ready", p.id), "stale"),
+        (format!("/projects/{}/register", p.id), "stale"),
     ] {
         let result = http
             .post(format!("{url}/api{path}"))
@@ -374,7 +374,7 @@ async fn local_api_auth_origin_and_project_scope() {
             .unwrap();
         assert_eq!(result.status(), 401);
     }
-    // A valid scoped credential is authenticated, but validation still rejects a bad acknowledgement.
+    // A valid scoped credential cannot access removed lifecycle endpoints.
     let result = http
         .post(format!("{url}/api/projects/{}/ack", p.id))
         .bearer_auth(&p.mcp_token)
@@ -383,7 +383,7 @@ async fn local_api_auth_origin_and_project_scope() {
         .send()
         .await
         .unwrap();
-    assert_eq!(result.status(), 400);
+    assert_eq!(result.status(), 404);
     // An old Core terminal reference cannot become a legacy terminal descriptor.
     let result = http
         .post(format!("{url}/api/projects/{}/show", p.id))

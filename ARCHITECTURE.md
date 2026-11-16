@@ -1,12 +1,12 @@
 # Dauerbot architecture
 
-Status: implemented, 2026-11-16. Backend and terminal transport checks pass. Real CLI acceptance covers task completion, retirement and same-session resume; authenticated four-CLI runtime migration is complete in #23; graphical IME acceptance remains tracked in #25. Source review and runtime acceptance are separate evidence.
+Current contract: application 0.4.5, API protocol 5, store schema 7. Source review, isolated protocol checks and real CLI acceptance provide separate evidence; see TESTING.md for recorded results.
 
-Each project connects its own Feishu bot to its main native Agent session. The desktop manages projects and tasks on the left, with the selected Agent's interactive terminal on the right. An independent Rust daemon keeps receiving events and managing schedules while Agent processes sleep.
+Each project connects its own Feishu bot to its main native Agent session. The desktop manages projects and scheduled runs on the left, with the selected Agent's interactive terminal on the right. An independent Rust daemon keeps receiving events and managing schedules while Agent processes sleep.
 
 ## Ownership
 
-Dauerbot owns durable task/event/run state, schedules, user decisions, attention records and outbound delivery. Legacy `herdr` 0.9.5 owns Agent PTYs and process lifetimes in a dedicated named session. Native CLIs own model authentication, model settings and native conversation history. The desktop owns terminal presentation and view/controller bridge processes, never a second Agent process.
+Dauerbot owns projects, the message delivery journal, schedules, attention records and outbound delivery. Legacy `herdr` 0.9.5 owns Agent PTYs and process lifetimes in a dedicated named session. Native CLIs own model authentication, model settings and native conversation history. The desktop owns terminal presentation and view/controller bridge processes, never a second Agent process.
 
 The legacy `herdr` backend and the newer `hc` / herdr-core / Herdr App backend are different systems. Product execution uses the legacy backend. External development subagents may use hc without changing the product backend.
 
@@ -18,27 +18,29 @@ Each binding owns its SDK event listener, reconnect state and access-token cache
 
 Schema 5 moves the former singleton credentials to their recorded project owner and removes the singleton binding. Existing unbound projects remain local. Credentials are stored in the private SQLite database, never returned through the desktop/API, and retained safely across daemon restarts.
 
-## Durable work
+## Input and delivery journal
 
-All task triggers enter a SQLite inbox: Feishu messages, explicit tasks, fired timers, decision answers and tracked child results. Administrative operations such as agent selection, delivery pause and schedule edits update state directly. A per-project supervisor serializes dispatch and execution transitions; projects progress independently.
+Feishu messages and fired schedules enter a SQLite inbox. A per-project lock serializes terminal writes and execution transitions, while projects progress independently. An event records input provenance and delivery state; an internal run records one submission attempt and its execution generation. These records do not represent Agent objectives, progress or successful business outcomes. Conversation records retain their meaning as Feishu chat metadata.
 
-A task stores its objective, progress, destination and waiting condition. An event records what made work runnable. A run records one processing attempt. An execution records a particular native CLI process generation and its legacy terminal identity. Existing conversations retain their meaning as Feishu chat metadata. Outbound messages retain stable request IDs and uncertain sends never receive an automatic blind retry.
+Incoming conversation messages have priority and steer the current native Agent immediately, including while it is working. Native paste-and-Enter submission preserves ongoing tools and uses the CLI's steering behavior. Explicit pause, takeover and native login/permission prompts suspend automatic input. Scheduled runs dispatch when the native Agent is idle. Uncertain input stays recorded for explicit review and never blocks fresh user direction or independent schedules.
 
-All work uses the project main session. Incoming conversation messages have priority and steer it immediately, including while native state is working or an earlier run is unacknowledged or unfinished. Per-project locking serializes terminal writes, not model turns. Message runs retain independent receipts and completion records; an uncertain input is not automatically replayed and does not block fresh user direction. Native paste-and-Enter submission preserves ongoing tools and uses the CLI's steering behavior. Explicit pause, takeover and native login/permission prompts suspend automatic input. Standalone tasks and timers remain serialized. Native history is resumed only within the same CLI. Switching CLI preserves durable progress and project memory, then begins a new native session with explicit continuity context.
+Outbound sends use stable request IDs. A repeated request must match its original content and destination; uncertain sends never receive an automatic retry. The managed MCP surface contains exactly `send_md`, `send_file` and `schedule_run`. Questions and their answers travel as ordinary Feishu messages. Agents manage their own background execution through HERDR and native facilities.
 
 ## Wakeup and retirement
 
-Every project automatically wakes or reuses its Agent for incoming messages and eligible work. There is no persistent stopped-project switch. Stop ends the current execution; subsequent messages resume the native conversation without replaying interrupted uncertain inputs. Only an explicit pause or manual terminal takeover suspends automatic input. Schema 6 removes the former project enabled flag, including old disabled values, while preserving explicit pauses. Timers create durable inbox events, even while no Agent exists. Queue insertion and project state transitions share a coordination boundary so retirement cannot lose a concurrent message.
+Incoming messages and eligible schedules automatically wake or reuse the project's Agent. Stop ends the current execution; later input resumes the native conversation without replaying interrupted uncertain input. Only explicit pause or manual terminal takeover holds new input. Timers persist their occurrences even while no Agent exists. The same project lock coordinates retirement with dispatch so new input cannot disappear in a concurrent shutdown.
 
-After a finished run, keep the Agent warm for ten minutes. Retirement requires no active or uncertain turn, no eligible event backlog, no active tracked child work, no native blocked prompt, no human takeover, and a verified native session reference for future resume. Unknown execution quiescence is a state to resolve; silence, output delivery and acknowledgement do not establish completion.
+Native HERDR identity and working/idle observations drive activity. MCP startup registers its authenticated generation privately; the Agent performs no readiness handshake. The daemon also recognizes native readiness without waiting for an MCP tool. Native hooks supply session references where supported, and the daemon verifies project, generation, managed name and process ownership before dispatch.
 
-A run completion report records the outcome and progress. Native turn boundaries and explicit background-job tracking provide separate execution evidence. Long-running background work registers with the daemon and reports completion. A user takeover lease prevents retirement and automatic task input until control returns.
+After observing native idle, the daemon settles submitted journal attempts whose native transition follows submission. A matching old state sequence cannot settle a new prompt. Older journal records without sequence metadata settle on verified native idle. When an observation omits a previously available sequence, a two-second guard prevents immediate settlement from the submission snapshot. Neither path changes uncertain delivery into success. Settled journal entries release a timer's pending-occurrence gate without claiming its business objective succeeded.
+
+The Agent stays warm for ten idle minutes. Retirement requires an empty eligible input queue, no native blocked prompt, no manual takeover, a verified resumable native session and foreground-process evidence that the CLI is quiescent. Uncertain history and removed task/job records don't pin the process. Unknown foreground processes keep it warm. Native history resumes only within the same CLI; switching CLI preserves project files, bot binding, schedules and message history, closes the old execution and starts a new native conversation when needed.
 
 ## CLI compatibility
 
 Installation identity includes executable, machine, version and transport. Runtime-specific adapters prepare argv, discover native session references, interpret observations and expose capability support. Preserve native login/model configuration and existing proxy variables. A requested model and a confirmed model are separate values; starting successfully does not confirm a model.
 
-The legacy managed integrations can report session IDs for Codex, Claude Code, Pi and agy. Their installation and lifecycle evidence differ. Preserve unrelated user configuration and verify hooks in isolated tests. Startup/readiness, input submission, receipt, turn completion and background quiescence remain distinct.
+The legacy managed integrations can report session IDs for Codex, Claude Code, Pi and agy. Their installation and lifecycle evidence differ. Preserve unrelated user configuration and verify hooks in isolated tests. Native readiness, input submission, native idle and foreground quiescence remain distinct observations.
 
 Headless app-server, stream-json, RPC and ACP implementations in Raft, Multica and OAR provide useful reference behavior. They do not automatically preserve interactive TUI takeover. The selected transport keeps native interactive CLIs in legacy HERDR.
 
@@ -48,22 +50,22 @@ The desktop consumes legacy terminal session observe/control streams. ANSI frame
 
 Viewing and control have separate semantics. Viewing does not hold the Agent awake indefinitely. Explicit control obtains an execution-generation lease; queued daemon work remains durable. Closing the panel releases only the connection. Reconnecting validates project, backend, terminal and generation before sending any input. Sleeping projects display their state without waking merely to render a page.
 
-## Schedules and proactive work
+## Scheduled runs
 
 Support once, interval and cron schedules with an IANA timezone. Persist the schedule, revision and next occurrence. Transactional firing records an occurrence and event before advancing the timer. After downtime, recurring work coalesces missed occurrences into one check, and a still-pending check prevents overlapping repeats. Users and Agents use the same schedule operations; users can inspect, pause, edit and cancel them.
 
-Readable project memory stores instructions and useful progress. SQLite owns transactional execution state. Future memory curation, goals and follow-up checks use ordinary tasks and timers, without adding a second scheduler or model proxy.
+Agents may schedule future checks through `schedule_run`; the native timer view and CLI retain pause, enable, edit and delete operations. No daemon task registry or progress synchronization is required.
 
-## Attention and deferred decisions
+## Attention and questions
 
 Native login, permission and startup problems create daemon-owned attention records before MCP is ready. Present a short reason, affected work and the appropriate action in the desktop; notify the responsible Feishu recipient when known. Repeated observations update the same item. Reading a notice does not resolve its underlying problem.
 
-A business decision persists its question and pauses the task. Answering it inserts a new event that wakes the Agent. This differs from a native CLI prompt, which retains its live interactive process. Existing authorized automatic workspace-trust handling remains available.
+An Agent asks the user through `send_md` and incorporates the ordinary Feishu reply as steering. A native CLI prompt retains its live interactive process. Existing authorized automatic workspace-trust handling remains available.
 
 ## Compatibility and delivery
 
-The owner's MacBook Pro and Mac mini completed the pre-refactor transition, including native agy MCP task verification in their existing conversations. The product supports fresh stores and normal upgrades from schema 4 onward. It removes the obsolete Core archive and migration notices, and retains no hc/Core runtime adapter. Bundle identity, data directory and update signing keys stay stable; ordinary protocol, execution identity and storage checks continue to apply.
+The product supports fresh stores and normal upgrades from schema 4 onward. Schema 7 keeps existing messages, schedule IDs, request identities, revisions, occurrence history and next-fire times. Compatibility tables retain internal journal foreign-key relationships; obsolete decision and job tables and their API/CLI/UI surfaces are removed. Upgrades never requeue previously submitted or uncertain input. Existing explicit pauses, bot credentials and native conversation references survive.
 
-Source, documentation, default UI and commits use English; desktop preference supports persistent English and Simplified Chinese.
+API protocol 5 and application version 0.4.5 mark the incompatible Agent/daemon contract. Desktop and CLI check protocol compatibility. The private MCP registration endpoint also checks protocol before exposing project tools, so an old daemon cannot silently accept the new lifecycle. Older desktops see the newer version and must not replace its daemon with an older build; the schema guard rejects attempts to open a newer store. Bundle identity, data directory and update signing keys stay stable.
 
-Implementation issues: #23 legacy execution and adapters, #24 durable tasks/scheduling/supervision, #25 native embedded workspace. Parent #22 closes only after all acceptance checks pass. Version 0.3.4 published the pre-refactor main. Version 0.4.0 releases the on-demand architecture and begins the bounded two-device transition.
+Product execution uses legacy `herdr` 0.9.5. There is no hc/Core runtime adapter or Core archive. Source, documentation, default UI and commits use English; the desktop supports persistent English and Simplified Chinese preferences.

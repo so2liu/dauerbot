@@ -3,6 +3,7 @@
 Its persisted marker checks fixture continuity, not any model's native resume.
 """
 import json
+import datetime
 import os
 from pathlib import Path
 import socket
@@ -62,8 +63,8 @@ rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-
 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 proc.stdin.flush()
 tools = rpc("tools/list")
-assert all("to" in t["inputSchema"]["required"] for t in tools["tools"] if t["name"] in {"send_markdown", "send_file"})
-assert {"session_ready", "ack_message", "send_markdown", "send_file", "ack_event", "finish_run", "schedule_task", "register_job"}.issubset({t["name"] for t in tools["tools"]})
+assert all("to" in t["inputSchema"]["required"] for t in tools["tools"] if t["name"] in {"send_md", "send_file"})
+assert {t["name"] for t in tools["tools"]} == {"send_md", "send_file", "schedule_run"}
 
 
 def tool(name, arguments):
@@ -73,7 +74,6 @@ def tool(name, arguments):
     return result
 
 
-tool("session_ready", {"native_session": marker.read_text()})
 sys.stdout.write("\r\nMOCK_AGENT_READY\r\n")
 sys.stdout.flush()
 buffer = b""
@@ -92,34 +92,31 @@ try:
             if body in ("fixture-hold-unacknowledged", "fixture-hold-for-steer"):
                 assert held is None
                 held = event
-                if body == "fixture-hold-for-steer":
-                    tool("ack_event", {"event_id": event.attrib["event_id"]})
                 sys.stdout.write("\r\nMOCK_HOLDING_FOR_STEER\r\n")
                 sys.stdout.flush()
                 continue
-            tool("ack_event", {"event_id": event.attrib["event_id"]})
             envelope = event.find("feishu_message")
             if envelope is not None:
                 source = envelope.attrib["message_id"]
                 to = envelope.find("source").attrib["chat_id"] or "oc_fixture"
                 if "direct-to-user" in text:
                     to = envelope.find("sender").attrib["open_id"]
-                tool("ack_message", {"message_id": source})
             else:
                 source = event.attrib["source"] + ":" + event.attrib["event_id"]
                 to = "oc_fixture"
-            tool("send_markdown", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + source})
+            tool("send_md", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + source})
+            if body == "fixture-create-schedule":
+                due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
+                tool("schedule_run", {"request_id":"fixture-schedule-run", "name":"MCP schedule", "prompt":"scheduled-via-mcp",
+                     "kind":"once", "at":due.isoformat(), "timezone":"UTC", "to":to})
             if "send-file" in text:
                 tool("send_file", {"to": to, "path": str(Path.cwd() / "report.txt"), "request_id": "file-" + source})
-            tool("checkpoint", {"task_id": event.attrib["task_id"], "summary": "Fixture task reached its verified completion point."})
-            tool("finish_run", {"run_id": event.attrib["run_id"], "outcome": "completed", "summary": "Fixture completed the task and delivered its result."})
             if body == "fixture-steer-release":
                 assert held is not None, "Steering arrived without a live original run"
-                tool("ack_event", {"event_id": held.attrib["event_id"]})
-                tool("finish_run", {"run_id": held.attrib["run_id"], "outcome": "completed", "summary": "Original run completed after receiving steering."})
                 held = None
             sys.stdout.write("\r\nMOCK_PROCESSED " + json.dumps({"source": source, "pid": os.getpid()}, ensure_ascii=False) + "\r\n")
             sys.stdout.flush()
             status("working" if held is not None else "idle")
 finally:
     proc.terminate()
+    proc.wait(timeout=5)

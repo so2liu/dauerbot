@@ -325,27 +325,43 @@ def main():
         checks.append("real SDK WebSocket endpoint discovery and handshake")
         api(f"/projects/{key}/start", {}, "POST")
         wait_for(lambda: api(f"/projects/{key}")["project"]["ready"], "real MCP did not register readiness",timeout=100 if real_agent else 35)
-        checks.append("isolated real HERDR terminal + real MCP initialize/tools/list/session_ready")
+        checks.append("isolated real HERDR terminal + real MCP initialize/tools/list with exactly three tools")
+        if not real_agent:
+            # Custom fixtures have no supported CLI-native session hook. Seed
+            # only their verified persisted marker, never a real user's store.
+            # Native CLI acceptance obtains this metadata from HERDR instead.
+            def fixture_continuity():
+                marker = workspace / ".fixture-session"
+                if not marker.exists():
+                    return False
+                native = marker.read_text()
+                with sqlite3.connect(run / "bridge.sqlite3") as conn:
+                    conn.execute("UPDATE projects SET native_session=?,execution=json_set(execution,'$.native_confirmed',json('true')) WHERE id=?",
+                                 (native, key))
+                    conn.execute("UPDATE work_executions SET native_session=? WHERE project_id=?", (native,key))
+                return True
+            wait_for(fixture_continuity, "fixture did not persist its resume marker")
+
         if args.real_steering:
             FIXTURE.emit(message("om_native_hold",
                 "Local steering acceptance check. Do not send Feishu messages or edit files. "
-                "Call native MCP ack_event for this event, then run one foreground shell command: sleep 20. "
-                "Do not finish this run yet; a second live user message will arrive to change direction. "
+                "Run one foreground shell command: sleep 20. "
+                "A second live user message will arrive to change direction. "
                 "After the sleep, obey that message instead of inventing further work."))
             def native_hold():
                 work = api(f"/projects/{key}/work")
                 event = next((e for e in work["events"] if e["source_id"] == "om_native_hold"), None)
                 pane = legacy_rpc("pane.get", {"pane_id": api(f"/projects/{key}")["project"]["execution"]["pane_id"]})["pane"]
-                return event if event and event["status"] == "acknowledged" and pane["agent_status"] == "working" else None
+                return event if event and event["status"] == "submitted" and pane["agent_status"] == "working" else None
             original = wait_for(native_hold, "native Agent did not start the held turn", timeout=120)
             generation = api(f"/projects/{key}")["project"]["generation"]
             FIXTURE.emit(message("om_native_steer",
                 "Change of direction: stop the earlier acceptance task after its current tool returns. "
-                "Do not send Feishu messages or edit files. Call native MCP ack_event for this new event now. "
-                "Then finish_run with outcome noop for BOTH the earlier held run and this run. "
-                "Use the run IDs in the actual event envelopes; no HTTP or Python tool substitutes."))
+                "Do not send Feishu messages or edit files. Incorporate this instruction and finish your turn normally. "
+                "Use no lifecycle or bookkeeping tools. "
+                "Only the native CLI should manage the turn."))
             def native_steer():
-                return next((e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_native_steer" and e["status"] in ("submitted","acknowledged","completed")), None)
+                return next((e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_native_steer" and e["status"] in ("submitted","submitted","delivered")), None)
             steer = wait_for(native_steer, "new message was not submitted during the live native turn", timeout=8)
             submitted = time.time_ns() // 1_000_000
             work = api(f"/projects/{key}/work")
@@ -353,21 +369,21 @@ def main():
             assert original_run["finished_at"] is None, "original run finished before steering submission"
             def completed_native():
                 work = api(f"/projects/{key}/work")
-                return work if all(any(r["event_id"] == event_id and r["status"] == "noop" for r in work["runs"]) for event_id in (original["id"], steer["id"])) else None
+                return work if all(any(r["event_id"] == event_id and r["status"] == "settled" for r in work["runs"]) for event_id in (original["id"], steer["id"])) else None
             final = wait_for(completed_native, "native Agent did not incorporate steering and settle both runs", timeout=180)
             assert api(f"/projects/{key}")["project"]["generation"] == generation
             assert not FIXTURE.messages, "steering acceptance sent an unintended Feishu message"
-            checks.append("native working turn receives steering before original finish_run; both runs settle through native MCP without process restart")
+            checks.append("native working turn receives steering and settles through HERDR without lifecycle tools or process restart")
             receipt = {"passed":True,"agent":real_agent,"checks":checks,"steering_submitted_ms":submitted,"original_run_unfinished_at_submission":True,"same_generation":True,"runs":[r for r in final["runs"] if r["event_id"] in (original["id"],steer["id"])],"run_dir":str(run)}
             (results / f"native-{real_agent}-steering.json").write_text(json.dumps(receipt, indent=2))
             print(f"Real {real_agent} busy-turn steering passed.")
             return
-        FIXTURE.emit(message("om_first", "请先确认本消息，调用 send_markdown 发送一条带 **测试** 的消息，再调用 send_file 发送项目目录的 report.txt（send-file）。这是开发验证，只需完成这两项。"))
+        FIXTURE.emit(message("om_first", "请先确认本消息，调用 send_md 发送一条带 **测试** 的消息，再调用 send_file 发送项目目录的 report.txt（send-file）。这是开发验证，只需完成这两项。"))
         wait_for(lambda: len(FIXTURE.messages) >= 2, "agent did not send Markdown and file",timeout=120 if real_agent else 35)
         assert FIXTURE.uploads and b"Fixture report" in FIXTURE.uploads[0]
         records = api(f"/projects/{key}")["messages"]
-        assert next(m for m in records if m["source_id"] == "om_first")["status"] == "acknowledged"
-        checks.append("WebSocket → durable inbox → PTY → MCP ack → Markdown/file HTTP delivery")
+        assert next(m for m in records if m["source_id"] == "om_first")["status"] == "submitted"
+        checks.append("WebSocket → durable inbox → PTY → native input → Markdown/file HTTP delivery")
         if real_agent:
             (results / f"real-{real_agent}.json").write_text(json.dumps({"passed": True,"checks": checks,"project":project["id"],"run_dir":str(run)},ensure_ascii=False,indent=2))
             print(f"Real {real_agent} model + MCP + HERDR + simulated Feishu round trip passed.")
@@ -375,7 +391,14 @@ def main():
         def project_state():
             return api(f"/projects/{key}")["project"]
 
+        def native_idle():
+            if not real_agent:
+                fixture_continuity()
+            return api(f"/projects/{key}/work")["execution"]["status"] == "idle"
+
         def settled():
+            if not real_agent:
+                fixture_continuity()
             work = api(f"/projects/{key}/work")
             return work if not any(r["status"] in {"submitting", "submitted", "running", "uncertain"} for r in work["runs"]) else None
 
@@ -452,33 +475,33 @@ def main():
                 work = api(f"/projects/{key}/work")
                 original = next((e for e in work["events"] if e["source_id"] == "om_" + hold), None)
                 native = legacy_rpc("pane.get", {"pane_id": project_state()["execution"]["pane_id"]})["pane"]
-                return original and original["status"] == ("acknowledged" if hold == "fixture-hold-for-steer" else "submitted") and native["agent_status"] == "working"
+                return original and original["status"] == "submitted" and native["agent_status"] == "working"
             wait_for(held_run, "fixture did not hold the original run while working")
             for suffix, text in (("one", "Change course now"), ("two", "fixture-steer-release")):
                 FIXTURE.emit(message("om_steer_" + hold + suffix, text))
-            wait_for(lambda: all(any(e["source_id"] == "om_steer_" + hold + suffix and e["status"] == "completed" for e in api(f"/projects/{key}/work")["events"]) for suffix in ("one", "two")), "steering waited for the unfinished original run")
+            wait_for(lambda: all(any(e["source_id"] == "om_steer_" + hold + suffix and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]) for suffix in ("one", "two")), "steering waited for the unfinished original run")
             wait_for(settled, "original run did not settle after steering")
             work = api(f"/projects/{key}/work")
             held_event = next(e for e in work["events"] if e["source_id"] == "om_" + hold)
             held = next(r for r in work["runs"] if r["event_id"] == held_event["id"])
             for suffix in ("one", "two"):
                 steer = next(e for e in work["events"] if e["source_id"] == "om_steer_" + hold + suffix)
-                assert steer["received_at"] <= held["finished_at"], "message did not steer the original run"
+                assert steer["created_at"] <= held["finished_at"], "message did not steer the original run"
             assert project_state()["generation"] == original_generation
-        checks.append("busy Agent receives a message burst before its original run finishes, even before its original receipt")
+        checks.append("busy Agent receives a message burst before native turn completion without receipt/completion tools")
         FIXTURE.emit(message("om_second", "second message"))
         FIXTURE.emit(message("om_third", "", kind="file", content={"file_key": "fixture-inbound", "file_name": "incoming.txt"}))
-        wait_for(lambda: all(any(m["source_id"] == key and m["status"] == "acknowledged" for m in api(f"/projects/{project['id']}")["messages"]) for key in ["om_second", "om_third"]), "queued messages failed")
+        wait_for(lambda: all(any(m["source_id"] == key and m["status"] == "submitted" for m in api(f"/projects/{project['id']}")["messages"]) for key in ["om_second", "om_third"]), "queued messages failed")
         assert list((run / "files").glob("*incoming.txt"))
         checks.append("ordered follow-up turns and streamed inbound attachment")
         FIXTURE.emit(message("om_private", "direct-to-user", chat_type="p2p", chat_id="oc_private"))
         wait_for(lambda: any(c["chat_id"]=="oc_private" for c in api("/conversations")["items"]), "new private chat was not discovered")
         assert next(p for p in api("/state")["projects"] if p["id"] == key)["bot"]["app_id"] == "cli_fixture"
         wait_for(lambda: any(m["receive_id"]=="ou_fixture" for m in FIXTURE.messages), "agent-selected user destination failed")
-        wait_for(lambda: any(m["source_id"]=="om_private" and m["status"]=="acknowledged" for m in api(f"/projects/{key}")["messages"]), "private message did not join the same main session")
+        wait_for(lambda: any(m["source_id"]=="om_private" and m["status"]=="submitted" for m in api(f"/projects/{key}")["messages"]), "private message did not join the same main session")
         checks.append("new private chat enters fixed bot project without chat binding + XML context + MCP explicit user to")
         FIXTURE.emit(message("om_new_group", "new group without binding", chat_id="oc_new_group"))
-        wait_for(lambda: any(m["source_id"]=="om_new_group" and m["status"]=="acknowledged" for m in api(f"/projects/{key}")["messages"]), "new group did not automatically enter bot project")
+        wait_for(lambda: any(m["source_id"]=="om_new_group" and m["status"]=="submitted" for m in api(f"/projects/{key}")["messages"]), "new group did not automatically enter bot project")
         checks.append("new group automatically enters the same bot project without chat configuration")
         count = FIXTURE.connects; FIXTURE.disconnect()
         wait_for(lambda: FIXTURE.connects > count, "daemon did not reconnect WebSocket")
@@ -492,7 +515,7 @@ def main():
         wait_for(lambda: api("/state"), "daemon did not restart")
         assert project_state()["terminal"] == old_terminal
         api(f"/projects/{key}/pause", {"paused": False})
-        wait_for(lambda: any(m["source_id"] == "om_after_restart" and m["status"] == "acknowledged" for m in api(f"/projects/{key}")["messages"]), "persistent queue did not resume")
+        wait_for(lambda: any(m["source_id"] == "om_after_restart" and m["status"] == "submitted" for m in api(f"/projects/{key}")["messages"]), "persistent queue did not resume")
         wait_for(settled, "resumed run did not finish")
         checks.append("daemon restart preserves the live legacy execution and durable paused queue")
 
@@ -503,21 +526,21 @@ def main():
                 conn.execute("UPDATE work_executions SET idle_since=?,last_activity=?,warm_until=? WHERE project_id=? AND status='idle'",
                              (now, now, now + 600_000, key))
 
-        wait_for(lambda: any(e["status"] == "completed" for e in api(f"/projects/{key}/work")["runs"]), "no completed run")
-        wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "execution did not become idle")
+        wait_for(lambda: any(e["status"] == "settled" for e in api(f"/projects/{key}/work")["runs"]), "no completed run")
+        wait_for(native_idle, "execution did not become idle")
         age_idle_execution()
         wait_for(lambda: project_state()["terminal"] is None, "idle execution was not retired")
         assert not legacy_rpc("workspace.list")["workspaces"], "idle retirement left an owned workspace"
         checks.append("finished fixture execution retires after the persisted ten-minute warm deadline")
         count = len(FIXTURE.messages)
         FIXTURE.emit(message("om_wakeup", "wake sleeping project"))
-        wait_for(lambda: any(m["source_id"] == "om_wakeup" and m["status"] == "acknowledged" for m in api(f"/projects/{key}")["messages"]), "new message did not wake the fixture")
+        wait_for(lambda: any(m["source_id"] == "om_wakeup" and m["status"] == "submitted" for m in api(f"/projects/{key}")["messages"]), "new message did not wake the fixture")
         wait_for(settled, "wakeup run did not finish")
         assert project_state()["terminal"] != old_terminal and len(FIXTURE.messages) > count
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "wake leaked a workspace"
         checks.append("Feishu message wakes a fresh execution with the explicit fixture resume marker")
 
-        wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "woken execution did not idle")
+        wait_for(native_idle, "woken execution did not idle")
         age_idle_execution()
         wait_for(lambda: project_state()["terminal"] is None, "fixture did not sleep before timer")
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
@@ -527,7 +550,33 @@ def main():
         wait_for(settled, "timer run did not finish")
         assert project_state()["terminal"] is not None
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "timer wake leaked a workspace"
-        checks.append("durable one-shot timer wakes a sleeping fixture through the common task inbox")
+        checks.append("durable one-shot timer wakes a sleeping fixture through the persisted input journal")
+        FIXTURE.emit(message("om_schedule_tool", "fixture-create-schedule"))
+        wait_for(lambda: "scheduled-via-mcp" in str(FIXTURE.messages), "schedule_run tool did not persist and fire its schedule")
+        wait_for(settled, "MCP scheduled input did not settle through native idle")
+        checks.append("schedule_run creates a durable one-shot through real MCP and native idle releases its occurrence")
+
+        api(f"/projects/{key}/pause", {"paused":True})
+        due = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=120)
+        recurring = api(f"/projects/{key}/timers", {"name":"Recover interval", "prompt":"interval-after-restart", "kind":"interval",
+                    "at":due.isoformat(), "interval_seconds":60, "timezone":"UTC", "to":"oc_fixture", "request_id":"recover-interval"})
+        def interval_events():
+            return [e for e in api(f"/projects/{key}/work")["events"] if e["payload"].get("timer_id") == recurring["id"]]
+        wait_for(lambda: len(interval_events()) == 1, "missed intervals did not coalesce")
+        daemon.terminate(); daemon.wait(timeout=15)
+        daemon = boot()
+        wait_for(lambda: api("/state"), "daemon did not recover interval schedule")
+        assert len(interval_events()) == 1, "restart duplicated a stored occurrence"
+        api(f"/projects/{key}/pause", {"paused":False})
+        wait_for(lambda: "interval-after-restart" in str(FIXTURE.messages), "stored interval did not deliver after restart")
+        wait_for(settled, "recovered interval did not settle")
+        assert api(f"/timers/{recurring['id']}/pause", {"enabled":False})["enabled"] is False
+        assert api(f"/timers/{recurring['id']}/pause", {"enabled":True})["enabled"] is True
+        api(f"/timers/{recurring['id']}", method="DELETE")
+        disabled = next(t for t in api(f"/projects/{key}/timers") if t["id"] == recurring["id"])
+        assert not disabled["enabled"] and disabled["next_fire"] is None
+        checks.append("interval recovery coalesces persisted occurrences; native timer pause/enable/delete paths survive restart")
+
         cli = subprocess.run([str(binary), "--data-dir", str(run), "project", "list"], capture_output=True, text=True, timeout=10)
         assert cli.returncode == 0 and "端到端验证项目" in cli.stdout
         checks.append("CLI and UI API share the same project state")
@@ -540,7 +589,7 @@ def main():
         # Interrupt an acknowledged run, then prove fresh input still wakes the
         # same native conversation without replaying the interrupted event.
         FIXTURE.emit(message("om_interrupted", "fixture-hold-for-steer"))
-        wait_for(lambda: any(e["source_id"] == "om_interrupted" and e["status"] == "acknowledged" for e in api(f"/projects/{key}/work")["events"]), "fixture did not begin the interrupted run")
+        wait_for(lambda: any(e["source_id"] == "om_interrupted" and e["status"] == "submitted" for e in api(f"/projects/{key}/work")["events"]), "fixture did not begin the interrupted run")
         stopped_generation = project_state()["generation"]
         stopped_native = project_state()["native_session"]
         api(f"/projects/{key}/stop", {}, "POST")
@@ -550,7 +599,7 @@ def main():
         legacy_rpc("pane.close", {"pane_id": user_pane})
         wait_for(lambda: next(p for p in api("/state")["projects"] if p["id"] == key)["lifecycle"] == "sleeping", "interrupted history incorrectly made a dormant project require manual startup")
         FIXTURE.emit(message("om_after_stop", "wake automatically after stop"))
-        wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "completed" for e in api(f"/projects/{key}/work")["events"]), "stopped execution did not automatically wake for new input")
+        wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "stopped execution did not automatically wake for new input")
         assert project_state()["generation"] != stopped_generation
         assert project_state()["native_session"] == stopped_native
         assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
@@ -561,9 +610,9 @@ def main():
         wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "queued" for e in api(f"/projects/{key}/work")["events"]), "explicitly paused message did not persist")
         assert project_state()["terminal"] is None
         api(f"/projects/{key}/pause", {"paused": False})
-        wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "completed" for e in api(f"/projects/{key}/work")["events"]), "unpause did not automatically resume delivery")
+        wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "unpause did not automatically resume delivery")
         checks.append("only an explicit pause holds new messages; resuming activity automatically wakes the Agent")
-        wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "old uncertain work pinned the new execution")
+        wait_for(native_idle, "old uncertain work pinned the new execution")
         age_idle_execution()
         wait_for(lambda: project_state()["terminal"] is None, "new execution could not retire with old uncertain history")
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
@@ -575,10 +624,10 @@ def main():
         (results / "smoke.json").write_text(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))
         print(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))
     except Exception:
-        if real_agent and "key" in locals():
+        if "key" in locals():
             try:
                 diagnostic = run / "failure-screen.json"
-                diagnostic.write_text(json.dumps(api(f"/projects/{key}/screen"), ensure_ascii=False, indent=2))
+                diagnostic.write_text(json.dumps({"state":api("/state"),"screen":api(f"/projects/{key}/screen")}, ensure_ascii=False, indent=2))
                 diagnostic.chmod(0o600)
             except Exception:
                 pass

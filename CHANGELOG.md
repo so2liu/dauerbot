@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.5 — 2026-11-16
+
+### Changed
+
+- Make the macOS menu bar the primary entry, with a project-status panel and Add Project, Open App and Settings actions. Closing the window keeps the utility resident. The workspace shows projects and scheduled runs with a collapsed terminal and explicit input takeover (#43).
+- Reuse an authenticated daemon across desktop updates when its API protocol remains compatible. Show the service version and provide a separate trusted-install-only update action that rejects downgrades and preserves native Agent sessions (#42).
+- Restore Enter and Tab handling in the native macOS terminal while preserving printable text and Chinese IME input (#40).
+- Reduce managed Agent MCP to `send_md`, `send_file` and `schedule_run`; remove task, progress, decision and background-job bookkeeping from bootstrap, API, CLI and desktop. Questions use ordinary Feishu messages and replies.
+- Drive dispatch and ten-minute idle retirement through native HERDR state and verified execution identity. Preserve uncertain input and outbound results without automatic replay.
+- Keep stored schedules, messages and timer controls through schema 7 upgrades. Mark the incompatible contract with API protocol 5 so desktop, CLI and MCP reject incompatible services.
+
 ## 0.4.4 — 2026-11-16
 
 ### Fixed

@@ -35,7 +35,7 @@ impl IntoResponse for ApiError {
     }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
-pub const PROTOCOL: u64 = 4;
+pub const PROTOCOL: u64 = 5;
 
 pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()
@@ -62,29 +62,17 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/projects/{id}/screen", get(screen))
         .route("/projects/{id}/terminal", get(show))
         .route("/projects/{id}/takeover", post(takeover))
-        .route("/projects/{id}/work", get(work_state).post(work_state))
-        .route("/projects/{id}/tasks", get(tasks).post(create_task))
+        .route("/projects/{id}/work", get(work_state))
         .route("/projects/{id}/timers", get(timers).post(create_timer))
-        .route("/projects/{id}/finish", post(finish_run))
-        .route("/projects/{id}/event-ack", post(ack_event))
-        .route("/projects/{id}/checkpoint", post(checkpoint))
-        .route("/projects/{id}/decision", post(request_decision))
-        .route("/projects/{id}/decision-answer", post(answer_decision))
-        .route("/projects/{id}/jobs", post(register_job))
-        .route("/projects/{id}/job-complete", post(complete_job))
-        .route("/tasks/{id}/cancel", post(cancel_task))
         .route(
             "/timers/{id}",
             axum::routing::put(update_timer).delete(delete_timer),
         )
         .route("/timers/{id}/pause", post(pause_timer))
         .route("/events/{id}/resolve", post(resolve_event))
-        .route("/decisions/{id}/answer", post(answer_decision_admin))
-        .route("/jobs/{id}/abandon", post(abandon_job))
         .route("/projects/{id}/messages", post(inject))
         .route("/projects/{id}/outbox", post(outbox))
-        .route("/projects/{id}/ready", post(ready))
-        .route("/projects/{id}/ack", post(ack))
+        .route("/projects/{id}/register", post(register))
         .route(
             "/projects/{id}/upload",
             post(upload).layer(DefaultBodyLimit::max(
@@ -160,22 +148,7 @@ async fn auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Resp
     let parts: Vec<_> = path.split('/').collect();
     if parts.len() == 4
         && parts[1] == "projects"
-        && [
-            "ready",
-            "ack",
-            "outbox",
-            "work",
-            "tasks",
-            "timers",
-            "finish",
-            "event-ack",
-            "checkpoint",
-            "decision",
-            "decision-answer",
-            "jobs",
-            "job-complete",
-        ]
-        .contains(&parts[3])
+        && ["register", "outbox", "timers"].contains(&parts[3])
         && req.method() == "POST"
         && let Ok(p) = app.db.project(parts[2]).await
     {
@@ -490,17 +463,15 @@ async fn outbox(
     Ok(Json(serde_json::to_value(m).unwrap()))
 }
 #[derive(Deserialize)]
-struct Ready {
+struct Registration {
     generation: String,
     terminal: String,
-    #[serde(default)]
-    native_session: String,
 }
-async fn ready(
+async fn register(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     session: Session,
-    Json(input): Json<Ready>,
+    Json(input): Json<Registration>,
 ) -> ApiResult {
     let p = app.db.project(&id).await?;
     if p.execution["pane_id"].as_str() != Some(&input.terminal) || p.generation != input.generation
@@ -512,10 +483,10 @@ async fn ready(
     // Keep this request alive briefly rather than requiring a model to recover
     // from a transient first-tool error. No project lock is held here.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    let observed = loop {
         let t = herdr::observe(&cfg, &p).await?;
         match herdr::check_identity(&p, &t) {
-            Ok(()) => break,
+            Ok(()) => break t,
             Err(error)
                 if error.is::<herdr::SessionStarting>()
                     && tokio::time::Instant::now() < deadline =>
@@ -524,7 +495,11 @@ async fn ready(
             }
             Err(error) => return Err(error.into()),
         }
-    }
+    };
+    let native = observed["native_session"]["value"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
     let authority = authority(session);
     let name = p.name.clone();
     app.db.call(move|c|{
@@ -533,58 +508,19 @@ async fn ready(
         let terminal=p.terminal.as_deref().context("Execution is not running")?;
         let changed=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,
           execution=CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END
-          WHERE id=?2 AND generation=?3 AND terminal=?4",rusqlite::params![input.native_session,p.id,input.generation,terminal])?;
+          WHERE id=?2 AND generation=?3 AND terminal=?4",rusqlite::params![native,p.id,input.generation,terminal])?;
         anyhow::ensure!(changed==1,"Session identity changed; reconnect MCP");
-        if !input.native_session.is_empty(){
-            work::set_native_session(c,&p.id,&input.generation,&input.native_session,db::now())?;
+        if !native.is_empty(){
+            work::set_native_session(c,&p.id,&input.generation,&native,db::now())?;
         }
         tx.commit()?;
         Ok(())
     }).await?;
     app.notify.notify_one();
 
-    Ok(Json(json!({"ok":true,"project":name})))
-}
-#[derive(Deserialize)]
-struct Ack {
-    message_id: String,
-}
-async fn ack(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<Ack>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let authority = authority(session);
-    app.db.call(move|c|{
-        let tx=c.unchecked_transaction()?;
-        authorize_session(c,&authority,&p.id)?;
-        let generation:String=c.query_row("SELECT generation FROM projects WHERE id=?",[&p.id],|r|r.get(0))?;
-        let linked:Option<(String,String)>=c.query_row(
-          "SELECT e.id,m.status FROM work_events e JOIN messages m ON m.id=e.message_id
-           WHERE m.project_id=? AND m.source_id=? AND m.direction='in'",
-          rusqlite::params![p.id,input.message_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        if let Some((event_id,status))=linked {
-            let current_run:bool=c.query_row(
-              "SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=? AND generation=? AND event_id=?)",
-              rusqlite::params![p.id,generation,event_id],|r|r.get(0))?;
-            if current_run {
-                work::ack_event(c,&p.id,&generation,&event_id,db::now())?;
-            } else {
-                anyhow::ensure!(status=="acknowledged","This message was not submitted to the current execution");
-            }
-        }
-        let changed=c.execute("UPDATE messages SET status='acknowledged',error='',updated_at=?
-          WHERE project_id=? AND source_id=? AND direction='in' AND status IN ('submitting','submitted','uncertain','acknowledged')",
-          rusqlite::params![db::now(),p.id,input.message_id])?;
-        anyhow::ensure!(changed==1,"This message does not belong to the project or has not been submitted");
-        tx.commit()?;
-        Ok(())
-    }).await?;
-    app.notify.notify_one();
-
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(
+        json!({"ok":true,"project":name,"api_protocol":PROTOCOL}),
+    ))
 }
 async fn retry(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let m = app.db.message(&id).await?;
@@ -702,38 +638,10 @@ async fn work_state(
             .await?
     )))
 }
-async fn tasks(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    Ok(Json(json!(
-        app.db.call(move |c| work::tasks(c, &p.id)).await?
-    )))
-}
 async fn timers(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let p = app.db.project(&id).await?;
     let state = app.db.call(move |c| work::snapshot(c, &p.id)).await?;
     Ok(Json(json!(state.timers)))
-}
-async fn create_task(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<work::TaskInput>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    if let Some(to) = input.to.as_deref().filter(|s| !s.is_empty()) {
-        feishu::recipient_type(to)?;
-    }
-    let source = db::id();
-    let authority = authority(session);
-    let event = app
-        .db
-        .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            work::submit_task(c, &p.id, input, "task", &source, db::now())
-        })
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(event)))
 }
 async fn create_timer(
     State(app): State<Arc<App>>,
@@ -825,219 +733,6 @@ async fn takeover(
         app.takeover(&id, &input.generation, input.active).await?,
     ))
 }
-async fn ack_event(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<crate::mcp::EventAck>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let authority = authority(session);
-    app.db
-        .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            work::ack_event(c, &p.id, &p.generation, &input.event_id, db::now())
-        })
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!({"ok":true})))
-}
-async fn finish_run(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<crate::mcp::Finish>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let lock = app.project_lock(&p.id).await;
-    let _guard = lock.lock().await;
-    let p = app.db.project(&p.id).await?;
-    let authority = authority(session);
-    let run = app
-        .db
-        .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            work::finish_run(
-                c,
-                &p.id,
-                &p.generation,
-                &input.run_id,
-                &input.outcome,
-                &input.summary,
-                db::now(),
-            )
-        })
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(run)))
-}
-async fn checkpoint(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<crate::mcp::Checkpoint>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let project_path = std::path::PathBuf::from(&p.path);
-    let authority = authority(session);
-    let task = app
-        .db
-        .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            work::checkpoint(c, &p.id, &input.task_id, &input.summary, db::now())
-        })
-        .await?;
-    let memory = project_path.join(".dauerbot/tasks");
-    let note = format!(
-        "# {}\n\n{}\n\n## Progress\n\n{}\n",
-        task.title, task.instructions, task.checkpoint
-    );
-    let task_id = task.id.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        crate::config::private_dir(&memory)?;
-        crate::config::write_private(&memory.join(format!("{task_id}.md")), note.as_bytes())
-    })
-    .await
-    .context("Cannot save project memory")??;
-    Ok(Json(json!(task)))
-}
-async fn request_decision(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<crate::mcp::Decision>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    if let Some(to) = input.to.as_deref().filter(|s| !s.is_empty()) {
-        feishu::recipient_type(to)?;
-    }
-    let dest = input.to.clone().unwrap_or_default();
-    let authority = authority(session);
-    let decision = app
-        .db
-        .call(move |c| {
-            authorize_session(c,&authority,&p.id)?;
-            let tx=c.unchecked_transaction()?;
-            let decision=work::request_decision(
-                &tx,
-                &p.id,
-                &p.generation,
-                &input.run_id,
-                &input.question,
-                &dest,
-                json!([]),
-                db::now(),
-            )?;
-            if !dest.is_empty() && let Some(binding)=crate::bot::get(&tx,&p.id)? {
-                let source=format!("decision-{}",decision.id);
-                let attachment=json!({"to":dest,"bot_app_id":binding.app_id});
-                tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
-                  VALUES(?,?,'out',?,?,'pending',?,?,?)",rusqlite::params![db::id(),p.id,source,input.question,attachment.to_string(),db::now(),db::now()])?;
-            }
-            tx.commit()?;
-            Ok(decision)
-        })
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(decision)))
-}
-async fn answer_decision(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<crate::mcp::Answer>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let authority = authority(session);
-    let event = app
-        .db
-        .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            work::answer_decision(c, &p.id, &input.decision_id, &input.answer, db::now())
-        })
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(event)))
-}
-#[derive(Deserialize)]
-struct DecisionAnswer {
-    answer: String,
-}
-async fn answer_decision_admin(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    Json(input): Json<DecisionAnswer>,
-) -> ApiResult {
-    let project = project_for_record(&app, "work_decisions", &id).await?;
-    let event = app
-        .db
-        .call(move |c| work::answer_decision(c, &project, &id, &input.answer, db::now()))
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(event)))
-}
-async fn register_job(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<crate::mcp::Job>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let authority = authority(session);
-    let job = app
-        .db
-        .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            work::register_job(
-                c,
-                &p.id,
-                &p.generation,
-                &input.run_id,
-                &input.name,
-                db::now(),
-            )
-        })
-        .await?;
-    Ok(Json(json!(job)))
-}
-async fn complete_job(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    session: Session,
-    Json(input): Json<crate::mcp::JobDone>,
-) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let authority = authority(session);
-    if !["completed", "failed"].contains(&input.status.as_str()) {
-        return Err(anyhow::anyhow!("Job status must be completed or failed").into());
-    }
-    let event = app
-        .db
-        .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            work::complete_job_with_status(
-                c,
-                &p.id,
-                &p.generation,
-                &input.job_id,
-                &input.status,
-                &input.summary,
-                db::now(),
-            )
-        })
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(event)))
-}
-async fn cancel_task(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
-    let project = project_for_record(&app, "work_tasks", &id).await?;
-    let result = app
-        .db
-        .call(move |c| work::cancel_task(c, &project, &id, db::now()))
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(result)))
-}
 #[derive(Deserialize)]
 struct EventResolution {
     action: String,
@@ -1059,23 +754,4 @@ async fn resolve_event(
         .await?;
     app.notify.notify_one();
     Ok(Json(json!(result)))
-}
-#[derive(Deserialize)]
-struct JobAbandon {
-    reason: String,
-}
-async fn abandon_job(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    Json(input): Json<JobAbandon>,
-) -> ApiResult {
-    let project = project_for_record(&app, "work_jobs", &id).await?;
-    let lock = app.project_lock(&project).await;
-    let _guard = lock.lock().await;
-    let job = app
-        .db
-        .call(move |c| work::abandon_job(c, &project, &id, &input.reason, db::now()))
-        .await?;
-    app.notify.notify_one();
-    Ok(Json(json!(job)))
 }

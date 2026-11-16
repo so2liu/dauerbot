@@ -860,17 +860,20 @@ pub fn quiescent(p: &Project, record: &Value) -> bool {
 }
 
 pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
-    let preflight: Result<ExecutionRef> = async {
+    let preflight: Result<(ExecutionRef, Value)> = async {
         let record = observe(config, p).await?;
         check_identity(p, &record)?;
         anyhow::ensure!(
             record["status"]["state"] != "blocked",
             "The Agent is waiting for interactive input"
         );
-        ExecutionRef::from_project(p)
+        Ok((
+            ExecutionRef::from_project(p)?,
+            record["state_change_seq"].clone(),
+        ))
     }
     .await;
-    let execution = preflight.map_err(NotSubmitted)?;
+    let (execution, sequence) = preflight.map_err(NotSubmitted)?;
     if p.agent == "custom" {
         rpc(
             config,
@@ -886,7 +889,7 @@ pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
         )
         .await?;
     }
-    Ok(json!({"submitted":true,"started":true}))
+    Ok(json!({"submitted":true,"started":true,"native_seq":sequence}))
 }
 
 pub async fn stop(config: &Config, p: &Project) -> Result<()> {
@@ -1127,7 +1130,7 @@ pub async fn confirm_project_trust(config: &Config, p: &Project) -> Result<()> {
 
 pub fn capabilities(agent: &str) -> Value {
     json!({"backend":"legacy","interactive_terminal":true,"native_resume":(["codex","claude","pi","agy"].contains(&agent)),
-        "native_session_source":"herdr.agent_session","model_confirmation":"unverified","background_quiescence":"requires_tracked_jobs"})
+        "native_session_source":"herdr.agent_session","model_confirmation":"unverified","background_quiescence":"native_state_and_foreground_processes"})
 }
 
 fn integration_target(agent: &str) -> Result<&'static str> {
