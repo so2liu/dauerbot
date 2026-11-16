@@ -1,11 +1,27 @@
+//! Legacy HERDR execution and terminal presentation transport.
+//!
+//! `hc` is intentionally absent from this module. Persisted legacy execution
+//! identities must be checked before sending input or closing a pane.
 use crate::{config::Config, db::Project};
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
 };
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
+    process::Command,
+    sync::Mutex,
+};
+
+pub use crate::adapter::{launch_args, merge_mcp};
+const PROTOCOL: u64 = 22;
+static START_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug)]
 pub struct RpcFailure {
@@ -15,29 +31,574 @@ pub struct RpcFailure {
 }
 impl std::fmt::Display for RpcFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HERDR {}: {} ({})", self.kind, self.message, self.hint)
+        write!(f, "HERDR {}: {}", self.kind, self.message)
     }
 }
 impl std::error::Error for RpcFailure {}
 pub fn definitely_not_sent(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RpcFailure>().is_some_and(|e| {
-        matches!(e.kind.as_str(), "blocked" | "status_mismatch")
-            || e.hint.contains("nothing was typed")
+        matches!(
+            e.kind.as_str(),
+            "agent_blocked"
+                | "agent_not_ready"
+                | "agent_not_found"
+                | "empty_agent_prompt"
+                | "invalid_target"
+        )
     })
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionRef {
+    pub backend: String,
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub managed_name: String,
+    pub generation: String,
+    pub shell_pid: Option<i64>,
+    pub launch_permit: PathBuf,
+}
+impl ExecutionRef {
+    pub fn from_project(p: &Project) -> Result<Self> {
+        let value: Self = serde_json::from_value(p.execution.clone())
+            .context("This execution predates the legacy HERDR backend; start a new session")?;
+        if value.backend != "legacy"
+            || value.generation != p.generation
+            || p.terminal.as_deref() != Some(value.terminal_id.as_str())
+            || value.shell_pid != p.terminal_pid
+        {
+            bail!("The saved execution identity changed; reconnect the project");
+        }
+        Ok(value)
+    }
+}
+
+fn command_environment(config: &Config, cmd: &mut Command) {
+    // Never route product traffic through the development agent's terminal.
+    for key in [
+        "HC_SESSION",
+        "HC_TERMINAL_ID",
+        "HC_TERMINAL_SOCKET",
+        "HC_SOCKET",
+        "HERDR_ENV",
+        "HERDR_SOCKET_PATH",
+        "HERDR_PANE_ID",
+        "HERDR_TERMINAL_ID",
+        "HERDR_SESSION",
+    ] {
+        cmd.env_remove(key);
+    }
+    if !config.herdr_config.is_empty() {
+        cmd.env("HERDR_CONFIG_PATH", &config.herdr_config);
+    }
+    cmd.kill_on_drop(true);
+}
+
 pub fn command(config: &Config) -> Command {
-    let mut cmd = Command::new(&config.hc);
-    cmd.env("HC_SESSION", &config.core_session)
-        .env_remove("HC_TERMINAL_ID")
-        .env_remove("HC_TERMINAL_SOCKET")
-        .env_remove("HC_SOCKET")
-        .kill_on_drop(true);
+    let mut cmd = Command::new(&config.herdr);
+    cmd.args(["--session", &config.herdr_session]);
+    command_environment(config, &mut cmd);
     cmd
 }
 
-/// Core is persistent and may have started without the desktop's network environment.
-/// Forward existing proxy settings only; retain Core's terminal identity and CLI configuration.
+fn server_command(config: &Config) -> Command {
+    let argv = login_shell_args(vec![
+        config.herdr.clone(),
+        "--session".into(),
+        config.herdr_session.clone(),
+        "server".into(),
+    ]);
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    command_environment(config, &mut cmd);
+    cmd
+}
+
+pub fn socket_path(config: &Config) -> Result<PathBuf> {
+    let root = if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(path)
+    } else {
+        directories::BaseDirs::new()
+            .context("Home directory is unavailable")?
+            .home_dir()
+            .join(".config")
+    };
+    let root = root.join("herdr");
+    if config.herdr_session == "default" {
+        Ok(root.join("herdr.sock"))
+    } else {
+        Ok(root
+            .join("sessions")
+            .join(&config.herdr_session)
+            .join("herdr.sock"))
+    }
+}
+
+/// Only a request/reply exchange is retried by callers; input ambiguity is retained.
+pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> {
+    let path = socket_path(config)?;
+    let id = crate::db::id();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        let mut stream = UnixStream::connect(&path).await.with_context(|| {
+            format!("Cannot connect to HERDR session '{}'", config.herdr_session)
+        })?;
+        let bytes = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
+        stream.write_all(&bytes).await?;
+        stream.write_all(b"\n").await?;
+        stream.flush().await?;
+        let mut lines = BufReader::new(stream).lines();
+        while let Some(line) = lines.next_line().await? {
+            let response: Value =
+                serde_json::from_str(&line).context("HERDR returned invalid JSON")?;
+            if response["id"] != id {
+                continue;
+            }
+            if let Some(error) = response.get("error") {
+                return Err(RpcFailure {
+                    kind: error["code"].as_str().unwrap_or("error").into(),
+                    message: error["message"].as_str().unwrap_or("Request failed").into(),
+                    hint: String::new(),
+                }
+                .into());
+            }
+            return response
+                .get("result")
+                .cloned()
+                .context("HERDR returned no result");
+        }
+        bail!("HERDR closed the connection before replying")
+    })
+    .await
+    .context("HERDR request timed out; input delivery may be uncertain")?
+}
+
+pub async fn probe(config: &Config) -> Result<Value> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        command(config).arg("--version").output(),
+    )
+    .await
+    .context("HERDR version check timed out")?
+    .context("Install the legacy herdr CLI 0.9.5 to run agents")?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !output.status.success() || version != "herdr 0.9.5" {
+        bail!("Dauerbot currently supports legacy herdr 0.9.5; found '{version}'");
+    }
+    let value = rpc(config, "ping", json!({})).await?;
+    if value["protocol"].as_u64() != Some(PROTOCOL) || value["version"] != "0.9.5" {
+        bail!(
+            "The running HERDR server differs from the supported 0.9.5 installation; open the matching session before continuing"
+        );
+    }
+    Ok(value)
+}
+
+pub async fn ensure_server(config: &Config) -> Result<()> {
+    let _guard = START_LOCK.lock().await;
+    if UnixStream::connect(socket_path(config)?).await.is_ok() {
+        probe(config).await?;
+        return Ok(());
+    }
+    // Only create a missing server; never restart an existing session.
+    let version = tokio::time::timeout(
+        Duration::from_secs(5),
+        command(config).arg("--version").output(),
+    )
+    .await??;
+    if !version.status.success() || String::from_utf8_lossy(&version.stdout).trim() != "herdr 0.9.5"
+    {
+        bail!("Install legacy herdr 0.9.5 before starting this project");
+    }
+    let mut child = server_command(config)
+        .kill_on_drop(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Cannot start the HERDR background server")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(value) = rpc(config, "ping", json!({})).await {
+            if value["protocol"].as_u64() != Some(PROTOCOL) {
+                bail!("HERDR server protocol differs from the supported installation");
+            }
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            // Another project may have started the shared server concurrently.
+            if probe(config).await.is_ok() {
+                return Ok(());
+            }
+            bail!(
+                "HERDR server exited during startup ({status}); open its session to inspect the error"
+            );
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // A slow live server remains owned by HERDR, not this view or request.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            bail!("HERDR server did not become ready; open its session and retry");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Full UUID encoded in base36 fits HERDR's 32-character managed-name limit.
+pub fn managed_name(generation: &str) -> Result<String> {
+    let mut number = uuid::Uuid::parse_str(generation)?.as_u128();
+    let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(alphabet[(number % 36) as usize]);
+        number /= 36;
+        if number == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    Ok(format!("db-{}", String::from_utf8(digits)?))
+}
+
+/// Create the identity before launch so an early MCP registration can validate it.
+pub async fn prepare_execution(
+    config: &Config,
+    p: &Project,
+    argv: &[String],
+    generation: &str,
+) -> Result<Value> {
+    ensure_server(config).await?;
+    if argv.is_empty() {
+        bail!("The Agent launch plan is empty");
+    }
+    let permit_root = if config.herdr_config.is_empty() {
+        socket_path(config)?
+            .parent()
+            .context("HERDR session directory is unavailable")?
+            .to_path_buf()
+    } else {
+        PathBuf::from(&config.herdr_config)
+            .parent()
+            .context("HERDR configuration directory is unavailable")?
+            .to_path_buf()
+    };
+    let permit_dir = permit_root.join("sessions").join(&p.id).join(generation);
+    crate::config::private_dir(&permit_dir)?;
+    let permit = permit_dir.join("launch.permit");
+    if permit.exists() {
+        bail!("This execution generation already has a launch permit");
+    }
+    let workspace = rpc(
+        config,
+        "workspace.create",
+        json!({"cwd":p.path,"label":format!("Dauerbot · {}",p.name),"focus":false}),
+    )
+    .await?;
+    // The gate is the actual PTY root. Once permitted, exec keeps its PID while
+    // changing into the login wrapper and then the Agent. A crash before the
+    // durable identity is saved times out instead of starting an orphan Agent.
+    let script = r#"count=0; while [ ! -f "$1" ]; do count=$((count+1)); [ "$count" -lt 300 ] || exit 75; sleep 0.1; done; rm -f "$1"; shift; exec "$@""#;
+    let mut command = vec![
+        "/bin/sh".to_owned(),
+        "-c".into(),
+        script.into(),
+        "dauerbot-launch".into(),
+        permit.to_string_lossy().into_owned(),
+    ];
+    if p.agent == "custom" {
+        command.extend(argv.to_vec());
+    } else {
+        command.extend(login_shell_args(argv.to_vec()));
+    }
+    let layout=rpc(config,"layout.apply",json!({"tab_id":workspace["tab"]["tab_id"],"focus":false,"tab_label":p.name,
+        "root":{"type":"pane","cwd":p.path,"command":command,"env":launch_network_env(std::env::vars()),"label":p.name}})).await?;
+    let pane_id = layout["layout"]["root"]["pane_id"]
+        .as_str()
+        .context("HERDR returned no command pane identity")?;
+    let pane = rpc(config, "pane.get", json!({"pane_id":pane_id})).await?;
+    let pane = &pane["pane"];
+    let name = managed_name(generation)?;
+    rpc(config,"pane.report_metadata",json!({"pane_id":pane_id,"source":"dauerbot","tokens":{
+        "hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":generation,"hfb_execution":name
+    }})).await?;
+    let info = rpc(config, "pane.process_info", json!({"pane_id":pane_id})).await?;
+    let execution = ExecutionRef {
+        backend: "legacy".into(),
+        workspace_id: pane["workspace_id"]
+            .as_str()
+            .context("HERDR returned no workspace")?
+            .into(),
+        pane_id: pane_id.into(),
+        terminal_id: pane["terminal_id"]
+            .as_str()
+            .context("HERDR returned no terminal")?
+            .into(),
+        managed_name: name,
+        generation: generation.into(),
+        shell_pid: Some(
+            info["process_info"]["shell_pid"]
+                .as_i64()
+                .context("HERDR command has no root process identity")?,
+        ),
+        launch_permit: permit,
+    };
+    Ok(serde_json::to_value(execution)?)
+}
+
+/// Save the execution before releasing this gate. No Agent can call MCP earlier.
+pub async fn launch_execution(_config: &Config, p: &Project, _argv: &[String]) -> Result<()> {
+    let execution = ExecutionRef::from_project(p)?;
+    crate::config::write_private(&execution.launch_permit, p.generation.as_bytes())?;
+    Ok(())
+}
+
+pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
+    let execution = ExecutionRef::from_project(p)?;
+    let pane = match rpc(config, "pane.get", json!({"pane_id":execution.pane_id})).await {
+        Ok(v) => v["pane"].clone(),
+        Err(error)
+            if error.downcast_ref::<RpcFailure>().is_some_and(|e| {
+                matches!(e.kind.as_str(), "pane_not_found" | "target_not_found")
+            }) =>
+        {
+            return Ok(json!({"state":"finished","execution":execution}));
+        }
+        Err(error) => return Err(error),
+    };
+    let native_agent = match rpc(config, "agent.get", json!({"target":execution.terminal_id})).await
+    {
+        Ok(v) => v["agent"].clone(),
+        Err(error)
+            if error
+                .downcast_ref::<RpcFailure>()
+                .is_some_and(|e| e.kind == "agent_not_found") =>
+        {
+            pane.clone()
+        }
+        Err(error) => return Err(error),
+    };
+    let info = match rpc(
+        config,
+        "pane.process_info",
+        json!({"pane_id":execution.pane_id}),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error)
+            if error.downcast_ref::<RpcFailure>().is_some_and(|e| {
+                matches!(e.kind.as_str(), "pane_not_found" | "target_not_found")
+            }) =>
+        {
+            return Ok(json!({"state":"finished","execution":execution}));
+        }
+        Err(error) => return Err(error),
+    };
+    let info = &info["process_info"];
+    let processes = info["foreground_processes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let foreground = processes
+        .iter()
+        .find(|v| !is_shell(v))
+        .or_else(|| processes.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    let agent_label = native_agent["agent"].as_str().unwrap_or("");
+    let pending = !p.ready && (agent_label.is_empty() || is_shell(&foreground));
+    let state = if processes.is_empty() {
+        "finished"
+    } else {
+        "live"
+    };
+    Ok(
+        json!({"state":state,"pid":info["shell_pid"],"argv":foreground["argv"],"foreground":foreground,
+        "status":{"state":native_agent["agent_status"].as_str().unwrap_or("unknown"),"app":agent_label},
+        "native_session":native_agent.get("agent_session").cloned().unwrap_or(Value::Null),
+        "interactive_ready":native_agent["interactive_ready"].as_bool().unwrap_or(!pending),
+        "launch_pending":pending,"completion_seq":native_agent["completion_seq"],"state_change_seq":native_agent["state_change_seq"],
+        "execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"tokens":pane["tokens"],
+        "cwd":pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("")}),
+    )
+}
+
+fn is_shell(process: &Value) -> bool {
+    let name = process["name"]
+        .as_str()
+        .or(process["argv0"].as_str())
+        .unwrap_or("");
+    let name = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .trim_start_matches('-');
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "fish" | "nu" | "pwsh" | "dash" | "login"
+    )
+}
+
+pub fn check_execution_identity(p: &Project, record: &Value) -> Result<()> {
+    let execution = ExecutionRef::from_project(p)?;
+    if record["state"] != "live" {
+        bail!("The main Agent has exited");
+    }
+    let observed: ExecutionRef = serde_json::from_value(record["execution"].clone())?;
+    if observed.generation != execution.generation
+        || observed.terminal_id != execution.terminal_id
+        || observed.pane_id != execution.pane_id
+        || observed.workspace_id != execution.workspace_id
+        || record["agent"]["terminal_id"] != execution.terminal_id
+        || record["agent"]["pane_id"] != execution.pane_id
+        || record["agent"]["workspace_id"] != execution.workspace_id
+        || (execution.shell_pid.is_some() && record["pid"].as_i64() != execution.shell_pid)
+    {
+        bail!("HERDR execution identity changed; automatic input was stopped");
+    }
+    if record["tokens"]["hfb_owner"] != "dauerbot"
+        || record["tokens"]["hfb_project"] != p.id
+        || record["tokens"]["hfb_generation"] != p.generation
+        || record["tokens"]["hfb_execution"] != execution.managed_name
+    {
+        bail!("HERDR execution generation metadata changed; automatic input was stopped");
+    }
+    Ok(())
+}
+
+pub fn check_identity(p: &Project, record: &Value) -> Result<()> {
+    check_execution_identity(p, record)?;
+    if record["launch_pending"] == true {
+        return Err(SessionStarting.into());
+    }
+    if is_shell(&record["foreground"]) {
+        bail!("The Agent returned to a shell; automatic input was stopped");
+    }
+    if p.agent != "custom" {
+        let actual = record["agent"]["agent"].as_str().unwrap_or("");
+        let expected = if p.agent == "agy" {
+            "antigravity"
+        } else if p.agent == "claude" {
+            "claude"
+        } else {
+            &p.agent
+        };
+        if actual != expected && !(p.agent == "agy" && actual == "agy") {
+            bail!("The foreground Agent differs from the selected CLI");
+        }
+    }
+    Ok(())
+}
+
+pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
+    let record = observe(config, p).await?;
+    check_identity(p, &record)?;
+    let execution = ExecutionRef::from_project(p)?;
+    if p.agent == "custom" {
+        rpc(
+            config,
+            "pane.send_input",
+            json!({"pane_id":execution.pane_id,"text":text,"keys":["Enter"]}),
+        )
+        .await?;
+    } else {
+        rpc(
+            config,
+            "agent.prompt",
+            json!({"target":execution.terminal_id,"text":text}),
+        )
+        .await?;
+    }
+    Ok(json!({"submitted":true,"started":true}))
+}
+
+pub async fn stop(config: &Config, p: &Project) -> Result<()> {
+    let record = observe(config, p).await?;
+    if record["state"] == "finished" {
+        return Ok(());
+    }
+    match check_execution_identity(p, &record) {
+        Ok(()) => {}
+        Err(error) if error.is::<SessionStarting>() => {}
+        Err(error) => return Err(error),
+    }
+    let execution = ExecutionRef::from_project(p)?;
+    rpc(config, "pane.close", json!({"pane_id":execution.pane_id})).await?;
+    Ok(())
+}
+
+pub async fn screen(config: &Config, p: &Project, lines: u32) -> Result<String> {
+    let execution = ExecutionRef::from_project(p)?;
+    let value = rpc(
+        config,
+        "pane.read",
+        json!({"pane_id":execution.pane_id,
+        "source":if lines==0 {"visible"} else {"recent"},"lines":lines.max(1),"strip_ansi":true}),
+    )
+    .await?;
+    value["read"]["text"]
+        .as_str()
+        .or(value["text"].as_str())
+        .map(str::to_owned)
+        .context("HERDR returned no terminal text")
+}
+
+pub async fn terminal_descriptor(config: &Config, p: &Project) -> Result<Value> {
+    let record = observe(config, p).await?;
+    match check_execution_identity(p, &record) {
+        Ok(()) => {}
+        Err(error) if error.is::<SessionStarting>() => {}
+        Err(error) => return Err(error),
+    }
+    let execution = ExecutionRef::from_project(p)?;
+    let mut public_execution = serde_json::to_value(&execution)?;
+    public_execution
+        .as_object_mut()
+        .context("Invalid execution descriptor")?
+        .remove("launch_permit");
+    Ok(
+        json!({"backend":"legacy","program":config.herdr,"herdr":config.herdr,"session":config.herdr_session,"herdr_session":config.herdr_session,
+        "terminal_id":execution.terminal_id,"terminal":execution.terminal_id,"pane_id":execution.pane_id,"generation":execution.generation,
+        "project_id":p.id,"execution":public_execution,"can_control":true,"config_path":config.herdr_config}),
+    )
+}
+
+pub async fn subscribe(config: &Config) -> Result<tokio::io::Lines<BufReader<UnixStream>>> {
+    let mut stream = UnixStream::connect(socket_path(config)?).await?;
+    let req = json!({"id":crate::db::id(),"method":"events.subscribe","params":{"subscriptions":[
+        {"type":"pane.updated"},{"type":"pane.exited"},{"type":"pane.agent_detected"}
+    ]}});
+    stream.write_all(format!("{req}\n").as_bytes()).await?;
+    stream.flush().await?;
+    Ok(BufReader::new(stream).lines())
+}
+
+#[derive(Debug)]
+pub struct SessionStarting;
+impl std::fmt::Display for SessionStarting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The main Agent is still starting")
+    }
+}
+impl std::error::Error for SessionStarting {}
+
+/// Preserve the login environment used by ordinary user terminals.
+pub fn login_shell_args(argv: Vec<String>) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let mut out = vec![
+        shell,
+        "-lic".into(),
+        r#"exec "$@""#.into(),
+        "dauerbot-agent".into(),
+    ];
+    out.extend(argv);
+    out
+}
+
 pub fn launch_network_env(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
@@ -52,231 +613,17 @@ pub fn launch_network_env(
         "no_proxy",
     ];
     vars.into_iter()
-        .filter(|(key, _)| KEYS.contains(&key.as_str()))
+        .filter(|(k, _)| KEYS.contains(&k.as_str()))
         .collect()
 }
 
-const LOGIN_EXEC: &str = r#"exec "$@""#;
-const LOGIN_MARKER: &str = "dauerbot-agent";
-
-/// Start native CLIs with the same profile and environment as a user's terminal.
-/// Positional arguments preserve every CLI argument without shell interpolation.
-pub fn login_shell_args(argv: Vec<String>) -> Vec<String> {
-    #[cfg(unix)]
-    {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            if cfg!(target_os = "macos") {
-                "/bin/zsh"
-            } else {
-                "/bin/sh"
-            }
-            .into()
-        });
-        let mut wrapped = vec![shell, "-lic".into(), LOGIN_EXEC.into(), LOGIN_MARKER.into()];
-        wrapped.extend(argv);
-        wrapped
-    }
-    #[cfg(not(unix))]
-    argv
-}
-
-pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> {
-    let mut child = command(config)
-        .arg("connect")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Cannot start hc connect; install herdr-core first")?;
-    let result = tokio::time::timeout(Duration::from_secs(100), async {
-        let input = child.stdin.as_mut().context("hc stdin is unavailable")?;
-        input
-            .write_all(
-                format!(
-                    "{}\n",
-                    json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
-                )
-                .as_bytes(),
-            )
-            .await?;
-        input.flush().await?;
-        let mut lines =
-            BufReader::new(child.stdout.take().context("hc stdout is unavailable")?).lines();
-        while let Some(line) = lines.next_line().await? {
-            let v: Value = serde_json::from_str(&line)?;
-            if v["id"] != 1 {
-                continue;
-            }
-            if let Some(error) = v.get("error") {
-                return Err(RpcFailure {
-                    kind: error["data"]["kind"].as_str().unwrap_or("error").into(),
-                    message: error["message"].as_str().unwrap_or("RPC failed").into(),
-                    hint: error["data"]["hint"].as_str().unwrap_or("").into(),
-                }
-                .into());
-            }
-            return Ok(v["result"].clone());
-        }
-        let mut detail = String::new();
-        if let Some(stderr) = child.stderr.take() {
-            let _ = stderr.take(8192).read_to_string(&mut detail).await;
-        }
-        bail!("hc connect exited early: {}", detail.trim())
-    })
-    .await
-    .context("HERDR request timed out; delivery may be uncertain")?;
-    let _ = child.kill().await;
-    result
-}
-
-pub async fn subscribe(
-    config: &Config,
-) -> Result<(
-    Child,
-    tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-)> {
-    let mut child = command(config)
-        .arg("connect")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let req = json!({"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{"labels":{"hfb.owner":"herdr-feishu-bridge"}}});
-    child
-        .stdin
-        .as_mut()
-        .context("hc stdin")?
-        .write_all(format!("{req}\n").as_bytes())
-        .await?;
-    child.stdin.as_mut().unwrap().flush().await?;
-    let lines = BufReader::new(child.stdout.take().context("hc stdout")?).lines();
-    Ok((child, lines))
-}
-
-#[derive(Debug)]
-pub struct SessionStarting;
-impl std::fmt::Display for SessionStarting {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The main session is still starting")
-    }
-}
-impl std::error::Error for SessionStarting {}
-
-/// Stable local placement survives App restarts and never inherits a mirrored space.
-pub fn view_labels(p: &Project, record: &Value) -> Value {
-    let existing = |key: &str| {
-        record["labels"][key]
-            .as_str()
-            .filter(|value| !value.is_empty() && !value.contains('/'))
-    };
-    let suffix = p.id.replace('-', "");
-    json!({
-        "herdr.space": existing("herdr.space").map(str::to_owned).unwrap_or_else(|| format!("spdauerbot{suffix}")),
-        "herdr.tab": existing("herdr.tab").map(str::to_owned).unwrap_or_else(|| format!("tbdauerbot{suffix}")),
-    })
-}
-
-/// Read only local panes; a mirrored terminal with the same short ID is unrelated.
-pub fn view_pane(layout: &Value, terminal: &str) -> Option<(String, Value)> {
-    for space in layout["spaces"].as_array()? {
-        let id = space["id"].as_str()?;
-        if id.contains('/') || space["machine"].as_str().is_some_and(|m| !m.is_empty()) {
-            continue;
-        }
-        for tab in space["tabs"].as_array().into_iter().flatten() {
-            if let Some(pane) = tab["terminals"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|pane| pane["terminal"] == terminal)
-                && let Some(id) = tab["id"].as_str()
-            {
-                return Some((id.to_owned(), pane["pane"].clone()));
-            }
-        }
-    }
-    None
-}
-
-pub async fn app_command(args: &[&str]) -> Result<Value> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        Command::new("herdr-app")
-            .kill_on_drop(true)
-            .args(args)
-            .output(),
-    )
-    .await
-    .context("Herdr App request timed out")?
-    .context("Cannot call herdr-app; install and open Herdr App first")?;
-    let result: Value =
-        serde_json::from_slice(&output.stdout).context("Herdr App returned invalid output")?;
-    if !output.status.success() || !result.is_object() {
-        bail!("Cannot reach Herdr App; open it and try Monitor again");
-    }
-    if let Some(error) = result["error"].as_str().filter(|e| !e.is_empty()) {
-        bail!("Cannot show the main session in Herdr App: {error}");
-    }
-    Ok(result)
-}
-
-pub fn check_identity(p: &Project, t: &Value) -> Result<()> {
-    if t["state"] != "live" {
-        bail!("The main session exited; resume it before continuing");
-    }
-    if t["labels"]["hfb.project"] != p.id || t["labels"]["hfb.generation"] != p.generation {
-        bail!("HERDR terminal labels do not match; delivery stopped");
-    }
-    if t["pid"].as_i64() != p.terminal_pid || p.terminal_pid.is_none() {
-        bail!("Terminal process changed; reconnect the session");
-    }
-    let argv = t["argv"]
-        .as_array()
-        .context("Cannot verify the terminal program")?;
-    let wrapped = argv.get(1).and_then(Value::as_str) == Some("-lic")
-        && argv.get(2).and_then(Value::as_str) == Some(LOGIN_EXEC)
-        && argv.get(3).and_then(Value::as_str) == Some(LOGIN_MARKER)
-        && argv.get(4).and_then(Value::as_str) == Some(p.agent.as_str())
-        && ["codex", "claude", "pi", "agy"].contains(&p.agent.as_str());
-    if wrapped && t["foreground"]["pid"] == t["pid"] && t["foreground"]["argv"] == t["argv"] {
-        return Err(SessionStarting.into());
-    }
-    let program = if wrapped {
-        t["foreground"]["argv"][0].as_str().ok_or(SessionStarting)?
-    } else {
-        argv.first().and_then(Value::as_str).unwrap_or("")
-    };
-    if matches!(
-        Path::new(program).file_name().and_then(|s| s.to_str()),
-        Some("sh" | "bash" | "zsh" | "fish" | "nu" | "pwsh")
-    ) {
-        bail!("The terminal returned to a shell; refusing automatic delivery");
-    }
-    Ok(())
-}
-
-/// App adoption temporarily enables restoration. Dauerbot retains its own sessions.
-/// A pending owned wrapper is safe to retain differently, but restored shells are not.
-pub fn should_disable_restoration(p: &Project, record: &Value) -> bool {
-    if record["keep"] != true || record["labels"]["hfb.owner"] != "herdr-feishu-bridge" {
-        return false;
-    }
-    match check_identity(p, record) {
-        Ok(()) => true,
-        Err(error) => error.is::<SessionStarting>(),
-    }
-}
-
-/// Only recognize the known workspace-trust dialog, never an arbitrary permission.
+/// Recognize only the native workspace trust screen already authorized by the user.
 pub fn is_project_trust(p: &Project, t: &Value, screen: &str) -> bool {
     if p.ready
         || p.agent != "agy"
-        || check_identity(p, t).is_err()
         || t["cwd"] != p.path
         || t["status"]["state"] != "blocked"
-        || t["status"]["app"] != "antigravity"
-        || t["status"]["kind"] != "permission"
-        || t["status"]["msg"] != "Trust this folder?"
+        || check_execution_identity(p, t).is_err()
     {
         return false;
     }
@@ -288,116 +635,86 @@ pub fn is_project_trust(p: &Project, t: &Value, screen: &str) -> bool {
         && lines.contains(&"No, exit")
 }
 
-pub fn launch_args(
-    p: &Project,
-    mcp_file: &Path,
-    mcp_entry: &Value,
-    instructions: &str,
-    resume: bool,
-) -> Result<Vec<String>> {
-    let mut argv: Vec<String> = match p.agent.as_str() {
-        "codex" => vec![
-            "codex".into(),
-            "--no-daemon".into(),
-            "--dangerously-bypass-approvals-and-sandbox".into(),
-            "-c".into(),
-            format!("mcp_servers.herdr_feishu.command={}", mcp_entry["command"]),
-            "-c".into(),
-            format!("mcp_servers.herdr_feishu.args={}", mcp_entry["args"]),
-            "-c".into(),
-            "mcp_servers.herdr_feishu.env_vars=[\"HC_TERMINAL_ID\",\"HC_TERMINAL_SOCKET\"]".into(),
-        ],
-        "claude" => vec![
-            "claude".into(),
-            "--dangerously-skip-permissions".into(),
-            "--mcp-config".into(),
-            mcp_file.to_string_lossy().into(),
-            "--append-system-prompt".into(),
-            instructions.into(),
-        ],
-        "pi" => vec![
-            "pi".into(),
-            "--approve".into(),
-            "--append-system-prompt".into(),
-            instructions.into(),
-        ],
-        "agy" => vec!["agy".into(), "--dangerously-skip-permissions".into()],
-        "custom" => p
-            .extra_args
-            .iter()
-            .map(|arg| {
-                arg.replace("{mcp_config}", &mcp_file.to_string_lossy())
-                    .replace(
-                        "{credentials}",
-                        &mcp_file
-                            .with_file_name("credentials.json")
-                            .to_string_lossy(),
-                    )
-                    .replace(
-                        "{bridge_exe}",
-                        &std::env::current_exe()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    )
-                    .replace("{instructions}", instructions)
-            })
-            .collect(),
-        _ => bail!("Unsupported agent"),
-    };
-    if p.agent != "custom" {
-        argv.extend(p.extra_args.clone());
+pub async fn confirm_project_trust(config: &Config, p: &Project) -> Result<()> {
+    let record = observe(config, p).await?;
+    let text = screen(config, p, 0).await?;
+    if !is_project_trust(p, &record, &text) {
+        bail!("The terminal is not the recognized project trust prompt");
     }
-    if resume {
-        if p.native_session.is_empty() {
-            bail!("Provide the CLI's native session ID or path before resuming");
-        }
-        match p.agent.as_str() {
-            "codex" => argv.extend(["resume".into(), p.native_session.clone()]),
-            "claude" => argv.extend(["--resume".into(), p.native_session.clone()]),
-            "pi" => argv.extend(["--session".into(), p.native_session.clone()]),
-            "agy" => argv.extend(["--conversation".into(), p.native_session.clone()]),
-            _ => bail!(
-                "Use custom argv to supply this agent's resume arguments, or reconnect an existing terminal"
-            ),
-        }
+    let execution = ExecutionRef::from_project(p)?;
+    let marker = execution
+        .launch_permit
+        .parent()
+        .context("Execution directory is unavailable")?
+        .join("trust.attempted");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    if p.agent != "custom" {
-        if p.agent == "agy" {
-            argv.push("-i".into());
-        }
-        argv.push(instructions.into());
+    let file=options.open(&marker).context("Workspace trust confirmation was already attempted for this execution; continue in its terminal")?;
+    file.sync_all()?;
+    // A recorded attempt is never repeated after a transport failure or restart.
+    // Recheck the exact screen and generation after committing that decision.
+    let latest = observe(config, p).await?;
+    let screen = screen(config, p, 0).await?;
+    if !is_project_trust(p, &latest, &screen) {
+        bail!("The workspace trust prompt changed before confirmation");
     }
-    Ok(argv)
+    rpc(
+        config,
+        "pane.send_keys",
+        json!({"pane_id":execution.pane_id,"keys":["Enter"]}),
+    )
+    .await?;
+    Ok(())
 }
 
-/// Only edit our own named server. Invalid/unrelated configuration is preserved.
-pub fn merge_mcp(path: &Path, entry: &Value) -> Result<()> {
-    let mut cfg: Value = if path.exists() {
-        serde_json::from_slice(&std::fs::read(path)?)
-            .context("Existing MCP configuration is not valid JSON; left unchanged")?
-    } else {
-        json!({})
-    };
-    if !cfg.is_object() {
-        bail!("The MCP configuration root must be an object");
+pub fn capabilities(agent: &str) -> Value {
+    json!({"backend":"legacy","interactive_terminal":true,"native_resume":(["codex","claude","pi","agy"].contains(&agent)),
+        "native_session_source":"herdr.agent_session","model_confirmation":"unverified","background_quiescence":"requires_tracked_jobs"})
+}
+
+fn integration_target(agent: &str) -> Result<&'static str> {
+    match agent {
+        "codex" => Ok("codex"),
+        "claude" => Ok("claude"),
+        "pi" => Ok("pi"),
+        "agy" => Ok("antigravity_cli"),
+        _ => bail!("This custom CLI has no managed HERDR integration"),
     }
-    if cfg.get("mcpServers").is_none() {
-        cfg["mcpServers"] = json!({});
+}
+
+pub async fn integration_status(config: &Config, agent: &str) -> Result<Value> {
+    let target = integration_target(agent)?;
+    let list = rpc(config, "integration.list", json!({})).await?;
+    list["integrations"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["target"] == target))
+        .cloned()
+        .context("The installed HERDR release has no integration for this CLI")
+}
+
+/// HERDR's installer merges its managed hook entry and preserves unrelated keys.
+/// This is called only for an explicit native project launch, never by probes.
+pub async fn install_integration(config: &Config, agent: &str) -> Result<Value> {
+    let current = integration_status(config, agent).await?;
+    if current["state"] == "current" {
+        return Ok(current);
     }
-    let servers = cfg["mcpServers"]
-        .as_object_mut()
-        .context("mcpServers must be an object")?;
-    if let Some(old) = servers.get("herdr_feishu") {
-        let ours = old["args"]
-            .as_array()
-            .is_some_and(|args| args.iter().any(|v| v == "mcp"));
-        if !ours {
-            bail!("A different herdr_feishu MCP entry already exists; left unchanged");
-        }
+    let target = integration_target(agent)?;
+    rpc(config, "integration.install", json!({"target":target}))
+        .await
+        .with_context(|| {
+            format!(
+                "Cannot install the {agent} session hook; check its native configuration and retry"
+            )
+        })?;
+    let installed = integration_status(config, agent).await?;
+    if installed["state"] != "current" {
+        bail!("The {agent} session hook is not ready after installation");
     }
-    servers.insert("herdr_feishu".into(), entry.clone());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::config::write_private(path, &serde_json::to_vec_pretty(&cfg)?)
+    Ok(installed)
 }
