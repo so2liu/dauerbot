@@ -878,13 +878,14 @@ pub async fn stop(config: &Config, p: &Project) -> Result<()> {
 
 pub async fn screen(config: &Config, p: &Project, lines: u32) -> Result<String> {
     let execution = ExecutionRef::from_project(p)?;
-    let value = rpc(
-        config,
-        "pane.read",
-        json!({"pane_id":execution.pane_id,
-        "source":if lines==0 {"visible"} else {"recent"},"lines":lines.max(1),"strip_ansi":true}),
-    )
-    .await?;
+    let mut params = json!({"pane_id":execution.pane_id,
+        "source":if lines==0 {"visible"} else {"recent"},"strip_ansi":true});
+    // HERDR applies `lines` to visible snapshots too. Omit it for the whole
+    // viewport so workspace trust recognition can see the path and selection.
+    if lines > 0 {
+        params["lines"] = json!(lines);
+    }
+    let value = rpc(config, "pane.read", params).await?;
     value["read"]["text"]
         .as_str()
         .or(value["text"].as_str())
@@ -1118,9 +1119,15 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
             let worker = tokio::spawn(async move {
                 let expected_methods = if starting {
-                    vec!["pane.get", "agent.get", "pane.process_info"]
+                    vec!["pane.read", "pane.get", "agent.get", "pane.process_info"]
                 } else {
-                    vec!["pane.get", "agent.get", "pane.process_info", "agent.prompt"]
+                    vec![
+                        "pane.read",
+                        "pane.get",
+                        "agent.get",
+                        "pane.process_info",
+                        "agent.prompt",
+                    ]
                 };
                 for expected in expected_methods {
                     let (stream, _) = listener.accept().await.unwrap();
@@ -1142,6 +1149,14 @@ mod tests {
                         );
                     }
                     let result = match expected {
+                        "pane.read" => {
+                            assert_eq!(request["params"]["source"], "visible");
+                            assert!(
+                                request["params"].get("lines").is_none(),
+                                "A trust check needs the complete visible viewport"
+                            );
+                            json!({"read":{"text":"project path\ntrust question\nselected yes"}})
+                        }
                         "pane.get" => json!({"pane":pane}),
                         "agent.get" => json!({"agent":pane}),
                         "pane.process_info" => {
@@ -1165,6 +1180,10 @@ mod tests {
                     );
                 }
             });
+            assert_eq!(
+                screen(&cfg, &p, 0).await.unwrap(),
+                "project path\ntrust question\nselected yes"
+            );
             let result = send(&cfg, &p, "test prompt").await;
             if starting {
                 let error = result.unwrap_err();
