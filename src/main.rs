@@ -91,7 +91,7 @@ enum Commands {
     /// Run the MCP stdio server, normally started by the agent CLI
     Mcp {
         #[arg(long)]
-        credentials: PathBuf,
+        credentials: Option<PathBuf>,
     },
     /// Print a local user-service configuration
     Service,
@@ -343,7 +343,12 @@ async fn main() -> Result<()> {
         ))
         .init();
     if let Commands::Mcp { credentials } = &cli.command {
-        return mcp::serve(credentials).await;
+        return match credentials {
+            Some(path) => mcp::serve(path).await,
+            None => {
+                mcp::serve_managed(&cli.data_dir.clone().unwrap_or_else(config::default_dir)).await
+            }
+        };
     }
     let dir = cli.data_dir.unwrap_or_else(config::default_dir);
     config::private_dir(&dir)?;

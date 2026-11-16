@@ -91,8 +91,13 @@ pub fn launch_args(
 /// Only edit our own named server. Invalid/unrelated configuration is preserved.
 pub fn merge_mcp(path: &Path, entry: &Value) -> Result<()> {
     let mut cfg: Value = if path.exists() {
-        serde_json::from_slice(&std::fs::read(path)?)
-            .context("Existing MCP configuration is not valid JSON; left unchanged")?
+        let bytes = std::fs::read(path)?;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            json!({})
+        } else {
+            serde_json::from_slice(&bytes)
+                .context("Existing MCP configuration is not valid JSON; left unchanged")?
+        }
     } else {
         json!({})
     };

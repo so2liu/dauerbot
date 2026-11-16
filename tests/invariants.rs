@@ -190,6 +190,16 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
     );
     record["processes"][1]["argv"][3] = json!("/another/generation/credentials.json");
     assert!(!herdr::quiescent(&p, &record));
+    p.execution["launch_permit"] = json!("/private/app/sessions/project/generation/launch.permit");
+    record["processes"][1]["argv"] = json!([
+        std::env::current_exe().unwrap(),
+        "--data-dir",
+        "/private/app",
+        "mcp"
+    ]);
+    assert!(herdr::quiescent(&p, &record));
+    record["processes"][1]["argv"][2] = json!("/another/installation");
+    assert!(!herdr::quiescent(&p, &record));
     for processes in [
         json!([{"name":"bash","argv":["bash","-c","long task"]}]),
         json!([{"name":"codex","argv":["codex"]},{"name":"python3","argv":["python3","task.py"]}]),

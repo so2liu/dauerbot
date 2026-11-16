@@ -320,6 +320,75 @@ impl ServerHandler for BridgeMcp {
             .with_instructions("You are the project's Feishu main session. Call session_ready first, ack_event for each durable event, and ack_message for nested Feishu messages. Persist progress and call finish_run when settled. Register background jobs and use schedule_task or request_decision for later work. Reply with send_markdown or send_file, choosing the mandatory to field (oc_ chat ID or ou_ user Open ID) according to user intent. It may differ from the source. Terminal output alone does not deliver a reply.")
     }
 }
+
+/// A global agy entry must resolve each invocation from its inherited HERDR identity,
+/// rather than retaining whichever project's credentials were written most recently.
+pub async fn serve_managed(dir: &Path) -> Result<()> {
+    let (Ok(pane), Ok(socket)) = (
+        std::env::var("HERDR_PANE_ID"),
+        std::env::var("HERDR_SOCKET_PATH"),
+    ) else {
+        return serve_unmanaged().await;
+    };
+    let cfg: crate::config::Config =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+    let expected = crate::herdr::socket_path(&cfg)?;
+    let owned = std::fs::canonicalize(&socket)
+        .ok()
+        .zip(std::fs::canonicalize(expected).ok())
+        .is_some_and(|(actual, expected)| actual == expected);
+    if !owned {
+        return serve_unmanaged().await;
+    }
+    let Some(path) = managed_credentials_path(dir, &pane)? else {
+        return serve_unmanaged().await;
+    };
+    serve(&path).await
+}
+
+struct Unmanaged;
+impl ServerHandler for Unmanaged {}
+
+async fn serve_unmanaged() -> Result<()> {
+    // Ordinary agy sessions share the global configuration but receive no project tools.
+    Unmanaged
+        .serve(rmcp::transport::stdio())
+        .await?
+        .waiting()
+        .await?;
+    Ok(())
+}
+
+fn managed_credentials_path(dir: &Path, pane: &str) -> Result<Option<std::path::PathBuf>> {
+    use rusqlite::OptionalExtension;
+    // Opening the application Db would run startup recovery against live work.
+    let connection = rusqlite::Connection::open_with_flags(
+        dir.join("bridge.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let identity: Option<(String, String)> = connection
+        .query_row(
+            "SELECT id,generation FROM projects
+             WHERE terminal IS NOT NULL AND enabled=1
+               AND json_extract(execution,'$.backend')='legacy'
+               AND json_extract(execution,'$.pane_id')=?1
+               AND json_extract(execution,'$.generation')=generation
+               AND json_extract(execution,'$.terminal_id')=terminal",
+            [&pane],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((project, generation)) = identity else {
+        return Ok(None);
+    };
+    Ok(Some(
+        dir.join("sessions")
+            .join(project)
+            .join(generation)
+            .join("credentials.json"),
+    ))
+}
+
 pub async fn serve(path: &Path) -> Result<()> {
     let credentials: Credentials = serde_json::from_slice(&std::fs::read(path)?)?;
     let url = reqwest::Url::parse(&credentials.url)?;
@@ -354,4 +423,51 @@ pub async fn serve(path: &Path) -> Result<()> {
         .waiting()
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+
+    #[test]
+    fn global_entry_resolves_current_generation_without_running_database_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(dir.path().join("bridge.sqlite3")).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE projects(id TEXT,generation TEXT,terminal TEXT,enabled INTEGER,execution TEXT);
+             CREATE TABLE messages(status TEXT);
+             INSERT INTO messages VALUES('sending');",
+        ).unwrap();
+        let execution = json!({"backend":"legacy","pane_id":"w1:p2","terminal_id":"terminal-1","generation":"generation-1"});
+        connection
+            .execute(
+                "INSERT INTO projects VALUES('project-1','generation-1','terminal-1',1,?)",
+                [execution.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            managed_credentials_path(dir.path(), "w1:p2")
+                .unwrap()
+                .unwrap(),
+            dir.path()
+                .join("sessions/project-1/generation-1/credentials.json")
+        );
+        assert!(
+            managed_credentials_path(dir.path(), "w9:p9")
+                .unwrap()
+                .is_none()
+        );
+        connection
+            .execute("UPDATE projects SET generation='generation-2'", [])
+            .unwrap();
+        assert!(
+            managed_credentials_path(dir.path(), "w1:p2")
+                .unwrap()
+                .is_none()
+        );
+        let state: String = connection
+            .query_row("SELECT status FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "sending");
+    }
 }
