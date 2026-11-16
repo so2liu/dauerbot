@@ -48,6 +48,31 @@ impl Language {
             "The compatible background service keeps running when the desktop updates. Updating it briefly reconnects messages and tools; Agent sessions keep running." => {
                 "桌面更新时兼容的后台服务会继续运行。更新后台服务会短暂重连消息和工具；智能体会话继续运行。"
             }
+            "Every" => "每",
+            "days" => "天",
+            "hours" => "小时",
+            "minutes" => "分钟",
+            "seconds" => "秒",
+            "Daily" => "每天",
+            "Weekdays" => "工作日",
+            "Independent instance" => "独立实例",
+            "Cannot open menu-bar panel" => "无法打开菜单栏面板",
+            "Next run" => "下次执行",
+            "Connections and occasional project controls." => "连接设置与偶尔使用的项目操作。",
+            "Add a project, then send instructions in Feishu." => {
+                "添加项目，然后在飞书里交代事情。"
+            }
+            "Send instructions in Feishu. New messages immediately steer the Agent, even while it is working." => {
+                "在飞书里发送指令；Agent 执行中也能立即收到补充消息。"
+            }
+            "Ask the Agent in Feishu to schedule something when you need it." => {
+                "需要时，在飞书里告诉 Agent 安排即可。"
+            }
+            "No scheduled tasks" => "还没有定时任务",
+            "Scheduled tasks" => "定时任务",
+            "Open Dauerbot" => "打开 Dauerbot",
+            "+ Add project" => "+ 添加项目",
+            "Settings" => "设置",
             "FEISHU BOT" => "飞书机器人",
             "Bot connection" => "机器人连接",
             "Connection lost or authentication failed; check this project's bot credentials and event subscriptions" => {
@@ -212,35 +237,16 @@ impl Language {
             "An earlier task was interrupted. New messages continue automatically; retry this task only if you want it repeated." => {
                 "之前有一项任务中断了。新消息会自动继续处理；仅在需要重新执行旧任务时重试。"
             }
-            "The Agent will stop. Project files remain on disk." => "智能体会停止，项目文件会保留。",
+            "The Agent will stop. Project files remain on disk." => {
+                "智能体会停止，项目文件会保留。"
+            }
             "Needs attention" => "需要处理",
             "Delivery settings saved" => "消息投递设置已保存",
             "Stop" => "停止",
             "Model" => "模型",
             "Model follows the CLI's own settings" => "模型沿用 CLI 中的设置",
-            "Tasks & schedules" => "任务与计划",
-            "＋ New task" => "＋ 新建任务",
-            "Task name" => "任务名称",
-            "What should the agent do?" => "希望智能体做什么？",
-            "Schedule" => "执行时间",
-            "Reply destination (optional)" => "回复目标（可选）",
-            "Run now" => "立即执行",
-            "Once" => "单次",
-            "Interval" => "固定间隔",
-            "Cron" => "Cron 计划",
-            "Start time (RFC 3339)" => "开始时间（RFC 3339）",
-            "Repeat every (seconds)" => "间隔（秒）",
-            "Cron expression (five fields)" => "Cron 表达式（五个字段）",
-            "Time zone" => "时区",
-            "Save schedule" => "保存计划",
-            "Create task" => "创建任务",
-            "Enter a task name and instructions" => "请输入任务名称和具体要求",
             "Task queued" => "任务已进入队列",
-            "Enter a positive interval in seconds" => "请输入大于零的间隔秒数",
             "Schedule saved" => "计划已保存",
-            "Schedule created" => "计划已创建",
-            "Task cancelled" => "任务已取消",
-            "Schedule removed" => "计划已移除",
             "Sleeping" => "休眠中",
             "sleeping" => "待命",
             "starting" => "启动中",
