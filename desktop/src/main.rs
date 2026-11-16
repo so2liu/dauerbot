@@ -2,6 +2,7 @@
 mod access;
 mod backend;
 mod locale;
+mod terminal;
 mod updater;
 
 use backend::{Backend, CommandRequest, Reply};
@@ -9,6 +10,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     button::*,
     input::{Input, InputState},
+    resizable::{h_resizable, resizable_panel},
     *,
 };
 use locale::Language;
@@ -40,6 +42,8 @@ struct Setup {
     events_confirmed: bool,
     published: bool,
     language: Language,
+    terminal_hidden: bool,
+    dismissed_core_projects: Vec<String>,
 }
 struct Desktop {
     backend: Backend,
@@ -62,6 +66,24 @@ struct Desktop {
     connection_error: Option<String>,
     pending_secret: String,
     update_status: Value,
+    terminal: Option<terminal::Bridge>,
+    terminal_key: String,
+    terminal_error: String,
+    tasks: Value,
+    timers: Value,
+    work_checked: std::time::Instant,
+    decision_answer: Entity<InputState>,
+    task_title: Entity<InputState>,
+    task_prompt: Entity<InputState>,
+    schedule: Entity<InputState>,
+    timezone: Entity<InputState>,
+    recipient: Entity<InputState>,
+    task_kind: usize,
+    task_form: bool,
+    editing_timer: Option<String>,
+    quitting: bool,
+    job_reason: Entity<InputState>,
+    takeover_requested: bool,
 }
 impl Desktop {
     fn tr(&self, text: &str) -> String {
@@ -80,10 +102,24 @@ impl Desktop {
         let name = input("For example: personal website", cx);
         let path = input("Choose the project folder", cx);
         let app_id = input("cli_…", cx);
+        let decision_answer = input("Your answer", cx);
+        let job_reason = input("What did you verify?", cx);
+        let task_title = input("Task name", cx);
+        let schedule = input("Schedule", cx);
+        let recipient = input("Reply destination (optional)", cx);
         let secret = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(setup.language.text("Stored only on this Mac"))
                 .masked(true)
+        });
+        let task_prompt = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .placeholder(setup.language.text("What should the agent do?"))
+        });
+        let timezone = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into()))
         });
         let _ = backend.tx.send(CommandRequest::Environment);
         cx.spawn_in(window, async move |entity, cx| {
@@ -125,6 +161,24 @@ impl Desktop {
             connection_error: None,
             pending_secret: String::new(),
             update_status: Value::Null,
+            terminal: None,
+            terminal_key: String::new(),
+            terminal_error: String::new(),
+            tasks: Value::Null,
+            timers: Value::Null,
+            work_checked: std::time::Instant::now() - Duration::from_secs(30),
+            decision_answer,
+            task_title,
+            task_prompt,
+            schedule,
+            timezone,
+            recipient,
+            task_kind: 0,
+            task_form: false,
+            editing_timer: None,
+            quitting: false,
+            job_reason,
+            takeover_requested: false,
         }
     }
     fn receive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -132,8 +186,55 @@ impl Desktop {
         while let Ok(reply) = self.backend.rx.try_recv() {
             changed = true;
             match reply {
+                Reply::Terminal {
+                    project,
+                    value,
+                    error,
+                } => {
+                    if project == self.selected
+                        && self.setup.page == 6
+                        && !self.setup.terminal_hidden
+                    {
+                        self.terminal_error = error;
+                        if let Ok(descriptor) =
+                            serde_json::from_value::<terminal::Descriptor>(value)
+                            && descriptor.project_id == self.selected
+                            && self.state["projects"].as_array().is_some_and(|projects| {
+                                projects.iter().any(|project| {
+                                    project["id"] == self.selected
+                                        && project["generation"] == descriptor.generation
+                                })
+                            })
+                        {
+                            self.terminal = Some(terminal::Bridge::build(descriptor, cx));
+                        }
+                    }
+                }
+                Reply::Takeover {
+                    project,
+                    generation,
+                    active,
+                } => {
+                    if project == self.selected
+                        && let Some(bridge) = &mut self.terminal
+                        && bridge.descriptor.generation == generation
+                    {
+                        self.takeover_requested = false;
+                        bridge.set_control(active, cx);
+                    }
+                }
+                Reply::Work {
+                    project,
+                    tasks,
+                    timers,
+                } => {
+                    if project == self.selected {
+                        self.tasks = tasks;
+                        self.timers = timers;
+                    }
+                }
                 Reply::Update(status) => self.update_status = status,
-                Reply::Restart => cx.quit(),
+                Reply::Restart => self.quit(cx),
                 Reply::State(value) => {
                     if self.state.is_null() {
                         self.notice =
@@ -166,6 +267,20 @@ impl Desktop {
                         self.selected = id.to_owned();
                     }
                     self.state = value;
+                    if let Some(tasks) = self.state["work"][&self.selected]["tasks"].as_array() {
+                        self.tasks = Value::Array(tasks.clone());
+                    }
+                    if let Some(timers) = self.state["work"][&self.selected]["timers"].as_array() {
+                        self.timers = Value::Array(timers.clone());
+                    }
+                    if let Some(bridge) = &mut self.terminal
+                        && bridge.controlling
+                        && (self.state["work"][&self.selected]["lease"]["active"] != true
+                            || self.state["work"][&self.selected]["lease"]["generation"]
+                                != bridge.descriptor.generation)
+                    {
+                        bridge.set_control(false, cx);
+                    }
                 }
                 Reply::Connection(reason) => {
                     self.connection_error = reason;
@@ -211,9 +326,146 @@ impl Desktop {
                 }
             }
         }
+        if let Some(terminal) = &mut self.terminal {
+            changed |= terminal.receive();
+        }
+        self.sync_terminal(cx);
+        if !self.selected.is_empty() && self.work_checked.elapsed() >= Duration::from_secs(10) {
+            self.work_checked = std::time::Instant::now();
+            let _ = self.backend.tx.send(CommandRequest::Work {
+                project: self.selected.clone(),
+            });
+        }
         changed
     }
+    fn release_terminal(&mut self) {
+        if let Some(bridge) = self.terminal.take()
+            && (bridge.controlling || self.takeover_requested)
+        {
+            let _ = self.backend.tx.send(CommandRequest::Takeover {
+                project: bridge.descriptor.project_id.clone(),
+                generation: bridge.descriptor.generation.clone(),
+                active: false,
+            });
+        }
+        self.takeover_requested = false;
+    }
+    fn quit(&mut self, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        self.quitting = true;
+        let pending = self
+            .terminal
+            .as_ref()
+            .filter(|bridge| bridge.controlling || self.takeover_requested)
+            .map(|bridge| {
+                self.backend.release_before_exit(
+                    bridge.descriptor.project_id.clone(),
+                    bridge.descriptor.generation.clone(),
+                )
+            });
+        self.release_terminal();
+        if let Some(pending) = pending {
+            cx.spawn(async move |_, cx| {
+                let _ = pending.recv_async().await;
+                let _ = cx.update(|cx| cx.quit());
+            })
+            .detach();
+        } else {
+            cx.quit();
+        }
+    }
+    fn sync_terminal(&mut self, _: &mut Context<Self>) {
+        if self.setup.page != 6 || self.setup.terminal_hidden {
+            return;
+        }
+        let project = self.state["projects"]
+            .as_array()
+            .and_then(|items| items.iter().find(|p| p["id"] == self.selected));
+        let key = project
+            .map(|p| {
+                format!(
+                    "{}/{}/{}",
+                    self.selected,
+                    p["generation"].as_str().unwrap_or(""),
+                    p["terminal"].as_str().unwrap_or("")
+                )
+            })
+            .unwrap_or_default();
+        let has_terminal = project.is_some_and(|p| p["terminal"].as_str().is_some());
+        if key != self.terminal_key {
+            self.release_terminal();
+            self.terminal_key = key;
+            self.terminal_error.clear();
+            if has_terminal {
+                let _ = self.backend.tx.send(CommandRequest::Terminal {
+                    project: self.selected.clone(),
+                });
+            }
+        }
+    }
+    fn select_project(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.selected != id {
+            self.release_terminal();
+            self.selected = id;
+            self.terminal_key.clear();
+            self.tasks = self.state["work"][&self.selected]["tasks"].clone();
+            self.timers = self.state["work"][&self.selected]["timers"].clone();
+            self.work_checked = std::time::Instant::now() - Duration::from_secs(30);
+            self.sync_terminal(cx);
+        }
+        cx.notify();
+    }
+    fn resolve_event(
+        &mut self,
+        event_id: String,
+        retry: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = if retry {
+            "Retry this task?"
+        } else {
+            "Dismiss this task?"
+        };
+        let description = if retry {
+            "The agent may already have changed files or sent a reply. Continue after reviewing its work."
+        } else {
+            "The task will stop waiting. Existing files and sent replies remain."
+        };
+        let action = if retry { "Retry task" } else { "Dismiss task" };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &self.tr(title),
+            Some(&self.tr(description)),
+            &[self.tr("Cancel").as_str(), self.tr(action).as_str()],
+            cx,
+        );
+        cx.spawn(async move |entity, cx| {
+            if answer.await.ok() == Some(1) {
+                let _ = entity.update(cx, |this, _| {
+                    this.api(
+                        "POST",
+                        format!("/events/{event_id}/resolve"),
+                        Some(json!({"action": if retry { "retry" } else { "dismiss" }})),
+                        if retry {
+                            "Task queued"
+                        } else {
+                            "Task dismissed"
+                        },
+                    );
+                    this.work_checked = std::time::Instant::now() - Duration::from_secs(30);
+                });
+            }
+        })
+        .detach();
+    }
     fn go(&mut self, page: usize) {
+        if self.setup.page == 6 && page != 6 {
+            self.release_terminal();
+            self.terminal_key.clear();
+        }
         self.setup.page = page.min(8);
         if let Ok(bytes) = serde_json::to_vec(&self.setup) {
             let _ = herdr_feishu_bridge::config::write_private(
@@ -468,7 +720,7 @@ impl Desktop {
             .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
             .child(self.card("Automatic binding", "Your first project becomes this bot's fixed owner. You do not need to select chats or enter IDs. Direct and group messages both reach this project."))
-            .child(self.card("Continue in Herdr App", "Start a session and open it in Herdr App. Conversations happen in Feishu; the live CLI stays in Herdr."))
+            .child(self.card("Your agent, inside Dauerbot", "Watch and operate the live terminal in this app. Closing the window leaves tasks running."))
             .child(self.btn("create-project", "Create project →", |this, _, cx| {
                 let manual = this.path.read(cx).value().to_string();
                 let path = if manual.trim().is_empty() { this.picked_path.clone() } else { manual };
@@ -489,16 +741,17 @@ impl Desktop {
             .flex()
             .flex_col()
             .gap_4()
-            .child(self.title(
-                "WORKSPACE",
-                "Projects",
-                "Talk in Feishu. Follow the live session in Herdr App.",
-            ))
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.tr("Projects")),
+            )
             .child(
                 div()
                     .flex()
                     .flex_wrap()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         self.connection_pill(
                             "HERDR",
@@ -510,44 +763,34 @@ impl Desktop {
                     .child(
                         self.connection_pill(
                             "Feishu",
-                            if self.state["settings"]["app_id"]
+                            self.state["runtime"]["feishu"]
                                 .as_str()
-                                .unwrap_or("")
-                                .is_empty()
-                            {
-                                "Not configured"
-                            } else {
-                                self.state["runtime"]["feishu"]
-                                    .as_str()
-                                    .unwrap_or("Disconnected")
-                            },
+                                .unwrap_or("Not configured"),
                         ),
                     ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.btn("add-project", "＋ Add project", |this, _, _| this.go(5), cx))
+                    .child(self.btn(
+                        "toggle-terminal",
+                        if self.setup.terminal_hidden {
+                            "Show terminal"
+                        } else {
+                            "Hide terminal"
+                        },
+                        |this, _, _| {
+                            this.setup.terminal_hidden = !this.setup.terminal_hidden;
+                            this.release_terminal();
+                            this.terminal_key.clear();
+                            this.go(6);
+                        },
+                        cx,
+                    )),
             );
-        let mut project_actions = div().flex().flex_wrap().gap_2().child(self.btn(
-            "add-project",
-            "＋ Add project",
-            |this, _, _| this.go(5),
-            cx,
-        ));
-        let bot_error = self.state["runtime"]["feishu_error"].as_str().unwrap_or("");
-        if !bot_error.is_empty() {
-            body = body.child(self.card_detail("Feishu connection needs attention", bot_error));
-        }
-        if self.state["settings"]["app_id"]
-            .as_str()
-            .unwrap_or("")
-            .is_empty()
-            || !bot_error.is_empty()
-        {
-            project_actions = project_actions.child(self.btn(
-                "configure-bot",
-                "Configure bot",
-                |this, _, _| this.go(2),
-                cx,
-            ));
-        }
-        body = body.child(project_actions);
         if projects.is_empty() {
             body = body.child(self.card(
                 "No projects yet",
@@ -556,154 +799,237 @@ impl Desktop {
         }
         for project in &projects {
             let id = project["id"].as_str().unwrap_or_default().to_owned();
-            let terminal = project["terminal"]
-                .as_str()
-                .map(|t| &self.state["runtime"]["terminals"][t]);
-            let status = if project["paused"] == true {
-                "Delivery paused"
-            } else if terminal.is_some_and(|t| t["state"] == "finished") {
-                "Exited"
-            } else if terminal.is_some_and(|t| t["status"]["state"] == "blocked") {
-                "Needs input"
-            } else if terminal.is_some_and(|t| t["status"]["state"] == "error") {
-                "CLI error"
-            } else if project["ready"] == true {
-                "Ready"
-            } else if terminal.is_some() {
-                "Starting"
-            } else {
-                "Stopped"
-            };
+            let bound = self.state["bot_project"] == project["id"];
+            let status =
+                project["lifecycle"]
+                    .as_str()
+                    .unwrap_or(if project["terminal"].is_null() {
+                        "Sleeping"
+                    } else {
+                        "Ready"
+                    });
             body = body.child(
                 Button::new(SharedString::from(format!("project-{id}")))
                     .label(format!(
-                        "{}  ·  {}  ·  {}",
+                        "{}{} · {}",
+                        if bound { "● " } else { "" },
                         project["name"].as_str().unwrap_or("Project"),
-                        agent_name(project["agent"].as_str().unwrap_or("")),
                         self.tr(status)
                     ))
                     .selected(id == self.selected)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = id.clone();
-                        cx.notify();
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_project(id.clone(), cx)),
+                    ),
             );
         }
         if let Some(project) = selected {
             let id = self.selected.clone();
-            let terminal = project["terminal"]
-                .as_str()
-                .map(|t| &self.state["runtime"]["terminals"][t]);
-            let live = terminal.is_some_and(|t| t["state"] != "finished");
             body = body
                 .child(
                     div()
-                        .p_5()
-                        .rounded_xl()
-                        .bg(rgb(0xffffff))
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(project["name"].as_str().unwrap_or("Project").to_owned()),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(MUTED))
-                                .child(project["path"].as_str().unwrap_or("").to_owned()),
-                        ),
+                        .mt_2()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(project["name"].as_str().unwrap_or("Project").to_owned()),
                 )
-                .child(div().text_sm().text_color(rgb(ACCENT)).child(self.tr(
-                    if self.state["bot_project"] == project["id"] {
-                        "Feishu bot bound · Direct and group messages reach this project"
-                    } else {
-                        "Local project"
-                    },
-                )));
-            if let Some(issue) = self.state["runtime"]["view_errors"][&id]
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(project["path"].as_str().unwrap_or("").to_owned()),
+                );
+            if let Some(message) = project["migration_notice"]
                 .as_str()
-                .filter(|s| !s.is_empty())
+                .filter(|text| !text.is_empty())
+                && !self.setup.dismissed_core_projects.contains(&id)
             {
-                body = body.child(self.card_detail("Could not open Herdr App", issue));
-            }
-            if terminal.is_some_and(|t| t["status"]["state"] == "blocked") {
-                body = body.child(self.card(
-                    "The main session needs input",
-                    "Open Herdr App to continue sign-in or answer the CLI prompt.",
-                ));
-            }
-            if terminal.is_some_and(|t| t["status"]["state"] == "error") {
+                let project_id = id.clone();
                 body = body
-                    .child(self.card("CLI error", "Open Herdr App to see the error and continue."));
-            }
-            let mut controls = div().flex().flex_wrap().gap_2();
-            if live {
-                let show_id = id.clone();
-                let stop_id = id.clone();
-                controls = controls
-                    .child(
-                        self.btn(
-                            "show",
-                            "Monitor in Herdr App",
-                            move |this, _, _| {
-                                this.api(
-                                    "POST",
-                                    format!("/projects/{show_id}/show"),
-                                    None,
-                                    "Main session opened in a Herdr App tab",
-                                )
-                            },
-                            cx,
-                        )
-                        .primary(),
-                    )
+                    .child(self.card("Session preserved", message))
                     .child(self.btn(
-                        "stop",
-                        "Stop session...",
-                        move |this, window, cx| {
-                            let answer = window.prompt(
-                                PromptLevel::Warning,
-                                &this.tr("Stop this project's main session?"),
-                                Some(&this.tr(
-                                    "This ends the CLI process. Project settings stay intact.",
-                                )),
-                                &[this.tr("Cancel").as_str(), this.tr("Stop").as_str()],
-                                cx,
-                            );
-                            let id = stop_id.clone();
-                            cx.spawn(async move |entity, cx| {
-                                if answer.await.ok() == Some(1) {
-                                    let _ = entity.update(cx, |this, _| {
-                                        this.api(
-                                            "POST",
-                                            format!("/projects/{id}/stop"),
-                                            None,
-                                            "Session stopped",
-                                        )
-                                    });
-                                }
-                            })
-                            .detach();
+                        "dismiss-migration",
+                        "Got it",
+                        move |this, _, _| {
+                            this.setup.dismissed_core_projects.push(project_id.clone());
+                            this.go(6);
                         },
                         cx,
                     ));
+            }
+            if let Some(issue) = self.state["runtime"]["issues"][&id]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                body = body.child(self.card_detail("Needs attention", issue));
+            }
+            let work = self.state["work"][&id].clone();
+            if project["terminal"].is_null()
+                && work["execution"]["status"] == "exited"
+                && let Some(error) = work["execution"]["error"]
+                    .as_str()
+                    .filter(|error| error.contains("\n\n"))
+            {
+                body = body.child(self.card_detail("Startup output", error));
+            }
+            for attention in work["attention"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["status"] == "open")
+                .take(2)
+            {
+                if let Some(message) = attention["message"].as_str() {
+                    body = body.child(self.card("Needs attention", message));
+                }
+            }
+            let unfinished = work["attention"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|item| item["status"] == "open" && item["reason"] == "unfinished_run");
+            for event in work["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|event| {
+                    ["uncertain", "failed"].contains(&event["status"].as_str().unwrap_or(""))
+                        || (unfinished
+                            && ["submitted", "acknowledged"]
+                                .contains(&event["status"].as_str().unwrap_or("")))
+                })
+                .take(2)
+            {
+                let event_id = event["id"].as_str().unwrap_or("").to_owned();
+                let retry_id = event_id.clone();
+                body = body
+                    .child(self.card("Review task result", "Check the terminal and saved work before retrying or dismissing this task."))
+                    .child(
+                        div().id(SharedString::from(format!("resolve-{event_id}"))).flex().gap_2()
+                            .child(self.btn("retry-event", "Retry task", move |this, window, cx| {
+                                this.resolve_event(retry_id.clone(), true, window, cx);
+                            }, cx))
+                            .child(self.btn("dismiss-event", "Dismiss task", move |this, window, cx| {
+                                this.resolve_event(event_id.clone(), false, window, cx);
+                            }, cx)),
+                    );
+            }
+            if let Some(decision) = work["decisions"]
+                .as_array()
+                .and_then(|items| items.iter().find(|item| item["status"] == "pending"))
+            {
+                let decision_id = decision["id"].as_str().unwrap_or("").to_owned();
+                body = body
+                    .child(self.card_detail(
+                        "Your answer is needed",
+                        decision["question"].as_str().unwrap_or(""),
+                    ))
+                    .child(Input::new(&self.decision_answer))
+                    .child(self.btn(
+                        "answer-decision",
+                        "Send answer",
+                        move |this, _, cx| {
+                            let answer = this.decision_answer.read(cx).value().to_string();
+                            this.api(
+                                "POST",
+                                format!("/decisions/{decision_id}/answer"),
+                                Some(json!({"answer":answer})),
+                                "Answer saved",
+                            );
+                        },
+                        cx,
+                    ));
+            }
+            let jobs: Vec<_> = work["jobs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|job| {
+                    ["active", "uncertain"].contains(&job["status"].as_str().unwrap_or(""))
+                })
+                .collect();
+            if !jobs.is_empty() {
+                body = body
+                    .child(self.card(
+                        "Background work needs review",
+                        "Stop the parent session, verify any remaining child work, and record what you checked.",
+                    ))
+                    .child(Input::new(&self.job_reason));
+                for job in jobs.into_iter().take(3) {
+                    let job_id = job["id"].as_str().unwrap_or("").to_owned();
+                    let label = job["label"]
+                        .as_str()
+                        .or(job["name"].as_str())
+                        .unwrap_or("Background task")
+                        .to_owned();
+                    body = body.child(
+                        div().flex().items_center().justify_between().gap_2()
+                            .child(label)
+                            .child(Button::new(SharedString::from(format!("abandon-{job_id}")))
+                                .label(self.tr("Abandon reviewed job"))
+                                .disabled(!project["terminal"].is_null() || self.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let reason = this.job_reason.read(cx).value().to_string();
+                                    if reason.trim().is_empty() {
+                                        this.notice = "Describe what you checked first".into();
+                                        this.error = true;
+                                        cx.notify();
+                                        return;
+                                    }
+                                    let answer = window.prompt(
+                                        PromptLevel::Warning,
+                                        &this.tr("Record this job as abandoned?"),
+                                        Some(&this.tr("This records your review. It does not terminate an external process.")),
+                                        &[this.tr("Cancel").as_str(), this.tr("Abandon reviewed job").as_str()],
+                                        cx,
+                                    );
+                                    let job_id = job_id.clone();
+                                    cx.spawn(async move |entity, cx| {
+                                        if answer.await.ok() == Some(1) {
+                                            let _ = entity.update(cx, |this, _| {
+                                                this.api("POST",format!("/jobs/{job_id}/abandon"),Some(json!({"reason":reason})),"Review saved");
+                                            });
+                                        }
+                                    }).detach();
+                                }))),
+                    );
+                }
+            }
+            if work["lease"]["active"] == true
+                && !self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.controlling)
+            {
+                let project = id.clone();
+                let generation = work["lease"]["generation"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned();
+                body = body.child(self.card("Manual control is reserved", "Release the reservation to let queued tasks continue, or take control in the terminal."))
+                    .child(self.btn("release-reservation", "Release reservation", move |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Takeover { project:project.clone(),generation:generation.clone(),active:false }); }, cx));
+            }
+            let start_action = if project["native_session"].as_str().unwrap_or("").is_empty() {
+                "start"
             } else {
-                let start_id = id.clone();
-                let resume_id = id.clone();
-                controls = controls
+                "resume"
+            };
+            let start = id.clone();
+            let stop = id.clone();
+            let pause = id.clone();
+            let paused = project["paused"].as_bool().unwrap_or(false);
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
                     .child(
                         self.btn(
-                            "start",
-                            "Start main session",
+                            "wake-project",
+                            "Start / resume",
                             move |this, _, _| {
                                 this.api(
                                     "POST",
-                                    format!("/projects/{start_id}/start"),
+                                    format!("/projects/{start}/{start_action}"),
                                     None,
                                     "Starting the main session...",
                                 )
@@ -713,58 +1039,52 @@ impl Desktop {
                         .primary(),
                     )
                     .child(self.btn(
-                        "resume",
-                        "Resume session",
+                        "pause-project",
+                        if paused {
+                            "Resume delivery"
+                        } else {
+                            "Pause delivery"
+                        },
                         move |this, _, _| {
                             this.api(
                                 "POST",
-                                format!("/projects/{resume_id}/resume"),
-                                None,
-                                "Resume requested",
+                                format!("/projects/{pause}/pause"),
+                                Some(json!({"paused":!paused})),
+                                "Delivery settings saved",
                             )
                         },
                         cx,
-                    ));
-            }
-            let paused = project["paused"].as_bool().unwrap_or(false);
-            let pause_id = id.clone();
-            controls = controls.child(self.btn(
-                "pause",
-                if paused {
-                    "Resume Feishu delivery"
-                } else {
-                    "Pause Feishu delivery"
-                },
-                move |this, _, _| {
-                    this.api(
-                        "POST",
-                        format!("/projects/{pause_id}/pause"),
-                        Some(json!({"paused": !paused})),
-                        if paused {
-                            "Feishu delivery resumed"
-                        } else {
-                            "Feishu delivery paused"
+                    ))
+                    .child(self.btn(
+                        "stop-project",
+                        "Stop",
+                        move |this, _, _| {
+                            this.api(
+                                "POST",
+                                format!("/projects/{stop}/stop"),
+                                None,
+                                "Session stopped",
+                            )
                         },
-                    )
-                },
-                cx,
-            ));
-            body = body.child(controls).child(
+                        cx,
+                    )),
+            );
+            body = body.child(
                 div()
-                    .mt_4()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(self.tr("Active agent")),
             );
-            let mut choices = div().flex().flex_wrap().gap_2();
+            let mut agents = div().flex().flex_wrap().gap_2();
             for (index, agent) in ["codex", "claude", "pi", "agy"].into_iter().enumerate() {
                 let project_id = id.clone();
-                choices = choices.child(
-                    Button::new(("switch-agent", index))
+                agents = agents.child(
+                    Button::new(("agent", index))
                         .label(agent_name(agent))
                         .selected(project["agent"] == agent)
                         .disabled(self.busy || project["agent"] == agent)
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            this.release_terminal();
                             this.api(
                                 "POST",
                                 format!("/projects/{project_id}/agent"),
@@ -775,13 +1095,486 @@ impl Desktop {
                         })),
                 );
             }
-            body = body
-                .child(choices)
-                .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr(
-                    "Switching restarts the main session. Project and bot bindings stay intact.",
-                )));
+            body = body.child(agents);
+            if let Some(model) = project["model"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .filter(|_| project["model_source"] == "native_observation")
+            {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(format!("{}: {model}", self.tr("Model"))),
+                );
+            } else {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(self.tr("Model follows the CLI's own settings")),
+                );
+            }
+            body = body.child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.tr("Tasks & schedules")),
+                    )
+                    .child(self.btn(
+                        "new-task",
+                        "＋ New task",
+                        |this, _, _| {
+                            this.task_form = !this.task_form;
+                            this.editing_timer = None;
+                        },
+                        cx,
+                    )),
+            );
+            if self.task_form {
+                body = body.child(self.task_editor(cx));
+            }
+            for task in records(&self.tasks, "tasks").into_iter().take(6) {
+                let task_id = task["id"].as_str().unwrap_or("").to_owned();
+                let state = task["status"]
+                    .as_str()
+                    .or(task["state"].as_str())
+                    .unwrap_or("Queued");
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(task["title"].as_str().unwrap_or("Task").to_owned())
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr(state))),
+                    );
+                if !["completed", "cancelled", "failed", "done"].contains(&state) {
+                    row = row.child(
+                        Button::new(SharedString::from(format!("cancel-{task_id}")))
+                            .label(self.tr("Cancel"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.api(
+                                    "POST",
+                                    format!("/tasks/{task_id}/cancel"),
+                                    None,
+                                    "Task cancelled",
+                                );
+                                this.work_checked =
+                                    std::time::Instant::now() - Duration::from_secs(30);
+                                cx.notify();
+                            })),
+                    );
+                }
+                body = body.child(row);
+            }
+            for timer in records(&self.timers, "timers") {
+                let timer_id = timer["id"].as_str().unwrap_or("").to_owned();
+                let edit = timer.clone();
+                let toggle_id = timer_id.clone();
+                let enabled = timer["enabled"].as_bool().unwrap_or(false);
+
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .text_sm()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(
+                                    timer["name"]
+                                        .as_str()
+                                        .unwrap_or("Scheduled task")
+                                        .to_owned(),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child(timer_description(&timer)),
+                                ),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("toggle-{timer_id}")))
+                                .label(self.tr(if enabled { "Pause" } else { "Enable" }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.api(
+                                        "POST",
+                                        format!("/timers/{toggle_id}/pause"),
+                                        Some(json!({"enabled":!enabled})),
+                                        "Schedule saved",
+                                    );
+                                    this.work_checked =
+                                        std::time::Instant::now() - Duration::from_secs(30);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("edit-{timer_id}")))
+                                .label(self.tr("Edit"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_timer(edit.clone(), window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("remove-{timer_id}")))
+                                .label(self.tr("Remove"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.api(
+                                        "DELETE",
+                                        format!("/timers/{timer_id}"),
+                                        None,
+                                        "Schedule removed",
+                                    );
+                                    this.work_checked =
+                                        std::time::Instant::now() - Duration::from_secs(30);
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+            let remove_id = self.selected.clone();
+            body = body.child(self.btn(
+                "remove-project",
+                "Remove project…",
+                move |this, window, cx| {
+                    let answer = window.prompt(
+                        PromptLevel::Warning,
+                        &this.tr("Remove this project?"),
+                        Some(&this.tr("Stop its session first. Project files remain on disk.")),
+                        &[this.tr("Cancel").as_str(), this.tr("Remove").as_str()],
+                        cx,
+                    );
+                    let project = remove_id.clone();
+                    cx.spawn(async move |entity, cx| {
+                        if answer.await.ok() == Some(1) {
+                            let _ = entity.update(cx, |this, _| {
+                                this.release_terminal();
+                                this.api(
+                                    "DELETE",
+                                    format!("/projects/{project}"),
+                                    None,
+                                    "Project removed",
+                                );
+                            });
+                        }
+                    })
+                    .detach();
+                },
+                cx,
+            ));
         }
         body.into_any_element()
+    }
+    fn task_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut kinds = div().flex().flex_wrap().gap_2();
+        for (index, label) in ["Run now", "Once", "Interval", "Cron"]
+            .into_iter()
+            .enumerate()
+        {
+            kinds = kinds.child(
+                Button::new(("task-kind", index))
+                    .label(self.tr(label))
+                    .selected(self.task_kind == index)
+                    .disabled(self.editing_timer.is_some() && index == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.task_kind = index;
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .p_3()
+            .bg(rgb(0xffffff))
+            .border_1()
+            .border_color(rgb(LINE))
+            .rounded_lg()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(kinds)
+            .child(self.field("Task name", &self.task_title))
+            .child(div().h(px(100.)).child(Input::new(&self.task_prompt)))
+            .when(self.task_kind > 0, |form| {
+                form.child(self.field(
+                    match self.task_kind {
+                        1 => "Start time (RFC 3339)",
+                        2 => "Repeat every (seconds)",
+                        _ => "Cron expression (five fields)",
+                    },
+                    &self.schedule,
+                ))
+                .child(self.field("Time zone", &self.timezone))
+            })
+            .child(self.field("Reply destination (optional)", &self.recipient))
+            .child(
+                self.btn(
+                    "save-task",
+                    if self.editing_timer.is_some() {
+                        "Save schedule"
+                    } else {
+                        "Create task"
+                    },
+                    |this, _, cx| this.save_task(cx),
+                    cx,
+                )
+                .primary(),
+            )
+            .into_any_element()
+    }
+    fn save_task(&mut self, cx: &mut Context<Self>) {
+        let title = self.task_title.read(cx).value().to_string();
+        let instructions = self.task_prompt.read(cx).value().to_string();
+        if title.trim().is_empty() || instructions.trim().is_empty() {
+            self.notice = "Enter a task name and instructions".into();
+            self.error = true;
+            return;
+        }
+        let to = self.recipient.read(cx).value().to_string();
+        let destination = (!to.trim().is_empty()).then_some(to);
+        if self.task_kind == 0 {
+            self.api(
+                "POST",
+                format!("/projects/{}/tasks", self.selected),
+                Some(json!({"title":title,"instructions":instructions,"to":destination})),
+                "Task queued",
+            );
+        } else {
+            let spec = self.schedule.read(cx).value().to_string();
+            let mut body = json!({"name":title,"prompt":instructions,"kind":(["","once","interval","cron"][self.task_kind]),"timezone":self.timezone.read(cx).value().to_string(),"to":destination});
+            match self.task_kind {
+                1 => {
+                    body["at"] = json!(spec);
+                }
+                2 => {
+                    let Ok(seconds) = spec.trim().parse::<u64>() else {
+                        self.error = true;
+                        self.notice = "Enter a positive interval in seconds".into();
+                        return;
+                    };
+                    body["interval_seconds"] = json!(seconds);
+                }
+                _ => {
+                    body["cron"] = json!(spec);
+                }
+            }
+            if let Some(id) = self.editing_timer.clone() {
+                self.api("PUT", format!("/timers/{id}"), Some(body), "Schedule saved");
+            } else {
+                self.api(
+                    "POST",
+                    format!("/projects/{}/timers", self.selected),
+                    Some(body),
+                    "Schedule created",
+                );
+            }
+        }
+        self.task_form = false;
+        self.editing_timer = None;
+        self.work_checked = std::time::Instant::now() - Duration::from_secs(30);
+    }
+    fn edit_timer(&mut self, timer: Value, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_timer = timer["id"].as_str().map(str::to_owned);
+        self.task_kind = match timer["kind"].as_str().unwrap_or("") {
+            "once" => 1,
+            "interval" => 2,
+            _ => 3,
+        };
+        self.task_title.update(cx, |input, cx| {
+            input.set_value(timer["name"].as_str().unwrap_or("").to_owned(), window, cx)
+        });
+        self.task_prompt.update(cx, |input, cx| {
+            input.set_value(
+                timer["prompt"].as_str().unwrap_or("").to_owned(),
+                window,
+                cx,
+            )
+        });
+        self.schedule.update(cx, |input, cx| {
+            input.set_value(
+                match self.task_kind {
+                    1 => timer_time(&timer["at"]),
+                    2 => timer["interval_seconds"].to_string(),
+                    _ => timer["cron"].as_str().unwrap_or("").to_owned(),
+                },
+                window,
+                cx,
+            )
+        });
+        self.timezone.update(cx, |input, cx| {
+            input.set_value(
+                timer["timezone"].as_str().unwrap_or("UTC").to_owned(),
+                window,
+                cx,
+            )
+        });
+        self.recipient.update(cx, |input, cx| {
+            input.set_value(timer["to"].as_str().unwrap_or("").to_owned(), window, cx)
+        });
+        self.task_form = true;
+    }
+    fn execution_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let control = self
+            .terminal
+            .as_ref()
+            .is_some_and(|bridge| bridge.controlling);
+        let mut header = div()
+            .h(px(52.))
+            .flex_shrink_0()
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .bg(rgb(0x202a35))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xe8eeeb))
+                    .child(self.tr(if control {
+                        "You are in control"
+                    } else {
+                        "Live terminal"
+                    })),
+            );
+        if let Some(bridge) = &self.terminal {
+            let project = bridge.descriptor.project_id.clone();
+            let generation = bridge.descriptor.generation.clone();
+            header = header.child(
+                Button::new("terminal-control")
+                    .label(self.tr(if control {
+                        "Release control"
+                    } else {
+                        "Take control"
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.takeover_requested = !control;
+                        let _ = this.backend.tx.send(CommandRequest::Takeover {
+                            project: project.clone(),
+                            generation: generation.clone(),
+                            active: !control,
+                        });
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut panel = div()
+            .size_full()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1e1e1e))
+            .child(header);
+        if let Some(bridge) = &self.terminal {
+            panel = panel.child(div().flex_1().min_h_0().child(bridge.view.clone()));
+            if !bridge.notice.is_empty() {
+                panel = panel.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_xs()
+                        .text_color(rgb(0xffcf89))
+                        .child(self.tr(&bridge.notice)),
+                );
+            }
+            if !control {
+                panel = panel.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_xs()
+                        .text_color(rgb(0xa7b5c2))
+                        .child(self.tr("Viewing only · Take control to type or scroll history")),
+                );
+            }
+        } else {
+            let lifecycle = self.state["projects"]
+                .as_array()
+                .and_then(|items| items.iter().find(|project| project["id"] == self.selected))
+                .and_then(|project| project["lifecycle"].as_str())
+                .unwrap_or("");
+            let message = if self.selected.is_empty() {
+                "Choose a project to view its agent"
+            } else if matches!(lifecycle, "starting" | "connecting") {
+                "Connecting to the live terminal…"
+            } else if lifecycle == "stopped" {
+                "Project is stopped. Start it to run tasks."
+            } else if matches!(lifecycle, "needs_attention" | "error") {
+                "Agent needs attention. Review the project notice."
+            } else {
+                "Agent is sleeping. Tasks and schedules will wake it automatically."
+            };
+            panel = panel.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_8()
+                    .text_color(rgb(0xa7b5c2))
+                    .child(self.tr(message)),
+            );
+        }
+        if !self.terminal_error.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(0xffcf89))
+                    .child(self.terminal_error.clone()),
+            );
+        }
+        panel
+            .child(
+                Button::new("reconnect-terminal")
+                    .label(self.tr("Reconnect"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.release_terminal();
+                        this.terminal_key.clear();
+                        this.sync_terminal(cx);
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+    fn workspace_layout(&mut self, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        if self.setup.terminal_hidden {
+            return div()
+                .id("project-controls")
+                .size_full()
+                .overflow_y_scroll()
+                .p_6()
+                .child(content)
+                .into_any_element();
+        }
+        let terminal = self.execution_panel(cx);
+        h_resizable("workspace-split")
+            .child(
+                resizable_panel().size(px(360.)).child(
+                    div()
+                        .id("project-controls")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .p_5()
+                        .child(content),
+                ),
+            )
+            .child(resizable_panel().child(terminal))
+            .into_any_element()
     }
     fn connection_pill(&self, name: &str, status: &str) -> Div {
         let status = connection_status(status);
@@ -1013,11 +1806,16 @@ impl Render for Desktop {
                                 this.name.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("For example: personal website"), window, cx));
                                 this.path.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Choose the project folder"), window, cx));
                                 this.secret.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Stored only on this Mac"), window, cx));
+                                for (input, placeholder) in [(&this.task_title, "Task name"), (&this.task_prompt, "What should the agent do?"), (&this.schedule, "Schedule"), (&this.recipient, "Reply destination (optional)"), (&this.decision_answer, "Your answer"), (&this.job_reason, "What did you verify?")] {
+                                    input.update(cx, |input, cx| input.set_placeholder(this.setup.language.text(placeholder), window, cx));
+                                }
                                 set_menus(this.setup.language, cx);
                                 cx.notify();
                             }))),
                     )
-                    .child(
+                    .child(if page == 6 {
+                        self.workspace_layout(content, cx)
+                    } else {
                         div()
                             .id(("content-scroll", page))
                             .flex_1()
@@ -1049,8 +1847,9 @@ impl Render for Desktop {
                                         view.child(steps)
                                     })
                                     .child(content),
-                            ),
-                    )
+                            )
+                            .into_any_element()
+                    })
                     .child(
                         div()
                             .px_8()
@@ -1062,6 +1861,33 @@ impl Render for Desktop {
                             .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
                     ),
             )
+    }
+}
+fn records(value: &Value, field: &str) -> Vec<Value> {
+    value
+        .as_array()
+        .or_else(|| value[field].as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+fn timer_time(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .as_i64()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|time| time.to_rfc3339())
+        })
+        .unwrap_or_default()
+}
+fn timer_description(timer: &Value) -> String {
+    let timezone = timer["timezone"].as_str().unwrap_or("UTC");
+    match timer["kind"].as_str().unwrap_or("") {
+        "once" => format!("{} · {timezone}", timer_time(&timer["at"])),
+        "interval" => format!("{} s · {timezone}", timer["interval_seconds"]),
+        _ => format!("{} · {timezone}", timer["cron"].as_str().unwrap_or("")),
     }
 }
 fn connection_status(status: &str) -> &str {
@@ -1118,7 +1944,6 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", ShowUpdates, None),
         ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
         let language = std::fs::read(backend.dir.join("desktop.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Setup>(&bytes).ok())
@@ -1138,6 +1963,15 @@ fn main() {
             },
             |window, cx| {
                 let view = cx.new(|cx| Desktop::new(backend, window, cx));
+                let quit_view = view.clone();
+                cx.on_action(move |_: &Quit, cx| {
+                    quit_view.update(cx, |this, cx| this.quit(cx));
+                });
+                let close_view = view.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    let _ = close_view.update(cx, |this, cx| this.quit(cx));
+                    false
+                });
                 let updates_view = view.clone();
                 cx.on_action(move |_: &ShowUpdates, cx| {
                     updates_view.update(cx, |this, cx| {

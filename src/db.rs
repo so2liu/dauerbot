@@ -33,6 +33,8 @@ pub struct Project {
     pub terminal_pid: Option<i64>,
     pub generation: String,
     pub ready: bool,
+    pub enabled: bool,
+    pub execution: serde_json::Value,
     pub native_session: String,
     pub extra_args: Vec<String>,
     pub created_at: i64,
@@ -88,9 +90,11 @@ fn project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         extra_args: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
         created_at: row.get(12)?,
         mcp_token: row.get(13)?,
+        enabled: row.get(14)?,
+        execution: serde_json::from_str(&row.get::<_, String>(15)?).unwrap_or_default(),
     })
 }
-const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token";
+const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token,enabled,execution";
 fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: row.get(0)?,
@@ -111,9 +115,15 @@ const MESSAGE: &str = "id,project_id,direction,source_id,content,status,error,at
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        let schema: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            schema <= 4,
+            "This data directory requires a newer Dauerbot version"
+        );
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch("
-            PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let migration = conn.unchecked_transaction()?;
+        migration.execute_batch("
             CREATE TABLE IF NOT EXISTS projects (
               id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL, agent TEXT NOT NULL,
               chat_id TEXT NOT NULL DEFAULT '', paused INTEGER NOT NULL DEFAULT 0,
@@ -128,11 +138,45 @@ impl Db {
               attachment TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
               UNIQUE(project_id,direction,source_id));
             CREATE INDEX IF NOT EXISTS message_pending ON messages(direction,status,created_at);
-            PRAGMA user_version=1;
+
         ")?;
-        crate::conversation::migrate(&conn)?;
-        crate::bot::migrate(&conn)?;
-        conn.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
+        let columns: Vec<String> = migration
+            .prepare("PRAGMA table_info(projects)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !columns.iter().any(|name| name == "enabled") {
+            migration.execute_batch(
+                "ALTER TABLE projects ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
+        migration.execute_batch(
+            "CREATE TABLE IF NOT EXISTS archived_core_executions (
+             project_id TEXT NOT NULL, terminal TEXT, terminal_pid INTEGER, generation TEXT,
+             native_session TEXT, archived_at INTEGER NOT NULL);",
+        )?;
+        if !columns.iter().any(|name| name == "execution") {
+            migration.execute_batch(
+                "ALTER TABLE projects ADD COLUMN execution TEXT NOT NULL DEFAULT 'null';",
+            )?;
+            // Old Core addresses belong to another backend. Preserve them for inspection,
+            // without terminating or attempting to adopt the user's old processes.
+            migration.execute_batch(
+                "CREATE TABLE IF NOT EXISTS archived_core_executions (
+                project_id TEXT NOT NULL, terminal TEXT, terminal_pid INTEGER, generation TEXT,
+                native_session TEXT, archived_at INTEGER NOT NULL);",
+            )?;
+            migration.execute("INSERT INTO archived_core_executions SELECT id,terminal,terminal_pid,generation,native_session,? FROM projects WHERE terminal IS NOT NULL", [now()])?;
+            migration.execute_batch(
+                "UPDATE projects SET enabled=0 WHERE terminal IS NOT NULL;
+                 UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0;",
+            )?;
+        }
+        crate::conversation::migrate(&migration)?;
+        crate::bot::migrate(&migration)?;
+        migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
+        crate::work::migrate(&migration)?;
+        migration.pragma_update(None, "user_version", 4)?;
+        migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
     pub fn sync<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -236,8 +280,48 @@ impl Db {
         let key = key.to_owned();
         self.call(move |c| {
             c.execute(
-                "UPDATE projects SET terminal=?,terminal_pid=?,generation=?,ready=0 WHERE id=?",
+                "UPDATE projects SET terminal=?,terminal_pid=?,generation=?,ready=0,execution=CASE WHEN ?1 IS NULL THEN 'null' ELSE execution END WHERE id=?",
                 params![terminal, pid, generation, key],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn save_execution(
+        &self,
+        key: &str,
+        execution: serde_json::Value,
+        generation: &str,
+    ) -> Result<()> {
+        let key = key.to_owned();
+        let generation = generation.to_owned();
+        self.call(move |c| {
+            c.execute("UPDATE projects SET terminal=?,terminal_pid=?,generation=?,ready=0,enabled=1,execution=? WHERE id=?",
+                params![execution["terminal_id"].as_str(),execution["shell_pid"].as_i64(),generation,execution.to_string(),key])?;
+            Ok(())
+        }).await
+    }
+    pub async fn enabled(&self, key: &str, enabled: bool) -> Result<()> {
+        let key = key.to_owned();
+        self.call(move |c| {
+            c.execute(
+                "UPDATE projects SET enabled=? WHERE id=?",
+                params![enabled, key],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn native_session(&self, key: &str, native: &str) -> Result<()> {
+        let key = key.to_owned();
+        let native = native.to_owned();
+        self.call(move |c| {
+            c.execute(
+                "UPDATE projects SET native_session=?,
+                 execution=CASE WHEN terminal IS NOT NULL AND execution!='null'
+                   THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END
+                 WHERE id=? AND ?<>''",
+                params![native, key, native],
             )?;
             Ok(())
         })
@@ -275,7 +359,9 @@ impl Db {
             native.to_owned(),
         );
         self.call(move|c|{
-            let n=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END WHERE id=?2 AND generation=?3 AND terminal=?4",
+            let n=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,
+                execution=CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END
+                WHERE id=?2 AND generation=?3 AND terminal=?4",
                 params![native,key,generation,terminal])?;
             if n!=1 {bail!("Session identity changed; reconnect MCP");} Ok(())
         }).await
@@ -367,8 +453,18 @@ impl Db {
         self.call(move |c| {
             c.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
+                let running: bool = c.query_row(
+                    "SELECT terminal IS NOT NULL FROM projects WHERE id=?",
+                    [&p.id],
+                    |r| r.get(0),
+                )?;
+                anyhow::ensure!(!running, "Stop the session before removing the project");
                 c.execute("DELETE FROM messages WHERE project_id=?", [&p.id])?;
                 c.execute("DELETE FROM projects WHERE id=?", [&p.id])?;
+                c.execute(
+                    "DELETE FROM archived_core_executions WHERE project_id=?",
+                    [&p.id],
+                )?;
                 Ok(())
             })();
             match result {

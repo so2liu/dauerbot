@@ -15,6 +15,22 @@ pub enum CommandRequest {
         body: Option<Value>,
         success: String,
     },
+    Terminal {
+        project: String,
+    },
+    Takeover {
+        project: String,
+        generation: String,
+        active: bool,
+    },
+    ReleaseBeforeExit {
+        project: String,
+        generation: String,
+        done: mpsc::Sender<()>,
+    },
+    Work {
+        project: String,
+    },
     Folder(PathBuf),
     Database(PathBuf),
     Environment,
@@ -25,6 +41,21 @@ pub enum CommandRequest {
 }
 pub enum Reply {
     State(Value),
+    Terminal {
+        project: String,
+        value: Value,
+        error: String,
+    },
+    Takeover {
+        project: String,
+        generation: String,
+        active: bool,
+    },
+    Work {
+        project: String,
+        tasks: Value,
+        timers: Value,
+    },
     Done {
         path: String,
         value: Value,
@@ -45,6 +76,21 @@ pub struct Backend {
     pub updates: mpsc::Sender<crate::updater::Action>,
 }
 impl Backend {
+    /// Preserve ordering with an in-flight acquisition, while keeping shutdown bounded.
+    pub fn release_before_exit(&self, project: String, generation: String) -> flume::Receiver<()> {
+        let (done, receiver) = flume::bounded(1);
+        let (acknowledge, acknowledged) = mpsc::channel();
+        let _ = self.tx.send(CommandRequest::ReleaseBeforeExit {
+            project,
+            generation,
+            done: acknowledge,
+        });
+        std::thread::spawn(move || {
+            let _ = acknowledged.recv_timeout(Duration::from_secs(3));
+            let _ = done.send(());
+        });
+        receiver
+    }
     pub fn start(dir: PathBuf) -> Self {
         let (tx, requests) = mpsc::channel();
         let (replies, rx) = mpsc::channel();
@@ -75,12 +121,16 @@ impl Backend {
                     .timeout(Duration::from_secs(3))
                     .build()?;
                 if let Ok(state) = request(&probe, &cfg, "GET", "/state", None).await
-                    && state["version"]
+                    && (state["version"]
                         .as_str()
                         .is_some_and(|v| v != herdr_feishu_bridge::update::CURRENT)
-                    && let Some(bundle) = herdr_feishu_bridge::update::bundle()
-                    && herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok()
+                        || state["api_protocol"].as_u64() != Some(herdr_feishu_bridge::api::PROTOCOL))
                 {
+                    let signed = herdr_feishu_bridge::update::bundle()
+                        .is_some_and(|bundle| herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok());
+                    if !signed {
+                        bail!("An older or incompatible Dauerbot daemon is using this data directory. Quit that daemon before starting this build, or use --data-dir for an independent instance.");
+                    }
                     herdr_feishu_bridge::update::stop_service(&data, &cfg).await?;
                 }
                 if let Err(e) = request(&probe, &cfg, "GET", "/state", None).await {
@@ -108,6 +158,8 @@ impl Backend {
                 let mut connection = ConnectionState::default();
                 let mut last_restart = std::time::Instant::now() - Duration::from_secs(10);
                 let mut last_state = Value::Null;
+                let mut takeover: Option<(String, String)> = None;
+                let mut lease_checked = std::time::Instant::now();
                 loop {
                     match requests.recv_timeout(Duration::from_millis(1200)) {
                         Ok(CommandRequest::Api {
@@ -127,6 +179,33 @@ impl Backend {
                                 let _ = replies.send(Reply::Error(e.to_string()));
                             }
                         },
+                        Ok(CommandRequest::Terminal { project }) => {
+                            let response = request(&probe, &cfg, "GET", &format!("/projects/{project}/terminal"), None).await;
+                            let (value, error) = match response { Ok(value) => (value, String::new()), Err(error) => (Value::Null, error.to_string()) };
+                            let _ = replies.send(Reply::Terminal { project, value, error });
+                        }
+                        Ok(CommandRequest::Takeover { project, generation, active }) => {
+                            match request(&probe, &cfg, "POST", &format!("/projects/{project}/takeover"), Some(json!({"generation":generation,"active":active}))).await {
+                                Ok(_) => {
+                                    takeover = active.then(|| (project.clone(), generation.clone()));
+                                    lease_checked = std::time::Instant::now();
+                                    let _ = replies.send(Reply::Takeover { project, generation, active });
+                                }
+                                Err(error) => { let _ = replies.send(Reply::Error(error.to_string())); }
+                            }
+                        }
+                        Ok(CommandRequest::ReleaseBeforeExit { project, generation, done }) => {
+                            let _ = request(&probe, &cfg, "POST", &format!("/projects/{project}/takeover"), Some(json!({"generation":generation,"active":false}))).await;
+                            if takeover.as_ref().is_some_and(|(p, g)| p == &project && g == &generation) {
+                                takeover = None;
+                            }
+                            let _ = done.send(());
+                        }
+                        Ok(CommandRequest::Work { project }) => {
+                            let tasks = request(&probe, &cfg, "GET", &format!("/projects/{project}/tasks"), None).await.unwrap_or(Value::Null);
+                            let timers = request(&probe, &cfg, "GET", &format!("/projects/{project}/timers"), None).await.unwrap_or(Value::Null);
+                            let _ = replies.send(Reply::Work { project, tasks, timers });
+                        }
                         Ok(CommandRequest::Folder(path)) => {
                             let result = crate::access::project_access(&path);
                             let _ = replies.send(Reply::Access(match result {
@@ -154,8 +233,28 @@ impl Backend {
                                 let _ = updater.send(crate::updater::Action::PreferencesChanged);
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            if let Some((project, generation)) = takeover.take() {
+                                let _ = request(&probe, &cfg, "POST", &format!("/projects/{project}/takeover"), Some(json!({"generation":generation,"active":false}))).await;
+                            }
+                            break;
+                        },
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if lease_checked.elapsed() >= Duration::from_secs(20) {
+                        if let Some((project, generation)) = takeover.clone() {
+                            match request(&probe, &cfg, "POST", &format!("/projects/{project}/takeover"), Some(json!({"generation":generation,"active":true,"heartbeat":true}))).await {
+                                Ok(lease) if lease["active"].as_bool() == Some(false) => {
+                                    takeover = None;
+                                    let _ = replies.send(Reply::Takeover { project, generation, active: false });
+                                }
+                                Ok(_) => {}
+                                Err(_) => {
+                                    let _ = replies.send(Reply::Error("Terminal control needs to reconnect. Release control before continuing.".into()));
+                                }
+                            }
+                        }
+                        lease_checked = std::time::Instant::now();
                     }
                     match request(&probe, &cfg, "GET", "/state", None).await {
                         Ok(state) => {
@@ -283,13 +382,13 @@ async fn request(
     }
     Ok(value)
 }
-fn environment(cfg: &Config, dir: &std::path::Path) -> Vec<(String, String)> {
+fn environment(_cfg: &Config, dir: &std::path::Path) -> Vec<(String, String)> {
     let mut result = vec![];
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
     for (name, executable) in [
-        ("HERDR", cfg.hc.as_str()),
+        ("HERDR", "herdr"),
         ("Codex", "codex"),
         ("Claude Code", "claude"),
         ("Pi", "pi"),

@@ -103,27 +103,119 @@ async fn one_projects_backlog_cannot_starve_another_project() {
     );
 }
 
+fn legacy_record(p: &mut herdr_feishu_bridge::db::Project, pid: i64) -> Value {
+    p.generation = "11111111-2222-4333-8444-555555555555".into();
+    p.terminal = Some("term_owned".into());
+    p.terminal_pid = Some(pid);
+    let name = herdr::managed_name(&p.generation).unwrap();
+    p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_owned",
+        "managed_name":name,"generation":p.generation,"shell_pid":pid,"launch_permit":"/private/fixture/launch.permit"});
+    json!({"state":"live","pid":pid,"execution":p.execution,"launch_pending":false,
+        "foreground":{"pid":pid,"name":p.agent,"argv":[p.agent]},
+        "agent":{"agent":p.agent,"workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_owned"},
+        "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":p.generation,"hfb_execution":name},
+        "cwd":p.path,"status":{"state":"idle","app":p.agent}})
+}
+
 #[tokio::test]
 async fn process_and_generation_are_required_before_typing() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(&dir.path().join("db")).unwrap();
-    let mut p = db.create(input(&dir, "一", "")).await.unwrap();
-    p.terminal_pid = Some(100);
-    p.generation = "generation-1".into();
-    let t = json!({"state":"live","pid":100,"argv":["codex","--no-daemon"],"labels":{"hfb.project":p.id,"hfb.generation":p.generation}});
-    assert!(herdr::check_identity(&p, &t).is_ok());
-    let mut changed = t.clone();
-    changed["pid"] = json!(101);
-    assert!(herdr::check_identity(&p, &changed).is_err());
-    changed = t.clone();
-    changed["argv"] = json!(["/bin/zsh"]);
-    assert!(herdr::check_identity(&p, &changed).is_err());
-    changed = t.clone();
-    changed["labels"]["hfb.generation"] = json!("older");
-    assert!(herdr::check_identity(&p, &changed).is_err());
-    changed = t;
-    changed["state"] = json!("finished");
-    assert!(herdr::check_identity(&p, &changed).is_err());
+    let mut p = db.create(input(&dir, "Identity", "")).await.unwrap();
+    let record = legacy_record(&mut p, 100);
+    assert!(herdr::check_identity(&p, &record).is_ok());
+    for (pointer, value) in [
+        ("/pid", json!(101)),
+        ("/foreground/name", json!("zsh")),
+        ("/tokens/hfb_generation", json!("replaced")),
+        ("/state", json!("finished")),
+        ("/agent/pane_id", json!("w2:p1")),
+        ("/agent/workspace_id", json!("w2")),
+        ("/agent/terminal_id", json!("term_other")),
+        ("/tokens/hfb_owner", json!("other")),
+    ] {
+        let mut changed = record.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(herdr::check_identity(&p, &changed).is_err(), "{pointer}");
+    }
+}
+
+#[tokio::test]
+async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db.create(input(&dir, "Quiescence", "")).await.unwrap();
+    let mut record = legacy_record(&mut p, 100);
+    record["processes"] = json!([{"name":"codex","argv":["codex"]}]);
+    assert!(herdr::quiescent(&p, &record));
+    record["processes"] = json!([
+        {"name":"codex","argv":["codex"]},
+        {"name":"hfb","argv":[std::env::current_exe().unwrap(),"mcp","--credentials","/private/fixture/credentials.json"]}
+    ]);
+    assert!(
+        herdr::quiescent(&p, &record),
+        "The generation's parked MCP child is not active background work"
+    );
+    record["processes"][1]["argv"][3] = json!("/another/generation/credentials.json");
+    assert!(!herdr::quiescent(&p, &record));
+    for processes in [
+        json!([{"name":"bash","argv":["bash","-c","long task"]}]),
+        json!([{"name":"codex","argv":["codex"]},{"name":"python3","argv":["python3","task.py"]}]),
+        json!([{"name":"node","argv":["node","unknown-wrapper.js"]}]),
+        json!([]),
+    ] {
+        record["processes"] = processes;
+        assert!(!herdr::quiescent(&p, &record));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        p.agent = "claude".into();
+        record["agent"]["agent"] = json!("claude");
+        let mut inhibitor = std::process::Command::new("/usr/bin/caffeinate")
+            .args(["-i", "-t", "2"])
+            .spawn()
+            .unwrap();
+        record["processes"] = json!([
+            {"pid":100,"name":"Claude.exe","argv":["claude"]},
+            {"pid":inhibitor.id(),"name":"caffeinate","argv":["caffeinate","-i","-t","2"]}
+        ]);
+        assert!(
+            herdr::quiescent(&p, &record),
+            "Claude's verified system sleep inhibitor performs no Agent work"
+        );
+        record["processes"][1]["argv"] =
+            json!(["caffeinate", "-i", "-t", "2", "python3", "task.py"]);
+        assert!(
+            !herdr::quiescent(&p, &record),
+            "caffeinate wrapping a command is active work"
+        );
+        let _ = inhibitor.kill();
+        let _ = inhibitor.wait();
+    }
+    p.agent = "custom".into();
+    p.extra_args = vec![
+        "/usr/local/bin/python3".into(),
+        "/private/fixture/agent.py".into(),
+        "{credentials}".into(),
+    ];
+    record["processes"] = json!([{"pid":100,"name":"Python","argv":["/Frameworks/Python.app/Contents/MacOS/Python","/private/fixture/agent.py","credentials"]}]);
+    assert!(
+        herdr::quiescent(&p, &record),
+        "macOS Python launchers exec the framework binary"
+    );
+    record["processes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("argv");
+    assert!(
+        herdr::quiescent(&p, &record),
+        "macOS may omit the framework interpreter argv entirely"
+    );
+    record["processes"][0]["pid"] = json!(101);
+    assert!(
+        !herdr::quiescent(&p, &record),
+        "A child interpreter cannot inherit the root launcher exemption"
+    );
 }
 
 #[tokio::test]
@@ -158,9 +250,9 @@ fn inbound_filters_bots_and_normalizes_messages() {
 }
 
 #[test]
-fn startup_settle_failure_retries_only_when_core_confirms_no_input() {
+fn native_submission_retries_only_when_legacy_confirms_no_input() {
     let safe: anyhow::Error = herdr::RpcFailure {
-        kind: "unavailable".into(),
+        kind: "agent_not_ready".into(),
         message: "still starting".into(),
         hint: "nothing was typed; check the screen".into(),
     }
@@ -250,8 +342,7 @@ async fn local_api_auth_origin_and_project_scope() {
         .await
         .unwrap();
     assert_eq!(result.status(), 400);
-    // A custom Core session's t1 must never be passed to an unrelated default App.
-    app.config.write().await.core_session = "isolated-test".into();
+    // An old Core terminal reference cannot become a legacy terminal descriptor.
     let result = http
         .post(format!("{url}/api/projects/{}/show", p.id))
         .bearer_auth(&cfg.token)
@@ -307,40 +398,51 @@ async fn antigravity_uses_interactive_prompt_flag_instead_of_a_positional_prompt
 async fn workspace_trust_requires_exact_project_identity_and_selected_yes() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(&dir.path().join("db")).unwrap();
-    let mut p = db.create(input(&dir, "信任边界", "")).await.unwrap();
+    let mut p = db.create(input(&dir, "Trust boundary", "")).await.unwrap();
     p.agent = "agy".into();
-    p.generation = "generation".into();
-    p.terminal_pid = Some(123);
-    let t = json!({
-        "state":"live","pid":123,"cwd":p.path,"argv":["agy","-i","prompt"],
-        "labels":{"hfb.project":p.id,"hfb.generation":p.generation},
-        "status":{"app":"antigravity","state":"blocked","kind":"permission","msg":"Trust this folder?"}
-    });
+    let mut record = legacy_record(&mut p, 123);
+    record["status"]["state"] = json!("blocked");
     let screen = format!(
         "Accessing workspace:\n\n{}\n\nDo you trust the contents of this project?\n\n> Yes, I trust this folder\n  No, exit\n",
         p.path
     );
-    assert!(herdr::is_project_trust(&p, &t, &screen));
-    for invalid in [
+    assert!(herdr::is_project_trust(&p, &record, &screen));
+    for text in [
         screen.replace(&p.path, "/another/project"),
         screen.replace("> Yes, I trust this folder", "  Yes, I trust this folder"),
         "Allow shell command execution?".into(),
     ] {
-        assert!(!herdr::is_project_trust(&p, &t, &invalid));
+        assert!(!herdr::is_project_trust(&p, &record, &text));
     }
-    for (field, replacement) in [
-        ("/status/msg", json!("Allow this tool?")),
-        ("/labels/hfb.generation", json!("old")),
+    for (pointer, value) in [
+        ("/status/state", json!("working")),
+        ("/tokens/hfb_generation", json!("old")),
         ("/pid", json!(999)),
         ("/state", json!("finished")),
         ("/cwd", json!("/another/project")),
     ] {
-        let mut invalid = t.clone();
-        *invalid.pointer_mut(field).unwrap() = replacement;
-        assert!(!herdr::is_project_trust(&p, &invalid, &screen));
+        let mut invalid = record.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        assert!(!herdr::is_project_trust(&p, &invalid, &screen), "{pointer}");
     }
+    p.agent = "claude".into();
+    let claude = format!(
+        "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source\n{}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n",
+        p.path
+    );
+    assert!(herdr::is_project_trust(&p, &record, &claude));
+    assert!(!herdr::is_project_trust(
+        &p,
+        &record,
+        &claude.replace("❯ 1.", "  1.")
+    ));
+    assert!(!herdr::is_project_trust(
+        &p,
+        &record,
+        &claude.replace(&p.path, "/another/project")
+    ));
     p.ready = true;
-    assert!(!herdr::is_project_trust(&p, &t, &screen));
+    assert!(!herdr::is_project_trust(&p, &record, &claude));
 }
 
 #[tokio::test]
@@ -408,6 +510,8 @@ fn launch_forwards_existing_network_settings_without_overriding_identity_or_mode
         ("no_proxy", "localhost,127.0.0.1"),
         ("HC_TERMINAL_ID", "unrelated"),
         ("HC_SESSION", "unrelated"),
+        ("HERDR_PANE_ID", "unrelated"),
+        ("HERDR_SOCKET_PATH", "unrelated"),
         ("ANTHROPIC_MODEL", "unrelated-model"),
         ("GEMINI_API_KEY", "unrelated-key"),
     ]
@@ -467,129 +571,88 @@ fn login_shell_loads_profile_and_preserves_literal_cli_arguments() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn login_wrapper_accepts_running_agent_but_rejects_initializing_or_restored_shell() {
+async fn native_execution_accepts_running_agent_but_rejects_startup_and_restored_shell() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(&dir.path().join("db")).unwrap();
-    let mut p = db
-        .create(input(&dir, "Login shell identity", ""))
-        .await
-        .unwrap();
+    let mut p = db.create(input(&dir, "Native identity", "")).await.unwrap();
     p.agent = "agy".into();
-    p.generation = "generation".into();
-    p.terminal_pid = Some(123);
-    let mut terminal = json!({
-        "state":"live","pid":123,
-        "argv":herdr::login_shell_args(vec!["agy".into(), "--dangerously-skip-permissions".into()]),
-        "labels":{"hfb.project":p.id,"hfb.generation":p.generation},
-        "foreground":{"pid":123,"argv":["/bin/zsh","-lic","exec \"$@\""]}
-    });
-    assert!(herdr::check_identity(&p, &terminal).is_err());
-    terminal["foreground"]["argv"] = json!(["/Users/example/.local/bin/agy"]);
-    assert!(herdr::check_identity(&p, &terminal).is_ok());
-    terminal["pid"] = json!(999);
-    assert!(herdr::check_identity(&p, &terminal).is_err());
-    terminal["pid"] = json!(123);
-    terminal["foreground"]["argv"] = json!(["/bin/zsh", "-l"]);
-    assert!(herdr::check_identity(&p, &terminal).is_err());
+    let mut record = legacy_record(&mut p, 123);
+    assert!(herdr::check_identity(&p, &record).is_ok());
+    record["launch_pending"] = json!(true);
+    record["foreground"]["name"] = json!("sh");
+    assert!(
+        herdr::check_identity(&p, &record)
+            .unwrap_err()
+            .is::<herdr::SessionStarting>()
+    );
+    assert!(
+        herdr::check_execution_identity(&p, &record).is_ok(),
+        "The saved startup gate remains viewable"
+    );
+    record["tokens"]["hfb_generation"] = json!("replaced");
+    assert!(
+        !herdr::check_identity(&p, &record)
+            .unwrap_err()
+            .is::<herdr::SessionStarting>()
+    );
+    record["tokens"]["hfb_generation"] = json!(p.generation);
+    record["launch_pending"] = json!(false);
+    assert!(
+        !herdr::check_identity(&p, &record)
+            .unwrap_err()
+            .is::<herdr::SessionStarting>(),
+        "A returned shell is never a pending native launch"
+    );
+    record["foreground"]["name"] = json!("agy");
+    record["pid"] = json!(999);
+    assert!(
+        herdr::check_identity(&p, &record).is_err(),
+        "A restored root PID cannot inherit the previous generation"
+    );
 }
 
 #[tokio::test]
-async fn pending_login_foreground_is_retryable_only_for_the_owned_generation() {
+async fn old_core_terminal_ids_cannot_control_legacy_terminals() {
     let dir = TempDir::new().unwrap();
     let db = Db::open(&dir.path().join("db")).unwrap();
-    let mut p = db
-        .create(input(&dir, "Starting session", ""))
-        .await
-        .unwrap();
-    p.agent = "agy".into();
-    p.generation = "generation".into();
+    let mut p = db.create(input(&dir, "Old Core", "")).await.unwrap();
+    p.terminal = Some("t1".into());
     p.terminal_pid = Some(123);
-    let mut terminal = json!({
-        "state":"live", "pid":123,
-        "argv":herdr::login_shell_args(vec!["agy".into()]),
-        "labels":{"hfb.project":p.id,"hfb.generation":p.generation}
-    });
-    assert!(
-        herdr::check_identity(&p, &terminal)
-            .unwrap_err()
-            .is::<herdr::SessionStarting>()
-    );
-    terminal["foreground"] = json!({"pid":123,"argv":terminal["argv"]});
-    assert!(
-        herdr::check_identity(&p, &terminal)
-            .unwrap_err()
-            .is::<herdr::SessionStarting>()
-    );
-    terminal["labels"]["hfb.generation"] = json!("replaced");
-    assert!(
-        !herdr::check_identity(&p, &terminal)
-            .unwrap_err()
-            .is::<herdr::SessionStarting>()
-    );
-    terminal["labels"]["hfb.generation"] = json!(p.generation);
-    terminal["foreground"] = json!({"argv":["/bin/zsh", "-l"]});
-    assert!(
-        !herdr::check_identity(&p, &terminal)
-            .unwrap_err()
-            .is::<herdr::SessionStarting>()
-    );
-    terminal["foreground"] = json!({"argv":["/Users/example/.local/bin/agy"]});
-    assert!(herdr::check_identity(&p, &terminal).is_ok());
+    p.generation = "old-core".into();
+    assert!(herdr::ExecutionRef::from_project(&p).is_err());
+    assert!(herdr::check_identity(&p, &json!({"state":"live","pid":123})).is_err());
 }
 
-#[tokio::test]
-async fn monitor_placement_stays_local_and_reuses_existing_space() {
-    let dir = TempDir::new().unwrap();
-    let db = Db::open(&dir.path().join("db")).unwrap();
-    let p = db
-        .create(input(&dir, "Monitor placement", ""))
-        .await
-        .unwrap();
-    let labels = herdr::view_labels(&p, &Value::Null);
-    assert!(!labels["herdr.space"].as_str().unwrap().contains('/'));
-    assert_eq!(labels, herdr::view_labels(&p, &Value::Null));
-    let existing = json!({"labels":{"herdr.space":"sp-existing","herdr.tab":"tb-existing"}});
-    assert_eq!(herdr::view_labels(&p, &existing), existing["labels"]);
-    let mirrored = json!({"labels":{"herdr.space":"mbp/sp-remote","herdr.tab":"mbp/tb-remote"}});
-    assert_eq!(herdr::view_labels(&p, &mirrored), labels);
-    let layout = json!({"spaces":[
-        {"id":"mbp/sp-remote","tabs":[{"id":"mbp/tb-remote","terminals":[{"pane":"mbp/p1","terminal":"t22"}]}]},
-        {"id":"sp-existing","tabs":[{"id":"tb-existing","terminals":[{"pane":"p1","terminal":"t22"}]}]}
-    ]});
-    assert_eq!(
-        herdr::view_pane(&layout, "t22"),
-        Some(("tb-existing".into(), json!("p1")))
+#[test]
+fn independent_data_directories_get_distinct_stable_legacy_sessions() {
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let first = Config::load(a.path()).unwrap();
+    let again = Config::load(a.path()).unwrap();
+    let other = Config::load(b.path()).unwrap();
+    assert_eq!(first.herdr_session, again.herdr_session);
+    assert_ne!(first.herdr_session, other.herdr_session);
+    assert_eq!(first.token, again.token);
+    assert_eq!(first.herdr_config, again.herdr_config);
+    assert!(
+        std::fs::read_to_string(&first.herdr_config)
+            .unwrap()
+            .contains("resume_agents_on_restore = false")
     );
-    assert_eq!(herdr::view_pane(&layout, "t23"), None);
 }
 
-#[tokio::test]
-async fn late_app_adoption_disables_restoration_only_for_the_owned_process() {
-    let dir = TempDir::new().unwrap();
-    let db = Db::open(&dir.path().join("db")).unwrap();
-    let mut p = db.create(input(&dir, "Late adoption", "")).await.unwrap();
-    p.agent = "agy".into();
-    p.generation = "generation".into();
-    p.terminal_pid = Some(123);
-    let mut record = json!({
-        "state":"live", "pid":123, "keep":true,
-        "argv":herdr::login_shell_args(vec!["agy".into()]),
-        "labels":{"hfb.owner":"herdr-feishu-bridge","hfb.project":p.id,"hfb.generation":p.generation},
-        "foreground":{"argv":["/Users/example/.local/bin/agy"]}
-    });
-    assert!(herdr::should_disable_restoration(&p, &record));
-    for (field, value) in [
-        ("/keep", json!(false)),
-        ("/pid", json!(999)),
-        ("/labels/hfb.owner", json!("another-owner")),
-        ("/labels/hfb.generation", json!("replaced")),
-        ("/foreground/argv", json!(["/bin/zsh", "-l"])),
-        ("/state", json!("finished")),
-    ] {
-        let mut invalid = record.clone();
-        *invalid.pointer_mut(field).unwrap() = value;
-        assert!(!herdr::should_disable_restoration(&p, &invalid), "{field}");
+#[test]
+fn managed_names_preserve_the_entire_execution_generation() {
+    let zero = herdr::managed_name("00000000-0000-0000-0000-000000000000").unwrap();
+    let maximum = herdr::managed_name("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+    let neighbor = herdr::managed_name("ffffffff-ffff-ffff-ffff-fffffffffffe").unwrap();
+    assert_ne!(maximum, neighbor);
+    for name in [zero, maximum, neighbor] {
+        assert!(name.len() <= 32);
+        assert!(name.starts_with("db-"));
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        );
     }
-    record["foreground"] = Value::Null;
-    assert!(herdr::should_disable_restoration(&p, &record));
 }

@@ -91,7 +91,7 @@ def main():
     (output / "release-notes.md").write_text(
         f"Dauerbot {version}\n\n{notes}\n\n"
         "Download the Apple Silicon zip, extract it, and move the app to Applications. "
-        "Install HERDR Core (hc) and sign in to your Agent CLI first.\n\n"
+        "Install legacy HERDR 0.9.5 (herdr) and sign in to your Agent CLI first.\n\n"
         "Signed with Developer ID Application, accepted by Apple notarization, "
         "and verified with Gatekeeper. The app includes its notarization ticket.\n\n"
         "Updater-enabled clients verify the manifest signature, SHA-256, Apple Team, and bundle ID. "

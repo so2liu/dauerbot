@@ -2,7 +2,7 @@
 
 Run after cargo build:
   python3 scripts/smoke.py
-Only its private HC_SESSION, terminals and fixture processes are cleaned up.
+Only its private legacy HERDR session, terminals and fixture processes are cleaned up.
 """
 import argparse
 import base64
@@ -12,6 +12,9 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
+import selectors
+import datetime
 import struct
 import subprocess
 import sys
@@ -237,12 +240,16 @@ def main():
     for key in list(env):
         if key.startswith("HC_"):
             env.pop(key)
-    env.update(XDG_CONFIG_HOME=str(run / "xdg-config"), XDG_STATE_HOME=str(run / "xdg-state"))
-    # macOS Unix sockets have a short path limit; keep the isolated endpoint short.
-    runtime_dir = tempfile.TemporaryDirectory(prefix="hfb-smoke-")
-    env["XDG_RUNTIME_DIR"] = runtime_dir.name
-    session = "hfb-smoke-" + uuid.uuid4().hex[:8]
-    env["HC_SESSION"] = session
+    # Keep Unix socket paths below macOS limits and separate from every user service.
+    runtime_dir = tempfile.TemporaryDirectory(prefix="db-smoke-", dir="/tmp")
+    env.update(XDG_CONFIG_HOME=runtime_dir.name, XDG_STATE_HOME=runtime_dir.name + "/state")
+    for name in ("HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "HERDR_SESSION", "HERDR_CONFIG_PATH"):
+        env.pop(name, None)
+    session = "smoke-" + uuid.uuid4().hex[:8]
+    if not real_agent:
+        fixture_home = Path(runtime_dir.name) / "home"
+        fixture_home.mkdir()
+        env.update(HOME=str(fixture_home), SHELL="/bin/sh")
     FIXTURE.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=FIXTURE.server.serve_forever, daemon=True).start()
     sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
@@ -251,11 +258,23 @@ def main():
     checks = []
     try:
         def boot():
-            return subprocess.Popen([str(binary), "--data-dir", str(run), "serve", "--port", str(port), "--core-session", session,
+            return subprocess.Popen([str(binary), "--data-dir", str(run), "serve", "--port", str(port), "--herdr-session", session,
                                      "--feishu-base", f"http://127.0.0.1:{FIXTURE.server.server_port}"], env=env, stdout=log, stderr=log)
         daemon = boot()
         config = wait_for(lambda: json.loads((run / "config.json").read_text()) if (run / "config.json").exists() else None, "no daemon config")
         base = f"http://127.0.0.1:{port}"
+
+        def legacy_rpc(method, params=None):
+            target = Path(runtime_dir.name) / "herdr" / "sessions" / session / "herdr.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+                stream.settimeout(5)
+                stream.connect(str(target))
+                request_id = uuid.uuid4().hex
+                stream.sendall((json.dumps({"id": request_id, "method": method, "params": params or {}}) + "\n").encode())
+                with stream.makefile("r") as reader:
+                    response = json.loads(reader.readline())
+                assert "error" not in response, response
+                return response["result"]
 
         def api(path, data=None, method=None, auth=True):
             headers = {"Content-Type": "application/json"}
@@ -280,7 +299,7 @@ def main():
         elif real_agent:
             extra_args=[]
         else:
-            extra_args=[sys.executable,str(ROOT/"scripts/mock_agent.py"),"{bridge_exe}","{credentials}"]
+            extra_args=[sys.executable,str(ROOT/"scripts/mock_agent.py"),"{bridge_exe}","{credentials}","{native_session}"]
         project = api("/projects", {"name": "端到端验证项目", "path": str(workspace), "agent": real_agent or "custom",
                                    "extra_args": extra_args})
         key = project["id"]
@@ -297,13 +316,33 @@ def main():
             (results / f"real-{real_agent}.json").write_text(json.dumps({"passed": True,"checks": checks,"project":project["id"],"run_dir":str(run)},ensure_ascii=False,indent=2))
             print(f"Real {real_agent} model + MCP + HERDR + simulated Feishu round trip passed.")
             return
-        def terminal_record(address):
-            return json.loads(subprocess.check_output(["hc", "get", address], env=env, text=True, timeout=10))
+        def project_state():
+            return api(f"/projects/{key}")["project"]
 
-        terminal = api(f"/projects/{key}")["project"]["terminal"]
-        subprocess.run(["hc", "keep", terminal], env=env, check=True, capture_output=True, timeout=10)
-        wait_for(lambda: terminal_record(terminal)["keep"] is False, "late App adoption left shell restoration enabled")
-        checks.append("late App adoption keep event disables shell restoration for the owned agent")
+        def settled():
+            work = api(f"/projects/{key}/work")
+            return work if not any(r["status"] in {"submitting", "submitted", "running", "uncertain"} for r in work["runs"]) else None
+
+        wait_for(settled, "initial run did not finish")
+        terminal = project_state()["terminal"]
+        descriptor = api(f"/projects/{key}/show", {}, "POST")
+        assert descriptor["terminal"] == terminal
+        assert descriptor["session"] == session
+        assert "launch_permit" not in descriptor.get("execution", {})
+        view_env = dict(env, HERDR_CONFIG_PATH=config["herdr_config"])
+        observer = subprocess.Popen([config["herdr"], "--session", session, "terminal", "session", "observe", terminal,
+                                     "--cols", "100", "--rows", "30"], env=view_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(observer.stdout, selectors.EVENT_READ)
+                assert selector.select(8), "terminal observer did not produce a frame"
+                frame = json.loads(observer.stdout.readline())
+            assert frame["type"] == "terminal.frame" and frame["encoding"] == "ansi"
+            assert frame["width"] > 0 and frame["height"] > 0 and base64.b64decode(frame["bytes"])
+        finally:
+            observer.terminate(); observer.wait(timeout=5)
+        assert project_state()["terminal"] == terminal and project_state()["ready"]
+        checks.append("native terminal observe stream attaches and detaches without ending the Agent")
         before = len(FIXTURE.messages)
         FIXTURE.emit(message("om_first", "duplicate payload"))
         wait_for(lambda: FIXTURE.acks >= 2, "duplicate event did not receive SDK ack")
@@ -332,25 +371,61 @@ def main():
         wait_for(lambda: any(m["source_id"] == "om_after_restart" for m in api(f"/projects/{key}")["messages"]), "paused event did not persist")
         old_terminal = api(f"/projects/{key}")["project"]["terminal"]
         daemon.terminate(); daemon.wait(timeout=15)
-        subprocess.run(["hc", "keep", old_terminal], env=env, check=True, capture_output=True, timeout=10)
-        assert terminal_record(old_terminal)["keep"] is True
         daemon = boot()
         wait_for(lambda: api("/state"), "daemon did not restart")
-        assert api(f"/projects/{key}")["project"]["terminal"] == old_terminal
-        wait_for(lambda: terminal_record(old_terminal)["keep"] is False, "restart snapshot left shell restoration enabled")
-        checks.append("daemon restart snapshot disables shell restoration after offline App adoption")
+        assert project_state()["terminal"] == old_terminal
         api(f"/projects/{key}/pause", {"paused": False})
         wait_for(lambda: any(m["source_id"] == "om_after_restart" and m["status"] == "acknowledged" for m in api(f"/projects/{key}")["messages"]), "persistent queue did not resume")
-        checks.append("daemon restart preserves agent terminal and resumes persistent paused queue")
-        subprocess.run(["hc", "server", "restart"], env=env, check=True, capture_output=True, timeout=20)
-        FIXTURE.emit(message("om_core_restart", "core restart"))
-        wait_for(lambda: any(m["source_id"] == "om_core_restart" and m["status"] == "acknowledged" for m in api(f"/projects/{key}")["messages"]), "core restart lost conversation")
-        checks.append("isolated Core restart preserves original agent and message flow")
+        wait_for(settled, "resumed run did not finish")
+        checks.append("daemon restart preserves the live legacy execution and durable paused queue")
+
+        # Only this fixture database's clock is advanced; production still uses ten minutes.
+        def age_idle_execution():
+            now = int(time.time() * 1000) - 601_000
+            with sqlite3.connect(run / "bridge.sqlite3") as conn:
+                conn.execute("UPDATE work_executions SET idle_since=?,last_activity=?,warm_until=? WHERE project_id=? AND status='idle'",
+                             (now, now, now + 600_000, key))
+
+        wait_for(lambda: any(e["status"] == "completed" for e in api(f"/projects/{key}/work")["runs"]), "no completed run")
+        wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "execution did not become idle")
+        age_idle_execution()
+        wait_for(lambda: project_state()["terminal"] is None, "idle execution was not retired")
+        assert not legacy_rpc("workspace.list")["workspaces"], "idle retirement left an owned workspace"
+        checks.append("finished fixture execution retires after the persisted ten-minute warm deadline")
+        count = len(FIXTURE.messages)
+        FIXTURE.emit(message("om_wakeup", "wake sleeping project"))
+        wait_for(lambda: any(m["source_id"] == "om_wakeup" and m["status"] == "acknowledged" for m in api(f"/projects/{key}")["messages"]), "new message did not wake the fixture")
+        wait_for(settled, "wakeup run did not finish")
+        assert project_state()["terminal"] != old_terminal and len(FIXTURE.messages) > count
+        assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "wake leaked a workspace"
+        checks.append("Feishu message wakes a fresh execution with the explicit fixture resume marker")
+
+        wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "woken execution did not idle")
+        age_idle_execution()
+        wait_for(lambda: project_state()["terminal"] is None, "fixture did not sleep before timer")
+        due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
+        timer = api(f"/projects/{key}/timers", {"name": "Scheduled wakeup", "prompt": "scheduled-wakeup", "kind": "once",
+                    "at": due.isoformat(), "timezone": "UTC", "to": "oc_fixture", "request_id": "fixture-timer"})
+        wait_for(lambda: "scheduled-wakeup" in str(FIXTURE.messages), "timer did not wake the fixture and deliver its result")
+        wait_for(settled, "timer run did not finish")
+        assert project_state()["terminal"] is not None
+        assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "timer wake leaked a workspace"
+        checks.append("durable one-shot timer wakes a sleeping fixture through the common task inbox")
         cli = subprocess.run([str(binary), "--data-dir", str(run), "project", "list"], capture_output=True, text=True, timeout=10)
         assert cli.returncode == 0 and "端到端验证项目" in cli.stdout
         checks.append("CLI and UI API share the same project state")
+        # A user-added terminal in the same workspace must survive project stop.
+        user_tab = legacy_rpc("layout.apply", {"workspace_id": project_state()["execution"]["workspace_id"],
+                    "focus": False, "root": {"type": "pane", "cwd": str(workspace),
+                    "command": [sys.executable, "-c", "import time; time.sleep(120)"], "label": "Unrelated fixture terminal"}})
+        user_pane = user_tab["layout"]["root"]["pane_id"]
+        user_identity = legacy_rpc("pane.get", {"pane_id": user_pane})["pane"]["terminal_id"]
         # Stopped sessions must retain later messages rather than execute them in a shell.
         api(f"/projects/{key}/stop", {}, "POST")
+        assert legacy_rpc("pane.get", {"pane_id": user_pane})["pane"]["terminal_id"] == user_identity
+        assert len(legacy_rpc("workspace.list")["workspaces"]) == 1
+        checks.append("project stop preserves unrelated user-added terminals in its workspace")
+        legacy_rpc("pane.close", {"pane_id": user_pane})
         FIXTURE.emit(message("om_stopped", "do not deliver to a stopped terminal"))
         wait_for(lambda: any(m["source_id"] == "om_stopped" and m["status"] == "queued" for m in api(f"/projects/{key}")["messages"]), "stopped-session message was not queued")
         checks.append("stopped agent does not consume later messages")
@@ -359,7 +434,7 @@ def main():
     finally:
         if daemon and daemon.poll() is None:
             daemon.terminate(); daemon.wait(timeout=15)
-        subprocess.run(["hc", "server", "stop"], env=env, capture_output=True, timeout=15)
+        subprocess.run(["herdr", "--session", session, "server", "stop"], env=env, capture_output=True, timeout=15)
         FIXTURE.disconnect(); FIXTURE.server.shutdown(); log.close()
         runtime_dir.cleanup()
 

@@ -1,12 +1,12 @@
 # Dauerbot
 
-A native macOS workspace that connects Feishu bot conversations to persistent CLI agents managed by HERDR. Built with Rust and GPUI, with an independent daemon shared by the desktop app, CLI, and MCP server.
+A native macOS workspace that connects Feishu, durable tasks, and schedules to native CLI agents running on demand in HERDR. Built with Rust and GPUI, with an independent daemon shared by the desktop app, CLI, and MCP server.
 
-One bot belongs to one project with one active agent. Direct messages and group messages reach the same main session; the agent chooses where to send its replies. Dauerbot supports Codex, Claude Code, Pi, and Antigravity through their installed CLIs and existing account and model settings. You can watch and take over the real terminal in Herdr App. Dauerbot does not proxy model APIs.
+One bot belongs to one project with one active agent. Direct messages and group messages reach the same main session; the agent chooses where to send its replies. Dauerbot supports Codex, Claude Code, Pi, and Antigravity through their installed CLIs and existing account and model settings. Watch and take over the real terminal directly in Dauerbot. The lightweight daemon stays online; an idle Agent sleeps after ten minutes and wakes for new work. Dauerbot does not proxy model APIs.
 
 ## Install
 
-Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. Install HERDR Core (`hc`) and sign in to the Agent CLI you want to use. Install Herdr App to monitor interactive terminals.
+Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. The published 0.3.4 release uses HERDR Core (`hc`) and Herdr App. The architecture on this branch instead requires legacy **`herdr` 0.9.5** and embeds its terminal directly. These backends are incompatible. Sign in to the native Agent CLI you want to use; Dauerbot keeps its existing login and model settings.
 
 Starting with 0.3.2, releases require Developer ID Application signing, Apple notarization, a stapled ticket, and Gatekeeper acceptance before publication. Intel builds and the minimum supported macOS version have not been verified.
 
@@ -20,7 +20,7 @@ Import the permission JSON supplied by the app, select long connections for even
 
 Create a project by choosing a directory and an Agent CLI. The first project becomes the bot's fixed owner. You do not need a chat ID or a separate chat-binding step. Messages received before project creation stay queued. Additional local projects do not share this bot's messages or sending permissions.
 
-Switch the active CLI in the workspace or with `hfb session switch`. This stops the old agent and starts a new main session while preserving the project, bot binding, and queues. You can also send local tasks through the CLI before connecting Feishu.
+Switch the active CLI in the workspace or with `hfb session switch`. Switching requires the current task to finish or be resolved, then closes the old execution and preserves the project, bot binding, progress and queues. The next task starts the selected CLI with continuity summaries. You can also send local tasks through the CLI before connecting Feishu.
 
 Avoid running another long-connection listener for the same Feishu app: the platform distributes events between listeners, so another program may receive the message instead.
 
@@ -28,7 +28,7 @@ Avoid running another long-connection listener for the same Feishu app: the plat
 
 The desktop renders native GPUI controls. There is no browser interface, WebView, Node.js runtime, or frontend build step. Closing the app leaves its daemon and HERDR agent running.
 
-The workspace shows your projects, connection status, and session controls. Talk to the agent in Feishu; use **Monitor in Herdr App** to watch its execution or take over the terminal. Desktop setup and permission checks have their own navigation entries. Local task input and message history remain available through the CLI rather than the desktop.
+The workspace has project and task controls on the left and the selected Agent's native terminal on the right. Observe is read-only; **Take control** enables direct input, login, model selection, and native prompts. **Release control** returns the session to automatic dispatch. Viewing does not prevent idle sleep. Explicit control pins the execution until released, protecting unsent input even if the desktop crashes. Closing a view disconnects its terminal bridge and leaves the Agent running. Create a task or schedule through its dedicated form; there is no duplicate chat history or message inspector.
 
 Switch between **English** and **简体中文** in the app. The choice takes effect immediately and stays saved on this Mac. Existing projects open directly in the workspace.
 
@@ -44,11 +44,11 @@ Use `--data-dir` for an independent instance. Its window shows an independent-in
 open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
 ```
 
-Use a separate data directory when selecting a different Core session, so saved terminal addresses cannot refer to the wrong Core instance.
+Each data directory derives its own dedicated legacy HERDR session. Migration archives old Core execution addresses without controlling or terminating those processes; projects, credentials, native history references and messages remain intact. Projects with a previous live Core execution stay stopped until you explicitly start or resume them, so the two backends cannot automatically write to the same native conversation.
 
 ## Build and develop
 
-Install Rust and Xcode on macOS. The dependency lockfiles define the exact Rust dependencies. HERDR Core 0.1.20 has been verified locally; a compatible version must provide the same terminal protocol.
+Install Rust and Xcode on macOS. The dependency lockfiles define the exact Rust dependencies. The execution and terminal-stream adapter targets legacy HERDR 0.9.5 / protocol 22. The terminal component uses a licensed Rust fork of gpui-terminal with the Alacritty emulator. See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and lifecycle contracts.
 
 ```sh
 ./scripts/build-desktop.sh
@@ -71,7 +71,7 @@ cargo clippy --locked --release --manifest-path desktop/Cargo.toml --all-targets
 python3 scripts/smoke.py --binary "$PWD/desktop/target/release/hfb"
 ```
 
-The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, and daemon/Core restarts. `--real-pi` or `--real-agent codex|claude` uses your locally configured account for a real model turn and may incur usage charges. Test artifacts stay in ignored directories.
+The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, daemon restarts, embedded terminal connections, warm retirement and task/timer wakeup. It uses private XDG configuration and HERDR sessions, with no real bot or model account. Test artifacts stay in ignored directories.
 
 Live sending is opt-in: `tests/live_feishu.rs` reads `.local/live.json` with `app_id`, `app_secret`, and `chat_id`. Run `cargo test --test live_feishu -- --ignored` only for an explicitly selected bot and recipient, then remove the temporary credentials. It sends a test Markdown message and a small file without opening a competing event listener.
 
@@ -91,15 +91,17 @@ hfb session stop my-project
 hfb session resume my-project
 ```
 
-`--data-dir` is a global argument. For an isolated daemon, use `hfb --data-dir /absolute/private-data serve --port 49322 --core-session my-bridge`.
+`--data-dir` is a global argument. For an isolated daemon, use `hfb --data-dir /absolute/private-data serve --port 49322 --herdr-session my-bridge`.
 
 Dauerbot preserves native CLI account, model, provider, and reasoning settings. It does not invent model flags. On macOS, native agents start through a login shell inside HERDR, loading the same profile exports and proxy settings as your terminal. CLI arguments are passed literally, including prompts and paths with spaces. As configured for this project, Codex uses `--dangerously-bypass-approvals-and-sandbox`, Claude Code and Antigravity use `--dangerously-skip-permissions`, and Pi uses `--approve` for project files. Pi extensions can still enforce their own approval rules.
 
-A main session is a real CLI process in HERDR. The default Core session can appear in a Herdr App tab; an isolated Core session must use CLI attach to avoid opening an unrelated terminal with the same address. Press `Ctrl+\` to detach. Login and permission prompts remain visible in HERDR. Dauerbot confirms recognized Antigravity project-trust prompts only after matching the project path, PID, generation, structured trust state, and selected Yes option; other blocked states retain the queue.
+A main session is a native CLI process owned by the legacy HERDR server. Desktop terminal observation connects to that exact execution; CLI attach remains available for terminal users. Login and permission prompts remain in place, with an actionable attention notice. Dauerbot confirms recognized Claude Code and Antigravity project-trust prompts after verifying the exact project and execution identity. It attempts this once per execution and leaves other prompts for the user.
+
+Use the same CLI's verified native session ID to resume history. Native hooks supply session identity where supported. Cross-CLI switching carries task summaries and files rather than claiming native transcript portability. Model selection stays native unless you explicitly supply an override; the terminal shows native model information, while unconfirmed metadata stays labeled unconfirmed.
 
 | CLI | MCP configuration | Native resume |
 | --- | --- | --- |
-| Codex | Dedicated launch configuration with `--no-daemon`; forwards HERDR terminal identity | `codex resume`, using the session registered through MCP metadata or a supplied ID |
+| Codex | Dedicated launch configuration; enables `--no-daemon` and `--dangerously-bypass-hook-trust` when the installed CLI advertises each flag, and forwards HERDR terminal identity | `codex resume`, using the session registered through MCP metadata or a supplied ID |
 | Claude Code | Project-specific `--mcp-config` | A new UUID for a new session; `--resume` for recovery |
 | Pi | Merges `herdr_feishu` into `.pi/mcp.json` | `--session` |
 | Antigravity (`agy`) | Merges `.agents/mcp_config.json`; `-i` submits the initial interactive prompt | `--conversation` |
@@ -113,7 +115,7 @@ The managed CLI starts `hfb mcp --credentials <private-file>` automatically.
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
 | `session_ready` | Optional `native_session` | Verify the terminal and process generation, then register readiness |
-| `ack_message` | `message_id` | Confirm receipt and unblock the next incoming message |
+| `ack_message` | `message_id` | Confirm receipt of the nested Feishu message and its linked event |
 | `send_markdown` | `to`, `text`, `request_id` | Send Markdown to the chosen chat or user |
 | `send_file` | `to`, `path`, `request_id` | Stream a local file, up to 100 MB |
 
@@ -121,7 +123,7 @@ The managed CLI starts `hfb mcp --credentials <private-file>` automatically.
 
 Incoming messages use an escaped XML envelope with source IDs, sender, body, attachments, mentions, and thread context. Group messages include a bounded member snapshot when available. Direct messages omit group-only `<chat>` and `<members>` elements; they do not emit `not_applicable` placeholders. Missing group permissions produce `status="unavailable"` without blocking the message. User text remains untrusted input, even inside XML.
 
-SQLite stores incoming and outgoing messages. Incoming events persist before SDK acknowledgment and deduplicate by project and platform message ID. Each project's queue waits for the agent's explicit acknowledgment before delivering the next message.
+SQLite stores incoming and outgoing messages. Incoming events persist before SDK acknowledgment and deduplicate by project and platform message ID. Each project serializes runs. Acknowledgment confirms receipt; `finish_run` ends the current run before the next task is dispatched.
 
 | Status | Meaning |
 | --- | --- |
@@ -133,7 +135,32 @@ SQLite stores incoming and outgoing messages. Incoming events persist before SDK
 | `uncertain` | Verify the result before retrying |
 | `dismissed` | Manually excluded from blocking delivery |
 
-Restarts preserve uncertain operations instead of blindly resending. PTY input and Feishu have no atomic transaction, so Dauerbot does not promise exactly-once delivery. It checks Core labels, PID, generation, and program identity before typing; exited agents and replacement shells do not receive queued tasks.
+Restarts preserve uncertain operations instead of blindly resending. PTY input and Feishu have no atomic transaction, so Dauerbot does not promise exactly-once delivery. It checks legacy metadata, root PID, generation, and foreground program identity before typing; exited agents and replacement shells do not receive queued tasks.
+
+## Tasks, schedules, and Agent tools
+
+Tasks, events, runs and timers live in SQLite independently of Agent processes. Once a native run has finished, the supervisor verifies idle state, queue emptiness, background jobs, session continuity and human takeover before beginning a ten-minute warm period. New work reuses a warm Agent or resumes a sleeping one. Stopping a project disables automatic wakeup until started again.
+
+```sh
+hfb task add my-project "Review dependencies" "Check for useful dependency updates"
+hfb task list my-project
+hfb timer add my-project "Daily review" "Review open tasks" --kind cron --cron '0 9 * * 1-5' --timezone Asia/Shanghai
+hfb timer add my-project "Follow up" "Check the build result" --kind once --at '2026-12-01T09:00:00+08:00' --timezone Asia/Shanghai
+hfb timer list my-project
+hfb work my-project
+hfb decision DECISION_ID "Proceed with the proposed approach"
+hfb event dismiss EVENT_ID
+# Retry only after checking whether the previous attempt already performed work.
+hfb event retry EVENT_ID
+```
+
+Schedules support once, interval and UNIX five-field cron expressions with IANA timezones. Recurring work coalesces missed occurrences after downtime and avoids piling up another occurrence while one remains pending. Editing or cancelling a timer removes unsubmitted occurrences of its old revision. Active work requires execution cancellation or explicit uncertain-result recovery.
+
+The MCP server exposes `session_ready`, `ack_message`, `ack_event`, `send_markdown`, `send_file`, `create_task`, `list_work`, `checkpoint`, `finish_run`, `schedule_task`, `request_decision`, `answer_decision`, `register_job`, and `complete_job`. Creation tools require stable request IDs for safe retries. Markdown/file recipients remain mandatory and Agent-selected. A checkpoint also writes readable task progress under the selected project's `.dauerbot/tasks/` directory.
+
+Register background commands and subagents before launching them; report their completion so retirement can proceed. `hfb job register` and `hfb job complete` support external child reporting. Native hidden background activity still needs adapter evidence: silence and an answer on screen never prove quiescence. If an idle Agent omits `finish_run`, Dauerbot shows an unfinished-task notice after a grace period; review the result before retrying or dismissing its event. A deferred business decision can release the process; a native login or permission prompt retains its live terminal. Decisions and resolved child jobs create events through the same inbox.
+
+An interrupted child can keep a task uncertain. Stop the project's execution, review the child result, and record your decision with `hfb job abandon JOB_ID "Reason for abandoning the reviewed work"`. Then retry or dismiss the parent event. Abandonment records the review without inventing a successful result; late completion reports cannot overwrite it.
 
 ## Updates and releases
 

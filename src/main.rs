@@ -30,9 +30,9 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
         #[arg(long)]
-        core_session: Option<String>,
+        herdr: Option<String>,
         #[arg(long)]
-        hc: Option<String>,
+        herdr_session: Option<String>,
         #[arg(long, hide = true)]
         feishu_base: Option<String>,
     },
@@ -49,6 +49,34 @@ enum Commands {
     Session {
         #[command(subcommand)]
         command: Sessions,
+    },
+    /// Manage durable tasks
+    Task {
+        #[command(subcommand)]
+        command: Tasks,
+    },
+    /// Resolve a task event after reviewing its saved result
+    Event {
+        #[command(subcommand)]
+        command: Events,
+    },
+    /// Manage durable schedules
+    Timer {
+        #[command(subcommand)]
+        command: Timers,
+    },
+    /// Report background work independently of the main Agent process
+    Job {
+        #[command(subcommand)]
+        command: Jobs,
+    },
+    /// Inspect project work or answer a pending decision
+    Work {
+        project: String,
+    },
+    Decision {
+        id: String,
+        answer: String,
     },
     /// Manage messages
     Message {
@@ -147,6 +175,78 @@ enum Sessions {
         project: String,
         #[arg(long)]
         agent: String,
+    },
+}
+#[derive(Subcommand)]
+enum Jobs {
+    Register {
+        project: String,
+        run_id: String,
+        name: String,
+    },
+    Complete {
+        project: String,
+        job_id: String,
+        summary: String,
+        #[arg(long)]
+        failed: bool,
+    },
+    /// Record reviewed child work as abandoned after stopping its execution
+    Abandon { job_id: String, reason: String },
+}
+#[derive(Subcommand)]
+enum Tasks {
+    List {
+        project: String,
+    },
+    Add {
+        project: String,
+        title: String,
+        instructions: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
+    Cancel {
+        id: String,
+    },
+}
+#[derive(Subcommand)]
+enum Events {
+    /// Retry work explicitly; review its result first to avoid repeated effects
+    Retry { id: String },
+    /// Dismiss an event after reviewing its result
+    Dismiss { id: String },
+}
+#[derive(Subcommand)]
+enum Timers {
+    List {
+        project: String,
+    },
+    Add {
+        project: String,
+        name: String,
+        prompt: String,
+        #[arg(long,value_parser=["once","interval","cron"])]
+        kind: String,
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long)]
+        interval_seconds: Option<i64>,
+        #[arg(long)]
+        cron: Option<String>,
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
+    Remove {
+        id: String,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
     },
 }
 #[derive(Subcommand)]
@@ -338,19 +438,19 @@ async fn main() -> Result<()> {
     let mut cfg = Config::load(&dir)?;
     if let Commands::Serve {
         port,
-        core_session,
-        hc,
+        herdr,
+        herdr_session,
         feishu_base,
     } = cli.command
     {
         if let Some(port) = port {
             cfg.port = port;
         }
-        if let Some(session) = core_session {
-            cfg.core_session = session;
+        if let Some(path) = herdr {
+            cfg.herdr = path;
         }
-        if let Some(hc) = hc {
-            cfg.hc = hc;
+        if let Some(session) = herdr_session {
+            cfg.herdr_session = session;
         }
         if let Some(base) = feishu_base {
             cfg.feishu_base = base;
@@ -409,6 +509,14 @@ async fn main() -> Result<()> {
             .build()?,
         cfg: cfg.clone(),
     };
+    if !matches!(&cli.command, Commands::Init | Commands::Service) {
+        let state = client.request("GET", "/state", None).await?;
+        if state["api_protocol"].as_u64() != Some(api::PROTOCOL) {
+            bail!(
+                "An incompatible Dauerbot daemon is using this data directory. Stop the old daemon and run this build's hfb serve, or use --data-dir for an independent instance."
+            );
+        }
+    }
     let value=match cli.command{
         Commands::Init=>json!({"data_dir":dir,"url":cfg.url()}),
         Commands::Status=>client.request("GET","/state",None).await?,
@@ -435,13 +543,20 @@ async fn main() -> Result<()> {
             }
             if let Sessions::Attach{project}=command{
                 let id=client.id(&project).await?;
-                let p=client.request("GET",&format!("/projects/{id}"),None).await?;
-                let terminal=p["project"]["terminal"].as_str().context("The project has no main session")?;
+                let descriptor=client.request("GET",&format!("/projects/{id}/terminal"),None).await?;
+                let terminal=descriptor["terminal_id"].as_str().context("The project has no main terminal")?;
+                let generation=descriptor["generation"].as_str().context("The execution identity is missing")?;
+                let lease=|active|Some(json!({"generation":generation,"active":active}));
+                client.request("POST",&format!("/projects/{id}/takeover"),lease(true)).await?;
                 let status=herdr_feishu_bridge::herdr::command(&cfg)
-                    .args(["attach",terminal])
+                    .args(["terminal","attach",terminal])
                     .stdin(std::process::Stdio::inherit()).stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit())
-                    .status().await?;
-                if !status.success(){bail!("Terminal attach ended; hc returned {}",status);}
+                    .status().await;
+                match status {
+                    Ok(status) if status.success()=>{client.request("POST",&format!("/projects/{id}/takeover"),lease(false)).await?;},
+                    Ok(status)=>bail!("Terminal attach ended with {status}. The control pin remains; release it in Dauerbot after checking your input."),
+                    Err(error)=>{let _=client.request("POST",&format!("/projects/{id}/takeover"),lease(false)).await;return Err(error.into())},
+                }
                 return Ok(())
             }
             let (project,operation)=match command{
@@ -452,6 +567,32 @@ async fn main() -> Result<()> {
             };
             let id=client.id(&project).await?;client.request(if operation=="screen"{"GET"}else{"POST"},&format!("/projects/{id}/{operation}"),None).await?
         }
+        Commands::Job{command}=>match command {
+            Jobs::Register{project,run_id,name}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/jobs"),Some(json!({"run_id":run_id,"name":name}))).await?},
+            Jobs::Complete{project,job_id,summary,failed}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/job-complete"),Some(json!({"job_id":job_id,"summary":summary,"status":if failed{"failed"}else{"completed"}}))).await?},
+            Jobs::Abandon{job_id,reason}=>client.request("POST",&format!("/jobs/{job_id}/abandon"),Some(json!({"reason":reason}))).await?,
+        },
+        Commands::Work{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}/work"),None).await?},
+        Commands::Event{command}=> {
+            let (id,action)=match command {
+                Events::Retry{id}=>(id,"retry"),
+                Events::Dismiss{id}=>(id,"dismiss"),
+            };
+            client.request("POST",&format!("/events/{id}/resolve"),Some(json!({"action":action}))).await?
+        },
+        Commands::Decision{id,answer}=>client.request("POST",&format!("/decisions/{id}/answer"),Some(json!({"answer":answer}))).await?,
+        Commands::Task{command}=>match command {
+            Tasks::List{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}/tasks"),None).await?},
+            Tasks::Add{project,title,instructions,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/tasks"),Some(json!({"title":title,"instructions":instructions,"to":to}))).await?},
+            Tasks::Cancel{id}=>client.request("POST",&format!("/tasks/{id}/cancel"),None).await?,
+        },
+        Commands::Timer{command}=>match command {
+            Timers::List{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}/timers"),None).await?},
+            Timers::Add{project,name,prompt,kind,at,interval_seconds,cron,timezone,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/timers"),Some(json!({"name":name,"prompt":prompt,"kind":kind,"at":at,"interval_seconds":interval_seconds,"cron":cron,"timezone":timezone,"to":to}))).await?},
+            Timers::Remove{id}=>client.request("DELETE",&format!("/timers/{id}"),None).await?,
+            Timers::Pause{id}=>client.request("POST",&format!("/timers/{id}/pause"),Some(json!({"enabled":false}))).await?,
+            Timers::Resume{id}=>client.request("POST",&format!("/timers/{id}/pause"),Some(json!({"enabled":true}))).await?,
+        },
         Commands::Message{command}=>match command{
             Messages::Inject{project,text}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/messages"),Some(json!({"content":text}))).await?}
             Messages::Send{project,text,request_id,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"content":text,"to":to,"request_id":request_id.unwrap_or_else(db::id)}))).await?}
