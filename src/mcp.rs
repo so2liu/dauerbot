@@ -49,6 +49,67 @@ pub struct File {
     pub request_id: String,
 }
 
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct EventAck {
+    pub event_id: String,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct Finish {
+    pub run_id: String,
+    pub outcome: String,
+    pub summary: String,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct Checkpoint {
+    pub task_id: String,
+    pub summary: String,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct CreateTask {
+    pub request_id: String,
+    pub title: String,
+    pub instructions: String,
+    pub to: Option<String>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct ScheduleTask {
+    /// Stable ID for this schedule creation; reuse on retries.
+    pub request_id: String,
+    pub name: String,
+    pub prompt: String,
+    /// once, interval, or cron
+    pub kind: String,
+    /// RFC3339 timestamp for one-shot schedules.
+    pub at: Option<String>,
+    pub interval_seconds: Option<u64>,
+    pub cron: Option<String>,
+    /// IANA timezone such as Asia/Shanghai or America/New_York.
+    pub timezone: String,
+    pub to: Option<String>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct Decision {
+    pub run_id: String,
+    pub question: String,
+    pub to: Option<String>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct Answer {
+    pub decision_id: String,
+    pub answer: String,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct Job {
+    pub run_id: String,
+    pub name: String,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct JobDone {
+    pub job_id: String,
+    pub summary: String,
+    pub status: String,
+}
+
 impl BridgeMcp {
     async fn post(&self, operation: &str, body: Value) -> Result<Value> {
         let response = self
@@ -76,8 +137,8 @@ impl BridgeMcp {
         Ok(result)
     }
     async fn ready(&self, native: &str) -> Result<Value> {
-        let terminal = std::env::var("HC_TERMINAL_ID")
-            .context("HERDR terminal identity is missing; use --no-daemon with Codex")?;
+        let terminal = std::env::var("HERDR_PANE_ID")
+            .context("Legacy HERDR pane identity is missing; launch through Dauerbot")?;
         self.post("ready",json!({"generation":self.credentials.generation,"terminal":terminal,"native_session":native})).await
     }
 }
@@ -133,6 +194,93 @@ impl BridgeMcp {
         )
     }
     #[tool(
+        description = "Confirm receipt of the current durable event. This is not task completion."
+    )]
+    async fn ack_event(
+        &self,
+        Parameters(input): Parameters<EventAck>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("event-ack", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Finish the current run with completed, noop, deferred, or failed and a useful progress summary. Settle native background work first; registered active jobs prevent completion and retirement."
+    )]
+    async fn finish_run(
+        &self,
+        Parameters(input): Parameters<Finish>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("finish", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Persist a task progress summary before waiting, sleeping, or switching Agent. Durable progress is independent of native conversation history."
+    )]
+    async fn checkpoint(
+        &self,
+        Parameters(input): Parameters<Checkpoint>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("checkpoint", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Inspect this project's durable tasks, runs, timers, decisions and background jobs."
+    )]
+    async fn list_work(&self) -> Result<CallToolResult, ErrorData> {
+        result(self.post("work", json!({})).await, false)
+    }
+    #[tool(
+        description = "Create a durable task for this project. It runs through the same main session queue and wakes the Agent when eligible."
+    )]
+    async fn create_task(
+        &self,
+        Parameters(input): Parameters<CreateTask>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("tasks", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Schedule future work: once with RFC3339 at, interval with interval_seconds, or cron with a five-field expression. Specify IANA timezone. The daemon persists the timer and wakes this Agent when due; no need to keep the process alive."
+    )]
+    async fn schedule_task(
+        &self,
+        Parameters(input): Parameters<ScheduleTask>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("timers", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Persist a user decision and defer the current task. Native login and permission prompts must remain in the interactive terminal instead. Choose a responsible Feishu recipient in to when known."
+    )]
+    async fn request_decision(
+        &self,
+        Parameters(input): Parameters<Decision>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("decision", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Record the user's answer to a pending decision. The answer creates a durable event for the original task."
+    )]
+    async fn answer_decision(
+        &self,
+        Parameters(input): Parameters<Answer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("decision-answer", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Register a background command or subagent job before launching it. Active jobs prevent this execution from being retired."
+    )]
+    async fn register_job(
+        &self,
+        Parameters(input): Parameters<Job>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("jobs", json!(input)).await, false)
+    }
+    #[tool(
+        description = "Report a registered background job completed or failed, with a useful result summary."
+    )]
+    async fn complete_job(
+        &self,
+        Parameters(input): Parameters<JobDone>,
+    ) -> Result<CallToolResult, ErrorData> {
+        result(self.post("job-complete", json!(input)).await, false)
+    }
+    #[tool(
         description = "Send Markdown to the Feishu chat or user selected in to. Use oc_ for chat IDs or ou_ for user Open IDs; replies may go to a different destination. Use a unique request_id for each message and reuse it only for retries with the same content and recipient. Only status=sent confirms success."
     )]
     async fn send_markdown(
@@ -169,7 +317,7 @@ impl BridgeMcp {
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("You are the project's Feishu main session. Call session_ready first and ack_message for incoming messages. Reply with send_markdown or send_file, choosing the mandatory to field (oc_ chat ID or ou_ user Open ID) according to user intent. It may differ from the source. Terminal output alone does not deliver a reply.")
+            .with_instructions("You are the project's Feishu main session. Call session_ready first, ack_event for each durable event, and ack_message for nested Feishu messages. Persist progress and call finish_run when settled. Register background jobs and use schedule_task or request_decision for later work. Reply with send_markdown or send_file, choosing the mandatory to field (oc_ chat ID or ou_ user Open ID) according to user intent. It may differ from the source. Terminal output alone does not deliver a reply.")
     }
 }
 pub async fn serve(path: &Path) -> Result<()> {
@@ -197,7 +345,7 @@ pub async fn serve(path: &Path) -> Result<()> {
     }
     if !registered {
         bail!(
-            "Cannot register the main terminal identity. Refusing to expose this project's tools to another terminal. Check daemon availability, HC_TERMINAL_ID, and Codex --no-daemon."
+            "Cannot register the main terminal identity. Refusing to expose this project's tools to another terminal. Check daemon availability and the legacy HERDR_PANE_ID environment."
         );
     }
     server

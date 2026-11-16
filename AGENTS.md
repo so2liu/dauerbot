@@ -6,7 +6,7 @@ The user-facing client is the native Rust/GPUI macOS application in `desktop/`. 
 
 Check macOS access against paths that the user explicitly selects. Do not scan private databases, call private TCC APIs, or treat one accessible file as proof of Full Disk Access. Explain that the desktop, daemon, HERDR, and Agent can have different permissions.
 
-Do not change a user's real Core/App configuration or terminate their terminals. HERDR tests must use an isolated `HC_SESSION` and a short `XDG_RUNTIME_DIR`. Keep the default bundle ID and data directory compatible across renames and upgrades; clearly label windows that use independent data directories.
+Product execution uses legacy `herdr` 0.9.5, not the incompatible `hc`/herdr-core backend. Keep runtime control behind the legacy backend module; desktop observes or controls the same execution through its native terminal stream. Do not change a user's real HERDR configuration or terminate their terminals. Legacy HERDR tests must use a private `XDG_CONFIG_HOME`, named `HERDR_SESSION`, and a short temporary path. Development delegation through herdr-subagents continues to use `hc` as directed by that skill, separately from product execution. Keep the default bundle ID and data directory compatible across renames and upgrades; clearly label windows that use independent data directories.
 
 Keep credentials out of Git, logs, and screenshots. Live Feishu tests must name the intended bot and chat and must not compete with an existing bot's event listener. Message submission does not prove completion; preserve `uncertain` results rather than retrying automatically.
 
