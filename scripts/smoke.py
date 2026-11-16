@@ -226,7 +226,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, help="use an already built bridge executable")
     parser.add_argument("--real-pi", action="store_true", help="one real model turn using the locally configured Pi account")
-    parser.add_argument("--real-agent",choices=["codex","claude","pi"],help="one real CLI/model turn; may incur model charges")
+    parser.add_argument("--real-agent",choices=["codex","claude","pi","agy"],help="one real CLI/model turn; may incur model charges")
     args = parser.parse_args()
     real_agent=args.real_agent or ("pi" if args.real_pi else None)
     binary = args.binary or ROOT / "target/debug/hfb"
@@ -238,7 +238,7 @@ def main():
     results = ROOT / "test-results"; results.mkdir(exist_ok=True,mode=0o700); results.chmod(0o700)
     env = os.environ.copy()
     for key in list(env):
-        if key.startswith("HC_"):
+        if key.startswith("HC_") or key in ("SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY", "SSH_ORIGINAL_COMMAND"):
             env.pop(key)
     # Keep Unix socket paths below macOS limits and separate from every user service.
     runtime_dir = tempfile.TemporaryDirectory(prefix="db-smoke-", dir="/tmp")
@@ -256,6 +256,12 @@ def main():
     log = (run / "daemon.log").open("w")
     daemon = None
     checks = []
+    agy_config = Path.home() / ".gemini/config/mcp_config.json"
+    agy_original = agy_config.read_bytes() if real_agent == "agy" and agy_config.exists() else None
+    if agy_original is not None:
+        backup = run / "original-agy-mcp.json"
+        backup.write_bytes(agy_original)
+        backup.chmod(0o600)
     try:
         def boot():
             return subprocess.Popen([str(binary), "--data-dir", str(run), "serve", "--port", str(port), "--herdr-session", session,
@@ -431,12 +437,27 @@ def main():
         checks.append("stopped agent does not consume later messages")
         (results / "smoke.json").write_text(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))
         print(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))
+    except Exception:
+        if real_agent and "key" in locals():
+            try:
+                diagnostic = run / "failure-screen.json"
+                diagnostic.write_text(json.dumps(api(f"/projects/{key}/screen"), ensure_ascii=False, indent=2))
+                diagnostic.chmod(0o600)
+            except Exception:
+                pass
+        raise
     finally:
         if daemon and daemon.poll() is None:
             daemon.terminate(); daemon.wait(timeout=15)
         subprocess.run(["herdr", "--session", session, "server", "stop"], env=env, capture_output=True, timeout=15)
         FIXTURE.disconnect(); FIXTURE.server.shutdown(); log.close()
         runtime_dir.cleanup()
+        if real_agent == "agy":
+            if agy_original is None:
+                agy_config.unlink(missing_ok=True)
+            else:
+                agy_config.write_bytes(agy_original)
+                agy_config.chmod(0o600)
 
 
 if __name__ == "__main__":

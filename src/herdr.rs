@@ -94,6 +94,10 @@ impl ExecutionRef {
 fn command_environment(config: &Config, cmd: &mut Command) {
     // Never route product traffic through the development agent's terminal.
     for key in [
+        "SSH_CLIENT",
+        "SSH_CONNECTION",
+        "SSH_TTY",
+        "SSH_ORIGINAL_COMMAND",
         "HC_SESSION",
         "HC_TERMINAL_ID",
         "HC_TERMINAL_SOCKET",
@@ -744,10 +748,16 @@ pub fn quiescent(p: &Project, record: &Value) -> bool {
             let credential = ExecutionRef::from_project(p)
                 .ok()
                 .map(|execution| execution.launch_permit.with_file_name("credentials.json"));
-            argv.len() == 4
+            let managed_dir = credential.as_ref().and_then(|path| path.ancestors().nth(4));
+            let generation_entry = argv.len() == 4
                 && argv[1] == "mcp"
                 && argv[2] == "--credentials"
-                && argv[3].as_str().map(Path::new) == credential.as_deref()
+                && argv[3].as_str().map(Path::new) == credential.as_deref();
+            let managed_entry = argv.len() == 4
+                && argv[1] == "--data-dir"
+                && argv[2].as_str().map(Path::new) == managed_dir
+                && argv[3] == "mcp";
+            (generation_entry || managed_entry)
                 && argv[0].as_str().is_some_and(|program| {
                     same_program(
                         program,

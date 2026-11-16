@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Register Antigravity CLI's MCP server in its supported global configuration. Each invocation resolves the active project and generation from verified HERDR identity; ordinary CLI sessions receive no project tools.
+- Start managed native sessions without SSH connection markers that make agy ignore the Mac's existing keychain login. Keep native model, proxy and SSH agent settings.
+
 ## 0.4.1 — 2026-11-16
 
 ### Fixed

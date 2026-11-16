@@ -11,7 +11,7 @@ pub mod mcp;
 pub mod update;
 pub mod work;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use config::Config;
 use db::{Db, Project};
 use rusqlite::OptionalExtension;
@@ -137,9 +137,15 @@ impl App {
             herdr::merge_mcp(&PathBuf::from(&p.path).join(".pi/mcp.json"), &pi_entry)?;
         }
         if p.agent == "agy" {
+            let home =
+                directories::BaseDirs::new().context("Cannot locate the user's home directory")?;
+            let global_entry = json!({
+                "command":std::env::current_exe()?,
+                "args":["--data-dir",self.dir,"mcp"]
+            });
             herdr::merge_mcp(
-                &PathBuf::from(&p.path).join(".agents/mcp_config.json"),
-                &entry,
+                &home.home_dir().join(".gemini/config/mcp_config.json"),
+                &global_entry,
             )?;
         }
         let instructions = format!(
