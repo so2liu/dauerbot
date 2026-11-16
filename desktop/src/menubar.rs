@@ -174,19 +174,42 @@ fn anchor_popover(window: &Window, cx: &App) {
         return;
     };
     let anchor = status_window.frame();
-    let mut top_left = anchor.origin;
-    top_left.x += anchor.size.width / 2. - native.frame().size.width / 2.;
-    top_left.y -= 6.;
+    let mut frame = native.frame();
     if let Some(screen) = status_window.screen() {
         let visible = screen.visibleFrame();
-        top_left.x = top_left.x.clamp(
-            visible.origin.x + 8.,
-            visible.origin.x + visible.size.width - native.frame().size.width - 8.,
+        let [left, bottom, width, height] = constrained_popover(
+            [frame.size.width, frame.size.height],
+            [anchor.origin.x + anchor.size.width / 2., anchor.origin.y],
+            [
+                visible.origin.x,
+                visible.origin.y,
+                visible.size.width,
+                visible.size.height,
+            ],
         );
-        // Keep the panel under the icon on displays with different scales or origins.
-        top_left.y = top_left.y.min(visible.origin.y + visible.size.height);
+        frame.origin.x = left;
+        frame.origin.y = bottom;
+        frame.size.width = width;
+        frame.size.height = height;
+        // AppKit resize notifications update GPUI's viewport; the project list scrolls.
+        native.setFrame_display(frame, false);
+    } else {
+        let mut top_left = anchor.origin;
+        top_left.x += anchor.size.width / 2. - frame.size.width / 2.;
+        top_left.y -= 6.;
+        native.setFrameTopLeftPoint(top_left);
     }
-    native.setFrameTopLeftPoint(top_left);
+}
+
+/// Cocoa screen coordinates increase upward. Returns the panel's bottom-left frame.
+fn constrained_popover(panel: [f64; 2], anchor: [f64; 2], visible: [f64; 4]) -> [f64; 4] {
+    let width = panel[0].min((visible[2] - 16.).max(1.));
+    let top = (anchor[1] - 6.).min(visible[1] + visible[3] - 8.);
+    let height = panel[1].min((top - visible[1] - 8.).max(1.));
+    let left_min = visible[0] + 8.;
+    let left_max = (visible[0] + visible[2] - 8. - width).max(left_min);
+    let left = (anchor[0] - width / 2.).clamp(left_min, left_max);
+    [left, top - height, width, height]
 }
 
 struct MenuPanel {
@@ -382,4 +405,30 @@ fn status_icon() -> Result<Icon> {
         }
     }
     Ok(Icon::from_rgba(rgba, 36, 36)?)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::constrained_popover;
+
+    #[test]
+    fn tall_project_panel_stays_inside_short_and_offset_displays() {
+        for (anchor, visible) in [
+            ([1400., 600.], [0., 0., 1440., 580.]),
+            ([-10., 580.], [-1280., 0., 1280., 560.]),
+            ([1400., -25.], [0., -900., 1440., 875.]),
+        ] {
+            let [left, bottom, width, height] = constrained_popover([324., 628.], anchor, visible);
+            assert!(left >= visible[0] + 8.);
+            assert!(left + width <= visible[0] + visible[2] - 8.);
+            assert!(bottom >= visible[1] + 8.);
+            assert!(bottom + height <= visible[1] + visible[3] - 8.);
+            assert!(bottom + height <= anchor[1] - 6.);
+            assert_eq!(width, 324.);
+        }
+        let frame = constrained_popover([324., 628.], [1400., 600.], [0., 0., 1440., 580.]);
+        assert!(frame[3] < 628.);
+        let frame = constrained_popover([324., 628.], [1400., 920.], [0., 0., 1440., 900.]);
+        assert_eq!(frame[3], 628.);
+    }
 }
