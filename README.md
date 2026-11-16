@@ -6,7 +6,7 @@ One bot belongs to one project with one active agent. Direct messages and group 
 
 ## Install
 
-Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. The published 0.3.4 release uses HERDR Core (`hc`) and Herdr App. The current source requires **`herdr` 0.9.5** and embeds its terminal directly; it does not support the former execution backend. Sign in to the native Agent CLI you want to use; Dauerbot keeps its existing login and model settings.
+Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. Version 0.4.0 requires **`herdr` 0.9.5** and embeds its terminal directly. Earlier Dauerbot releases used HERDR Core (`hc`) and Herdr App; that execution backend is no longer supported. Sign in to the native Agent CLI you want to use; Dauerbot keeps its existing login and model settings.
 
 Starting with 0.3.2, releases require Developer ID Application signing, Apple notarization, a stapled ticket, and Gatekeeper acceptance before publication. Intel builds and the minimum supported macOS version have not been verified.
 
