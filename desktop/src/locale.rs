@@ -21,6 +21,133 @@ impl Language {
             return source.to_owned();
         }
         let translated = match source {
+            "Paste is larger than 1 MiB" => "粘贴内容超过 1 MiB",
+            "Terminal input is busy; try again." => "终端输入繁忙，请重试。",
+            "Terminal frame exceeded the size limit" => "终端画面超过大小限制",
+            "Terminal connection closed. Reconnect to view it again." => {
+                "终端连接已关闭，请重新连接。"
+            }
+            "Session preserved" => "已保留原会话",
+            "Previous Core session preserved; Start/Resume to use the new backend" => {
+                "原 Core 会话已保留。点击“启动 / 恢复”使用新的运行方式。"
+            }
+            "Got it" => "知道了",
+            "What did you verify?" => "你确认了哪些情况？",
+            "Background work needs review" => "需要确认后台任务",
+            "Stop the parent session, verify any remaining child work, and record what you checked." => {
+                "请先停止主会话，确认剩余子任务的状态，并记录检查结果。"
+            }
+            "Abandon reviewed job" => "放弃已检查的子任务",
+            "Describe what you checked first" => "请先填写检查结果",
+            "Record this job as abandoned?" => "将这个子任务记录为已放弃？",
+            "This records your review. It does not terminate an external process." => {
+                "这会保存你的检查结果，不会结束外部进程。"
+            }
+            "Review saved" => "检查结果已保存",
+            "Review task result" => "查看任务结果",
+            "Check the terminal and saved work before retrying or dismissing this task." => {
+                "重试或忽略任务前，请先查看终端和已保存的工作。"
+            }
+            "Retry task" => "重试任务",
+            "Dismiss task" => "忽略任务",
+            "Retry this task?" => "重试这个任务？",
+            "Dismiss this task?" => "忽略这个任务？",
+            "The agent may already have changed files or sent a reply. Continue after reviewing its work." => {
+                "智能体可能已经修改了文件或发出回复。请先检查已完成的工作。"
+            }
+            "The task will stop waiting. Existing files and sent replies remain." => {
+                "任务将停止等待，现有文件和已发出的回复会保留。"
+            }
+            "Task dismissed" => "任务已忽略",
+            "Show terminal" => "显示终端",
+            "Hide terminal" => "收起终端",
+            "Pause" => "暂停",
+            "Enable" => "启用",
+            "Remove project…" => "移除项目…",
+            "Remove this project?" => "移除这个项目？",
+            "Stop its session first. Project files remain on disk." => {
+                "请先停止会话。项目文件仍会保留在磁盘上。"
+            }
+            "Project removed" => "项目已移除",
+            "Connecting to the live terminal…" => "正在连接实时终端…",
+            "Project is stopped. Start it to run tasks." => "项目已停止，启动后即可执行任务。",
+            "Agent needs attention. Review the project notice." => {
+                "智能体需要处理，请查看项目提示。"
+            }
+            "Your answer" => "你的回答",
+            "Your answer is needed" => "需要你的回答",
+            "Send answer" => "提交回答",
+            "Answer saved" => "回答已保存",
+            "Manual control is reserved" => "会话已保留人工控制",
+            "Release the reservation to let queued tasks continue, or take control in the terminal." => {
+                "交还控制后，排队任务会继续执行；也可以在右侧接管终端。"
+            }
+            "Release reservation" => "交还控制",
+            "Your agent, inside Dauerbot" => "在 Dauerbot 中操作智能体",
+            "Watch and operate the live terminal in this app. Closing the window leaves tasks running." => {
+                "直接在应用内查看和操作终端，关闭窗口后任务继续运行。"
+            }
+            "Live terminal" => "实时终端",
+            "You are in control" => "正在由你操作",
+            "Take control" => "接管操作",
+            "Release control" => "交还控制",
+            "Reconnect" => "重新连接",
+            "Viewing only · Take control to type or scroll history" => {
+                "只读查看 · 接管后可输入及滚动历史"
+            }
+            "Choose a project to view its agent" => "选择项目，查看智能体",
+            "Agent is sleeping. Tasks and schedules will wake it automatically." => {
+                "智能体正在休眠，任务和定时计划会自动唤醒它。"
+            }
+            "Needs attention" => "需要处理",
+            "Start / resume" => "启动 / 继续",
+            "Resume delivery" => "恢复消息投递",
+            "Pause delivery" => "暂停消息投递",
+            "Delivery settings saved" => "消息投递设置已保存",
+            "Stop" => "停止",
+            "Session stopped" => "会话已停止",
+            "Model" => "模型",
+            "Model follows the CLI's own settings" => "模型沿用 CLI 中的设置",
+            "Tasks & schedules" => "任务与计划",
+            "＋ New task" => "＋ 新建任务",
+            "Task name" => "任务名称",
+            "What should the agent do?" => "希望智能体做什么？",
+            "Schedule" => "执行时间",
+            "Reply destination (optional)" => "回复目标（可选）",
+            "Run now" => "立即执行",
+            "Once" => "单次",
+            "Interval" => "固定间隔",
+            "Cron" => "Cron 计划",
+            "Start time (RFC 3339)" => "开始时间（RFC 3339）",
+            "Repeat every (seconds)" => "间隔（秒）",
+            "Cron expression (five fields)" => "Cron 表达式（五个字段）",
+            "Time zone" => "时区",
+            "Save schedule" => "保存计划",
+            "Create task" => "创建任务",
+            "Enter a task name and instructions" => "请输入任务名称和具体要求",
+            "Task queued" => "任务已进入队列",
+            "Enter a positive interval in seconds" => "请输入大于零的间隔秒数",
+            "Schedule saved" => "计划已保存",
+            "Schedule created" => "计划已创建",
+            "Task cancelled" => "任务已取消",
+            "Schedule removed" => "计划已移除",
+            "Sleeping" => "休眠中",
+            "sleeping" => "休眠中",
+            "starting" => "启动中",
+            "ready" => "已就绪",
+            "busy" => "执行中",
+            "needs_attention" => "需要处理",
+            "paused" => "已暂停",
+            "exited" => "已退出",
+            "error" => "发生错误",
+            "queued" => "排队中",
+            "running" => "执行中",
+            "completed" => "已完成",
+            "cancelled" => "已取消",
+            "waiting" => "等待中",
+            "failed" => "失败",
+            "Edit" => "编辑",
+            "Remove" => "移除",
             "Welcome" => "欢迎使用",
             "Create a Feishu bot" => "创建飞书机器人",
             "Connect your bot" => "连接机器人",
@@ -176,18 +303,11 @@ impl Language {
             "Your first project becomes this bot's fixed owner. You do not need to select chats or enter IDs. Direct and group messages both reach this project." => {
                 "首个项目会自动绑定机器人，无需选择聊天或填写 ID。私聊与群聊消息均进入该项目。"
             }
-            "Continue in Herdr App" => "在 Herdr App 中继续",
-            "Start a session and open it in Herdr App. Conversations happen in Feishu; the live CLI stays in Herdr." => {
-                "启动会话后，在 Herdr App 中查看执行情况。在飞书里交流，在 Herdr 中操作 CLI。"
-            }
             "Create project →" => "创建项目 →",
             "Enter a project name and choose a folder" => "请输入项目名称并选择文件夹",
             "Project created. Start the main session to begin." => "项目已创建，可以启动主会话了。",
             "WORKSPACE" => "工作区",
             "Projects" => "项目",
-            "Talk in Feishu. Follow the live session in Herdr App." => {
-                "在飞书里交流，在 Herdr App 中查看执行情况。"
-            }
             "Disconnected" => "未连接",
             "Not configured" => "未配置",
             "Feishu" => "飞书",
@@ -207,22 +327,13 @@ impl Language {
                 "已绑定飞书机器人 · 私聊与群聊消息均进入此项目"
             }
             "Local project" => "本地项目",
-            "Could not open Herdr App" => "无法打开 Herdr App",
             "The main session needs input" => "主会话需要你操作",
-            "Open Herdr App to continue sign-in or answer the CLI prompt." => {
-                "打开 Herdr App，继续登录或处理 CLI 提示。"
-            }
-            "Open Herdr App to see the error and continue." => "打开 Herdr App 查看错误并继续。",
-            "Monitor in Herdr App" => "在 Herdr App 中查看",
-            "Main session opened in a Herdr App tab" => "已在 Herdr App 标签页中打开主会话",
             "Stop session..." => "停止会话…",
             "Stop this project's main session?" => "确定停止此项目的主会话？",
             "This ends the CLI process. Project settings stay intact." => {
                 "这将结束 CLI 进程，项目配置会保留。"
             }
             "Cancel" => "取消",
-            "Stop" => "停止",
-            "Session stopped" => "会话已停止",
             "Start main session" => "启动主会话",
             "Starting the main session..." => "正在启动主会话…",
             "Resume session" => "恢复上次会话",
