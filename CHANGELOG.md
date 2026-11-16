@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.4 — 2026-11-16
+
+### Changed
+
+- Open existing projects directly in a compact native workspace, with setup separated from everyday project actions.
+- Add an immediate, persistent English and Simplified Chinese language switch without resetting setup progress or form input.
+- Remove the local task composer, message inspector, message history, and repeated message-detail polling.
+- Keep scrolling independent between pages so navigation does not clip the next view.
+
+### Fixed
+
+- Keep persistent main sessions visible in the local Herdr App when the agent is still starting, the app opens later, or a mirrored machine is selected.
+- Reuse and focus the correct local pane on repeated monitoring requests, preserving the existing agent process and session.
+- Reconcile late adoption and reconnect events without restoring an unrelated shell into the owned main session.
+
 ## 0.3.3 — 2026-11-16
 
 ### Fixed
