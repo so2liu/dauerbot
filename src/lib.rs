@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Runtime {
     pub feishu: String,
     pub feishu_error: String,
+    pub bots: HashMap<String, Value>,
     pub core: String,
     pub core_error: String,
     pub terminals: HashMap<String, Value>,
@@ -38,7 +39,7 @@ pub struct App {
     pub db: Db,
     pub config: RwLock<Config>,
     pub http: reqwest::Client,
-    pub token: Mutex<feishu::TokenCache>,
+    pub token: Mutex<HashMap<String, feishu::TokenCache>>,
     pub runtime: RwLock<Runtime>,
     pub notify: Notify,
     pub settings_tx: watch::Sender<u64>,
@@ -48,9 +49,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dir: PathBuf, cfg: Config) -> Result<Arc<Self>> {
+    pub fn new(dir: PathBuf, mut cfg: Config) -> Result<Arc<Self>> {
         config::private_dir(&dir.join("files"))?;
         let db = Db::open(&dir.join("bridge.sqlite3"))?;
+        if db.import_bot(&cfg.app_id, &cfg.app_secret)? {
+            cfg.app_id.clear();
+            cfg.app_secret.clear();
+            cfg.save(&dir)?;
+        }
         let (settings_tx, _) = watch::channel(0);
         Ok(Arc::new(Self {
             dir,
@@ -59,7 +65,7 @@ impl App {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(80))
                 .build()?,
-            token: Mutex::new(feishu::TokenCache::default()),
+            token: Mutex::new(HashMap::new()),
             runtime: RwLock::new(Runtime::default()),
             notify: Notify::new(),
             settings_tx,
@@ -298,12 +304,11 @@ impl App {
         to: Option<&str>,
     ) -> Result<db::Message> {
         let p = self.db.project(key).await?;
-        if self.db.bot_project().await?.as_deref() != Some(&p.id) {
-            bail!("This project does not belong to the configured Feishu bot");
-        }
+        let binding = self.db.bot(&p.id).await?;
         let to = to.unwrap_or(&p.chat_id);
         feishu::recipient_type(to)?;
         attachment["to"] = json!(to);
+        attachment["bot_app_id"] = json!(binding.app_id);
         if request_id.is_empty() || request_id.len() > 200 {
             bail!("request_id must contain 1 to 200 characters");
         }
@@ -442,11 +447,11 @@ impl App {
             tx.execute("INSERT INTO work_attention(id,project_id,generation,reason,message,to_id,actions,first_seen,last_seen)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET message=excluded.message,to_id=excluded.to_id,occurrences=work_attention.occurrences+1,last_seen=excluded.last_seen",
                 rusqlite::params![attention_id,id,generation,reason,message,to,json!(["open_terminal","retry"]).to_string(),now,now])?;
-            if !to.is_empty() && bot::owner(&tx)?.as_deref()==Some(&id) {
+            if !to.is_empty() && let Some(binding)=bot::get(&tx,&id)? {
                 feishu::recipient_type(&to)?;
                 let notice=format!("**{project_name} needs your attention**\n\n{message}\n\nOpen Dauerbot and select this project to continue in its terminal. Queued tasks remain saved.");
                 tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
-                    VALUES(?,?,'out',?,?,'pending',?,?,?)",rusqlite::params![db::id(),id,format!("attention-{attention_id}"),notice,json!({"to":to}).to_string(),now,now])?;
+                    VALUES(?,?,'out',?,?,'pending',?,?,?)",rusqlite::params![db::id(),id,format!("attention-{attention_id}"),notice,json!({"to":to,"bot_app_id":binding.app_id}).to_string(),now,now])?;
             }
             tx.commit()?;Ok(())
         }).await?;
@@ -968,6 +973,9 @@ mod supervisor_tests {
             })
             .await
             .unwrap();
+        app.db
+            .sync(|c| bot::save(c, &p.id, "cli_fixture", "secret", false))
+            .unwrap();
         let project = p.id.clone();
         app.db.call(move|c|{
             work::submit_task(c,&project,serde_json::from_value(json!({"title":"Private check","instructions":"Check the result","to":"ou_responsible"}))?,"task","scheduled",db::now())?;
@@ -976,6 +984,8 @@ mod supervisor_tests {
         }).await.unwrap();
         app.db
             .ingest_bot(
+                &p.id,
+                "cli_fixture",
                 "oc_unrelated_group",
                 "om_later",
                 "Unrelated message",

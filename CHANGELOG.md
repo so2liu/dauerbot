@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 — 2026-11-16
+
+### Changed
+
+- Give every project its own Feishu bot credentials, event connection, token cache and connection status. Reject attempts to bind the same App ID to two projects.
+- Open bot setup after creating a project, with an explicit local-only option. Show Connect/Manage Bot in each project's workspace, and keep credential drafts and setup confirmations separate.
+- Migrate the former global bot to its recorded project owner without assigning it to other projects. Scope chat context by project, including when two bots share a group.
+- Complete the two-device Core transition and remove its execution archive, migration notices and unused configuration. Existing project data, tasks, schedules and native conversations remain in the current store.
 
 ### Fixed
 

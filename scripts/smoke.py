@@ -23,6 +23,7 @@ import time
 import tempfile
 import urllib.request
 import urllib.error
+import urllib.parse
 import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +92,7 @@ def exact(conn, size):
 class Fixture:
     def __init__(self):
         self.connections = []
+        self.connection_bots = {}
         self.lock = threading.Lock()
         self.messages = []
         self.uploads = []
@@ -98,18 +100,22 @@ class Fixture:
         self.connects = 0
         self.server = None
 
-    def emit(self, event):
+    def emit(self, event, app_id="cli_fixture"):
         with self.lock:
             for conn in self.connections[:]:
+                if self.connection_bots.get(conn) != app_id:
+                    continue
                 try:
                     conn.sendall(ws_frame(b"heartbeat", 9))
                     conn.sendall(ws_frame(event_frame(event)))
                 except OSError:
                     pass
 
-    def disconnect(self):
+    def disconnect(self, app_id=None):
         with self.lock:
             for conn in self.connections[:]:
+                if app_id is not None and self.connection_bots.get(conn) != app_id:
+                    continue
                 try:
                     conn.shutdown(socket.SHUT_RDWR)
                 except OSError:
@@ -136,16 +142,18 @@ class Handler(BaseHTTPRequestHandler):
         data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if self.path.endswith("/callback/ws/endpoint"):
             port = FIXTURE.server.server_port
-            self.reply({"code": 0, "msg": "ok", "data": {"URL": f"ws://127.0.0.1:{port}/ws?service_id=1", "ClientConfig": {"PingInterval": 15}}})
+            app_id = json.loads(data)["AppID"]
+            self.reply({"code": 0, "msg": "ok", "data": {"URL": f"ws://127.0.0.1:{port}/ws?service_id=1&app_id={app_id}", "ClientConfig": {"PingInterval": 15}}})
         elif self.path.endswith("/tenant_access_token/internal"):
-            self.reply({"code": 0, "tenant_access_token": "fixture-token", "expire": 7200})
+            self.reply({"code": 0, "tenant_access_token": "fixture-token-" + json.loads(data)["app_id"], "expire": 7200})
         elif self.path.endswith("/files"):
-            assert self.headers.get("Authorization") == "Bearer fixture-token"
+            assert self.headers.get("Authorization") in {"Bearer fixture-token-cli_fixture", "Bearer fixture-token-cli_second"}
             FIXTURE.uploads.append(data)
             self.reply({"code": 0, "data": {"file_key": "fixture-file-key"}})
         elif self.path.startswith("/open-apis/im/v1/messages"):
-            assert self.headers.get("Authorization") == "Bearer fixture-token"
+            assert self.headers.get("Authorization") in {"Bearer fixture-token-cli_fixture", "Bearer fixture-token-cli_second"}
             value = json.loads(data)
+            value["fixture_app_id"] = self.headers["Authorization"].removeprefix("Bearer fixture-token-")
             assert value["receive_id"] in {"oc_fixture", "oc_private", "ou_fixture", "oc_new_group"}, value
             FIXTURE.messages.append(value)
             self.reply({"code": 0, "data": {"message_id": "om_sent_" + str(len(FIXTURE.messages))}})
@@ -154,7 +162,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/open-apis/im/v1/chats/oc_fixture/members"):
-            self.reply({"code":0,"data":{"items":[{"member_id":"ou_fixture","name":"测试用户"}],"has_more":False}}); return
+            app_id = self.headers["Authorization"].removeprefix("Bearer fixture-token-")
+            self.reply({"code":0,"data":{"items":[{"member_id":"ou_fixture","name":"测试用户-" + app_id}],"has_more":False}}); return
         if self.path == "/open-apis/im/v1/chats/oc_fixture":
             self.reply({"code":0,"data":{"name":"端到端测试群"}}); return
         if "/resources/" in self.path:
@@ -171,6 +180,7 @@ class Handler(BaseHTTPRequestHandler):
         conn = self.connection
         with FIXTURE.lock:
             FIXTURE.connections.append(conn); FIXTURE.connects += 1
+            FIXTURE.connection_bots[conn] = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)["app_id"][0]
         try:
             while True:
                 a, b = exact(conn, 2)
@@ -199,6 +209,7 @@ class Handler(BaseHTTPRequestHandler):
             with FIXTURE.lock:
                 if conn in FIXTURE.connections:
                     FIXTURE.connections.remove(conn)
+                FIXTURE.connection_bots.pop(conn, None)
             self.close_connection = True
 
 
@@ -295,9 +306,6 @@ def main():
                 raise RuntimeError(f"{path}: {error.read().decode()}") from error
 
         wait_for(lambda: api("/state"), "daemon not ready")
-        api("/settings", {"app_id": "cli_fixture", "app_secret": "fixture-secret"}, "PUT")
-        wait_for(lambda: FIXTURE.connections, "SDK did not establish WebSocket")
-        checks.append("real SDK WebSocket endpoint discovery and handshake")
         if real_agent=="pi":
             extra_args=["--approve"]
         elif real_agent=="codex":
@@ -309,6 +317,10 @@ def main():
         project = api("/projects", {"name": "端到端验证项目", "path": str(workspace), "agent": real_agent or "custom",
                                    "extra_args": extra_args})
         key = project["id"]
+        assert api("/state")["projects"][0]["bot"] is None, "a new project inherited a bot"
+        api(f"/projects/{key}/bot", {"app_id":"cli_fixture","app_secret":"fixture-secret"}, "PUT")
+        wait_for(lambda: FIXTURE.connections, "SDK did not establish WebSocket")
+        checks.append("real SDK WebSocket endpoint discovery and handshake")
         api(f"/projects/{key}/start", {}, "POST")
         wait_for(lambda: api(f"/projects/{key}")["project"]["ready"], "real MCP did not register readiness",timeout=100 if real_agent else 35)
         checks.append("isolated real HERDR terminal + real MCP initialize/tools/list/session_ready")
@@ -330,6 +342,45 @@ def main():
             return work if not any(r["status"] in {"submitting", "submitted", "running", "uncertain"} for r in work["runs"]) else None
 
         wait_for(settled, "initial run did not finish")
+        second_workspace = run / "second-workspace"
+        second_workspace.mkdir()
+        second = api("/projects", {"name":"Second bot project","path":str(second_workspace),"agent":"custom","extra_args":extra_args})
+        second_id = second["id"]
+        assert next(p for p in api("/state")["projects"] if p["id"] == second_id)["bot"] is None
+        try:
+            api(f"/projects/{second_id}/bot", {"app_id":"cli_fixture","app_secret":"other-secret"}, "PUT")
+            raise AssertionError("one bot was bound to two projects")
+        except RuntimeError as error:
+            assert "already connected to another project" in str(error)
+        first_connection = next(c for c in FIXTURE.connections if FIXTURE.connection_bots[c] == "cli_fixture")
+        api(f"/projects/{second_id}/bot", {"app_id":"cli_second","app_secret":"second-secret"}, "PUT")
+        wait_for(lambda: "cli_second" in FIXTURE.connection_bots.values(), "second bot did not connect")
+        assert first_connection in FIXTURE.connections, "connecting a second bot restarted the first"
+        api(f"/projects/{second_id}/start", {}, "POST")
+        wait_for(lambda: api(f"/projects/{second_id}")["project"]["ready"], "second Agent did not register MCP")
+        for bot, marker in [("cli_fixture","project-a-only"), ("cli_second","project-b-only")]:
+            FIXTURE.emit(message("om_shared_bot_test", marker), app_id=bot)
+        for project_id, bot, marker, other_marker in [
+            (key,"cli_fixture","project-a-only","project-b-only"),
+            (second_id,"cli_second","project-b-only","project-a-only"),
+        ]:
+            wait_for(lambda bot=bot: any(m["fixture_app_id"] == bot and "om_shared_bot_test" in m["content"] for m in FIXTURE.messages), "bot did not reply with its own credentials")
+            inbound = [m for m in api(f"/projects/{project_id}")["messages"] if m["source_id"] == "om_shared_bot_test"]
+            assert len(inbound) == 1 and inbound[0]["content"] == marker
+            reply = next(m for m in FIXTURE.messages if m["fixture_app_id"] == bot and "om_shared_bot_test" in m["content"])
+            assert marker in reply["content"] and other_marker not in reply["content"]
+            assert "测试用户-" + bot in reply["content"], "group context leaked between bots in the same chat"
+        wait_for(settled, "first bot run did not finish")
+        wait_for(lambda: not any(r["status"] in {"submitting","submitted","running","uncertain"} for r in api(f"/projects/{second_id}/work")["runs"]), "second bot run did not finish")
+        old_second = next(c for c in FIXTURE.connections if FIXTURE.connection_bots[c] == "cli_second")
+        FIXTURE.disconnect("cli_second")
+        wait_for(lambda: any(FIXTURE.connection_bots[c] == "cli_second" and c != old_second for c in FIXTURE.connections), "second bot did not reconnect independently")
+        assert first_connection in FIXTURE.connections
+        api(f"/projects/{second_id}/stop", {}, "POST")
+        api(f"/projects/{second_id}", method="DELETE")
+        wait_for(lambda: "cli_second" not in FIXTURE.connection_bots.values(), "removed project's bot listener remained active")
+        assert first_connection in FIXTURE.connections
+        checks.append("two project bots isolate messages, tokens, same-group context and reconnects; new projects never inherit a bot")
         terminal = project_state()["terminal"]
         descriptor = api(f"/projects/{key}/show", {}, "POST")
         assert descriptor["terminal"] == terminal
@@ -362,7 +413,7 @@ def main():
         checks.append("ordered follow-up turns and streamed inbound attachment")
         FIXTURE.emit(message("om_private", "direct-to-user", chat_type="p2p", chat_id="oc_private"))
         wait_for(lambda: any(c["chat_id"]=="oc_private" for c in api("/conversations")["items"]), "new private chat was not discovered")
-        assert api("/state")["bot_project"] == key
+        assert next(p for p in api("/state")["projects"] if p["id"] == key)["bot"]["app_id"] == "cli_fixture"
         wait_for(lambda: any(m["receive_id"]=="ou_fixture" for m in FIXTURE.messages), "agent-selected user destination failed")
         wait_for(lambda: any(m["source_id"]=="om_private" and m["status"]=="acknowledged" for m in api(f"/projects/{key}")["messages"]), "private message did not join the same main session")
         checks.append("new private chat enters fixed bot project without chat binding + XML context + MCP explicit user to")

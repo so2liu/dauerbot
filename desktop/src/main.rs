@@ -39,11 +39,15 @@ actions!(bridge, [Quit, ShowUpdates]);
 #[serde(default)]
 struct Setup {
     page: usize,
-    events_confirmed: bool,
-    published: bool,
+    bots: std::collections::HashMap<String, BotSetup>,
     language: Language,
     terminal_hidden: bool,
-    dismissed_core_projects: Vec<String>,
+}
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct BotSetup {
+    events_confirmed: bool,
+    published: bool,
 }
 struct Desktop {
     backend: Backend,
@@ -63,6 +67,8 @@ struct Desktop {
     access_result: String,
     environment: Vec<(String, String)>,
     credentials_checked: bool,
+    credentials_project: String,
+    credentials_app_id: String,
     connection_error: Option<String>,
     pending_secret: String,
     update_status: Value,
@@ -158,6 +164,8 @@ impl Desktop {
             access_result: String::new(),
             environment: vec![],
             credentials_checked: false,
+            credentials_project: String::new(),
+            credentials_app_id: String::new(),
             connection_error: None,
             pending_secret: String::new(),
             update_status: Value::Null,
@@ -239,17 +247,6 @@ impl Desktop {
                     if self.state.is_null() {
                         self.notice =
                             "Local service ready. Connect a bot or create a local project.".into();
-                        if let Some(id) = value["settings"]["app_id"].as_str()
-                            && self.app_id.read(cx).value().is_empty()
-                        {
-                            self.app_id
-                                .update(cx, |input, cx| input.set_value(id.to_owned(), window, cx));
-                        }
-                    }
-                    if self.selected.is_empty()
-                        && let Some(id) = value["bot_project"].as_str()
-                    {
-                        self.selected = id.to_owned();
                     }
                     if self.state.is_null()
                         && value["projects"]
@@ -265,6 +262,27 @@ impl Desktop {
                             .and_then(|project| project["id"].as_str())
                     {
                         self.selected = id.to_owned();
+                    }
+                    let current_app_id = value["projects"]
+                        .as_array()
+                        .and_then(|projects| projects.iter().find(|p| p["id"] == self.selected))
+                        .and_then(|project| project["bot"]["app_id"].as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if self.credentials_project != self.selected
+                        || (self.credentials_app_id != current_app_id
+                            && self.app_id.read(cx).value().as_ref() == self.credentials_app_id
+                            && self.secret.read(cx).value().is_empty())
+                    {
+                        self.app_id.update(cx, |input, cx| {
+                            input.set_value(current_app_id.clone(), window, cx)
+                        });
+                        self.secret
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        self.pending_secret.clear();
+                        self.credentials_checked = false;
+                        self.credentials_project = self.selected.clone();
+                        self.credentials_app_id = current_app_id;
                     }
                     self.state = value;
                     if let Some(tasks) = self.state["work"][&self.selected]["tasks"].as_array() {
@@ -306,22 +324,24 @@ impl Desktop {
                 } => {
                     self.busy = false;
                     self.error = false;
-                    if path == "/settings"
+                    if path == format!("/projects/{}/bot", self.selected)
                         && self.secret.read(cx).value().as_ref() == self.pending_secret
                     {
                         self.secret
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         self.pending_secret.clear();
+                        self.credentials_app_id = value["app_id"].as_str().unwrap_or("").to_owned();
                     }
                     if !message.is_empty() {
                         self.notice = message;
                     }
-                    if path == "/settings/check" {
+                    if path == format!("/projects/{}/bot/check", self.selected) {
                         self.credentials_checked = true;
                     }
                     if path == "/projects" {
                         self.selected = value["id"].as_str().unwrap_or_default().into();
-                        self.go(6);
+                        self.credentials_project.clear();
+                        self.go(2);
                     }
                 }
             }
@@ -625,12 +645,12 @@ impl Desktop {
         div().flex().flex_col().gap_4()
             .child(self.title("YOUR AGENTS, A LITTLE CLOSER", "Keep working.\nTake the conversation with you.", "Talk to your project's main session in Feishu, then continue on your Mac. Connect your first bot to get started."))
             .child(div().flex().gap_4()
-                .child(self.card("01  Connect Feishu", "Create an enterprise app bot. Credentials stay on your Mac." ).flex_1())
-                .child(self.card("02  Choose a project", "Connect an installed CLI to a persistent HERDR session.").flex_1())
+                .child(self.card("01  Choose a project", "Choose a project folder and an installed Agent CLI.").flex_1())
+                .child(self.card("02  Connect its bot", "Connect a dedicated Feishu bot to this project, or continue locally.").flex_1())
                 .child(self.card("03  Continue the conversation", "Messages, tasks, and files reach the same main session.").flex_1()))
             .child(self.card("You control access", "Choose the project folder yourself. Protected files may require additional access; ordinary projects do not need Full Disk Access, Accessibility, or Screen Recording."))
-            .child(self.btn("begin", "Start setup →", |this, _, _| this.go(1), cx).primary())
-            .child(self.btn("local-first", "Try locally and connect Feishu later", |this, _, _| this.go(5), cx))
+            .child(self.btn("begin", "Add your first project →", |this, _, _| this.go(5), cx).primary())
+            .child(self.btn("bot-guide", "How to create a Feishu bot", |this, _, _| this.go(1), cx))
             .into_any_element()
     }
     fn bot(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -644,25 +664,60 @@ impl Desktop {
             .child(self.btn("bot-next", "Bot enabled. Add credentials →", |this, _, _| this.go(2), cx).primary()).into_any_element()
     }
     fn credentials(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let projects = self.state["projects"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if projects.is_empty() {
+            return div().flex().flex_col().gap_4()
+                .child(self.title("FEISHU BOT", "Choose a project first", "Each project connects to its own bot. Create a project before adding bot credentials."))
+                .child(self.btn("bot-add-project", "Add project →", |this, _, _| this.go(5), cx).primary())
+                .into_any_element();
+        }
+        let mut choices = div().flex().flex_wrap().gap_2();
+        for project in &projects {
+            let id = project["id"].as_str().unwrap_or("").to_owned();
+            choices = choices.child(
+                Button::new(SharedString::from(format!("bot-project-{id}")))
+                    .label(project["name"].as_str().unwrap_or("Project").to_owned())
+                    .selected(self.selected == id)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_project(id.clone(), cx)),
+                    ),
+            );
+        }
+        let selected = self.selected.clone();
+        let status = self.state["runtime"]["bots"][&selected].clone();
         div().flex().flex_col().gap_4()
-            .child(self.title("SETUP / 02", "Connect the bot to this Mac", "The local service connects after you save. Credential validation checks app identity; message permissions and subscriptions come next."))
+            .child(self.title("FEISHU BOT", "Connect this project's bot", "Every project has its own bot. Direct and group messages received by this bot go to this project."))
+            .child(choices)
             .child(self.field("App ID", &self.app_id))
             .child(self.field("App Secret", &self.secret))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr("The secret stays masked and saved values are never shown. Leave it blank to keep the current secret; enter a new one when changing App ID. Credentials stay in a local file readable only by your user.")))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr("The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac.")))
             .child(self.btn("save-credentials", "Save and connect", |this, _, cx| {
                 let id = this.app_id.read(cx).value().to_string();
                 if !id.starts_with("cli_") { this.notice = "Enter an App ID starting with cli_".into(); this.error = true; return; }
                 let secret = this.secret.read(cx).value().to_string();
                 this.pending_secret = secret.clone();
                 this.credentials_checked = false;
-                this.api("PUT", "/settings".into(), Some(json!({"app_id":id,"app_secret":secret})), "Credentials saved. Validate them to continue.");
-            }, cx).primary())
-            .child(self.btn("check-credentials", "Validate credentials", |this, _, _| this.api("POST", "/settings/check".into(), None, "App identity verified. Configure message events next."), cx))
-            .child(self.card("Connection status", &format!("{} · {}", self.tr(connection_status(self.state["runtime"]["feishu"].as_str().unwrap_or("Waiting for service"))), self.state["runtime"]["feishu_error"].as_str().unwrap_or(""))))
+                this.api("PUT", format!("/projects/{}/bot",this.selected), Some(json!({"app_id":id,"app_secret":secret})), "Bot connected to this project. Validate its credentials to continue.");
+            }, cx).primary().disabled(self.credentials_project != self.selected || self.busy))
+            .child(self.btn("check-credentials", "Validate credentials", |this, _, _| this.api("POST", format!("/projects/{}/bot/check",this.selected), None, "App identity verified. Configure message events next."), cx))
+            .child(self.card("Connection status", &format!("{} · {}", self.tr(connection_status(status["status"].as_str().unwrap_or("unconfigured"))), self.tr(status["error"].as_str().unwrap_or("")))))
             .child(self.btn("credentials-next", "Configure message permissions →", |this, _, _| this.go(3), cx).primary().disabled(!self.credentials_checked || self.busy))
+            .child(self.btn("bot-local-only", "Use locally for now", |this, _, _| this.go(6), cx))
             .into_any_element()
     }
     fn events(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let app_id = self.state["projects"]
+            .as_array()
+            .and_then(|projects| projects.iter().find(|p| p["id"] == self.selected))
+            .and_then(|p| p["bot"]["app_id"].as_str())
+            .unwrap_or("");
+        let key = format!("{}:{app_id}", self.selected);
+        let confirmed = self.setup.bots.get(&key).cloned().unwrap_or_default();
+        let event_key = key.clone();
+        let release_key = key.clone();
         div().flex().flex_col().gap_4()
             .child(self.title("SETUP / 03", "Receive messages and send replies", "Complete these steps in the Feishu developer console. Manual confirmations are separate from automatic checks."))
             .child(self.card("1. Import app permissions", "In Permissions, import the JSON below to send bot messages, receive direct messages and group mentions, read message resources, upload files, and read group context."))
@@ -671,9 +726,9 @@ impl Desktop {
             .child(self.card("2. Receive events over a long connection", "Under Events and Callbacks, choose long connections. Save valid credentials in Dauerbot and keep it running before saving the subscription. Add im.message.receive_v1 to receive messages."))
             .child(self.card("Need every group reply?", "The full JSON includes im:message.group_msg for all user messages in groups; your administrator may need to approve it. The basic set only receives bot mentions. All messages this bot receives reach its fixed project."))
             .child(self.card("3. Publish the app and add the bot", "Create a version in Version Management and Release, choose its availability, and publish it. Wait for administrator approval if required. Add the bot to a group or use direct messages. Publish a new version after changing permissions or subscriptions."))
-            .child(self.btn("confirmed-events", if self.setup.events_confirmed { "✓ Events and permissions confirmed manually" } else { "I configured permissions and event subscriptions" }, |this, _, _| { this.setup.events_confirmed = !this.setup.events_confirmed; this.go(3); }, cx))
-            .child(self.btn("confirmed-release", if self.setup.published { "✓ Publishing and bot access confirmed manually" } else { "I published the app and made the bot available" }, |this, _, _| { this.setup.published = !this.setup.published; this.go(3); }, cx))
-            .child(self.btn("events-next", "Check local permissions →", |this, _, _| this.go(4), cx).primary().disabled(!self.setup.events_confirmed || !self.setup.published))
+            .child(self.btn("confirmed-events", if confirmed.events_confirmed { "✓ Events and permissions confirmed manually" } else { "I configured permissions and event subscriptions" }, move |this, _, _| { let setup=this.setup.bots.entry(event_key.clone()).or_default(); setup.events_confirmed = !setup.events_confirmed; this.go(3); }, cx))
+            .child(self.btn("confirmed-release", if confirmed.published { "✓ Publishing and bot access confirmed manually" } else { "I published the app and made the bot available" }, move |this, _, _| { let setup=this.setup.bots.entry(release_key.clone()).or_default(); setup.published = !setup.published; this.go(3); }, cx))
+            .child(self.btn("events-next", "Go to workspace →", |this, _, _| this.go(6), cx).primary().disabled(app_id.is_empty() || !confirmed.events_confirmed || !confirmed.published))
             .into_any_element()
     }
     fn permissions(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -719,7 +774,7 @@ impl Desktop {
             .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("{} {picked}", self.tr("Selected:")))))
             .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
-            .child(self.card("Automatic binding", "Your first project becomes this bot's fixed owner. You do not need to select chats or enter IDs. Direct and group messages both reach this project."))
+            .child(self.card("Connect a dedicated bot", "After creating this project, connect its own Feishu bot or continue locally. You never need to enter chat IDs."))
             .child(self.card("Your agent, inside Dauerbot", "Watch and operate the live terminal in this app. Closing the window leaves tasks running."))
             .child(self.btn("create-project", "Create project →", |this, _, cx| {
                 let manual = this.path.read(cx).value().to_string();
@@ -727,7 +782,7 @@ impl Desktop {
                 let name = this.name.read(cx).value().to_string();
                 if name.trim().is_empty() || path.is_empty() { this.notice = "Enter a project name and choose a folder".into(); this.error = true; return; }
                 let agent = ["codex","claude","pi","agy"][this.agent];
-                this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":""})), "Project created. Start the main session to begin.");
+                this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":""})), "Project created. Connect its bot or continue locally.");
             }, cx).primary())
             .into_any_element()
     }
@@ -763,7 +818,7 @@ impl Desktop {
                     .child(
                         self.connection_pill(
                             "Feishu",
-                            self.state["runtime"]["feishu"]
+                            self.state["runtime"]["bots"][&self.selected]["status"]
                                 .as_str()
                                 .unwrap_or("Not configured"),
                         ),
@@ -799,7 +854,7 @@ impl Desktop {
         }
         for project in &projects {
             let id = project["id"].as_str().unwrap_or_default().to_owned();
-            let bound = self.state["bot_project"] == project["id"];
+            let bound = project["bot"]["has_secret"] == true;
             let status =
                 project["lifecycle"]
                     .as_str()
@@ -838,23 +893,39 @@ impl Desktop {
                         .text_color(rgb(MUTED))
                         .child(project["path"].as_str().unwrap_or("").to_owned()),
                 );
-            if let Some(message) = project["migration_notice"]
-                .as_str()
-                .filter(|text| !text.is_empty())
-                && !self.setup.dismissed_core_projects.contains(&id)
-            {
-                let project_id = id.clone();
-                body = body
-                    .child(self.card("Session preserved", message))
+            let bound = project["bot"]["has_secret"] == true;
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(if bound { ACCENT } else { MUTED }))
+                            .child(self.tr(if bound {
+                                "Bot connected"
+                            } else {
+                                "No bot connected"
+                            })),
+                    )
                     .child(self.btn(
-                        "dismiss-migration",
-                        "Got it",
-                        move |this, _, _| {
-                            this.setup.dismissed_core_projects.push(project_id.clone());
-                            this.go(6);
-                        },
+                        "project-bot",
+                        if bound { "Manage bot" } else { "Connect bot" },
+                        |this, _, _| this.go(2),
                         cx,
-                    ));
+                    )),
+            );
+            if !bound {
+                body = body.child(div().text_xs().text_color(rgb(MUTED))
+                    .child(self.tr("This project is local only. Connect a dedicated Feishu bot to receive messages.")));
+            }
+            if let Some(error) = self.state["runtime"]["bots"][&id]["error"]
+                .as_str()
+                .filter(|error| !error.is_empty())
+            {
+                body = body.child(self.card_detail("Bot connection", error));
             }
             if let Some(issue) = self.state["runtime"]["issues"][&id]
                 .as_str()
@@ -2007,12 +2078,12 @@ mod preference_tests {
         let mut setup: Setup = serde_json::from_str(old).unwrap();
         assert_eq!(setup.language, Language::En);
         assert_eq!(setup.page, 3);
-        assert!(setup.events_confirmed);
+        assert!(setup.bots.is_empty());
         setup.language = Language::Zh;
         let encoded = serde_json::to_vec(&setup).unwrap();
         let reloaded: Setup = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(reloaded.language, Language::Zh);
         assert_eq!(reloaded.page, 3);
-        assert!(reloaded.events_confirmed);
+        assert!(reloaded.bots.is_empty());
     }
 }

@@ -142,7 +142,7 @@ async fn inherited_native_pointer_is_not_confirmation_for_a_new_execution() {
 }
 
 #[tokio::test]
-async fn migration_failure_rolls_back_archive_pointer_and_schema_changes() {
+async fn pre_refactor_store_is_refused_without_mutating_its_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bridge.sqlite3");
     let db = Db::open(&path).unwrap();
@@ -159,9 +159,7 @@ async fn migration_failure_rolls_back_archive_pointer_and_schema_changes() {
         c.execute_batch(
             "ALTER TABLE projects DROP COLUMN execution;
              ALTER TABLE projects DROP COLUMN enabled;
-             PRAGMA user_version=3;
-             CREATE TRIGGER reject_archive BEFORE INSERT ON archived_core_executions
-               BEGIN SELECT RAISE(ABORT,'Injected archive write failure'); END;",
+             PRAGMA user_version=3;",
         )?;
         Ok(())
     })
@@ -190,13 +188,14 @@ async fn migration_failure_rolls_back_archive_pointer_and_schema_changes() {
         )
         .unwrap();
     assert_eq!(terminal, "old-core-terminal");
-    c.execute_batch("DROP TRIGGER reject_archive").unwrap();
-    drop(c);
-    let reopened = Db::open(&path).unwrap();
-    let migrated = reopened.project(&project.id).await.unwrap();
-    assert!(migrated.terminal.is_none());
-    assert!(!migrated.enabled);
-    assert_eq!(migrated.native_session, "previous-native");
+    let native: String = c
+        .query_row(
+            "SELECT native_session FROM projects WHERE id=?",
+            [&project.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(native, "previous-native");
 }
 
 #[tokio::test]
@@ -314,7 +313,11 @@ async fn project_removal_cleans_all_durable_foreign_keys_and_preserves_other_wor
     let mut another = input(dir.path());
     another.name = "Other project".into();
     let other = db.create(another).await.unwrap();
+    db.sync(|c| herdr_feishu_bridge::bot::save(c, &project.id, "cli_fixture", "secret", false))
+        .unwrap();
     db.ingest_bot(
+        &project.id,
+        "cli_fixture",
         "oc_source",
         "im_original",
         "Existing Feishu input",

@@ -25,19 +25,42 @@ async fn durable_dedup_and_uncertain_recovery() {
     let path = dir.path().join("db.sqlite");
     let db = Db::open(&path).unwrap();
     let p = db.create(input(&dir, "一", "oc_test")).await.unwrap();
+    db.sync(|c| herdr_feishu_bridge::bot::save(c, &p.id, "cli_fixture", "secret", false))
+        .unwrap();
     let key = db
-        .ingest_bot("oc_test", "om_one", "hello", &json!({}))
+        .ingest_bot(
+            &p.id,
+            "cli_fixture",
+            "oc_test",
+            "om_one",
+            "hello",
+            &json!({}),
+        )
         .unwrap()
         .unwrap();
     assert!(
-        db.ingest_bot("oc_test", "om_one", "hello", &json!({}))
-            .unwrap()
-            .is_none()
+        db.ingest_bot(
+            &p.id,
+            "cli_fixture",
+            "oc_test",
+            "om_one",
+            "hello",
+            &json!({})
+        )
+        .unwrap()
+        .is_none()
     );
     assert!(
-        db.ingest_bot("oc_unbound", "om_two", "hello", &json!({}))
-            .unwrap()
-            .is_some()
+        db.ingest_bot(
+            &p.id,
+            "cli_fixture",
+            "oc_unbound",
+            "om_two",
+            "hello",
+            &json!({})
+        )
+        .unwrap()
+        .is_some()
     );
     assert!(
         db.ack(&p.id, "om_one").await.is_err(),
@@ -68,8 +91,8 @@ async fn outbox_request_ids_do_not_create_duplicate_messages() {
     assert_eq!(first.id, again.id);
     assert_eq!(db.messages(&p.id).await.unwrap().len(), 1);
     assert!(
-        db.create(input(&dir, "二", "oc_test")).await.is_err(),
-        "chat routing must be unambiguous"
+        db.create(input(&dir, "二", "oc_test")).await.is_ok(),
+        "The receiving bot selects the project, so projects can share a group"
     );
 }
 
@@ -79,10 +102,19 @@ async fn one_projects_backlog_cannot_starve_another_project() {
     let db = Db::open(&dir.path().join("db")).unwrap();
     let a = db.create(input(&dir, "积压项目", "oc_a")).await.unwrap();
     let b = db.create(input(&dir, "其他项目", "oc_b")).await.unwrap();
+    db.sync(|c| herdr_feishu_bridge::bot::save(c, &a.id, "cli_fixture", "secret", false))
+        .unwrap();
     db.pause(&a.id, true).await.unwrap();
     for n in 0..40 {
-        db.ingest_bot("oc_a", &format!("om_a_{n}"), "backlog", &json!({}))
-            .unwrap();
+        db.ingest_bot(
+            &a.id,
+            "cli_fixture",
+            "oc_a",
+            &format!("om_a_{n}"),
+            "backlog",
+            &json!({}),
+        )
+        .unwrap();
     }
     // Local projects can receive independent tasks through the authenticated API.
     let project_id = b.id.clone();

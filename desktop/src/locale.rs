@@ -42,6 +42,59 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "FEISHU BOT" => "飞书机器人",
+            "Bot connection" => "机器人连接",
+            "Connection lost or authentication failed; check this project's bot credentials and event subscriptions" => {
+                "连接已断开或认证失败，请检查此项目的机器人凭据和事件订阅。"
+            }
+            "Migrate this pre-refactor data directory with Dauerbot 0.4.1 before upgrading" => {
+                "请先使用 Dauerbot 0.4.1 迁移此旧版数据目录，再进行升级。"
+            }
+            "01  Choose a project" => "01  选择项目",
+            "Choose a project folder and an installed Agent CLI." => {
+                "选择项目文件夹和已安装的智能体 CLI。"
+            }
+            "02  Connect its bot" => "02  连接专属机器人",
+            "Connect a dedicated Feishu bot to this project, or continue locally." => {
+                "为此项目连接专属飞书机器人，也可以先在本地使用。"
+            }
+            "Add your first project →" => "添加第一个项目 →",
+            "How to create a Feishu bot" => "如何创建飞书机器人",
+            "Go to workspace →" => "进入工作台 →",
+            "Choose a project first" => "先选择一个项目",
+            "Each project connects to its own bot. Create a project before adding bot credentials." => {
+                "每个项目连接自己的机器人。请先创建项目，再填写机器人的凭据。"
+            }
+            "Connect this project's bot" => "连接这个项目的机器人",
+            "Every project has its own bot. Direct and group messages received by this bot go to this project." => {
+                "每个项目都有自己的机器人。这个机器人收到的私聊和群聊消息，都会进入此项目。"
+            }
+            "The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac." => {
+                "密钥始终隐藏。留空会保留这个机器人已保存的密钥；更换 App ID 时需要填写对应的新密钥。凭据仅保存在这台 Mac 上。"
+            }
+            "Bot connected to this project. Validate its credentials to continue." => {
+                "机器人已连接到此项目，请验证凭据后继续。"
+            }
+            "Use locally for now" => "暂时只在本地使用",
+            "Connect a dedicated bot" => "连接专属机器人",
+            "After creating this project, connect its own Feishu bot or continue locally. You never need to enter chat IDs." => {
+                "创建项目后，连接它自己的飞书机器人，也可以先在本地使用。无需填写聊天 ID。"
+            }
+            "Project created. Connect its bot or continue locally." => {
+                "项目已创建，可以连接它的机器人，也可以先在本地使用。"
+            }
+            "Bot connected" => "已连接机器人",
+            "No bot connected" => "尚未连接机器人",
+            "This project's private and group messages reach its active agent." => {
+                "这个机器人收到的私聊和群聊消息，都会交给本项目当前的智能体。"
+            }
+            "This project is local only. Connect a dedicated Feishu bot to receive messages." => {
+                "此项目目前仅在本地使用，连接专属飞书机器人后即可接收消息。"
+            }
+            "Manage bot" => "管理机器人",
+            "This bot is already connected to another project" => "此机器人已绑定到另一个项目",
+            "Enter this bot's App Secret" => "请输入这个机器人的 App Secret",
+            "Connect a Feishu bot to this project first" => "请先为此项目连接飞书机器人",
             "An older or incompatible Dauerbot daemon is using this data directory. Quit that daemon before starting this build, or use --data-dir for an independent instance." => {
                 "当前数据目录正在由旧版或不兼容的 Dauerbot 服务使用。请先退出旧服务，或用 --data-dir 打开独立实例。"
             }
@@ -83,9 +136,6 @@ impl Language {
                 "终端连接已关闭，请重新连接。"
             }
             "Session preserved" => "已保留原会话",
-            "Previous Core session preserved; Start/Resume to use the new backend" => {
-                "原 Core 会话已保留。点击“启动 / 恢复”使用新的运行方式。"
-            }
             "Got it" => "知道了",
             "What did you verify?" => "你确认了哪些情况？",
             "Background work needs review" => "需要确认后台任务",
