@@ -402,7 +402,7 @@ async fn workspace_trust_requires_exact_project_identity_and_selected_yes() {
     }
     p.agent = "claude".into();
     let claude = format!(
-        "Quick safety check: Is this a project you created or one you trust?\n{}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n",
+        "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source\n{}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n",
         p.path
     );
     assert!(herdr::is_project_trust(&p, &record, &claude));

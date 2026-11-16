@@ -887,8 +887,11 @@ pub fn is_project_trust(p: &Project, t: &Value, screen: &str) -> bool {
                 && lines.contains(&"No, exit")
         }
         "claude" => {
-            lines.contains(&"Quick safety check: Is this a project you created or one you trust?")
-                && lines.contains(&"❯ 1. Yes, I trust this folder")
+            lines.iter().any(|line| {
+                line.starts_with(
+                    "Quick safety check: Is this a project you created or one you trust?",
+                )
+            }) && lines.contains(&"❯ 1. Yes, I trust this folder")
                 && lines.contains(&"2. No, exit")
         }
         _ => false,
