@@ -316,7 +316,7 @@ async fn ensure_service(
             {
                 return Ok(());
             }
-            if restart && let Some(version) = state["version"].as_str() {
+            if let Some(version) = state["version"].as_str() {
                 anyhow::ensure!(
                     !herdr_feishu_bridge::update::is_newer(
                         version,
@@ -544,20 +544,23 @@ mod connection_tests {
     }
 
     #[tokio::test]
-    async fn explicit_service_updates_do_not_downgrade_a_newer_daemon() {
-        let (config, worker) = service_fixture(
-            "200 OK",
-            json!({
-                "version": "99.0.0", "api_protocol": herdr_feishu_bridge::api::PROTOCOL
-            }),
-        );
+    async fn service_replacements_never_downgrade_a_newer_daemon() {
         let data = tempfile::tempdir().unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let error = ensure_service(data.path(), &config, &client, true)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("newer than this app"));
-        worker.join().unwrap();
+        for (restart, protocol) in [
+            (true, herdr_feishu_bridge::api::PROTOCOL),
+            (false, herdr_feishu_bridge::api::PROTOCOL + 1),
+        ] {
+            let (config, worker) = service_fixture(
+                "200 OK",
+                json!({"version": "99.0.0", "api_protocol": protocol}),
+            );
+            let error = ensure_service(data.path(), &config, &client, restart)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("newer than this app"));
+            worker.join().unwrap();
+        }
     }
 
     #[tokio::test]
