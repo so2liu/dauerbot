@@ -54,7 +54,6 @@ pub enum Reply {
     },
     Work {
         project: String,
-        tasks: Value,
         timers: Value,
     },
     Done {
@@ -169,9 +168,8 @@ impl Backend {
                             let _ = done.send(());
                         }
                         Ok(CommandRequest::Work { project }) => {
-                            let tasks = request(&probe, &cfg, "GET", &format!("/projects/{project}/tasks"), None).await.unwrap_or(Value::Null);
                             let timers = request(&probe, &cfg, "GET", &format!("/projects/{project}/timers"), None).await.unwrap_or(Value::Null);
-                            let _ = replies.send(Reply::Work { project, tasks, timers });
+                            let _ = replies.send(Reply::Work { project, timers });
                         }
                         Ok(CommandRequest::Folder(path)) => {
                             let result = crate::access::project_access(&path);

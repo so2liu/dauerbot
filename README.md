@@ -22,17 +22,17 @@ Each project has its own App ID, App Secret, event connection and connection sta
 
 From the CLI, bind and validate a project's bot with `hfb feishu set <project> --app-id cli_...` (the secret is read from stdin) and `hfb feishu check <project>`. `hfb feishu disconnect <project>` disconnects only that project. Existing singleton installations keep their bot on its recorded project when upgrading; other projects remain unbound.
 
-Switch the active CLI in the workspace or with `hfb session switch`. Switching requires the current task to finish or be resolved, then closes the old execution and preserves the project, bot binding, progress and queues. The next task starts the selected CLI with continuity summaries. You can also send local tasks through the CLI before connecting Feishu.
+Switch the active CLI in project settings or with `hfb session switch`. Switching requires the current task to finish or be resolved, then closes the old execution and preserves the project, bot binding, progress and queues. The next task starts the selected CLI with continuity summaries. You can also send local tasks through the CLI before connecting Feishu.
 
 Avoid running another long-connection listener for the same Feishu app: the platform distributes events between listeners, so another program may receive the message instead.
 
 ## Native desktop and local data
 
-The desktop renders native GPUI controls. There is no browser interface, WebView, Node.js runtime, or frontend build step. Closing the app leaves its daemon and HERDR agent running.
+The desktop renders native GPUI controls. There is no browser interface, WebView, Node.js runtime, or frontend build step. Dauerbot starts in the macOS menu bar: click its icon to see project states, add a project, or open the full app. Selecting a project opens its details. Closing the window returns to the menu bar and leaves the daemon and HERDR Agent running; Quit exits the desktop.
 
-The workspace has project and task controls on the left and the selected Agent's native terminal on the right. Observe is read-only; **Take control** enables direct input, login, model selection, and native prompts. **Release control** returns the session to automatic dispatch. Viewing does not prevent idle sleep. Explicit control pins the execution until released, protecting unsent input even if the desktop crashes. Closing a view disconnects its terminal bridge and leaves the Agent running. Create a task or schedule through its dedicated form; there is no duplicate chat history or message inspector.
+The full window has projects on the left and real scheduled tasks in the center. The selected Agent's native terminal is a debugging tool on the right, collapsed by default. Expand it to observe; **Take control** enables direct input, login, model selection, and native prompts. **Release control** returns the session to automatic dispatch. Viewing does not prevent idle sleep. Explicit control pins the execution until released, protecting unsent input even if the desktop crashes. Hiding the terminal or closing the window releases control and disconnects the terminal bridge. Send instructions and ask the Agent to schedule work in Feishu; the desktop lists schedules and lets you pause or enable them. Agent execution steps and manual task/schedule forms are not part of the main view. Settings contains bot setup, permissions, updates, and occasional session/recovery controls.
 
-Switch between **English** and **简体中文** in the app. The choice takes effect immediately and stays saved on this Mac. Existing projects open directly in the workspace.
+Switch between **English** and **简体中文** in the app. The choice takes effect immediately and stays saved on this Mac. Project state changes also appear in the menu-bar panel.
 
 Dauerbot checks only the project folders or SQLite files you select. Database checks read schema metadata rather than business records. Full Disk Access is optional and must be granted in System Settings to the application that actually performs the task. Granting access to Dauerbot does not automatically grant it to an existing HERDR or Agent process. Normal operation does not require Accessibility or Screen Recording.
 
