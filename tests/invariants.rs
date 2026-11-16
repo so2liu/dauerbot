@@ -167,6 +167,31 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
         record["processes"] = processes;
         assert!(!herdr::quiescent(&p, &record));
     }
+    #[cfg(target_os = "macos")]
+    {
+        p.agent = "claude".into();
+        record["agent"]["agent"] = json!("claude");
+        let mut inhibitor = std::process::Command::new("/usr/bin/caffeinate")
+            .args(["-i", "-t", "2"])
+            .spawn()
+            .unwrap();
+        record["processes"] = json!([
+            {"pid":100,"name":"Claude.exe","argv":["claude"]},
+            {"pid":inhibitor.id(),"name":"caffeinate","argv":["caffeinate","-i","-t","2"]}
+        ]);
+        assert!(
+            herdr::quiescent(&p, &record),
+            "Claude's verified system sleep inhibitor performs no Agent work"
+        );
+        record["processes"][1]["argv"] =
+            json!(["caffeinate", "-i", "-t", "2", "python3", "task.py"]);
+        assert!(
+            !herdr::quiescent(&p, &record),
+            "caffeinate wrapping a command is active work"
+        );
+        let _ = inhibitor.kill();
+        let _ = inhibitor.wait();
+    }
     p.agent = "custom".into();
     p.extra_args = vec![
         "/usr/local/bin/python3".into(),

@@ -35,7 +35,23 @@ impl std::fmt::Display for RpcFailure {
     }
 }
 impl std::error::Error for RpcFailure {}
+#[derive(Debug)]
+pub struct NotSubmitted(anyhow::Error);
+impl std::fmt::Display for NotSubmitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for NotSubmitted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 pub fn definitely_not_sent(error: &anyhow::Error) -> bool {
+    if error.is::<NotSubmitted>() || error.is::<SessionStarting>() {
+        return true;
+    }
     error.downcast_ref::<RpcFailure>().is_some_and(|e| {
         matches!(
             e.kind.as_str(),
@@ -141,9 +157,10 @@ pub async fn rpc(config: &Config, method: &str, params: Value) -> Result<Value> 
     let path = socket_path(config)?;
     let id = crate::db::id();
     tokio::time::timeout(Duration::from_secs(12), async {
-        let mut stream = UnixStream::connect(&path).await.with_context(|| {
-            format!("Cannot connect to HERDR session '{}'", config.herdr_session)
-        })?;
+        let mut stream = UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("Cannot connect to HERDR session '{}'", config.herdr_session))
+            .map_err(NotSubmitted)?;
         let bytes = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
         stream.write_all(&bytes).await?;
         stream.write_all(b"\n").await?;
@@ -508,9 +525,12 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         .cloned()
         .unwrap_or(Value::Null);
     let agent_label = native_agent["agent"].as_str().unwrap_or("");
-    let pending =
-        !p.ready && ((p.agent != "custom" && agent_label.is_empty()) || is_shell(&foreground));
-    let state = if processes.is_empty() {
+    // A transient empty foreground lookup is not proof of PTY exit. In
+    // particular, native executable wrappers can disappear briefly at startup.
+    let no_foreground = processes.is_empty();
+    let pending = no_foreground
+        || (!p.ready && ((p.agent != "custom" && agent_label.is_empty()) || is_shell(&foreground)));
+    let state = if no_foreground && root_has_exited(execution.shell_pid) {
         "finished"
     } else {
         "live"
@@ -524,6 +544,30 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         "processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"tokens":pane["tokens"],
         "cwd":pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("")}),
     )
+}
+
+fn root_has_exited(pid: Option<i64>) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        let Some(pid) = pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+        else {
+            return false;
+        };
+        // Signal zero does not modify the process. ESRCH is 3 on both supported
+        // Unix targets (macOS and Linux); EPERM and all unknown errors mean alive
+        // or unknown, so they preserve the interactive pane.
+        unsafe { kill(pid, 0) == -1 && std::io::Error::last_os_error().raw_os_error() == Some(3) }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 fn is_shell(process: &Value) -> bool {
@@ -601,6 +645,49 @@ fn same_program(actual: &str, expected: &str) -> bool {
                 .ok()
                 .zip(std::fs::canonicalize(expected).ok())
                 .is_some_and(|(a, b)| a == b))
+}
+
+fn is_claude_sleep_inhibitor(process: &Value) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        #[link(name = "proc")]
+        unsafe extern "C" {
+            fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, size: u32) -> i32;
+        }
+        let Some(args) = process["argv"].as_array() else {
+            return false;
+        };
+        if args.len() != 4
+            || args[1] != "-i"
+            || args[2] != "-t"
+            || args[3]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_none_or(|seconds| seconds == 0)
+        {
+            return false;
+        }
+        let Some(pid) = process["pid"]
+            .as_i64()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+        else {
+            return false;
+        };
+        let mut buffer = [0_u8; 4096];
+        let length = unsafe { proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if length <= 0 {
+            return false;
+        }
+        let bytes = buffer.split(|byte| *byte == 0).next().unwrap_or_default();
+        Path::new(std::ffi::OsStr::from_bytes(bytes)) == Path::new("/usr/bin/caffeinate")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = process;
+        false
+    }
 }
 
 /// Retirement requires the CLI itself in the foreground, not a tool subprocess
@@ -684,12 +771,18 @@ pub fn quiescent(p: &Project, record: &Value) -> bool {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(name);
-        let expected = |name: &str| match p.agent.as_str() {
-            "codex" => name == "codex" || name.starts_with("codex-"),
-            "claude" => matches!(name, "claude" | "claude.exe" | "claude-code"),
-            "pi" => name == "pi",
-            "agy" => matches!(name, "agy" | "antigravity" | "antigravity-cli"),
-            _ => false,
+        if p.agent == "claude" && executable == "caffeinate" && is_claude_sleep_inhibitor(process) {
+            return true;
+        }
+        let expected = |name: &str| {
+            let name = name.to_ascii_lowercase();
+            match p.agent.as_str() {
+                "codex" => name == "codex" || name.starts_with("codex-"),
+                "claude" => matches!(name.as_str(), "claude" | "claude.exe" | "claude-code"),
+                "pi" => name == "pi",
+                "agy" => matches!(name.as_str(), "agy" | "antigravity" | "antigravity-cli"),
+                _ => false,
+            }
         };
         if expected(executable)
             || process["argv0"]
@@ -723,9 +816,13 @@ pub fn quiescent(p: &Project, record: &Value) -> bool {
 }
 
 pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
-    let record = observe(config, p).await?;
-    check_identity(p, &record)?;
-    let execution = ExecutionRef::from_project(p)?;
+    let preflight: Result<ExecutionRef> = async {
+        let record = observe(config, p).await?;
+        check_identity(p, &record)?;
+        ExecutionRef::from_project(p)
+    }
+    .await;
+    let execution = preflight.map_err(NotSubmitted)?;
     if p.agent == "custom" {
         rpc(
             config,
@@ -988,72 +1085,108 @@ mod tests {
 
     #[tokio::test]
     async fn native_observation_and_prompt_use_public_pane_target() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let cfg = Config {
-            herdr_session: dir.path().to_string_lossy().into_owned(),
-            ..Config::default()
-        };
-        let db = crate::db::Db::open(&dir.path().join("db")).unwrap();
-        let mut p = db
-            .create(crate::db::ProjectInput {
-                name: "Native target".into(),
-                path: dir.path().to_string_lossy().into_owned(),
-                agent: "codex".into(),
-                chat_id: String::new(),
-                native_session: String::new(),
-                extra_args: vec![],
-            })
-            .await
-            .unwrap();
-        p.generation = uuid::Uuid::new_v4().to_string();
-        p.terminal = Some("term_uuid".into());
-        p.terminal_pid = Some(100);
-        p.ready = true;
-        let name = managed_name(&p.generation).unwrap();
-        p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_uuid","managed_name":name,"generation":p.generation,"shell_pid":100,"launch_permit":dir.path().join("launch.permit")});
-        let pane = json!({"pane_id":"w1:p1","workspace_id":"w1","terminal_id":"term_uuid","agent":"codex","agent_status":"idle","tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":p.generation,"hfb_execution":name}});
-        let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
-        let worker = tokio::spawn(async move {
-            for expected in ["pane.get", "agent.get", "pane.process_info", "agent.prompt"] {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (input, mut output) = stream.into_split();
-                let request: Value = serde_json::from_str(
-                    &BufReader::new(input)
-                        .lines()
-                        .next_line()
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                )
+        for starting in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cfg = Config {
+                herdr_session: dir.path().to_string_lossy().into_owned(),
+                ..Config::default()
+            };
+            let db = crate::db::Db::open(&dir.path().join("db")).unwrap();
+            let mut p = db
+                .create(crate::db::ProjectInput {
+                    name: "Native target".into(),
+                    path: dir.path().to_string_lossy().into_owned(),
+                    agent: "codex".into(),
+                    chat_id: String::new(),
+                    native_session: String::new(),
+                    extra_args: vec![],
+                })
+                .await
                 .unwrap();
-                assert_eq!(request["method"], expected);
-                if expected.starts_with("agent.") {
-                    assert_eq!(
-                        request["params"]["target"], "w1:p1",
-                        "Agent targets do not accept terminal UUIDs"
+            p.generation = uuid::Uuid::new_v4().to_string();
+            p.terminal = Some("term_uuid".into());
+            let root_pid = if starting {
+                i64::from(std::process::id())
+            } else {
+                100
+            };
+            p.terminal_pid = Some(root_pid);
+            p.ready = !starting;
+            let name = managed_name(&p.generation).unwrap();
+            p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_uuid","managed_name":name,"generation":p.generation,"shell_pid":root_pid,"launch_permit":dir.path().join("launch.permit")});
+            let pane = json!({"pane_id":"w1:p1","workspace_id":"w1","terminal_id":"term_uuid","agent":if starting {""} else {"codex"},"agent_status":"idle","tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":p.generation,"hfb_execution":name}});
+            let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
+            let worker = tokio::spawn(async move {
+                let expected_methods = if starting {
+                    vec!["pane.get", "agent.get", "pane.process_info"]
+                } else {
+                    vec!["pane.get", "agent.get", "pane.process_info", "agent.prompt"]
+                };
+                for expected in expected_methods {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (input, mut output) = stream.into_split();
+                    let request: Value = serde_json::from_str(
+                        &BufReader::new(input)
+                            .lines()
+                            .next_line()
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(request["method"], expected);
+                    if expected.starts_with("agent.") {
+                        assert_eq!(
+                            request["params"]["target"], "w1:p1",
+                            "Agent targets do not accept terminal UUIDs"
+                        );
+                    }
+                    let result = match expected {
+                        "pane.get" => json!({"pane":pane}),
+                        "agent.get" => json!({"agent":pane}),
+                        "pane.process_info" => {
+                            json!({"process_info":{"shell_pid":root_pid,"foreground_processes":if starting { json!([]) } else { json!([{"pid":root_pid,"name":"codex","argv":["codex"]}]) }}})
+                        }
+                        _ => json!({"agent":pane}),
+                    };
+                    output
+                        .write_all(
+                            format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                if starting {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                            .await
+                            .is_err(),
+                        "Preflight refusal must never write a prompt request"
                     );
                 }
-                let result = match expected {
-                    "pane.get" => json!({"pane":pane}),
-                    "agent.get" => json!({"agent":pane}),
-                    "pane.process_info" => {
-                        json!({"process_info":{"shell_pid":100,"foreground_processes":[{"pid":100,"name":"codex","argv":["codex"]}]}})
-                    }
-                    _ => json!({"agent":pane}),
-                };
-                output
-                    .write_all(
-                        format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
-                    )
-                    .await
-                    .unwrap();
+            });
+            let result = send(&cfg, &p, "test prompt").await;
+            if starting {
+                let error = result.unwrap_err();
+                assert!(definitely_not_sent(&error));
+                assert!(error.is::<NotSubmitted>());
+                assert!(error.chain().any(|e| e.is::<SessionStarting>()));
+            } else {
+                assert_eq!(result.unwrap()["submitted"], true);
             }
-        });
-        assert_eq!(
-            send(&cfg, &p, "test prompt").await.unwrap()["submitted"],
-            true
-        );
-        worker.await.unwrap();
+            worker.await.unwrap();
+            let error = rpc(
+                &cfg,
+                "agent.prompt",
+                json!({"target":"w1:p1","text":"no connection"}),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                definitely_not_sent(&error),
+                "A failed socket connection wrote no request bytes"
+            );
+        }
     }
 
     #[tokio::test]
