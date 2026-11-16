@@ -104,9 +104,9 @@ Use the same CLI's verified native session ID to resume history. Native hooks su
 | Codex | Dedicated launch configuration; enables `--no-daemon` and `--dangerously-bypass-hook-trust` when the installed CLI advertises each flag, and forwards HERDR terminal identity | `codex resume`, using the session registered through MCP metadata or a supplied ID |
 | Claude Code | Project-specific `--mcp-config` | A new UUID for a new session; `--resume` for recovery |
 | Pi | Merges `herdr_feishu` into `.pi/mcp.json` | `--session` |
-| Antigravity (`agy`) | Merges `.agents/mcp_config.json`; `-i` submits the initial interactive prompt | `--conversation` |
+| Antigravity (`agy`) | Registers `herdr_feishu` in `~/.gemini/config/mcp_config.json`; the server resolves the current execution from verified HERDR identity. `-i` submits the initial interactive prompt | `--conversation` |
 
-Configuration merges preserve other MCP entries and reject invalid JSON or an entry belonging to a different project. Ignore generated local configuration in the target project. Custom CLI argument arrays run without a shell and can use `{mcp_config}`, `{credentials}`, `{bridge_exe}`, and `{instructions}`. Per-session credentials live under `sessions/<project>/<generation>/` and cannot administer other projects.
+Configuration merges preserve other MCP entries and reject invalid JSON or an unrelated server using the same name. Ordinary agy sessions receive no Dauerbot project tools. Ignore generated local configuration in the target project. Custom CLI argument arrays run without a shell and can use `{mcp_config}`, `{credentials}`, `{bridge_exe}`, and `{instructions}`. Per-session credentials live under `sessions/<project>/<generation>/` and cannot administer other projects.
 
 ## Messages and MCP
 
