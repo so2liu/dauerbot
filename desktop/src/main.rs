@@ -973,7 +973,7 @@ impl Desktop {
                 let event_id = event["id"].as_str().unwrap_or("").to_owned();
                 let retry_id = event_id.clone();
                 body = body
-                    .child(self.card("Review task result", "Check the terminal and saved work before retrying or dismissing this task."))
+                    .child(self.card("Review task result", "An earlier task was interrupted. New messages continue automatically; retry this task only if you want it repeated."))
                     .child(
                         div().id(SharedString::from(format!("resolve-{event_id}"))).flex().gap_2()
                             .child(self.btn("retry-event", "Retry task", move |this, window, cx| {
@@ -1079,13 +1079,6 @@ impl Desktop {
                 body = body.child(self.card("Manual control is reserved", "Release the reservation to let queued tasks continue, or take control in the terminal."))
                     .child(self.btn("release-reservation", "Release reservation", move |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Takeover { project:project.clone(),generation:generation.clone(),active:false }); }, cx));
             }
-            let start_action = if project["native_session"].as_str().unwrap_or("").is_empty() {
-                "start"
-            } else {
-                "resume"
-            };
-            let start = id.clone();
-            let stop = id.clone();
             let pause = id.clone();
             let paused = project["paused"].as_bool().unwrap_or(false);
             body = body.child(
@@ -1093,28 +1086,12 @@ impl Desktop {
                     .flex()
                     .flex_wrap()
                     .gap_2()
-                    .child(
-                        self.btn(
-                            "wake-project",
-                            "Start / resume",
-                            move |this, _, _| {
-                                this.api(
-                                    "POST",
-                                    format!("/projects/{start}/{start_action}"),
-                                    None,
-                                    "Starting the main session...",
-                                )
-                            },
-                            cx,
-                        )
-                        .primary(),
-                    )
                     .child(self.btn(
                         "pause-project",
                         if paused {
-                            "Resume delivery"
+                            "Resume automatic activity"
                         } else {
-                            "Pause delivery"
+                            "Pause automatic activity"
                         },
                         move |this, _, _| {
                             this.api(
@@ -1126,19 +1103,13 @@ impl Desktop {
                         },
                         cx,
                     ))
-                    .child(self.btn(
-                        "stop-project",
-                        "Stop",
-                        move |this, _, _| {
-                            this.api(
-                                "POST",
-                                format!("/projects/{stop}/stop"),
-                                None,
-                                "Session stopped",
-                            )
-                        },
-                        cx,
-                    )),
+                    .child(
+                        div().text_sm().text_color(rgb(0x667782)).child(self.tr(if paused {
+                            "Automatic activity is paused. Messages stay saved until you resume."
+                        } else {
+                            "Messages start the Agent automatically."
+                        })),
+                    ),
             );
             body = body.child(
                 div()
@@ -1328,7 +1299,7 @@ impl Desktop {
                     let answer = window.prompt(
                         PromptLevel::Warning,
                         &this.tr("Remove this project?"),
-                        Some(&this.tr("Stop its session first. Project files remain on disk.")),
+                        Some(&this.tr("The Agent will stop. Project files remain on disk.")),
                         &[this.tr("Cancel").as_str(), this.tr("Remove").as_str()],
                         cx,
                     );
@@ -1585,12 +1556,12 @@ impl Desktop {
                 "Choose a project to view its agent"
             } else if matches!(lifecycle, "starting" | "connecting") {
                 "Connecting to the live terminal…"
-            } else if lifecycle == "stopped" {
-                "Project is stopped. Start it to run tasks."
+            } else if lifecycle == "paused" {
+                "Automatic activity is paused. Messages stay saved until you resume."
             } else if matches!(lifecycle, "needs_attention" | "error") {
                 "Agent needs attention. Review the project notice."
             } else {
-                "Agent is sleeping. Tasks and schedules will wake it automatically."
+                "Ready for messages. The Agent starts automatically when needed."
             };
             panel = panel.child(
                 div()

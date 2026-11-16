@@ -33,7 +33,6 @@ pub struct Project {
     pub terminal_pid: Option<i64>,
     pub generation: String,
     pub ready: bool,
-    pub enabled: bool,
     pub execution: serde_json::Value,
     pub native_session: String,
     pub extra_args: Vec<String>,
@@ -90,11 +89,10 @@ fn project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         extra_args: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
         created_at: row.get(12)?,
         mcp_token: row.get(13)?,
-        enabled: row.get(14)?,
-        execution: serde_json::from_str(&row.get::<_, String>(15)?).unwrap_or_default(),
+        execution: serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
     })
 }
-const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token,enabled,execution";
+const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token,execution";
 fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: row.get(0)?,
@@ -122,7 +120,7 @@ impl Db {
         }
         let schema: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            schema <= 5,
+            schema <= 6,
             "This data directory requires a newer Dauerbot version"
         );
         anyhow::ensure!(
@@ -139,7 +137,7 @@ impl Db {
               terminal TEXT, terminal_pid INTEGER, generation TEXT NOT NULL DEFAULT '',
               ready INTEGER NOT NULL DEFAULT 0, native_session TEXT NOT NULL DEFAULT '',
               extra_args TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, mcp_token TEXT NOT NULL,
-              enabled INTEGER NOT NULL DEFAULT 1, execution TEXT NOT NULL DEFAULT 'null');
+              execution TEXT NOT NULL DEFAULT 'null');
             CREATE TABLE IF NOT EXISTS messages (
               id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
               direction TEXT NOT NULL, source_id TEXT NOT NULL, content TEXT NOT NULL,
@@ -152,11 +150,21 @@ impl Db {
         if schema == 4 {
             migration.execute_batch("DROP TABLE IF EXISTS archived_core_executions;")?;
         }
+        // A stopped execution must never disable future message-triggered wakeup.
+        // Keep explicit pauses, credentials and native conversation references.
+        let has_enabled: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name='enabled')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_enabled {
+            migration.execute_batch("ALTER TABLE projects DROP COLUMN enabled;")?;
+        }
         crate::conversation::migrate(&migration)?;
         crate::bot::migrate(&migration)?;
         migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         crate::work::migrate(&migration)?;
-        migration.pragma_update(None, "user_version", 5)?;
+        migration.pragma_update(None, "user_version", 6)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
@@ -276,21 +284,10 @@ impl Db {
         let key = key.to_owned();
         let generation = generation.to_owned();
         self.call(move |c| {
-            c.execute("UPDATE projects SET terminal=?,terminal_pid=?,generation=?,ready=0,enabled=1,execution=? WHERE id=?",
+            c.execute("UPDATE projects SET terminal=?,terminal_pid=?,generation=?,ready=0,execution=? WHERE id=?",
                 params![execution["terminal_id"].as_str(),execution["shell_pid"].as_i64(),generation,execution.to_string(),key])?;
             Ok(())
         }).await
-    }
-    pub async fn enabled(&self, key: &str, enabled: bool) -> Result<()> {
-        let key = key.to_owned();
-        self.call(move |c| {
-            c.execute(
-                "UPDATE projects SET enabled=? WHERE id=?",
-                params![enabled, key],
-            )?;
-            Ok(())
-        })
-        .await
     }
     pub async fn native_session(&self, key: &str, native: &str) -> Result<()> {
         let key = key.to_owned();

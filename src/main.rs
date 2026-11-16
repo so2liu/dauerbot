@@ -138,6 +138,7 @@ enum Projects {
     Show {
         project: String,
     },
+    /// Pause automatic activity; incoming messages remain saved.
     Pause {
         project: String,
     },
@@ -158,6 +159,7 @@ enum Sessions {
     Resume {
         project: String,
     },
+    /// End the current process. New work automatically resumes the conversation.
     Stop {
         project: String,
     },

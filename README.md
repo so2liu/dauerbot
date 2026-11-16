@@ -46,7 +46,7 @@ Use `--data-dir` for an independent instance. Its window shows an independent-in
 open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
 ```
 
-Each data directory derives its own dedicated HERDR session. A one-time transition preserves existing projects, credentials, native history references and messages, and clears old Core execution addresses. Projects with a previous live Core execution stay stopped until you explicitly start or resume them. This transition does not provide ongoing support for the former backend.
+Each data directory derives its own dedicated HERDR session. Normal schema upgrades preserve existing projects, credentials, native history references, messages and explicit pauses. Product execution uses only legacy herdr 0.9.5.
 
 ## Build and develop
 
@@ -141,7 +141,7 @@ Restarts preserve uncertain operations instead of blindly resending. PTY input a
 
 ## Tasks, schedules, and Agent tools
 
-Tasks, events, runs and timers live in SQLite independently of Agent processes. Once a native run has finished, the supervisor verifies idle state, queue emptiness, background jobs, session continuity and human takeover before beginning a ten-minute warm period. New work reuses a warm Agent or resumes a sleeping one. Stopping a project disables automatic wakeup until started again.
+Tasks, events, runs and timers live in SQLite independently of Agent processes. Once a native run has finished, the supervisor verifies idle state, queue emptiness, background jobs, session continuity and human takeover before beginning a ten-minute warm period. New work reuses a warm Agent or resumes a sleeping one. Every project starts or resumes its Agent automatically when a message arrives. Stopping a session ends only its current process; later messages wake a fresh execution of the same native conversation. Explicitly pausing automatic activity is the only persistent user control that holds new input. Interrupted work retains its uncertain receipt without blocking fresh conversation messages.
 
 ```sh
 hfb task add my-project "Review dependencies" "Check for useful dependency updates"

@@ -28,7 +28,7 @@ All work uses the project main session. Incoming conversation messages have prio
 
 ## Wakeup and retirement
 
-The supervisor wakes or reuses an Agent for eligible work. Timers create durable inbox events, even while no Agent exists. Queue insertion and project state transitions share a coordination boundary so retirement cannot lose a concurrent message.
+Every project automatically wakes or reuses its Agent for incoming messages and eligible work. There is no persistent stopped-project switch. Stop ends the current execution; subsequent messages resume the native conversation without replaying interrupted uncertain inputs. Only an explicit pause or manual terminal takeover suspends automatic input. Schema 6 removes the former project enabled flag, including old disabled values, while preserving explicit pauses. Timers create durable inbox events, even while no Agent exists. Queue insertion and project state transitions share a coordination boundary so retirement cannot lose a concurrent message.
 
 After a finished run, keep the Agent warm for ten minutes. Retirement requires no active or uncertain turn, no eligible event backlog, no active tracked child work, no native blocked prompt, no human takeover, and a verified native session reference for future resume. Unknown execution quiescence is a state to resolve; silence, output delivery and acknowledgement do not establish completion.
 

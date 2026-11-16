@@ -19,6 +19,56 @@ fn input(path: &std::path::Path) -> ProjectInput {
 }
 
 #[tokio::test]
+async fn upgrade_removes_the_stopped_project_gate_and_preserves_explicit_pauses() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bridge.sqlite3");
+    let db = Db::open(&path).unwrap();
+    let stopped = db.create(input(dir.path())).await.unwrap();
+    let mut paused_input = input(dir.path());
+    paused_input.name = "Explicitly paused".into();
+    let paused = db.create(paused_input).await.unwrap();
+    db.pause(&paused.id, true).await.unwrap();
+    db.sync(|c| {
+        herdr_feishu_bridge::bot::save(c, &stopped.id, "cli_preserved", "saved-secret", false)?;
+        c.execute_batch(
+            "ALTER TABLE projects ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+             UPDATE projects SET enabled=0;
+             PRAGMA user_version=5;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
+
+    let upgraded = Db::open(&path).unwrap();
+    assert!(!upgraded.project(&stopped.id).await.unwrap().paused);
+    assert!(upgraded.project(&paused.id).await.unwrap().paused);
+    assert_eq!(
+        upgraded.project(&stopped.id).await.unwrap().native_session,
+        "previous-native"
+    );
+    assert_eq!(
+        upgraded.bot(&stopped.id).await.unwrap().app_secret,
+        "saved-secret"
+    );
+    upgraded
+        .sync(|c| {
+            let obsolete: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name='enabled')",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(!obsolete);
+            assert_eq!(
+                c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+                6
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
 async fn admitted_old_generation_cannot_finish_after_execution_changes() {
     let dir = tempfile::tempdir().unwrap();
     let app = App::new(dir.path().into(), Config::default()).unwrap();
@@ -158,7 +208,6 @@ async fn pre_refactor_store_is_refused_without_mutating_its_sessions() {
     db.sync(|c| {
         c.execute_batch(
             "ALTER TABLE projects DROP COLUMN execution;
-             ALTER TABLE projects DROP COLUMN enabled;
              PRAGMA user_version=3;",
         )?;
         Ok(())
