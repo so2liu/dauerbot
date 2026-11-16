@@ -18,7 +18,28 @@ impl Language {
     }
     pub fn text(self, source: &str) -> String {
         if self == Self::En {
-            return source.to_owned();
+            return match source {
+                "sleeping" => "Sleeping",
+                "starting" => "Starting",
+                "ready" => "Ready",
+                "busy" | "running" => "Working",
+                "needs_attention" => "Needs attention",
+                "taken_over" => "Manual control",
+                "offline" => "HERDR unavailable",
+                "paused" => "Paused",
+                "stopped" => "Stopped",
+                "exited" => "Exited",
+                "error" => "Error",
+                "queued" => "Queued",
+                "submitted" | "acknowledged" => "In progress",
+                "uncertain" => "Review needed",
+                "completed" => "Completed",
+                "cancelled" => "Cancelled",
+                "waiting" | "deferred" => "Waiting",
+                "failed" => "Failed",
+                _ => source,
+            }
+            .to_owned();
         }
         let translated = match source {
             "Paste is larger than 1 MiB" => "粘贴内容超过 1 MiB",
@@ -137,14 +158,20 @@ impl Language {
             "ready" => "已就绪",
             "busy" => "执行中",
             "needs_attention" => "需要处理",
+            "taken_over" => "手动控制中",
+            "offline" => "HERDR 暂不可用",
+            "stopped" => "已停止",
             "paused" => "已暂停",
             "exited" => "已退出",
             "error" => "发生错误",
             "queued" => "排队中",
+            "submitted" | "acknowledged" => "进行中",
+            "uncertain" => "需要检查结果",
             "running" => "执行中",
             "completed" => "已完成",
             "cancelled" => "已取消",
             "waiting" => "等待中",
+            "deferred" => "等待中",
             "failed" => "失败",
             "Edit" => "编辑",
             "Remove" => "移除",
