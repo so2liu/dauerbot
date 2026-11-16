@@ -7,11 +7,7 @@ use serde_json::{Value, json};
 async fn real_markdown_and_file_delivery() -> anyhow::Result<()> {
     let credentials: Value = serde_json::from_slice(&std::fs::read(".local/live.json")?)?;
     let dir = tempfile::TempDir::new()?;
-    let cfg = Config {
-        app_id: credentials["app_id"].as_str().unwrap().into(),
-        app_secret: credentials["app_secret"].as_str().unwrap().into(),
-        ..Config::default()
-    };
+    let cfg = Config::default();
     let app = App::new(dir.path().into(), cfg)?;
     let project = app
         .db
@@ -24,6 +20,15 @@ async fn real_markdown_and_file_delivery() -> anyhow::Result<()> {
             extra_args: vec![],
         })
         .await?;
+    app.db.sync(|c| {
+        herdr_feishu_bridge::bot::save(
+            c,
+            &project.id,
+            credentials["app_id"].as_str().unwrap(),
+            credentials["app_secret"].as_str().unwrap(),
+            false,
+        )
+    })?;
     let markdown=app.outbox(&project.id,"live-markdown","**HERDR Bridge 开发测试**\n\nRust daemon 的 Markdown 发送链路已连通。此为授权的开发验证消息，无需回复。",json!({})).await?;
     assert_eq!(markdown.status, "sent", "{}", markdown.error);
     let file = dir.path().join("herdr-bridge-test.txt");

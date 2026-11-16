@@ -115,9 +115,14 @@ const MESSAGE: &str = "id,project_id,direction,source_id,content,status,error,at
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let schema: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            schema <= 4,
+            schema <= 5,
             "This data directory requires a newer Dauerbot version"
         );
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -130,7 +135,6 @@ impl Db {
               terminal TEXT, terminal_pid INTEGER, generation TEXT NOT NULL DEFAULT '',
               ready INTEGER NOT NULL DEFAULT 0, native_session TEXT NOT NULL DEFAULT '',
               extra_args TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, mcp_token TEXT NOT NULL);
-            CREATE UNIQUE INDEX IF NOT EXISTS project_chat ON projects(chat_id) WHERE chat_id <> '';
             CREATE TABLE IF NOT EXISTS messages (
               id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
               direction TEXT NOT NULL, source_id TEXT NOT NULL, content TEXT NOT NULL,
@@ -175,7 +179,7 @@ impl Db {
         crate::bot::migrate(&migration)?;
         migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         crate::work::migrate(&migration)?;
-        migration.pragma_update(None, "user_version", 4)?;
+        migration.pragma_update(None, "user_version", 5)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
@@ -229,7 +233,6 @@ impl Db {
             tx.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
             params![key,input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,now(),id()])?;
             crate::conversation::primary(&tx, &key, input.chat_id.trim(), "")?;
-            crate::bot::ensure_owner(&tx)?;
             tx.commit()?;
             Ok(())
         }).await?;
@@ -366,30 +369,40 @@ impl Db {
             if n!=1 {bail!("Session identity changed; reconnect MCP");} Ok(())
         }).await
     }
-    /// All events from the configured bot enter its project, regardless of chat type or ID.
+    /// The receiving Bot supplies the project; chat IDs are source metadata only.
     pub fn ingest_bot(
         &self,
+        project: &str,
+        app_id: &str,
         chat: &str,
         source: &str,
         content: &str,
         attachment: &serde_json::Value,
     ) -> Result<Option<String>> {
-        self.sync(|c|{
-            let context = &attachment["source"];
-            let kind = context["chat_type"].as_str().unwrap_or("unknown");
-            c.execute("INSERT INTO conversations(chat_id,kind,seen_at,preview) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET seen_at=excluded.seen_at,preview=excluded.preview,kind=CASE WHEN excluded.kind='unknown' THEN conversations.kind ELSE excluded.kind END", params![chat,kind,now(),content.chars().take(96).collect::<String>()])?;
-            if c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE direction='in' AND source_id=?)",[source],|r|r.get::<_,bool>(0))? { return Ok(None); }
-            let destination = crate::bot::owner(c)?;
-            let Some(project)=destination else {
-                c.execute("INSERT OR IGNORE INTO unrouted_messages(source_id,chat_id,content,attachment,created_at) VALUES(?,?,?,?,?)",params![source,chat,content,serde_json::to_string(attachment)?,now()])?;
-                return Ok(None)
-            };
-            c.execute("UPDATE conversations SET project_id=? WHERE chat_id=?",params![project,chat])?;
-            let key=id();
-            let n=c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
-                params![key,project,source,content,serde_json::to_string(attachment)?,now(),now()])?;
-            if n==1 { c.execute("DELETE FROM unrouted_messages WHERE source_id=?",[source])?; }
-            Ok((n==1).then_some(key))
+        self.sync(|c| {
+            let tx = c.unchecked_transaction()?;
+            let bound: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM project_bots WHERE project_id=? AND app_id=?)",
+                params![project, app_id], |r| r.get(0),
+            )?;
+            anyhow::ensure!(bound, "The receiving bot is no longer bound to this project");
+            let kind = attachment["source"]["chat_type"].as_str().unwrap_or("unknown");
+            tx.execute(
+                "INSERT INTO conversations(project_id,chat_id,kind,seen_at,preview) VALUES(?,?,?,?,?)
+                 ON CONFLICT(project_id,chat_id) DO UPDATE SET seen_at=excluded.seen_at,preview=excluded.preview,
+                 kind=CASE WHEN excluded.kind='unknown' THEN conversations.kind ELSE excluded.kind END",
+                params![project, chat, kind, now(), content.chars().take(96).collect::<String>()],
+            )?;
+            let mut attachment = attachment.clone();
+            attachment["bot_app_id"] = serde_json::json!(app_id);
+            let key = id();
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
+                 VALUES(?,?,'in',?,?,'queued',?,?,?)",
+                params![key,project,source,content,attachment.to_string(),now(),now()],
+            )?;
+            tx.commit()?;
+            Ok((inserted == 1).then_some(key))
         })
     }
     pub async fn enqueue_out(

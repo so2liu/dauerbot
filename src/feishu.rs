@@ -1,4 +1,4 @@
-use crate::{App, config::Config, db};
+use crate::{App, bot::Binding, config::Config, db};
 use anyhow::{Context, Result, bail};
 use open_lark::ws_client::{EventDispatcherHandler, EventHandler, LarkWsClient};
 use serde_json::{Value, json};
@@ -19,15 +19,23 @@ pub struct TokenCache {
     until: Option<Instant>,
 }
 
-pub async fn token(app: &App) -> Result<String> {
+pub async fn token(app: &App, binding: &Binding) -> Result<String> {
     let cfg = app.config.read().await.clone();
-    if cfg.app_id.is_empty() || cfg.app_secret.is_empty() {
+    if binding.app_id.is_empty() || binding.app_secret.is_empty() {
         bail!("Configure Feishu app credentials first");
     }
-    let mut cache = app.token.lock().await;
-    let key = format!("{}:{}", cfg.app_id, cfg.feishu_base);
-    if cache.key == key && cache.until.is_some_and(|t| t > Instant::now()) {
-        return Ok(cache.token.clone());
+    let key = format!(
+        "{}:{}:{}",
+        binding.app_id, binding.app_secret, cfg.feishu_base
+    );
+    {
+        let tokens = app.token.lock().await;
+        if let Some(cache) = tokens.get(&binding.project_id)
+            && cache.key == key
+            && cache.until.is_some_and(|t| t > Instant::now())
+        {
+            return Ok(cache.token.clone());
+        }
     }
     let response = app
         .http
@@ -35,10 +43,12 @@ pub async fn token(app: &App) -> Result<String> {
             "{}/open-apis/auth/v3/tenant_access_token/internal",
             cfg.feishu_base
         ))
-        .json(&json!({"app_id":cfg.app_id,"app_secret":cfg.app_secret}))
+        .json(&json!({"app_id":binding.app_id,"app_secret":binding.app_secret}))
         .send()
         .await?;
     let v = api_json(response).await?;
+    let mut tokens = app.token.lock().await;
+    let cache = tokens.entry(binding.project_id.clone()).or_default();
     cache.key = key;
     cache.token = v["tenant_access_token"]
         .as_str()
@@ -76,7 +86,16 @@ pub async fn api_json(response: reqwest::Response) -> Result<Value> {
 
 pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String> {
     let cfg = app.config.read().await.clone();
-    let token = token(app).await?;
+    let binding = app.db.bot(&m.project_id).await?;
+    if m.attachment["bot_app_id"]
+        .as_str()
+        .is_some_and(|id| id != binding.app_id)
+    {
+        bail!(
+            "This message belongs to the previous bot; review it before sending with a different bot"
+        );
+    }
+    let token = token(app, &binding).await?;
     let to = m.attachment["to"].as_str().unwrap_or(&p.chat_id);
     let receive_id_type = recipient_type(to)?;
     let (kind, content) = if let Some(path) = m.attachment["path"].as_str() {
@@ -159,7 +178,8 @@ pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
     };
     let kind = m.attachment["kind"].as_str().unwrap_or("file");
     let cfg = app.config.read().await.clone();
-    let token = token(app).await?;
+    let binding = app.db.bot(&m.project_id).await?;
+    let token = token(app, &binding).await?;
     let mut url = reqwest::Url::parse(&format!("{}/open-apis/im/v1/messages", cfg.feishu_base))?;
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("Invalid URL"))?
@@ -211,17 +231,37 @@ pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
     Ok(Some(target))
 }
 
-pub struct Inbound(pub Arc<App>);
+pub struct Inbound {
+    pub app: Arc<App>,
+    pub binding: Binding,
+}
 impl EventHandler for Inbound {
     fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let v: Value = serde_json::from_slice(payload)?;
         if let Some((chat, source, text, attachment)) = normalize(&v)? {
-            self.0.db.ingest_bot(&chat, &source, &text, &attachment)?;
-            if let Ok(mut runtime) = self.0.runtime.try_write() {
+            if v["header"]["app_id"]
+                .as_str()
+                .is_some_and(|id| id != self.binding.app_id)
+            {
+                return Err(anyhow::anyhow!("The Feishu event belongs to a different bot").into());
+            }
+            self.app.db.ingest_bot(
+                &self.binding.project_id,
+                &self.binding.app_id,
+                &chat,
+                &source,
+                &text,
+                &attachment,
+            )?;
+            if let Ok(mut runtime) = self.app.runtime.try_write() {
                 runtime.feishu = "receiving".into();
                 runtime.feishu_error.clear();
+                if let Some(state) = runtime.bots.get_mut(&self.binding.project_id) {
+                    state["status"] = json!("receiving");
+                    state["error"] = json!("");
+                }
             }
-            self.0.notify.notify_one();
+            self.app.notify.notify_one();
         }
         Ok(())
     }
@@ -294,59 +334,126 @@ fn collect_text(v: &Value, out: &mut String) {
 
 pub async fn websocket(app: Arc<App>) {
     let mut revision = app.settings_tx.subscribe();
+    let mut workers: std::collections::HashMap<String, (Binding, tokio::task::JoinHandle<()>)> =
+        std::collections::HashMap::new();
+    loop {
+        let bindings = match app.db.bots().await {
+            Ok(bindings) => bindings,
+            Err(_) => {
+                let mut runtime = app.runtime.write().await;
+                runtime.feishu_error = "Cannot read project bot connections".into();
+                drop(runtime);
+                tokio::select! {
+                    _ = app.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                }
+            }
+        };
+        let replaced: Vec<String> = workers
+            .iter()
+            .filter(|(project, (current, handle))| {
+                handle.is_finished()
+                    || !bindings.iter().any(|next| {
+                        next.project_id == **project
+                            && next.app_id == current.app_id
+                            && next.app_secret == current.app_secret
+                    })
+            })
+            .map(|(project, _)| project.clone())
+            .collect();
+        for project in replaced {
+            if let Some((_, worker)) = workers.remove(&project) {
+                worker.abort();
+                let _ = worker.await;
+            }
+            app.runtime.write().await.bots.remove(&project);
+        }
+        for binding in bindings {
+            if !workers.contains_key(&binding.project_id) {
+                let worker = tokio::spawn(websocket_for(app.clone(), binding.clone()));
+                workers.insert(binding.project_id.clone(), (binding, worker));
+            }
+        }
+        {
+            let mut runtime = app.runtime.write().await;
+            if workers.is_empty() {
+                runtime.feishu = "unconfigured".into();
+            }
+            runtime.feishu_error.clear();
+        }
+        tokio::select! {
+            _ = app.shutdown.cancelled() => break,
+            _ = revision.changed() => {},
+        }
+    }
+    for (_, (_, worker)) in workers {
+        worker.abort();
+        let _ = worker.await;
+    }
+}
+
+async fn connection_state(app: &App, binding: &Binding, status: &str, error: &str) {
+    let mut runtime = app.runtime.write().await;
+    runtime.bots.insert(
+        binding.project_id.clone(),
+        json!({"app_id":binding.app_id,"status":status,"error":error}),
+    );
+    runtime.feishu = if runtime
+        .bots
+        .values()
+        .any(|b| b["status"] == "awaiting_events" || b["status"] == "receiving")
+    {
+        "connected"
+    } else {
+        status
+    }
+    .into();
+}
+
+async fn websocket_for(app: Arc<App>, binding: Binding) {
     let mut delay = 1;
     loop {
         let cfg = app.config.read().await.clone();
-        if cfg.app_id.is_empty() || cfg.app_secret.is_empty() {
-            app.runtime.write().await.feishu = "unconfigured".into();
-
-            if revision.changed().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        app.runtime.write().await.feishu = "connecting".into();
-
+        connection_state(&app, &binding, "connecting", "").await;
         let handler = EventDispatcherHandler::builder()
-            .register_raw("im.message.receive_v1", Inbound(app.clone()))
+            .register_raw(
+                "im.message.receive_v1",
+                Inbound {
+                    app: app.clone(),
+                    binding: binding.clone(),
+                },
+            )
             .expect("unique handler")
             .build();
         let config = open_lark::Config::builder()
-            .app_id(&cfg.app_id)
-            .app_secret(&cfg.app_secret)
+            .app_id(&binding.app_id)
+            .app_secret(&binding.app_secret)
             .base_url(&cfg.feishu_base)
             .max_response_size(2 * 1024 * 1024)
             .build();
-        // open() owns one session. This supervisor also cancels old credentials on change.
         let started = Instant::now();
-        app.runtime.write().await.feishu = "awaiting_events".into();
-
+        connection_state(&app, &binding, "awaiting_events", "").await;
         tokio::select! {
-            _=app.shutdown.cancelled()=>return,
-            result=LarkWsClient::open(Arc::new(config),handler)=>{
-                // SDK errors can contain a gateway URL; keep credentials out of UI/logs.
-                let reason=if result.is_ok(){"Connection ended"}else{"Connection lost or authentication failed; check app credentials and event subscriptions"};
-                let mut rt=app.runtime.write().await;rt.feishu="reconnecting".into();rt.feishu_error=reason.into();
+            _ = app.shutdown.cancelled() => return,
+            result = LarkWsClient::open(Arc::new(config), handler) => {
+                let reason = if result.is_ok() { "Connection ended" } else {
+                    "Connection lost or authentication failed; check this project's bot credentials and event subscriptions"
+                };
+                connection_state(&app, &binding, "reconnecting", reason).await;
             }
-            _=revision.changed()=>{delay=1;continue}
         }
-
         if started.elapsed() > Duration::from_secs(60) {
             delay = 1;
         }
         tokio::select! {
-            _=app.shutdown.cancelled()=>return,
-            _=revision.changed()=>delay=1,
-            _=tokio::time::sleep(Duration::from_secs(delay))=>delay=(delay*2).min(60),
+            _ = app.shutdown.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => delay = (delay * 2).min(60),
         }
     }
 }
 
-pub fn reset_cache(cache: &mut TokenCache) {
-    *cache = TokenCache::default();
-}
 pub fn public_config(cfg: &Config) -> Value {
-    json!({"app_id":cfg.app_id,"has_secret":!cfg.app_secret.is_empty(),"core_session":cfg.core_session,"hc":cfg.hc,"port":cfg.port})
+    json!({"port":cfg.port})
 }
 
 /// Both private/group chat IDs and direct user Open IDs are valid destinations.
@@ -375,8 +482,8 @@ pub async fn context(app: &App, m: &db::Message) -> Value {
         .db
         .sync(|c| {
             Ok(c.query_row(
-                "SELECT context FROM conversations WHERE chat_id=?",
-                [chat],
+                "SELECT context FROM conversations WHERE project_id=? AND chat_id=?",
+                rusqlite::params![m.project_id, chat],
                 |r| r.get::<_, String>(0),
             )
             .unwrap_or_else(|_| "{}".into()))
@@ -391,7 +498,8 @@ pub async fn context(app: &App, m: &db::Message) -> Value {
     } else {
         let fetch = async {
             let cfg = app.config.read().await.clone();
-            let token = token(app).await?;
+            let binding = app.db.bot(&m.project_id).await?;
+            let token = token(app, &binding).await?;
             let base = format!("{}/open-apis/im/v1/chats/{chat}", cfg.feishu_base);
             let name = api_json(app.http.get(&base).bearer_auth(&token).send().await?)
                 .await
@@ -420,7 +528,7 @@ pub async fn context(app: &App, m: &db::Message) -> Value {
             Ok(Ok(v)) => v,
             _ => json!({"members_status":"unavailable","members":[],"fetched_at":db::now()}),
         };
-        let _ = app.db.sync(|c| {c.execute("UPDATE conversations SET context=?,name=CASE WHEN ?='' THEN name ELSE ? END WHERE chat_id=?",rusqlite::params![value.to_string(),value["name"].as_str().unwrap_or(""),value["name"].as_str().unwrap_or(""),chat])?;Ok(())});
+        let _ = app.db.sync(|c| {c.execute("UPDATE conversations SET context=?,name=CASE WHEN ?='' THEN name ELSE ? END WHERE project_id=? AND chat_id=?",rusqlite::params![value.to_string(),value["name"].as_str().unwrap_or(""),value["name"].as_str().unwrap_or(""),m.project_id,chat])?;Ok(())});
         value
     };
     let sender = source["sender"]["open_id"].as_str().unwrap_or("");

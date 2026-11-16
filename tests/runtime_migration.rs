@@ -26,7 +26,11 @@ async fn backend_migration_preserves_bot_messages_and_native_history_without_ado
         .create(project(dir.path(), "Existing project"))
         .await
         .unwrap();
+    db.sync(|c| herdr_feishu_bridge::bot::save(c, &p.id, "cli_fixture", "secret", false))
+        .unwrap();
     db.ingest_bot(
+        &p.id,
+        "cli_fixture",
         "oc_private",
         "om_saved",
         "Saved before migration",
@@ -48,7 +52,7 @@ async fn backend_migration_preserves_bot_messages_and_native_history_without_ado
     assert_eq!(migrated.native_session, "native-history");
     assert!(migrated.terminal.is_none());
     assert!(migrated.execution.is_null());
-    assert_eq!(db.bot_project().await.unwrap(), Some(p.id.clone()));
+    assert_eq!(db.bot(&p.id).await.unwrap().app_id, "cli_fixture");
     assert_eq!(db.messages(&p.id).await.unwrap().len(), 1);
     let old = db
         .sync(|c| {

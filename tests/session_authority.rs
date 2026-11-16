@@ -314,7 +314,11 @@ async fn project_removal_cleans_all_durable_foreign_keys_and_preserves_other_wor
     let mut another = input(dir.path());
     another.name = "Other project".into();
     let other = db.create(another).await.unwrap();
+    db.sync(|c| herdr_feishu_bridge::bot::save(c, &project.id, "cli_fixture", "secret", false))
+        .unwrap();
     db.ingest_bot(
+        &project.id,
+        "cli_fixture",
         "oc_source",
         "im_original",
         "Existing Feishu input",

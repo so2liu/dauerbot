@@ -35,14 +35,13 @@ impl IntoResponse for ApiError {
     }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
-pub const PROTOCOL: u64 = 2;
+pub const PROTOCOL: u64 = 3;
 
 pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()
         .route("/state", get(state))
         .route("/service/shutdown", post(shutdown_service))
-        .route("/settings", get(settings).put(save_settings))
-        .route("/settings/check", post(check_settings))
+        .route("/settings", get(settings))
         .route("/conversations", get(conversations))
         .route("/projects", post(create_project))
         .route(
@@ -50,6 +49,11 @@ pub fn router(app: Arc<App>) -> Router {
             get(project).put(update_project).delete(delete_project),
         )
         .route("/projects/{id}/start", post(start))
+        .route(
+            "/projects/{id}/bot",
+            get(project_bot).put(save_bot).delete(disconnect_bot),
+        )
+        .route("/projects/{id}/bot/check", post(check_bot))
         .route("/projects/{id}/resume", post(resume))
         .route("/projects/{id}/agent", post(switch_agent))
         .route("/projects/{id}/stop", post(stop))
@@ -218,10 +222,16 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
     let runtime = serde_json::to_value(&*app.runtime.read().await).map_err(anyhow::Error::from)?;
     let mut records = Vec::new();
     let mut work_states = serde_json::Map::new();
+    let bindings = app.db.bots().await?;
     for p in projects {
         let id = p.id.clone();
         let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
         let mut record = json!(p);
+        record["bot"] = bindings
+            .iter()
+            .find(|b| b.project_id == p.id)
+            .map(|b| json!({"app_id":b.app_id,"has_secret":!b.app_secret.is_empty()}))
+            .unwrap_or(Value::Null);
         if !p.enabled {
             let id = p.id.clone();
             let preserved =
@@ -252,7 +262,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         records.push(record);
     }
     Ok(Json(
-        json!({"projects":records,"work":work_states,"bot_project":app.db.bot_project().await?,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL}),
+        json!({"projects":records,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {
@@ -266,26 +276,62 @@ struct Settings {
     #[serde(default)]
     clear_secret: bool,
 }
-async fn save_settings(State(app): State<Arc<App>>, Json(input): Json<Settings>) -> ApiResult {
-    let mut cfg = app.config.write().await;
-    let changed_id = cfg.app_id != input.app_id.trim();
-    cfg.app_id = input.app_id.trim().into();
-    if input.clear_secret || changed_id {
-        cfg.app_secret.clear();
-    }
-    if !input.app_secret.is_empty() {
-        cfg.app_secret = input.app_secret;
-    }
-    cfg.save(&app.dir)?;
-    feishu::reset_cache(&mut *app.token.lock().await);
-    let result = feishu::public_config(&cfg);
-    drop(cfg);
-    app.settings_tx.send_modify(|v| *v += 1);
-
-    Ok(Json(result))
+async fn project_bot(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    let project = app.db.project(&id).await?;
+    let binding = app
+        .db
+        .bots()
+        .await?
+        .into_iter()
+        .find(|b| b.project_id == project.id);
+    Ok(Json(
+        binding
+            .map(|b| json!({"app_id":b.app_id,"has_secret":true}))
+            .unwrap_or(Value::Null),
+    ))
 }
-async fn check_settings(State(app): State<Arc<App>>) -> ApiResult {
-    feishu::token(&app).await?;
+async fn save_bot(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<Settings>,
+) -> ApiResult {
+    let project = app.db.project(&id).await?;
+    let project_id = project.id.clone();
+    app.db
+        .call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            crate::bot::save(
+                &tx,
+                &project_id,
+                input.app_id.trim(),
+                &input.app_secret,
+                input.clear_secret,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    app.token.lock().await.remove(&project.id);
+    app.settings_tx.send_modify(|v| *v += 1);
+    project_bot(State(app), Path(project.id)).await
+}
+async fn disconnect_bot(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    let project = app.db.project(&id).await?;
+    let project_id = project.id.clone();
+    app.db
+        .call(move |c| {
+            c.execute("DELETE FROM project_bots WHERE project_id=?", [project_id])?;
+            Ok(())
+        })
+        .await?;
+    app.token.lock().await.remove(&project.id);
+    app.settings_tx.send_modify(|v| *v += 1);
+    Ok(Json(json!({"disconnected":true})))
+}
+async fn check_bot(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    let project = app.db.project(&id).await?;
+    let binding = app.db.bot(&project.id).await?;
+    feishu::token(&app, &binding).await?;
     Ok(Json(
         json!({"ok":true,"message":"App credentials are valid; subscribe to im.message.receive_v1 in the Feishu console"}),
     ))
@@ -336,6 +382,8 @@ async fn delete_project(State(app): State<Arc<App>>, Path(id): Path<String>) -> 
     let lock = app.project_lock(&p.id).await;
     let _guard = lock.lock().await;
     app.db.remove_project(&p.id).await?;
+    app.token.lock().await.remove(&p.id);
+    app.settings_tx.send_modify(|v| *v += 1);
 
     Ok(Json(json!({"ok":true})))
 }
@@ -436,8 +484,8 @@ async fn outbox(
     let authority = authority(session);
     let message_id=app.db.call(move |c|{
         authorize_session(c,&authority,&p.id)?;
-        anyhow::ensure!(crate::bot::owner(c)?.as_deref()==Some(&p.id),
-          "This project does not belong to the configured Feishu bot");
+        let binding=crate::bot::get(c,&p.id)?.context("Connect a Feishu bot to this project first")?;
+        attachment["bot_app_id"]=json!(binding.app_id);
         c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
           VALUES(?,?,'out',?,?,'pending',?,?,?)",rusqlite::params![db::id(),p.id,input.request_id,input.content,attachment.to_string(),db::now(),db::now()])?;
         let (id,content,saved):(String,String,String)=c.query_row("SELECT id,content,attachment FROM messages WHERE project_id=? AND direction='out' AND source_id=?",
@@ -891,9 +939,9 @@ async fn request_decision(
                 json!([]),
                 db::now(),
             )?;
-            if !dest.is_empty() && crate::bot::owner(&tx)?.as_deref()==Some(&p.id){
+            if !dest.is_empty() && let Some(binding)=crate::bot::get(&tx,&p.id)? {
                 let source=format!("decision-{}",decision.id);
-                let attachment=json!({"to":dest});
+                let attachment=json!({"to":dest,"bot_app_id":binding.app_id});
                 tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
                   VALUES(?,?,'out',?,?,'pending',?,?,?)",rusqlite::params![db::id(),p.id,source,input.question,attachment.to_string(),db::now(),db::now()])?;
             }

@@ -14,11 +14,11 @@ Dauerbot uses the MIT license. It is an independent project with no official aff
 
 ## Connect your bot
 
-The native app guides you through creating an enterprise custom app in the Feishu developer console, enabling its bot capability, and saving its App ID and App Secret locally. A group Webhook bot cannot provide the required two-way messaging.
+Create a project by choosing a directory and an Agent CLI, then connect its dedicated bot. You can also keep the project local until you are ready. The native app guides you through creating an enterprise custom app in the Feishu developer console, enabling its bot capability, and saving its App ID and App Secret locally. A group Webhook bot cannot provide the required two-way messaging.
 
 Import the permission JSON supplied by the app, select long connections for event delivery, subscribe to `im.message.receive_v1`, and publish the app. The full permission set receives all group messages; the basic set receives group mentions. Add the bot to a group, or message it directly. Credential validation proves the app's identity; it does not prove that event permissions work.
 
-Create a project by choosing a directory and an Agent CLI. The first project becomes the bot's fixed owner. You do not need a chat ID or a separate chat-binding step. Messages received before project creation stay queued. Additional local projects do not share this bot's messages or sending permissions.
+Each project has its own App ID, App Secret, event connection and connection status. The same bot cannot belong to two projects. New projects stay unbound until you connect their bot; they never inherit another project's credentials. Private and group messages are routed by the receiving bot, so you do not need a chat ID or a chat-binding step. Two bots can receive messages in the same group without sharing their project history or permissions.
 
 Switch the active CLI in the workspace or with `hfb session switch`. Switching requires the current task to finish or be resolved, then closes the old execution and preserves the project, bot binding, progress and queues. The next task starts the selected CLI with continuity summaries. You can also send local tasks through the CLI before connecting Feishu.
 

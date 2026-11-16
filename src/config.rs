@@ -18,7 +18,9 @@ pub struct Config {
     pub herdr_config: String,
     pub core_session: String,
     pub feishu_base: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub app_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub app_secret: String,
 }
 

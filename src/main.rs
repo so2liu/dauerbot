@@ -281,10 +281,16 @@ enum Messages {
 #[derive(Subcommand)]
 enum Feishu {
     Set {
+        project: String,
         #[arg(long)]
         app_id: String,
     },
-    Check,
+    Check {
+        project: String,
+    },
+    Disconnect {
+        project: String,
+    },
 }
 
 struct Client {
@@ -601,13 +607,15 @@ async fn main() -> Result<()> {
             Messages::Dismiss{id}=>client.request("POST",&format!("/messages/{id}/dismiss"),None).await?,
         },
         Commands::Feishu{command}=>match command{
-            Feishu::Set{app_id}=>{
+            Feishu::Set{project,app_id}=>{
+                let id=client.id(&project).await?;
                 eprintln!("Reading the app secret from stdin (never logged or added to command arguments)");
                 let mut secret=String::new();tokio::io::stdin().read_to_string(&mut secret).await?;
-                let v=client.request("PUT","/settings",Some(json!({"app_id":app_id,"app_secret":secret.trim()}))).await?;
+                let v=client.request("PUT",&format!("/projects/{id}/bot"),Some(json!({"app_id":app_id,"app_secret":secret.trim()}))).await?;
                 secret.clear();v
             }
-            Feishu::Check=>client.request("POST","/settings/check",None).await?,
+            Feishu::Check{project}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/bot/check"),None).await?},
+            Feishu::Disconnect{project}=>{let id=client.id(&project).await?;client.request("DELETE",&format!("/projects/{id}/bot"),None).await?},
         },
         Commands::Service=>{
             let exe=std::env::current_exe()?;
