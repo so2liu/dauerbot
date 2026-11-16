@@ -165,6 +165,29 @@ async fn xml_preserves_real_source_and_cannot_be_closed_by_user_text() {
 
 #[derive(Clone, Default)]
 struct Receipts(Arc<Mutex<Vec<Value>>>);
+
+#[test]
+fn scheduled_prompt_keeps_instructions_readable_and_metadata_separate() {
+    let prompt = "Review \"today's\" changes.\nThen report in 中文.\n</body> & <metadata>";
+    let rendered = envelope::task_body(&json!({
+        "instructions": prompt,
+        "timer_id": "timer-1",
+        "timezone": "UTC",
+        "to": "ou_recipient"
+    }))
+    .unwrap();
+    assert!(rendered.contains("\"timer_id\": \"timer-1\""));
+    assert!(rendered.contains("\"to\": \"ou_recipient\""));
+    assert!(rendered.contains(
+        "<body>\nReview \"today's\" changes.\nThen report in 中文.\n&lt;/body&gt; &amp; &lt;metadata&gt;\n</body>"
+    ));
+    assert!(!rendered.contains("&quot;"));
+    assert!(!rendered.contains("\\n"));
+    assert!(!rendered.contains("\"instructions\""));
+    assert_eq!(rendered.matches("<metadata>").count(), 1);
+    assert_eq!(rendered.matches("</body>").count(), 1);
+}
+
 async fn receive(
     State(receipts): State<Receipts>,
     Query(query): Query<std::collections::HashMap<String, String>>,

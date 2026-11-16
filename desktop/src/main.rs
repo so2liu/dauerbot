@@ -1140,7 +1140,11 @@ impl Desktop {
             if self.task_form {
                 body = body.child(self.task_editor(cx));
             }
-            for task in records(&self.tasks, "tasks").into_iter().take(6) {
+            for task in records(&self.tasks, "tasks")
+                .into_iter()
+                .filter(|task| task["status"] != "imported")
+                .take(6)
+            {
                 let task_id = task["id"].as_str().unwrap_or("").to_owned();
                 let state = task["status"]
                     .as_str()

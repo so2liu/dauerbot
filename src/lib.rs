@@ -823,10 +823,7 @@ impl App {
                 let context = feishu::context(self, &message).await;
                 envelope::render(&message, &context, file.as_deref())
             } else {
-                format!(
-                    "<body>{}</body>",
-                    xml(&serde_json::to_string(&event.payload)?)
-                )
+                envelope::task_body(&event.payload)?
             })
         }
         .await;
@@ -842,7 +839,7 @@ impl App {
             }
         };
         let text = format!(
-            "<dauerbot_event event_id=\"{}\" task_id=\"{}\" run_id=\"{}\" source=\"{}\">{}</dauerbot_event>",
+            "<dauerbot_event\n  event_id=\"{}\"\n  task_id=\"{}\"\n  run_id=\"{}\"\n  source=\"{}\">\n{}\n</dauerbot_event>",
             event.id,
             event.task_id,
             run.id,

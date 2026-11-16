@@ -27,6 +27,28 @@ pub fn escape(text: &str) -> String {
 fn attr(value: &Value, key: &str) -> String {
     escape(value[key].as_str().unwrap_or(""))
 }
+
+/// XML character data does not need the quote escaping used by attributes.
+fn text(value: &str) -> String {
+    escape(value).replace("&quot;", "\"").replace("&apos;", "'")
+}
+
+/// Keep task instructions readable instead of serializing them into a JSON string.
+pub fn task_body(payload: &Value) -> Result<String, serde_json::Error> {
+    let mut metadata = payload.clone();
+    let instructions = metadata
+        .as_object_mut()
+        .and_then(|object| object.remove("instructions"));
+    let metadata = text(&serde_json::to_string_pretty(&metadata)?);
+    let body = instructions
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(text)
+        .unwrap_or_default();
+    Ok(format!(
+        "<metadata>\n{metadata}\n</metadata>\n<body>\n{body}\n</body>"
+    ))
+}
 pub fn render(message: &Message, context: &Value, attachment: Option<&Path>) -> String {
     let source = &message.attachment["source"];
     let platform = if source.is_object() {
