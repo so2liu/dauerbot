@@ -86,6 +86,17 @@
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
 
+// macOS supplies key_char for Enter and Tab as well as printable text.
+pub(crate) fn uses_text_input(key: &Keystroke) -> bool {
+    !key.modifiers.control
+        && !key.modifiers.alt
+        && !key.modifiers.platform
+        && key
+            .key_char
+            .as_ref()
+            .is_some_and(|text| !text.chars().any(char::is_control))
+}
+
 /// Convert a GPUI keystroke to terminal escape sequence bytes.
 ///
 /// This function translates GPUI keyboard events into the appropriate byte sequences
@@ -428,5 +439,31 @@ mod tests {
 
         let space = Keystroke::parse("space").unwrap();
         assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn macos_enter_and_tab_are_terminal_keys_while_printable_text_uses_ime() {
+        for (name, text, bytes) in [
+            ("enter", "\n", b"\r".as_slice()),
+            ("tab", "\t", b"\t".as_slice()),
+        ] {
+            let mut key = Keystroke::parse(name).unwrap();
+            key.key_char = Some(text.into());
+            assert!(!uses_text_input(&key));
+            assert_eq!(
+                keystroke_to_bytes(&key, TermMode::empty()).as_deref(),
+                Some(bytes)
+            );
+        }
+        let mut key = Keystroke::parse("a").unwrap();
+        key.key_char = Some("a".into());
+        assert!(uses_text_input(&key));
+        key.key_char = Some("中".into());
+        assert!(uses_text_input(&key));
     }
 }

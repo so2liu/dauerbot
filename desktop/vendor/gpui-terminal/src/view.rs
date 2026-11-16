@@ -863,11 +863,7 @@ impl TerminalView {
             return;
         }
         // Printable text goes through macOS text input so IME does not duplicate keystrokes.
-        if !key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.platform
-            && key.key_char.is_some()
-        {
+        if crate::input::uses_text_input(key) {
             return;
         }
         if self.marked.borrow().is_some() {
