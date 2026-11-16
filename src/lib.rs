@@ -518,6 +518,11 @@ impl App {
         let record = match herdr::observe(&cfg, &p).await {
             Ok(record) => record,
             Err(error) => {
+                let id = p.id.clone();
+                let generation = p.generation.clone();
+                self.db
+                    .call(move |c| work::touch_execution(c, &id, &generation, db::now()))
+                    .await?;
                 self.set_phase(&p, "offline", Value::Null).await;
                 return Err(error);
             }
@@ -583,6 +588,11 @@ impl App {
             return Ok(());
         }
         if let Err(error) = herdr::check_identity(&p, &record) {
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            self.db
+                .call(move |c| work::touch_execution(c, &id, &generation, db::now()))
+                .await?;
             if error.is::<herdr::SessionStarting>() {
                 self.set_phase(&p, "starting", record).await;
                 return Ok(());
@@ -605,6 +615,13 @@ impl App {
                 .await?;
         }
         let native_status = record["status"]["state"].as_str().unwrap_or("");
+        if !p.ready || !["idle", "done"].contains(&native_status) {
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            self.db
+                .call(move |c| work::touch_execution(c, &id, &generation, db::now()))
+                .await?;
+        }
         let lease = {
             let id = p.id.clone();
             let generation_id = p.generation.clone();
@@ -680,13 +697,6 @@ impl App {
             }).await?;
         }
         let busy = native_status == "working";
-        if busy || !["idle", "done"].contains(&native_status) {
-            let id = p.id.clone();
-            let generation_id = p.generation.clone();
-            self.db
-                .call(move |c| work::touch_execution(c, &id, &generation_id, db::now()))
-                .await?;
-        }
         if !p.ready {
             self.set_phase(&p, "starting", record.clone()).await;
             let old = state

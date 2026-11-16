@@ -101,7 +101,7 @@ Use the same CLI's verified native session ID to resume history. Native hooks su
 
 | CLI | MCP configuration | Native resume |
 | --- | --- | --- |
-| Codex | Dedicated launch configuration with `--no-daemon`; forwards HERDR terminal identity | `codex resume`, using the session registered through MCP metadata or a supplied ID |
+| Codex | Dedicated launch configuration; enables `--no-daemon` when the installed CLI advertises it and forwards HERDR terminal identity | `codex resume`, using the session registered through MCP metadata or a supplied ID |
 | Claude Code | Project-specific `--mcp-config` | A new UUID for a new session; `--resume` for recovery |
 | Pi | Merges `herdr_feishu` into `.pi/mcp.json` | `--session` |
 | Antigravity (`agy`) | Merges `.agents/mcp_config.json`; `-i` submits the initial interactive prompt | `--conversation` |
