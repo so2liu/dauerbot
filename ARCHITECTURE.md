@@ -58,4 +58,4 @@ The pre-refactor transition covers only the owner's MacBook Pro and Mac mini. Pr
 
 Source, documentation, default UI and commits use English; desktop preference supports persistent English and Simplified Chinese.
 
-Implementation issues: #23 legacy execution and adapters, #24 durable tasks/scheduling/supervision, #25 native embedded workspace. Parent #22 closes only after all acceptance checks pass. Version 0.3.4 publishes the pre-refactor main; this implementation does not publish another version automatically.
+Implementation issues: #23 legacy execution and adapters, #24 durable tasks/scheduling/supervision, #25 native embedded workspace. Parent #22 closes only after all acceptance checks pass. Version 0.3.4 published the pre-refactor main. Version 0.4.0 releases the on-demand architecture and begins the bounded two-device transition.

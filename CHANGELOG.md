@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 — 2026-11-16
+
+### Changed
+
+- Run native Agents on demand through HERDR 0.9.5. Messages, tasks and timers wake the Agent; verified completion starts a ten-minute warm period before the process retires. Later work resumes the same CLI's native conversation.
+- Replace the former hc/Core execution backend. Existing projects, bot credentials, binding and history migrate once; previous Core executions remain stopped until explicitly started or resumed.
+- Embed the real Agent terminal in the native GPUI workspace, with read-only observation and explicit control. Taking control pauses automatic input and retirement until release.
+- Keep everyday project, task and schedule controls separate from bot setup, permissions and updates, with persistent English and Simplified Chinese.
+
+### Added
+
+- Durable tasks, events, runs, executions, progress checkpoints, deferred decisions and tracked child jobs shared by the desktop, CLI and MCP.
+- Once, interval and timezone-aware cron schedules that survive daemon restarts and wake sleeping Agents without overlapping pending occurrences.
+- Actionable login, permission and unfinished-work notices, plus explicit recovery for uncertain operations.
+
+### Fixed
+
+- Use public HERDR pane targets for native prompt delivery and verified native session references for resume.
+- Handle current Claude Code workspace trust and Codex hook trust without manual startup confirmation, using only supported native flags and verified project prompts.
+- Wait for Pi's direct MCP tools before the first task, preserve proxy/login-shell settings, and distinguish unsent prompts from uncertain submissions.
+- Preserve an execution during transient process observations and restart the warm period after blocked or disconnected observations.
+
+### Validation
+
+- Local backend and desktop tests, clippy, and 16 isolated protocol/lifecycle smoke checks pass.
+- Real Codex, Claude Code and Pi task/retirement/same-session resume flows pass. Authenticated agy end-to-end acceptance and visible desktop IME/selection/clipboard acceptance remain open in #23 and #25.
+
 ## 0.3.4 — 2026-11-16
 
 ### Changed
