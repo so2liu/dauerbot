@@ -79,9 +79,7 @@ struct Desktop {
     terminal_error: String,
     timers: Value,
     work_checked: std::time::Instant,
-    decision_answer: Entity<InputState>,
     quitting: bool,
-    job_reason: Entity<InputState>,
     takeover_requested: bool,
 }
 impl Desktop {
@@ -103,8 +101,6 @@ impl Desktop {
         let name = input("For example: personal website", cx);
         let path = input("Choose the project folder", cx);
         let app_id = input("cli_…", cx);
-        let decision_answer = input("Your answer", cx);
-        let job_reason = input("What did you verify?", cx);
         let secret = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(setup.language.text("Stored only on this Mac"))
@@ -157,9 +153,7 @@ impl Desktop {
             terminal_error: String::new(),
             timers: Value::Null,
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
-            decision_answer,
             quitting: false,
-            job_reason,
             takeover_requested: false,
         }
     }
@@ -410,16 +404,20 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) {
         let title = if retry {
-            "Retry this task?"
+            "Retry this input?"
         } else {
-            "Dismiss this task?"
+            "Dismiss this input?"
         };
         let description = if retry {
             "The agent may already have changed files or sent a reply. Continue after reviewing its work."
         } else {
-            "The task will stop waiting. Existing files and sent replies remain."
+            "The input will stop waiting. Existing files and sent replies remain."
         };
-        let action = if retry { "Retry task" } else { "Dismiss task" };
+        let action = if retry {
+            "Retry input"
+        } else {
+            "Dismiss input"
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
             &self.tr(title),
@@ -435,9 +433,9 @@ impl Desktop {
                         format!("/events/{event_id}/resolve"),
                         Some(json!({"action": if retry { "retry" } else { "dismiss" }})),
                         if retry {
-                            "Task queued"
+                            "Input queued"
                         } else {
-                            "Task dismissed"
+                            "Input dismissed"
                         },
                     );
                     this.work_checked = std::time::Instant::now() - Duration::from_secs(30);
@@ -612,7 +610,7 @@ impl Desktop {
             .child(div().flex().gap_4()
                 .child(self.card("01  Choose a project", "Choose a project folder and an installed Agent CLI.").flex_1())
                 .child(self.card("02  Connect its bot", "Connect a dedicated Feishu bot to this project, or continue locally.").flex_1())
-                .child(self.card("03  Continue the conversation", "Messages, tasks, and files reach the same main session.").flex_1()))
+                .child(self.card("03  Continue the conversation", "Messages, scheduled runs, and files reach the same main session.").flex_1()))
             .child(self.card("You control access", "Choose the project folder yourself. Protected files may require additional access; ordinary projects do not need Full Disk Access, Accessibility, or Screen Recording."))
             .child(self.btn("begin", "Add your first project →", |this, _, _| this.go(5), cx).primary())
             .child(self.btn("bot-guide", "How to create a Feishu bot", |this, _, _| this.go(1), cx))
@@ -740,7 +738,7 @@ impl Desktop {
             .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
             .child(self.card("Connect a dedicated bot", "After creating this project, connect its own Feishu bot or continue locally. You never need to enter chat IDs."))
-            .child(self.card("Your agent, inside Dauerbot", "Watch and operate the live terminal in this app. Closing the window leaves tasks running."))
+            .child(self.card("Your agent, inside Dauerbot", "Watch and operate the live terminal in this app. Closing the window leaves the Agent running."))
             .child(self.btn("create-project", "Create project →", |this, _, cx| {
                 let manual = this.path.read(cx).value().to_string();
                 let path = if manual.trim().is_empty() { this.picked_path.clone() } else { manual };
@@ -834,117 +832,28 @@ impl Desktop {
                     body = body.child(self.card("Needs attention", message));
                 }
             }
-            let unfinished = work["attention"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|item| item["status"] == "open" && item["reason"] == "unfinished_run");
             for event in work["events"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter(|event| {
                     ["uncertain", "failed"].contains(&event["status"].as_str().unwrap_or(""))
-                        || (unfinished
-                            && ["submitted", "acknowledged"]
-                                .contains(&event["status"].as_str().unwrap_or("")))
                 })
                 .take(2)
             {
                 let event_id = event["id"].as_str().unwrap_or("").to_owned();
                 let retry_id = event_id.clone();
                 body = body
-                    .child(self.card("Review task result", "An earlier task was interrupted. New messages continue automatically; retry this task only if you want it repeated."))
+                    .child(self.card("Review input delivery", "An earlier input delivery is uncertain. New messages continue automatically; retry only after checking its effects."))
                     .child(
                         div().id(SharedString::from(format!("resolve-{event_id}"))).flex().gap_2()
-                            .child(self.btn("retry-event", "Retry task", move |this, window, cx| {
+                            .child(self.btn("retry-event", "Retry input", move |this, window, cx| {
                                 this.resolve_event(retry_id.clone(), true, window, cx);
                             }, cx))
-                            .child(self.btn("dismiss-event", "Dismiss task", move |this, window, cx| {
+                            .child(self.btn("dismiss-event", "Dismiss input", move |this, window, cx| {
                                 this.resolve_event(event_id.clone(), false, window, cx);
                             }, cx)),
                     );
-            }
-            if let Some(decision) = work["decisions"]
-                .as_array()
-                .and_then(|items| items.iter().find(|item| item["status"] == "pending"))
-            {
-                let decision_id = decision["id"].as_str().unwrap_or("").to_owned();
-                body = body
-                    .child(self.card_detail(
-                        "Your answer is needed",
-                        decision["question"].as_str().unwrap_or(""),
-                    ))
-                    .child(Input::new(&self.decision_answer))
-                    .child(self.btn(
-                        "answer-decision",
-                        "Send answer",
-                        move |this, _, cx| {
-                            let answer = this.decision_answer.read(cx).value().to_string();
-                            this.api(
-                                "POST",
-                                format!("/decisions/{decision_id}/answer"),
-                                Some(json!({"answer":answer})),
-                                "Answer saved",
-                            );
-                        },
-                        cx,
-                    ));
-            }
-            let jobs: Vec<_> = work["jobs"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|job| {
-                    ["active", "uncertain"].contains(&job["status"].as_str().unwrap_or(""))
-                })
-                .collect();
-            if !jobs.is_empty() {
-                body = body
-                    .child(self.card(
-                        "Background work needs review",
-                        "Stop the parent session, verify any remaining child work, and record what you checked.",
-                    ))
-                    .child(Input::new(&self.job_reason));
-                for job in jobs.into_iter().take(3) {
-                    let job_id = job["id"].as_str().unwrap_or("").to_owned();
-                    let label = job["label"]
-                        .as_str()
-                        .or(job["name"].as_str())
-                        .unwrap_or("Background task")
-                        .to_owned();
-                    body = body.child(
-                        div().flex().items_center().justify_between().gap_2()
-                            .child(label)
-                            .child(Button::new(SharedString::from(format!("abandon-{job_id}")))
-                                .label(self.tr("Abandon reviewed job"))
-                                .disabled(!project["terminal"].is_null() || self.busy)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let reason = this.job_reason.read(cx).value().to_string();
-                                    if reason.trim().is_empty() {
-                                        this.notice = "Describe what you checked first".into();
-                                        this.error = true;
-                                        cx.notify();
-                                        return;
-                                    }
-                                    let answer = window.prompt(
-                                        PromptLevel::Warning,
-                                        &this.tr("Record this job as abandoned?"),
-                                        Some(&this.tr("This records your review. It does not terminate an external process.")),
-                                        &[this.tr("Cancel").as_str(), this.tr("Abandon reviewed job").as_str()],
-                                        cx,
-                                    );
-                                    let job_id = job_id.clone();
-                                    cx.spawn(async move |entity, cx| {
-                                        if answer.await.ok() == Some(1) {
-                                            let _ = entity.update(cx, |this, _| {
-                                                this.api("POST",format!("/jobs/{job_id}/abandon"),Some(json!({"reason":reason})),"Review saved");
-                                            });
-                                        }
-                                    }).detach();
-                                }))),
-                    );
-                }
             }
             if work["lease"]["active"] == true
                 && !self
@@ -957,7 +866,7 @@ impl Desktop {
                     .as_str()
                     .unwrap_or("")
                     .to_owned();
-                body = body.child(self.card("Manual control is reserved", "Release the reservation to let queued tasks continue, or take control in the terminal."))
+                body = body.child(self.card("Manual control is reserved", "Release the reservation to let queued messages continue, or take control in the terminal."))
                     .child(self.btn("release-reservation", "Release reservation", move |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Takeover { project:project.clone(),generation:generation.clone(),active:false }); }, cx));
             }
             let pause = id.clone();
@@ -1260,7 +1169,7 @@ impl Desktop {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.tr("Scheduled tasks")),
+                            .child(self.tr("Scheduled runs")),
                     )
                     .child(
                         div()
@@ -1271,7 +1180,7 @@ impl Desktop {
             );
         if timers.is_empty() {
             content = content.child(self.card(
-                "No scheduled tasks",
+                "No scheduled runs",
                 "Ask the Agent in Feishu to schedule something when you need it.",
             ));
         }
@@ -1286,12 +1195,7 @@ impl Desktop {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(
-                    timer["name"]
-                        .as_str()
-                        .unwrap_or("Scheduled task")
-                        .to_owned(),
-                )
+                .child(timer["name"].as_str().unwrap_or("Scheduled run").to_owned())
                 .child(
                     div()
                         .text_xs()
@@ -1626,9 +1530,6 @@ impl Render for Desktop {
                                 this.name.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("For example: personal website"), window, cx));
                                 this.path.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Choose the project folder"), window, cx));
                                 this.secret.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Stored only on this Mac"), window, cx));
-                                for (input, placeholder) in [(&this.decision_answer, "Your answer"), (&this.job_reason, "What did you verify?")] {
-                                    input.update(cx, |input, cx| input.set_placeholder(this.setup.language.text(placeholder), window, cx));
-                                }
                                 set_menus(this.setup.language, cx);
                                 cx.notify();
                             }))),

@@ -198,7 +198,7 @@ struct Receipts(Arc<Mutex<Vec<Value>>>);
 #[test]
 fn scheduled_prompt_keeps_instructions_readable_and_metadata_separate() {
     let prompt = "Review \"today's\" changes.\nThen report in 中文.\n</body> & <metadata>";
-    let rendered = envelope::task_body(&json!({
+    let rendered = envelope::scheduled_body(&json!({
         "instructions": prompt,
         "timer_id": "timer-1",
         "timezone": "UTC",

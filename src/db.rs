@@ -120,7 +120,7 @@ impl Db {
         }
         let schema: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            schema <= 6,
+            schema <= 7,
             "This data directory requires a newer Dauerbot version"
         );
         anyhow::ensure!(
@@ -164,7 +164,7 @@ impl Db {
         crate::bot::migrate(&migration)?;
         migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         crate::work::migrate(&migration)?;
-        migration.pragma_update(None, "user_version", 6)?;
+        migration.pragma_update(None, "user_version", 7)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
@@ -424,13 +424,6 @@ impl Db {
         let (key, status, error) = (key.to_owned(), status.to_owned(), error.to_owned());
         self.call(move|c|{c.execute("UPDATE messages SET status=?,error=?,updated_at=?,attempts=attempts+CASE WHEN ? IN ('submitting','sending') THEN 1 ELSE 0 END WHERE id=?",
             params![status,error,now(),status,key])?;Ok(())}).await
-    }
-    pub async fn ack(&self, key: &str, source: &str) -> Result<()> {
-        let (key, source) = (key.to_owned(), source.to_owned());
-        self.call(move|c|{
-            let n=c.execute("UPDATE messages SET status='acknowledged',error='',updated_at=? WHERE project_id=? AND source_id=? AND direction='in' AND status IN ('submitting','submitted','uncertain','acknowledged')",params![now(),key,source])?;
-            if n!=1 {bail!("This message does not belong to the project or has not been submitted");} Ok(())
-        }).await
     }
     pub async fn remove_project(&self, key: &str) -> Result<()> {
         let p = self.project(key).await?;

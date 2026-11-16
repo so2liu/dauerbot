@@ -33,8 +33,8 @@ fn text(value: &str) -> String {
     escape(value).replace("&quot;", "\"").replace("&apos;", "'")
 }
 
-/// Keep task instructions readable instead of serializing them into a JSON string.
-pub fn task_body(payload: &Value) -> Result<String, serde_json::Error> {
+/// Keep scheduled instructions readable instead of serializing them into a JSON string.
+pub fn scheduled_body(payload: &Value) -> Result<String, serde_json::Error> {
     let mut metadata = payload.clone();
     let instructions = metadata
         .as_object_mut()

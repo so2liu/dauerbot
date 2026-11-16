@@ -1,9 +1,8 @@
 use anyhow::{Context, Result, bail};
 use rmcp::{
-    ErrorData, RoleServer, ServerHandler, ServiceExt,
+    ErrorData, ServerHandler, ServiceExt,
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
-    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -26,15 +25,6 @@ pub struct BridgeMcp {
     tool_router: ToolRouter<Self>,
 }
 #[derive(Deserialize, JsonSchema)]
-pub struct Ready {
-    #[serde(default)]
-    pub native_session: Option<String>,
-}
-#[derive(Deserialize, JsonSchema)]
-pub struct Ack {
-    pub message_id: String,
-}
-#[derive(Deserialize, JsonSchema)]
 pub struct Markdown {
     /// Feishu chat ID oc_... (group or direct) or user Open ID ou_...; the agent chooses the recipient.
     pub to: String,
@@ -50,29 +40,7 @@ pub struct File {
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
-pub struct EventAck {
-    pub event_id: String,
-}
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct Finish {
-    pub run_id: String,
-    pub outcome: String,
-    pub summary: String,
-}
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct Checkpoint {
-    pub task_id: String,
-    pub summary: String,
-}
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct CreateTask {
-    pub request_id: String,
-    pub title: String,
-    pub instructions: String,
-    pub to: Option<String>,
-}
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct ScheduleTask {
+pub struct ScheduleRun {
     /// Stable ID for this schedule creation; reuse on retries.
     pub request_id: String,
     pub name: String,
@@ -87,29 +55,6 @@ pub struct ScheduleTask {
     pub timezone: String,
     pub to: Option<String>,
 }
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct Decision {
-    pub run_id: String,
-    pub question: String,
-    pub to: Option<String>,
-}
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct Answer {
-    pub decision_id: String,
-    pub answer: String,
-}
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct Job {
-    pub run_id: String,
-    pub name: String,
-}
-#[derive(Deserialize, Serialize, JsonSchema)]
-pub struct JobDone {
-    pub job_id: String,
-    pub summary: String,
-    pub status: String,
-}
-
 impl BridgeMcp {
     async fn post(&self, operation: &str, body: Value) -> Result<Value> {
         let response = self
@@ -125,6 +70,12 @@ impl BridgeMcp {
             .await
             .context("Cannot connect to the Dauerbot daemon")?;
         let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            bail!(
+                "The Dauerbot daemon does not support this MCP contract. Use a matching daemon build (API protocol {}).",
+                crate::api::PROTOCOL
+            );
+        }
         let result: Value = response.json().await?;
         if !status.is_success() {
             bail!(
@@ -136,10 +87,20 @@ impl BridgeMcp {
         }
         Ok(result)
     }
-    async fn ready(&self, native: &str) -> Result<Value> {
+    async fn register(&self) -> Result<Value> {
         let terminal = std::env::var("HERDR_PANE_ID")
             .context("Legacy HERDR pane identity is missing; launch through Dauerbot")?;
-        self.post("ready",json!({"generation":self.credentials.generation,"terminal":terminal,"native_session":native})).await
+        let registration = self
+            .post(
+                "register",
+                json!({"generation":self.credentials.generation,"terminal":terminal}),
+            )
+            .await?;
+        anyhow::ensure!(
+            registration["api_protocol"].as_u64() == Some(crate::api::PROTOCOL),
+            "The Dauerbot daemon uses an incompatible API protocol"
+        );
+        Ok(registration)
     }
 }
 fn result(value: Result<Value>, must_sent: bool) -> Result<CallToolResult, ErrorData> {
@@ -162,128 +123,18 @@ fn result(value: Result<Value>, must_sent: bool) -> Result<CallToolResult, Error
 #[tool_router]
 impl BridgeMcp {
     #[tool(
-        description = "Register the current main session as ready. Call this first after startup; provide the native session ID when known to support exact recovery."
-    )]
-    async fn session_ready(
-        &self,
-        Parameters(input): Parameters<Ready>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let native = input
-            .native_session
-            .or_else(|| {
-                ctx.meta
-                    .get("threadId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_default();
-        result(self.ready(&native).await, false)
-    }
-    #[tool(
-        description = "Acknowledge receipt of a Feishu message_id. Call this first for every incoming <feishu_message> to preserve queue order."
-    )]
-    async fn ack_message(
-        &self,
-        Parameters(input): Parameters<Ack>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(
-            self.post("ack", json!({"message_id":input.message_id}))
-                .await,
-            false,
-        )
-    }
-    #[tool(
-        description = "Confirm receipt of the current durable event. This is not task completion."
-    )]
-    async fn ack_event(
-        &self,
-        Parameters(input): Parameters<EventAck>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("event-ack", json!(input)).await, false)
-    }
-    #[tool(
-        description = "Finish the current run with completed, noop, deferred, or failed and a useful progress summary. Settle native background work first; registered active jobs prevent completion and retirement."
-    )]
-    async fn finish_run(
-        &self,
-        Parameters(input): Parameters<Finish>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("finish", json!(input)).await, false)
-    }
-    #[tool(
-        description = "Persist a task progress summary before waiting, sleeping, or switching Agent. Durable progress is independent of native conversation history."
-    )]
-    async fn checkpoint(
-        &self,
-        Parameters(input): Parameters<Checkpoint>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("checkpoint", json!(input)).await, false)
-    }
-    #[tool(
-        description = "Inspect this project's durable tasks, runs, timers, decisions and background jobs."
-    )]
-    async fn list_work(&self) -> Result<CallToolResult, ErrorData> {
-        result(self.post("work", json!({})).await, false)
-    }
-    #[tool(
-        description = "Create a durable task for this project. It runs through the same main session queue and wakes the Agent when eligible."
-    )]
-    async fn create_task(
-        &self,
-        Parameters(input): Parameters<CreateTask>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("tasks", json!(input)).await, false)
-    }
-    #[tool(
         description = "Schedule future work: once with RFC3339 at, interval with interval_seconds, or cron with a five-field expression. Specify IANA timezone. The daemon persists the timer and wakes this Agent when due; no need to keep the process alive."
     )]
-    async fn schedule_task(
+    async fn schedule_run(
         &self,
-        Parameters(input): Parameters<ScheduleTask>,
+        Parameters(input): Parameters<ScheduleRun>,
     ) -> Result<CallToolResult, ErrorData> {
         result(self.post("timers", json!(input)).await, false)
     }
     #[tool(
-        description = "Persist a user decision and defer the current task. Native login and permission prompts must remain in the interactive terminal instead. Choose a responsible Feishu recipient in to when known."
-    )]
-    async fn request_decision(
-        &self,
-        Parameters(input): Parameters<Decision>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("decision", json!(input)).await, false)
-    }
-    #[tool(
-        description = "Record the user's answer to a pending decision. The answer creates a durable event for the original task."
-    )]
-    async fn answer_decision(
-        &self,
-        Parameters(input): Parameters<Answer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("decision-answer", json!(input)).await, false)
-    }
-    #[tool(
-        description = "Register a background command or subagent job before launching it. Active jobs prevent this execution from being retired."
-    )]
-    async fn register_job(
-        &self,
-        Parameters(input): Parameters<Job>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("jobs", json!(input)).await, false)
-    }
-    #[tool(
-        description = "Report a registered background job completed or failed, with a useful result summary."
-    )]
-    async fn complete_job(
-        &self,
-        Parameters(input): Parameters<JobDone>,
-    ) -> Result<CallToolResult, ErrorData> {
-        result(self.post("job-complete", json!(input)).await, false)
-    }
-    #[tool(
         description = "Send Markdown to the Feishu chat or user selected in to. Use oc_ for chat IDs or ou_ for user Open IDs; replies may go to a different destination. Use a unique request_id for each message and reuse it only for retries with the same content and recipient. Only status=sent confirms success."
     )]
-    async fn send_markdown(
+    async fn send_md(
         &self,
         Parameters(input): Parameters<Markdown>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -317,7 +168,7 @@ impl BridgeMcp {
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("You are the project's Feishu main session. Call session_ready first, ack_event for each durable event, and ack_message for nested Feishu messages. Persist progress and call finish_run when settled. Register background jobs and use schedule_task or request_decision for later work. Reply with send_markdown or send_file, choosing the mandatory to field (oc_ chat ID or ou_ user Open ID) according to user intent. It may differ from the source. Terminal output alone does not deliver a reply.")
+            .with_instructions("You are the project’s Feishu session. Incoming messages steer your current work immediately. Reply and ask questions using send_md or send_file with the mandatory to field (oc_ chat ID or ou_ user Open ID). Terminal output alone does not deliver a reply. Use schedule_run for future once, interval, or cron runs. Native HERDR state manages the session lifecycle; no task bookkeeping is required. Preserve uncertain send outcomes and reuse request_id only for the same request.")
     }
 }
 
@@ -404,17 +255,20 @@ pub async fn serve(path: &Path) -> Result<()> {
         tool_router: BridgeMcp::tool_router(),
     };
     // terminal.run may not have committed its returned address when the CLI launches MCP.
-    let mut registered = false;
+    let mut registration_error = None;
     for _ in 0..12 {
-        if server.ready("").await.is_ok() {
-            registered = true;
-            break;
+        match server.register().await {
+            Ok(_) => {
+                registration_error = None;
+                break;
+            }
+            Err(error) => registration_error = Some(error),
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    if !registered {
+    if let Some(error) = registration_error {
         bail!(
-            "Cannot register the main terminal identity. Refusing to expose this project's tools to another terminal. Check daemon availability and the legacy HERDR_PANE_ID environment."
+            "Cannot register the main terminal identity: {error}. Check daemon compatibility, availability and the legacy HERDR_PANE_ID environment."
         );
     }
     server

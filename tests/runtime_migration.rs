@@ -33,8 +33,8 @@ async fn project_tools_are_generation_scoped_and_cannot_manage_other_projects() 
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(axum::serve(listener, api::router(app.clone())).into_future());
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
-    let payload = json!({"title":"Work","instructions":"Do the work","request_id":"same-task"});
-    let path = format!("{url}/api/projects/{}/tasks", a.id);
+    let payload = json!({"name":"Scheduled run","prompt":"Do the work","kind":"interval","interval_seconds":60,"timezone":"UTC","request_id":"same-schedule"});
+    let path = format!("{url}/api/projects/{}/timers", a.id);
     let stale = http
         .post(&path)
         .bearer_auth(&a.mcp_token)
@@ -56,7 +56,7 @@ async fn project_tools_are_generation_scoped_and_cannot_manage_other_projects() 
     let again: serde_json::Value = request().send().await.unwrap().json().await.unwrap();
     assert_eq!(first["id"], again["id"]);
     let other = http
-        .post(format!("{url}/api/projects/{}/tasks", b.id))
+        .post(format!("{url}/api/projects/{}/timers", b.id))
         .bearer_auth(&a.mcp_token)
         .header("x-hfb-generation", "active-generation")
         .json(&payload)

@@ -68,8 +68,8 @@ impl Language {
             "Ask the Agent in Feishu to schedule something when you need it." => {
                 "需要时，在飞书里告诉 Agent 安排即可。"
             }
-            "No scheduled tasks" => "还没有定时任务",
-            "Scheduled tasks" => "定时任务",
+            "No scheduled runs" => "还没有定时任务",
+            "Scheduled runs" => "定时任务",
             "Open Dauerbot" => "打开 Dauerbot",
             "+ Add project" => "+ 添加项目",
             "Settings" => "设置",
@@ -133,11 +133,8 @@ impl Language {
             "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check. Dauerbot retries automatically after thirty seconds." => {
                 "CLI 在接收任务前退出了。请在“环境检查”中确认安装和登录状态，Dauerbot 会在三十秒后自动重试。"
             }
-            "The Agent stopped working without completing its task record. Continue in the terminal and ask it to call finish_run, or review the saved result before retrying or dismissing the task." => {
-                "智能体已停止执行，但还没有登记任务完成。请在终端中让它调用 finish_run，或先检查结果，再重试或忽略这个任务。"
-            }
-            "Sign in to the Agent CLI in this project's terminal. Saved tasks will continue after login." => {
-                "请在项目右侧终端中登录智能体。已保存的任务会在登录后继续。"
+            "Sign in to the Agent CLI in this project's terminal. Saved messages will continue after login." => {
+                "请在项目右侧终端中登录智能体。已保存的消息会在登录后继续。"
             }
             "The Agent needs a permission decision. Continue in this project's terminal." => {
                 "智能体正在等待权限确认，请在项目右侧终端中处理。"
@@ -154,7 +151,7 @@ impl Language {
             "The Agent exited during a task. Check the saved result before retrying uncertain work." => {
                 "智能体在任务执行期间退出了。请先检查已保存的结果，再决定是否重试。"
             }
-            "Task input may have reached the Agent. Verify its terminal before retrying this task." => {
+            "Input may have reached the Agent. Verify its terminal before retrying this input." => {
                 "任务可能已经发送给智能体。请先检查终端，再决定是否重试。"
             }
             "Paste is larger than 1 MiB" => "粘贴内容超过 1 MiB",
@@ -165,33 +162,22 @@ impl Language {
             }
             "Session preserved" => "已保留原会话",
             "Got it" => "知道了",
-            "What did you verify?" => "你确认了哪些情况？",
-            "Background work needs review" => "需要确认后台任务",
-            "Stop the parent session, verify any remaining child work, and record what you checked." => {
-                "请先停止主会话，确认剩余子任务的状态，并记录检查结果。"
-            }
-            "Abandon reviewed job" => "放弃已检查的子任务",
-            "Describe what you checked first" => "请先填写检查结果",
-            "Record this job as abandoned?" => "将这个子任务记录为已放弃？",
-            "This records your review. It does not terminate an external process." => {
-                "这会保存你的检查结果，不会结束外部进程。"
-            }
-            "Review saved" => "检查结果已保存",
-            "Review task result" => "查看任务结果",
-            "Check the terminal and saved work before retrying or dismissing this task." => {
+
+            "Review input delivery" => "查看任务结果",
+            "Check the terminal and saved work before retrying or dismissing this input." => {
                 "重试或忽略任务前，请先查看终端和已保存的工作。"
             }
-            "Retry task" => "重试任务",
-            "Dismiss task" => "忽略任务",
-            "Retry this task?" => "重试这个任务？",
-            "Dismiss this task?" => "忽略这个任务？",
+            "Retry input" => "重试任务",
+            "Dismiss input" => "忽略任务",
+            "Retry this input?" => "重试这个任务？",
+            "Dismiss this input?" => "忽略这个任务？",
             "The agent may already have changed files or sent a reply. Continue after reviewing its work." => {
                 "智能体可能已经修改了文件或发出回复。请先检查已完成的工作。"
             }
-            "The task will stop waiting. Existing files and sent replies remain." => {
+            "The input will stop waiting. Existing files and sent replies remain." => {
                 "任务将停止等待，现有文件和已发出的回复会保留。"
             }
-            "Task dismissed" => "任务已忽略",
+            "Input dismissed" => "输入已忽略",
             "Show terminal" => "显示终端",
             "Hide terminal" => "收起终端",
             "Pause" => "暂停",
@@ -204,16 +190,14 @@ impl Language {
                 "智能体需要处理，请查看项目提示。"
             }
             "Your answer" => "你的回答",
-            "Your answer is needed" => "需要你的回答",
             "Send answer" => "提交回答",
-            "Answer saved" => "回答已保存",
             "Manual control is reserved" => "会话已保留人工控制",
-            "Release the reservation to let queued tasks continue, or take control in the terminal." => {
+            "Release the reservation to let queued messages continue, or take control in the terminal." => {
                 "交还控制后，排队任务会继续执行；也可以在右侧接管终端。"
             }
             "Release reservation" => "交还控制",
             "Your agent, inside Dauerbot" => "在 Dauerbot 中操作智能体",
-            "Watch and operate the live terminal in this app. Closing the window leaves tasks running." => {
+            "Watch and operate the live terminal in this app. Closing the window leaves the Agent running." => {
                 "直接在应用内查看和操作终端，关闭窗口后任务继续运行。"
             }
             "Live terminal" => "实时终端",
@@ -234,7 +218,7 @@ impl Language {
             }
             "Pause automatic activity" => "暂停自动运行",
             "Resume automatic activity" => "恢复自动运行",
-            "An earlier task was interrupted. New messages continue automatically; retry this task only if you want it repeated." => {
+            "An earlier input delivery is uncertain. New messages continue automatically; retry only after checking its effects." => {
                 "之前有一项任务中断了。新消息会自动继续处理；仅在需要重新执行旧任务时重试。"
             }
             "The Agent will stop. Project files remain on disk." => {
@@ -245,7 +229,7 @@ impl Language {
             "Stop" => "停止",
             "Model" => "模型",
             "Model follows the CLI's own settings" => "模型沿用 CLI 中的设置",
-            "Task queued" => "任务已进入队列",
+            "Input queued" => "输入已进入队列",
             "Schedule saved" => "计划已保存",
             "Sleeping" => "休眠中",
             "sleeping" => "待命",
@@ -306,7 +290,7 @@ impl Language {
                 "连接已有 CLI 与 Herdr 持久会话。"
             }
             "03  Continue the conversation" => "03  继续对话",
-            "Messages, tasks, and files reach the same main session." => {
+            "Messages, scheduled runs, and files reach the same main session." => {
                 "文本、任务和附件，回到同一主会话。"
             }
             "You control access" => "由你决定授权",

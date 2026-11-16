@@ -16,16 +16,11 @@ fn store() -> Connection {
     migrate(&c).unwrap();
     c
 }
-fn input(instructions: &str) -> TaskInput {
-    TaskInput {
-        title: "Work".into(),
-        instructions: instructions.into(),
-        to: Some("ou_owner".into()),
-        request_id: None,
-    }
-}
 fn submit(c: &Connection, source: &str, now: i64) -> Event {
-    submit_task(c, "p", input("Remember the task"), "task", source, now).unwrap()
+    c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at)
+        VALUES(?,'p','in',?,'User direction','queued',?,?)",params![source,source,now,now]).unwrap();
+    sync_inbound(c).unwrap();
+    event(c, "p", source).unwrap()
 }
 fn interval(seconds: i64) -> TimerInput {
     TimerInput {
@@ -41,82 +36,75 @@ fn interval(seconds: i64) -> TimerInput {
     }
 }
 fn finish(c: &Connection, run: &Run, now: i64) {
-    finish_run(c, "p", &run.generation, &run.id, "completed", "Done", now).unwrap();
+    delivery(c, &run.id, "submitted", "", now).unwrap();
+    observe_idle(c, "p", &run.generation, None, now).unwrap();
 }
 
+#[test]
+fn native_idle_settles_submission_only_after_a_new_transition_and_never_resolves_uncertainty() {
+    let c = store();
+    begin_execution(&c, "p", "g", 0).unwrap();
+    submit(&c, "original", 1);
+    let original = claim_steering(&c, "p", "g", 2).unwrap().unwrap();
+    submission_sequence(&c, &original.id, Some(10)).unwrap();
+    delivery(&c, &original.id, "submitted", "", 3).unwrap();
+    observe_idle(&c, "p", "g", Some(10), 4).unwrap();
+    assert_eq!(run(&c, "p", &original.id).unwrap().status, "submitted");
+
+    // A user steer is accepted while earlier delivery has not settled.
+    submit(&c, "steer", 5);
+    let steer = claim_steering(&c, "p", "g", 6).unwrap().unwrap();
+    delivery(
+        &c,
+        &steer.id,
+        "uncertain",
+        "Lost response after writing input",
+        7,
+    )
+    .unwrap();
+    observe_idle(&c, "p", "g", Some(12), 8).unwrap();
+    assert_eq!(run(&c, "p", &original.id).unwrap().status, "settled");
+    assert_eq!(event(&c, "p", "original").unwrap().status, "delivered");
+    assert_eq!(event(&c, "p", "steer").unwrap().status, "uncertain");
+    sync_inbound(&c).unwrap();
+    assert_eq!(event(&c, "p", "original").unwrap().status, "delivered");
+    assert!(claim_steering(&c, "p", "g", 9).unwrap().is_none());
+
+    // An old uncertain input neither pins the CLI nor blocks an independent timer.
+    assert!(!execution_idle(&c, "p", "g", 10).unwrap());
+    assert!(execution_idle(&c, "p", "g", 10 + WARM_MS).unwrap());
+    create_timer(&c, "p", interval(1), 10 + WARM_MS).unwrap();
+    assert_eq!(fire_due(&c, 1010 + WARM_MS).unwrap().len(), 1);
+    assert_eq!(
+        claim_next(&c, "p", "g", 1011 + WARM_MS)
+            .unwrap()
+            .unwrap()
+            .event_id,
+        events(&c, "p")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.source == "timer")
+            .unwrap()
+            .id
+    );
+}
 #[test]
 fn an_interrupted_old_execution_does_not_pin_new_work_or_its_idle_retirement() {
     let c = store();
     begin_execution(&c, "p", "old", 0).unwrap();
     let old_event = submit(&c, "interrupted", 1);
     let old = claim_next(&c, "p", "old", 2).unwrap().unwrap();
-    ack_event(&c, "p", "old", &old_event.id, 3).unwrap();
     finish_execution(&c, "p", "old", "stopped", "Stopped", 4).unwrap();
     begin_execution(&c, "p", "new", 5).unwrap();
     let fresh_event = submit(&c, "independent-timer", 6);
     let fresh = claim_next(&c, "p", "new", 7).unwrap().unwrap();
     assert_eq!(fresh.event_id, fresh_event.id);
-    ack_event(&c, "p", "new", &fresh_event.id, 8).unwrap();
     finish(&c, &fresh, 9);
     assert!(active_execution_run(&c, "p", "new").unwrap().is_none());
     assert!(!execution_idle(&c, "p", "new", 10).unwrap());
     assert!(execution_idle(&c, "p", "new", 10 + WARM_MS).unwrap());
     assert_eq!(run(&c, "p", &old.id).unwrap().status, "uncertain");
     assert_eq!(event_status(&c, &old_event.id), "uncertain");
-}
-
-#[test]
-fn conversation_messages_steer_unfinished_work_without_replaying_uncertain_input() {
-    let c = store();
-    begin_execution(&c, "p", "g", 0).unwrap();
-    submit(&c, "long-task", 1);
-    let original = claim_next(&c, "p", "g", 2).unwrap().unwrap();
-    delivery(&c, &original.id, "submitted", "", 3).unwrap();
-    let scheduled = submit(&c, "later-task", 4);
-    for id in ["correction", "stop", "clarification"] {
-        c.execute(
-            "INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at)
-             VALUES(?,'p','in',?,'Latest user direction','queued',5,5)",
-            params![id, id],
-        ).unwrap();
-    }
-    sync_inbound(&c).unwrap();
-    let first = claim_steering(&c, "p", "g", 6).unwrap().unwrap();
-    assert_eq!(first.event_id, "correction");
-    delivery(
-        &c,
-        &first.id,
-        "uncertain",
-        "Connection closed after write",
-        7,
-    )
-    .unwrap();
-    let second = claim_steering(&c, "p", "g", 8).unwrap().unwrap();
-    assert_eq!(second.event_id, "stop");
-    delivery(&c, &second.id, "submitted", "", 9).unwrap();
-    let third = claim_next(&c, "p", "g", 10).unwrap().unwrap();
-    assert_eq!(third.event_id, "clarification");
-    ack_event(&c, "p", "g", &third.event_id, 11).unwrap();
-    finish(&c, &third, 12);
-    assert!(claim_steering(&c, "p", "g", 13).unwrap().is_none());
-    assert!(claim_next(&c, "p", "g", 13).unwrap().is_none());
-    assert_eq!(event_status(&c, &first.event_id), "uncertain");
-    assert_eq!(event_status(&c, &scheduled.id), "queued");
-    assert_eq!(run(&c, "p", &original.id).unwrap().status, "submitted");
-    assert!(!execution_idle(&c, "p", "g", WARM_MS * 10).unwrap());
-
-    c.execute(
-        "INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at)
-         VALUES('takeover','p','in','takeover','Keep the draft','queued',14,14)", [],
-    ).unwrap();
-    sync_inbound(&c).unwrap();
-    set_takeover(&c, "p", "g", true, 15).unwrap();
-    assert!(claim_steering(&c, "p", "g", 16).unwrap().is_none());
-    set_takeover(&c, "p", "g", false, 17).unwrap();
-    assert_eq!(
-        claim_steering(&c, "p", "g", 18).unwrap().unwrap().event_id,
-        "takeover"
-    );
 }
 
 #[test]
@@ -131,7 +119,6 @@ fn a_large_backlog_cannot_hide_the_event_that_needs_recovery() {
     let state = snapshot(&c, "p").unwrap();
     assert_eq!(state.events.len(), 200);
     assert_eq!(state.events[0].id, blocked.id);
-    assert_eq!(state.tasks[0].id, blocked.task_id);
     assert_eq!(state.events[0].status, "uncertain");
 }
 
@@ -159,10 +146,8 @@ fn migration_preserves_receipt_and_uncertainty_without_replaying_old_work() {
     }
     assert_eq!(sync_inbound(&c).unwrap(), 7);
     assert_eq!(sync_inbound(&c).unwrap(), 0);
-    assert_eq!(tasks(&c, "p").unwrap().len(), 7);
     assert_eq!(event(&c, "p", "m1").unwrap().status, "uncertain");
     assert_eq!(event(&c, "p", "m3").unwrap().status, "acknowledged");
-    assert_eq!(task(&c, "p", "m3").unwrap().status, "imported");
     assert!(active_run(&c, "p").unwrap().is_none());
     // An uncertain older input is never replayed, but must not block a new message.
     let fresh = claim_steering(&c, "p", "g", 5).unwrap().unwrap();
@@ -186,73 +171,6 @@ fn migration_preserves_receipt_and_uncertainty_without_replaying_old_work() {
     assert!(claim_next(&c, "p", "g", 11).unwrap().is_some());
 }
 
-#[test]
-fn receipt_and_late_delivery_do_not_complete_or_regress_a_run() {
-    let c = store();
-    begin_execution(&c, "p", "g", 0).unwrap();
-    let event = submit(&c, "first", 1);
-    let run = claim_next(&c, "p", "g", 2).unwrap().unwrap();
-    ack_event(&c, "p", "g", &event.id, 3).unwrap();
-    delivery(&c, &run.id, "submitted", "", 4).unwrap();
-    assert_eq!(active_run(&c, "p").unwrap().unwrap().status, "running");
-    assert!(!execution_idle(&c, "p", "g", WARM_MS * 10).unwrap());
-    assert!(finish_run(&c, "p", "replacement", &run.id, "completed", "Done", 5).is_err());
-    finish(&c, &run, 6);
-    delivery(&c, &run.id, "uncertain", "A late send timeout", 7).unwrap();
-    assert_eq!(
-        herdr_feishu_bridge::work::run(&c, "p", &run.id)
-            .unwrap()
-            .status,
-        "completed"
-    );
-    assert_eq!(event_status(&c, &event.id), "completed");
-    assert!(!execution_idle(&c, "p", "g", 8).unwrap());
-    assert!(!execution_idle(&c, "p", "g", 8 + WARM_MS - 1).unwrap());
-    assert!(execution_idle(&c, "p", "g", 8 + WARM_MS).unwrap());
-    submit(&c, "racing-message", 8 + WARM_MS);
-    assert!(!execution_idle(&c, "p", "g", 8 + WARM_MS).unwrap());
-}
-
-#[test]
-fn legacy_message_mirror_cannot_requeue_submitted_or_completed_effects() {
-    let c = store();
-    c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at)
-      VALUES('message','p','in','im_one','Perform once','queued',1,1)",[]).unwrap();
-    sync_inbound(&c).unwrap();
-    let run = claim_next(&c, "p", "g", 2).unwrap().unwrap();
-    sync_inbound(&c).unwrap();
-    assert_eq!(event_status(&c, "message"), "submitting");
-    delivery(&c, &run.id, "submitted", "", 3).unwrap();
-    sync_inbound(&c).unwrap();
-    assert_eq!(event_status(&c, "message"), "submitted");
-    ack_event(&c, "p", "g", "message", 4).unwrap();
-    delivery(&c, &run.id, "uncertain", "late timeout", 5).unwrap();
-    sync_inbound(&c).unwrap();
-    assert_eq!(active_run(&c, "p").unwrap().unwrap().status, "running");
-    assert_eq!(event_status(&c, "message"), "acknowledged");
-    finish_run(
-        &c,
-        "p",
-        "g",
-        &run.id,
-        "failed",
-        "Verified provider failure",
-        6,
-    )
-    .unwrap();
-    sync_inbound(&c).unwrap();
-    assert_eq!(event_status(&c, "message"), "failed");
-    assert!(active_run(&c, "p").unwrap().is_none());
-    assert!(claim_next(&c, "p", "g", 7).unwrap().is_none());
-    let status: String = c
-        .query_row("SELECT status FROM messages WHERE id='message'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(status, "acknowledged");
-    submit(&c, "next-independent-task", 8);
-    assert!(claim_next(&c, "p", "g", 9).unwrap().is_some());
-}
 fn event_status(c: &Connection, id: &str) -> String {
     event(c, "p", id).unwrap().status
 }
@@ -301,6 +219,24 @@ fn interval_downtime_coalesces_and_pending_occurrences_do_not_overlap() {
         )
         .unwrap();
     assert_eq!(count, 3);
+}
+
+#[test]
+fn timer_pending_gate_clears_on_native_idle_with_or_without_transition_metadata() {
+    for sequence in [Some(12), None] {
+        let c = store();
+        create_timer(&c, "p", interval(10), 0).unwrap();
+        let event = fire_due(&c, 10_000).unwrap().remove(0);
+        let run = claim_next(&c, "p", "g", 10_001).unwrap().unwrap();
+        submission_sequence(&c, &run.id, Some(10)).unwrap();
+        delivery(&c, &run.id, "submitted", "", 10_002).unwrap();
+        observe_idle(&c, "p", "g", Some(10), 10_003).unwrap();
+        assert_eq!(event_status(&c, &event.id), "submitted");
+        observe_idle(&c, "p", "g", sequence, 12_003).unwrap();
+        assert_eq!(event_status(&c, &event.id), "delivered");
+        assert_eq!(fire_due(&c, 20_000).unwrap().len(), 1);
+        assert!(claim_steering(&c, "p", "g", 20_001).unwrap().is_none());
+    }
 }
 
 #[test]
@@ -411,72 +347,14 @@ fn five_field_cron_uses_unix_weekdays_day_union_and_dst_gaps() {
 }
 
 #[test]
-fn decision_answer_and_child_result_are_durable_wakeup_events() {
-    let c = store();
-    begin_execution(&c, "p", "g", 0).unwrap();
-    let original = submit(&c, "decision-task", 1);
-    let run = claim_next(&c, "p", "g", 2).unwrap().unwrap();
-    let decision = request_decision(
-        &c,
-        "p",
-        "g",
-        &run.id,
-        "Which option?",
-        "ou_owner",
-        json!(["A", "B"]),
-        3,
-    )
-    .unwrap();
-    finish_run(
-        &c,
-        "p",
-        "g",
-        &run.id,
-        "deferred",
-        "Waiting for an answer",
-        4,
-    )
-    .unwrap();
-    finish_execution(&c, "p", "g", "sleeping", "", 5).unwrap();
-    let answer = answer_decision(&c, "p", &decision.id, "B", 6).unwrap();
-    assert_eq!(answer.source, "decision");
-    assert_eq!(answer.task_id, original.task_id);
-    assert_eq!(
-        answer_decision(&c, "p", &decision.id, "B", 7).unwrap().id,
-        answer.id
-    );
-    assert!(answer_decision(&c, "p", &decision.id, "A", 7).is_err());
-
-    begin_execution(&c, "p", "g2", 8).unwrap();
-    let resumed = claim_next(&c, "p", "g2", 9).unwrap().unwrap();
-    let child = register_job(&c, "p", "g2", &resumed.id, "Research", 10).unwrap();
-    assert!(finish_run(&c, "p", "g2", &resumed.id, "completed", "Done", 11).is_err());
-    assert!(!execution_idle(&c, "p", "g2", WARM_MS * 2).unwrap());
-    let result = complete_job(&c, "p", "g2", &child.id, "Found the answer", 12).unwrap();
-    assert_eq!(result.source, "child");
-    assert_eq!(
-        complete_job(&c, "p", "g2", &child.id, "Found the answer", 13)
-            .unwrap()
-            .id,
-        result.id
-    );
-    finish(&c, &resumed, 13);
-    assert!(!execution_idle(&c, "p", "g2", WARM_MS * 2).unwrap());
-    let followup = claim_next(&c, "p", "g2", 14).unwrap().unwrap();
-    finish(&c, &followup, 15);
-}
-
-#[test]
 fn interrupted_work_requires_explicit_resolution_and_is_never_blindly_replayed() {
     let c = store();
     begin_execution(&c, "p", "g", 0).unwrap();
     let event = submit(&c, "interrupted", 1);
     let run = claim_next(&c, "p", "g", 2).unwrap().unwrap();
-    ack_event(&c, "p", "g", &event.id, 3).unwrap();
     finish_execution(&c, "p", "g", "exited", "Process disappeared", 4).unwrap();
     assert_eq!(active_run(&c, "p").unwrap().unwrap().status, "uncertain");
     assert!(claim_next(&c, "p", "replacement", 5).unwrap().is_none());
-    assert!(cancel_task(&c, "p", &event.task_id, 6).is_err());
     resolve_event(&c, "p", &event.id, true, 7).unwrap();
     let retry = claim_next(&c, "p", "replacement", 8).unwrap().unwrap();
     assert_ne!(retry.id, run.id);
@@ -490,33 +368,8 @@ fn interrupted_work_requires_explicit_resolution_and_is_never_blindly_replayed()
 }
 
 #[test]
-fn event_identity_and_attention_dedup_do_not_hide_conflicting_work() {
+fn schedule_request_ids_deduplicate_across_network_retries() {
     let c = store();
-    let first = submit(&c, "idempotent", 0);
-    assert_eq!(submit(&c, "idempotent", 1).id, first.id);
-    assert!(submit_task(&c, "p", input("Different effects"), "task", "idempotent", 2).is_err());
-    assert_eq!(tasks(&c, "p").unwrap().len(), 1);
-    let one =
-        upsert_attention(&c, "p", "g", "login", "Sign in to continue", "ou_owner", 3).unwrap();
-    let two = upsert_attention(&c, "p", "g", "login", "Still waiting for sign-in", "", 4).unwrap();
-    assert_eq!(one["id"], two["id"]);
-    assert_eq!(one["created"], true);
-    assert_eq!(two["created"], false);
-    assert_eq!(two["to"], "ou_owner");
-    assert_eq!(snapshot(&c, "p").unwrap().attention[0].status, "open");
-    resolve_attention(&c, "p", "g", 5).unwrap();
-    let again = upsert_attention(&c, "p", "g", "login", "Sign in again", "ou_owner", 6).unwrap();
-    assert_ne!(again["id"], one["id"]);
-}
-
-#[test]
-fn mcp_request_ids_deduplicate_tasks_and_schedules_across_network_retries() {
-    let c = store();
-    let mut task_input = input("One deliberate task");
-    task_input.request_id = Some("tool-request".into());
-    let one = submit_task(&c, "p", task_input.clone(), "task", "random-one", 0).unwrap();
-    let two = submit_task(&c, "p", task_input, "task", "random-two", 1).unwrap();
-    assert_eq!(one.id, two.id);
     let mut scheduled = interval(30);
     scheduled.request_id = Some("schedule-request".into());
     let one = create_timer(&c, "p", scheduled.clone(), 0).unwrap();
@@ -526,17 +379,4 @@ fn mcp_request_ids_deduplicate_tasks_and_schedules_across_network_retries() {
     scheduled.prompt = "Different effects".into();
     assert!(create_timer(&c, "p", scheduled, 10_000).is_err());
     assert_eq!(snapshot(&c, "p").unwrap().timers.len(), 1);
-}
-
-#[test]
-fn deleting_a_project_cascades_durable_work_without_affecting_other_projects() {
-    let c = store();
-    let event = submit(&c, "first", 1);
-    create_timer(&c, "p", interval(5), 0).unwrap();
-    claim_next(&c, "p", "g", 2).unwrap().unwrap();
-    submit_task(&c, "other", input("Keep me"), "task", "other", 3).unwrap();
-    c.execute("DELETE FROM projects WHERE id='p'", []).unwrap();
-    assert!(task(&c, "p", &event.task_id).is_err());
-    assert!(events(&c, "p").unwrap().is_empty());
-    assert_eq!(tasks(&c, "other").unwrap().len(), 1);
 }

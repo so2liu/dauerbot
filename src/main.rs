@@ -50,12 +50,7 @@ enum Commands {
         #[command(subcommand)]
         command: Sessions,
     },
-    /// Manage durable tasks
-    Task {
-        #[command(subcommand)]
-        command: Tasks,
-    },
-    /// Resolve a task event after reviewing its saved result
+    /// Resolve an input delivery after reviewing its saved result
     Event {
         #[command(subcommand)]
         command: Events,
@@ -64,19 +59,6 @@ enum Commands {
     Timer {
         #[command(subcommand)]
         command: Timers,
-    },
-    /// Report background work independently of the main Agent process
-    Job {
-        #[command(subcommand)]
-        command: Jobs,
-    },
-    /// Inspect project work or answer a pending decision
-    Work {
-        project: String,
-    },
-    Decision {
-        id: String,
-        answer: String,
     },
     /// Manage messages
     Message {
@@ -177,39 +159,6 @@ enum Sessions {
         project: String,
         #[arg(long)]
         agent: String,
-    },
-}
-#[derive(Subcommand)]
-enum Jobs {
-    Register {
-        project: String,
-        run_id: String,
-        name: String,
-    },
-    Complete {
-        project: String,
-        job_id: String,
-        summary: String,
-        #[arg(long)]
-        failed: bool,
-    },
-    /// Record reviewed child work as abandoned after stopping its execution
-    Abandon { job_id: String, reason: String },
-}
-#[derive(Subcommand)]
-enum Tasks {
-    List {
-        project: String,
-    },
-    Add {
-        project: String,
-        title: String,
-        instructions: String,
-        #[arg(long)]
-        to: Option<String>,
-    },
-    Cancel {
-        id: String,
     },
 }
 #[derive(Subcommand)]
@@ -580,24 +529,12 @@ async fn main() -> Result<()> {
             };
             let id=client.id(&project).await?;client.request(if operation=="screen"{"GET"}else{"POST"},&format!("/projects/{id}/{operation}"),None).await?
         }
-        Commands::Job{command}=>match command {
-            Jobs::Register{project,run_id,name}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/jobs"),Some(json!({"run_id":run_id,"name":name}))).await?},
-            Jobs::Complete{project,job_id,summary,failed}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/job-complete"),Some(json!({"job_id":job_id,"summary":summary,"status":if failed{"failed"}else{"completed"}}))).await?},
-            Jobs::Abandon{job_id,reason}=>client.request("POST",&format!("/jobs/{job_id}/abandon"),Some(json!({"reason":reason}))).await?,
-        },
-        Commands::Work{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}/work"),None).await?},
         Commands::Event{command}=> {
             let (id,action)=match command {
                 Events::Retry{id}=>(id,"retry"),
                 Events::Dismiss{id}=>(id,"dismiss"),
             };
             client.request("POST",&format!("/events/{id}/resolve"),Some(json!({"action":action}))).await?
-        },
-        Commands::Decision{id,answer}=>client.request("POST",&format!("/decisions/{id}/answer"),Some(json!({"answer":answer}))).await?,
-        Commands::Task{command}=>match command {
-            Tasks::List{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}/tasks"),None).await?},
-            Tasks::Add{project,title,instructions,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/tasks"),Some(json!({"title":title,"instructions":instructions,"to":to}))).await?},
-            Tasks::Cancel{id}=>client.request("POST",&format!("/tasks/{id}/cancel"),None).await?,
         },
         Commands::Timer{command}=>match command {
             Timers::List{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}/timers"),None).await?},
