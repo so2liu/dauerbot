@@ -863,6 +863,10 @@ pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
     let preflight: Result<ExecutionRef> = async {
         let record = observe(config, p).await?;
         check_identity(p, &record)?;
+        anyhow::ensure!(
+            record["status"]["state"] != "blocked",
+            "The Agent is waiting for interactive input"
+        );
         ExecutionRef::from_project(p)
     }
     .await;

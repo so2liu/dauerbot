@@ -1,6 +1,6 @@
 # Dauerbot architecture
 
-Status: implemented, 2026-11-16. Backend and terminal transport checks pass. Real CLI acceptance covers task completion, retirement and same-session resume; the full four-CLI matrix and graphical IME acceptance remain tracked in #23 and #25. Source review and runtime acceptance are separate evidence.
+Status: implemented, 2026-11-16. Backend and terminal transport checks pass. Real CLI acceptance covers task completion, retirement and same-session resume; authenticated four-CLI runtime migration is complete in #23; graphical IME acceptance remains tracked in #25. Source review and runtime acceptance are separate evidence.
 
 Each project connects its own Feishu bot to its main native Agent session. The desktop manages projects and tasks on the left, with the selected Agent's interactive terminal on the right. An independent Rust daemon keeps receiving events and managing schedules while Agent processes sleep.
 
@@ -24,7 +24,7 @@ All task triggers enter a SQLite inbox: Feishu messages, explicit tasks, fired t
 
 A task stores its objective, progress, destination and waiting condition. An event records what made work runnable. A run records one processing attempt. An execution records a particular native CLI process generation and its legacy terminal identity. Existing conversations retain their meaning as Feishu chat metadata. Outbound messages retain stable request IDs and uncertain sends never receive an automatic blind retry.
 
-Initially all tasks use the project main session in order. Native history is resumed only within the same CLI. Switching CLI preserves durable progress and project memory, then begins a new native session with explicit continuity context.
+All work uses the project main session. Incoming conversation messages have priority and steer it immediately, including while native state is working or an earlier run is unacknowledged or unfinished. Per-project locking serializes terminal writes, not model turns. Message runs retain independent receipts and completion records; an uncertain input is not automatically replayed and does not block fresh user direction. Native paste-and-Enter submission preserves ongoing tools and uses the CLI's steering behavior. Explicit pause, takeover and native login/permission prompts suspend automatic input. Standalone tasks and timers remain serialized. Native history is resumed only within the same CLI. Switching CLI preserves durable progress and project memory, then begins a new native session with explicit continuity context.
 
 ## Wakeup and retirement
 

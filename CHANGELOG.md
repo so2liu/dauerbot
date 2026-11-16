@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.3 — 2026-11-16
+
+### Fixed
+
+- Send incoming conversation messages to the active Agent immediately, including while it is working or an earlier run is unfinished. Use native steering submission instead of waiting for the next task.
+- Keep fresh user direction deliverable after an uncertain earlier input without replaying that input. Preserve explicit delivery pause, terminal takeover, login prompts and permission decisions.
+- Drain message bursts in order while retaining independent receipts and completion records. Standalone tasks and timers remain serialized.
+
 ## 0.4.2 — 2026-11-16
 
 ### Changed

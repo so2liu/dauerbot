@@ -668,20 +668,52 @@ pub fn claim_next(
     generation: &str,
     now: i64,
 ) -> Result<Option<Run>> {
+    claim(c, project, generation, now, false)
+}
+
+/// Conversation input steers the live Agent even while earlier work is unfinished.
+/// The inbox is a durable delivery journal, not a turn-completion barrier.
+pub fn claim_steering(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+    now: i64,
+) -> Result<Option<Run>> {
+    claim(c, project, generation, now, true)
+}
+
+fn claim(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+    now: i64,
+    steering_only: bool,
+) -> Result<Option<Run>> {
     transaction(c, |c| {
-        if active_run(c, project)?.is_some() || has_takeover(c, project, generation)? {
+        if has_takeover(c, project, generation)? {
             return Ok(None);
         }
-        let blocked:bool=c.query_row(
+        let message = c.query_row(
+            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND message_id IS NOT NULL ORDER BY created_at,rowid LIMIT 1"),
+            [project], event_row,
+        ).optional()?;
+        let next = if message.is_some() {
+            message
+        } else {
+            if steering_only || active_run(c, project)?.is_some() {
+                return Ok(None);
+            }
+            let blocked:bool=c.query_row(
           "SELECT EXISTS(SELECT 1 FROM work_events e WHERE project_id=? AND (
             status IN ('submitting','submitted','uncertain') OR
             (status='failed' AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.event_id=e.id AND r.outcome='failed' AND r.finished_at IS NOT NULL))))",
           [project],|r|r.get(0))?;
-        if blocked {
-            return Ok(None);
-        }
-        let next=c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' ORDER BY created_at,rowid LIMIT 1"),
-          [project],event_row).optional()?;
+            if blocked {
+                return Ok(None);
+            }
+            c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' ORDER BY created_at,rowid LIMIT 1"),
+              [project],event_row).optional()?
+        };
         let Some(event) = next else { return Ok(None) };
         let id = crate::db::id();
         c.execute(

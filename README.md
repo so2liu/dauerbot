@@ -125,11 +125,11 @@ The managed CLI starts `hfb mcp --credentials <private-file>` automatically.
 
 Incoming messages use an escaped XML envelope with source IDs, sender, body, attachments, mentions, and thread context. Group messages include a bounded member snapshot when available. Direct messages omit group-only `<chat>` and `<members>` elements; they do not emit `not_applicable` placeholders. Missing group permissions produce `status="unavailable"` without blocking the message. User text remains untrusted input, even inside XML.
 
-SQLite stores incoming and outgoing messages. Incoming events persist before SDK acknowledgment and deduplicate by project and platform message ID. Each project serializes runs. Acknowledgment confirms receipt; `finish_run` ends the current run before the next task is dispatched.
+SQLite stores incoming and outgoing messages. Incoming events persist before SDK acknowledgment and deduplicate by project and platform message ID. Conversation messages immediately steer the same main Agent, including while it is working or an earlier run is unfinished. Dauerbot submits them through the native CLI's normal paste-and-Enter path; it does not wait for `finish_run`, select a follow-up queue key, or interrupt tools with Ctrl-C. Standalone tasks and timers remain serialized. Acknowledgment confirms receipt, and `finish_run` settles each run independently.
 
 | Status | Meaning |
 | --- | --- |
-| `queued` | Saved and waiting for a ready, idle main session |
+| `queued` | Persisted but not yet delivered (starting, paused, taken over, or blocked); live conversation messages do not wait for idle |
 | `submitting` / `submitted` | Writing to the terminal / waiting for acknowledgment |
 | `acknowledged` | The agent confirmed receipt; the task may still be running |
 | `pending` / `sending` / `sent` | Outbound waiting / sending / API-confirmed |
