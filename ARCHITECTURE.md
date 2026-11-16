@@ -2,13 +2,21 @@
 
 Status: implemented, 2026-11-16. Backend and terminal transport checks pass. Real CLI acceptance covers task completion, retirement and same-session resume; the full four-CLI matrix and graphical IME acceptance remain tracked in #23 and #25. Source review and runtime acceptance are separate evidence.
 
-Dauerbot connects one Feishu bot to one project and its main native Agent session. The desktop manages projects and tasks on the left, with the selected Agent's interactive terminal on the right. An independent Rust daemon keeps receiving events and managing schedules while Agent processes sleep.
+Each project connects its own Feishu bot to its main native Agent session. The desktop manages projects and tasks on the left, with the selected Agent's interactive terminal on the right. An independent Rust daemon keeps receiving events and managing schedules while Agent processes sleep.
 
 ## Ownership
 
 Dauerbot owns durable task/event/run state, schedules, user decisions, attention records and outbound delivery. Legacy `herdr` 0.9.5 owns Agent PTYs and process lifetimes in a dedicated named session. Native CLIs own model authentication, model settings and native conversation history. The desktop owns terminal presentation and view/controller bridge processes, never a second Agent process.
 
 The legacy `herdr` backend and the newer `hc` / herdr-core / Herdr App backend are different systems. Product execution uses the legacy backend. External development subagents may use hc without changing the product backend.
+
+## Project and bot identity
+
+`project_bots` stores one private credential pair per project and enforces a unique App ID across projects. A new project has no bot until its owner explicitly connects one. The desktop opens that connection step after project creation, with an option to continue locally. Native Agent selection is independent of bot identity.
+
+Each binding owns its SDK event listener, reconnect state and access-token cache. Binding changes restart only the affected listener. The receiving listener supplies the project and App ID to a transactional inbox insert; chat IDs never choose the destination project. Conversations and cached group snapshots are scoped by `(project_id, chat_id)`, so two bots can participate in the same group without mixing their data. Outgoing messages retain their bot App ID and cannot silently send through a replacement bot.
+
+Schema 5 moves the former singleton credentials to their recorded project owner and removes the singleton binding. Existing unbound projects remain local. Credentials are stored in the private SQLite database, never returned through the desktop/API, and retained safely across daemon restarts.
 
 ## Durable work
 
@@ -54,7 +62,7 @@ A business decision persists its question and pauses the task. Answering it inse
 
 ## Compatibility and delivery
 
-The pre-refactor transition covers only the owner's MacBook Pro and Mac mini. Preserve their credentials, bot/project binding, projects, history and uncertain operations through a one-time migration. Keep the existing bundle identifier, data directory and update signing key for that transition. There is no hc/Core runtime adapter or dual-backend support. After both devices are migrated and verified, remove the old Core execution archive, migration notices and transition-only paths. This does not retire the selected `herdr` 0.9.5 runtime or ordinary protocol, identity and storage version checks.
+The owner's MacBook Pro and Mac mini completed the pre-refactor transition, including native agy MCP task verification in their existing conversations. The product supports fresh stores and normal upgrades from schema 4 onward. It removes the obsolete Core archive and migration notices, and retains no hc/Core runtime adapter. Bundle identity, data directory and update signing keys stay stable; ordinary protocol, execution identity and storage checks continue to apply.
 
 Source, documentation, default UI and commits use English; desktop preference supports persistent English and Simplified Chinese.
 

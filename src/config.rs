@@ -11,12 +11,9 @@ use uuid::Uuid;
 pub struct Config {
     pub port: u16,
     pub token: String,
-    /// Previous Core settings are retained for reading existing installations.
-    pub hc: String,
     pub herdr: String,
     pub herdr_session: String,
     pub herdr_config: String,
-    pub core_session: String,
     pub feishu_base: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub app_id: String,
@@ -29,11 +26,9 @@ impl Default for Config {
         Self {
             port: 49321,
             token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
-            hc: "hc".into(),
             herdr: find_program("herdr"),
             herdr_session: "dauerbot".into(),
             herdr_config: String::new(),
-            core_session: "default".into(),
             feishu_base: "https://open.feishu.cn".into(),
             app_id: String::new(),
             app_secret: String::new(),

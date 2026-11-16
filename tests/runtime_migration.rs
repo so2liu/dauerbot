@@ -1,8 +1,4 @@
-use herdr_feishu_bridge::{
-    App, api,
-    config::Config,
-    db::{Db, ProjectInput},
-};
+use herdr_feishu_bridge::{App, api, config::Config, db::ProjectInput};
 use serde_json::json;
 use std::future::IntoFuture;
 
@@ -15,58 +11,6 @@ fn project(dir: &std::path::Path, name: &str) -> ProjectInput {
         native_session: "native-history".into(),
         extra_args: vec![],
     }
-}
-
-#[tokio::test]
-async fn backend_migration_preserves_bot_messages_and_native_history_without_adopting_core_ids() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bridge.sqlite3");
-    let db = Db::open(&path).unwrap();
-    let p = db
-        .create(project(dir.path(), "Existing project"))
-        .await
-        .unwrap();
-    db.sync(|c| herdr_feishu_bridge::bot::save(c, &p.id, "cli_fixture", "secret", false))
-        .unwrap();
-    db.ingest_bot(
-        &p.id,
-        "cli_fixture",
-        "oc_private",
-        "om_saved",
-        "Saved before migration",
-        &json!({"source":{"chat_id":"oc_private","chat_type":"p2p"}}),
-    )
-    .unwrap();
-    db.set_session(
-        &p.id,
-        Some("t-old-core".into()),
-        Some(123),
-        "old-generation".into(),
-    )
-    .await
-    .unwrap();
-    db.sync(|c|{c.execute_batch("ALTER TABLE projects DROP COLUMN execution; ALTER TABLE projects DROP COLUMN enabled; DROP TABLE archived_core_executions; PRAGMA user_version=3;")?;Ok(())}).unwrap();
-    drop(db);
-    let db = Db::open(&path).unwrap();
-    let migrated = db.project(&p.id).await.unwrap();
-    assert_eq!(migrated.native_session, "native-history");
-    assert!(migrated.terminal.is_none());
-    assert!(migrated.execution.is_null());
-    assert_eq!(db.bot(&p.id).await.unwrap().app_id, "cli_fixture");
-    assert_eq!(db.messages(&p.id).await.unwrap().len(), 1);
-    let old = db
-        .sync(|c| {
-            Ok(c.query_row(
-                "SELECT terminal FROM archived_core_executions WHERE project_id=?",
-                [p.id],
-                |r| r.get::<_, String>(0),
-            )?)
-        })
-        .unwrap();
-    assert_eq!(old, "t-old-core");
-    drop(db);
-    let again = Db::open(&path).unwrap();
-    assert_eq!(again.projects().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

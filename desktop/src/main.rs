@@ -42,7 +42,6 @@ struct Setup {
     bots: std::collections::HashMap<String, BotSetup>,
     language: Language,
     terminal_hidden: bool,
-    dismissed_core_projects: Vec<String>,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -704,7 +703,7 @@ impl Desktop {
                 this.api("PUT", format!("/projects/{}/bot",this.selected), Some(json!({"app_id":id,"app_secret":secret})), "Bot connected to this project. Validate its credentials to continue.");
             }, cx).primary().disabled(self.credentials_project != self.selected || self.busy))
             .child(self.btn("check-credentials", "Validate credentials", |this, _, _| this.api("POST", format!("/projects/{}/bot/check",this.selected), None, "App identity verified. Configure message events next."), cx))
-            .child(self.card("Connection status", &format!("{} · {}", self.tr(connection_status(status["status"].as_str().unwrap_or("unconfigured"))), status["error"].as_str().unwrap_or(""))))
+            .child(self.card("Connection status", &format!("{} · {}", self.tr(connection_status(status["status"].as_str().unwrap_or("unconfigured"))), self.tr(status["error"].as_str().unwrap_or("")))))
             .child(self.btn("credentials-next", "Configure message permissions →", |this, _, _| this.go(3), cx).primary().disabled(!self.credentials_checked || self.busy))
             .child(self.btn("bot-local-only", "Use locally for now", |this, _, _| this.go(6), cx))
             .into_any_element()
@@ -895,28 +894,38 @@ impl Desktop {
                         .child(project["path"].as_str().unwrap_or("").to_owned()),
                 );
             let bound = project["bot"]["has_secret"] == true;
-            body = body.child(self.card(
-                if bound { "Bot connected" } else { "No bot connected" },
-                if bound { "This project's private and group messages reach its active agent." }
-                else { "This project is local only. Connect a dedicated Feishu bot to receive messages." },
-            )).child(self.btn("project-bot", if bound { "Manage bot" } else { "Connect bot" }, |this, _, _| this.go(2), cx));
-            if let Some(message) = project["migration_notice"]
-                .as_str()
-                .filter(|text| !text.is_empty())
-                && !self.setup.dismissed_core_projects.contains(&id)
-            {
-                let project_id = id.clone();
-                body = body
-                    .child(self.card("Session preserved", message))
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(if bound { ACCENT } else { MUTED }))
+                            .child(self.tr(if bound {
+                                "Bot connected"
+                            } else {
+                                "No bot connected"
+                            })),
+                    )
                     .child(self.btn(
-                        "dismiss-migration",
-                        "Got it",
-                        move |this, _, _| {
-                            this.setup.dismissed_core_projects.push(project_id.clone());
-                            this.go(6);
-                        },
+                        "project-bot",
+                        if bound { "Manage bot" } else { "Connect bot" },
+                        |this, _, _| this.go(2),
                         cx,
-                    ));
+                    )),
+            );
+            if !bound {
+                body = body.child(div().text_xs().text_color(rgb(MUTED))
+                    .child(self.tr("This project is local only. Connect a dedicated Feishu bot to receive messages.")));
+            }
+            if let Some(error) = self.state["runtime"]["bots"][&id]["error"]
+                .as_str()
+                .filter(|error| !error.is_empty())
+            {
+                body = body.child(self.card_detail("Bot connection", error));
             }
             if let Some(issue) = self.state["runtime"]["issues"][&id]
                 .as_str()

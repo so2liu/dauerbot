@@ -125,6 +125,10 @@ impl Db {
             schema <= 5,
             "This data directory requires a newer Dauerbot version"
         );
+        anyhow::ensure!(
+            schema == 0 || schema >= 4,
+            "Migrate this pre-refactor data directory with Dauerbot 0.4.1 before upgrading"
+        );
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let migration = conn.unchecked_transaction()?;
@@ -134,7 +138,8 @@ impl Db {
               chat_id TEXT NOT NULL DEFAULT '', paused INTEGER NOT NULL DEFAULT 0,
               terminal TEXT, terminal_pid INTEGER, generation TEXT NOT NULL DEFAULT '',
               ready INTEGER NOT NULL DEFAULT 0, native_session TEXT NOT NULL DEFAULT '',
-              extra_args TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, mcp_token TEXT NOT NULL);
+              extra_args TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, mcp_token TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1, execution TEXT NOT NULL DEFAULT 'null');
             CREATE TABLE IF NOT EXISTS messages (
               id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
               direction TEXT NOT NULL, source_id TEXT NOT NULL, content TEXT NOT NULL,
@@ -144,36 +149,8 @@ impl Db {
             CREATE INDEX IF NOT EXISTS message_pending ON messages(direction,status,created_at);
 
         ")?;
-        let columns: Vec<String> = migration
-            .prepare("PRAGMA table_info(projects)")?
-            .query_map([], |row| row.get(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        if !columns.iter().any(|name| name == "enabled") {
-            migration.execute_batch(
-                "ALTER TABLE projects ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
-            )?;
-        }
-        migration.execute_batch(
-            "CREATE TABLE IF NOT EXISTS archived_core_executions (
-             project_id TEXT NOT NULL, terminal TEXT, terminal_pid INTEGER, generation TEXT,
-             native_session TEXT, archived_at INTEGER NOT NULL);",
-        )?;
-        if !columns.iter().any(|name| name == "execution") {
-            migration.execute_batch(
-                "ALTER TABLE projects ADD COLUMN execution TEXT NOT NULL DEFAULT 'null';",
-            )?;
-            // Old Core addresses belong to another backend. Preserve them for inspection,
-            // without terminating or attempting to adopt the user's old processes.
-            migration.execute_batch(
-                "CREATE TABLE IF NOT EXISTS archived_core_executions (
-                project_id TEXT NOT NULL, terminal TEXT, terminal_pid INTEGER, generation TEXT,
-                native_session TEXT, archived_at INTEGER NOT NULL);",
-            )?;
-            migration.execute("INSERT INTO archived_core_executions SELECT id,terminal,terminal_pid,generation,native_session,? FROM projects WHERE terminal IS NOT NULL", [now()])?;
-            migration.execute_batch(
-                "UPDATE projects SET enabled=0 WHERE terminal IS NOT NULL;
-                 UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0;",
-            )?;
+        if schema == 4 {
+            migration.execute_batch("DROP TABLE IF EXISTS archived_core_executions;")?;
         }
         crate::conversation::migrate(&migration)?;
         crate::bot::migrate(&migration)?;
@@ -474,10 +451,6 @@ impl Db {
                 anyhow::ensure!(!running, "Stop the session before removing the project");
                 c.execute("DELETE FROM messages WHERE project_id=?", [&p.id])?;
                 c.execute("DELETE FROM projects WHERE id=?", [&p.id])?;
-                c.execute(
-                    "DELETE FROM archived_core_executions WHERE project_id=?",
-                    [&p.id],
-                )?;
                 Ok(())
             })();
             match result {

@@ -232,21 +232,6 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
             .find(|b| b.project_id == p.id)
             .map(|b| json!({"app_id":b.app_id,"has_secret":!b.app_secret.is_empty()}))
             .unwrap_or(Value::Null);
-        if !p.enabled {
-            let id = p.id.clone();
-            let preserved =
-                app.db
-                    .call(move |c| {
-                        Ok(c.query_row(
-                "SELECT EXISTS(SELECT 1 FROM archived_core_executions WHERE project_id=?)",
-                [id],|r|r.get::<_,bool>(0))?)
-                    })
-                    .await?;
-            if preserved {
-                record["migration_notice"] =
-                    json!("Previous Core session preserved; Start/Resume to use the new backend");
-            }
-        }
         if let Some(phase) = runtime["projects"].get(&p.id).and_then(Value::as_object) {
             record.as_object_mut().unwrap().extend(phase.clone());
         } else {

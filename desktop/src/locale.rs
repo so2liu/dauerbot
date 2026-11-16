@@ -43,10 +43,21 @@ impl Language {
         }
         let translated = match source {
             "FEISHU BOT" => "飞书机器人",
+            "Bot connection" => "机器人连接",
+            "Connection lost or authentication failed; check this project's bot credentials and event subscriptions" => {
+                "连接已断开或认证失败，请检查此项目的机器人凭据和事件订阅。"
+            }
+            "Migrate this pre-refactor data directory with Dauerbot 0.4.1 before upgrading" => {
+                "请先使用 Dauerbot 0.4.1 迁移此旧版数据目录，再进行升级。"
+            }
             "01  Choose a project" => "01  选择项目",
-            "Choose a project folder and an installed Agent CLI." => "选择项目文件夹和已安装的智能体 CLI。",
+            "Choose a project folder and an installed Agent CLI." => {
+                "选择项目文件夹和已安装的智能体 CLI。"
+            }
             "02  Connect its bot" => "02  连接专属机器人",
-            "Connect a dedicated Feishu bot to this project, or continue locally." => "为此项目连接专属飞书机器人，也可以先在本地使用。",
+            "Connect a dedicated Feishu bot to this project, or continue locally." => {
+                "为此项目连接专属飞书机器人，也可以先在本地使用。"
+            }
             "Add your first project →" => "添加第一个项目 →",
             "How to create a Feishu bot" => "如何创建飞书机器人",
             "Go to workspace →" => "进入工作台 →",
@@ -81,7 +92,6 @@ impl Language {
                 "此项目目前仅在本地使用，连接专属飞书机器人后即可接收消息。"
             }
             "Manage bot" => "管理机器人",
-            "Connect bot" => "连接机器人",
             "This bot is already connected to another project" => "此机器人已绑定到另一个项目",
             "Enter this bot's App Secret" => "请输入这个机器人的 App Secret",
             "Connect a Feishu bot to this project first" => "请先为此项目连接飞书机器人",
@@ -126,9 +136,6 @@ impl Language {
                 "终端连接已关闭，请重新连接。"
             }
             "Session preserved" => "已保留原会话",
-            "Previous Core session preserved; Start/Resume to use the new backend" => {
-                "原 Core 会话已保留。点击“启动 / 恢复”使用新的运行方式。"
-            }
             "Got it" => "知道了",
             "What did you verify?" => "你确认了哪些情况？",
             "Background work needs review" => "需要确认后台任务",
