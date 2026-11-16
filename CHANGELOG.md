@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 — 2026-11-16
+
+### Fixed
+
+- Start the background HERDR server directly instead of loading an interactive login shell. A Mac mini migration exposed shell initialization blocking server startup indefinitely. Native Agent sessions still load their login shell and existing settings.
+
 ## 0.4.0 — 2026-11-16
 
 ### Changed
