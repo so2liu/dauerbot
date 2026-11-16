@@ -42,6 +42,7 @@ pub fn definitely_not_sent(error: &anyhow::Error) -> bool {
             "agent_blocked"
                 | "agent_not_ready"
                 | "agent_not_found"
+                | "agent_target_ambiguous"
                 | "empty_agent_prompt"
                 | "invalid_target"
         )
@@ -314,7 +315,10 @@ pub async fn prepare_execution(
     } else {
         command.extend(login_shell_args(argv.to_vec()));
     }
-    let layout=rpc(config,"layout.apply",json!({"tab_id":workspace["tab"]["tab_id"],"focus":false,"tab_label":p.name,
+    let result: Result<Value> = async {
+    // Add a command tab rather than replacing the initial tab: a user may have
+    // split or added a pane since workspace.create returned.
+    let layout=rpc(config,"layout.apply",json!({"workspace_id":workspace["workspace"]["workspace_id"],"focus":false,"tab_label":p.name,
         "root":{"type":"pane","cwd":p.path,"command":command,"env":launch_network_env(std::env::vars()),"label":p.name}})).await?;
     let pane_id = layout["layout"]["root"]["pane_id"]
         .as_str()
@@ -344,9 +348,104 @@ pub async fn prepare_execution(
                 .as_i64()
                 .context("HERDR command has no root process identity")?,
         ),
-        launch_permit: permit,
+        launch_permit: permit.clone(),
     };
+    // Closing only the original terminal preserves any panes added by the user.
+    close_matching_pane(config, &workspace["root_pane"]).await?;
     Ok(serde_json::to_value(execution)?)
+    }.await;
+    match result {
+        Ok(execution) => Ok(execution),
+        Err(error) => {
+            // layout.apply can fail after creating its PTY. Recover only the pane
+            // whose root argv contains this private generation's gate capability.
+            match cleanup_preparation(config, &workspace, &permit).await {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("Execution cleanup failed: {cleanup:#}")))
+                }
+            }
+        }
+    }
+}
+
+async fn close_matching_pane(config: &Config, expected: &Value) -> Result<()> {
+    let pane_id = expected["pane_id"]
+        .as_str()
+        .context("Missing cleanup pane identity")?;
+    let current = match rpc(config, "pane.get", json!({"pane_id":pane_id})).await {
+        Ok(value) => value["pane"].clone(),
+        Err(error) if missing_pane(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if current["terminal_id"] != expected["terminal_id"]
+        || current["workspace_id"] != expected["workspace_id"]
+    {
+        bail!("HERDR cleanup identity changed; the pane was preserved");
+    }
+    rpc(config, "pane.close", json!({"pane_id":pane_id})).await?;
+    Ok(())
+}
+
+fn missing_pane(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RpcFailure>().is_some_and(|e| {
+        matches!(
+            e.kind.as_str(),
+            "pane_not_found" | "target_not_found" | "workspace_not_found"
+        )
+    })
+}
+
+async fn cleanup_preparation(config: &Config, workspace: &Value, permit: &Path) -> Result<()> {
+    let panes = rpc(
+        config,
+        "pane.list",
+        json!({"workspace_id":workspace["workspace"]["workspace_id"]}),
+    )
+    .await;
+    match panes {
+        Ok(value) => {
+            for pane in value["panes"]
+                .as_array()
+                .context("Missing cleanup pane list")?
+            {
+                let info = rpc(
+                    config,
+                    "pane.process_info",
+                    json!({"pane_id":pane["pane_id"]}),
+                )
+                .await?;
+                let owns_gate = info["process_info"]["foreground_processes"]
+                    .as_array()
+                    .is_some_and(|processes| {
+                        processes.iter().any(|process| {
+                            process["argv"].as_array().is_some_and(|args| {
+                                args.iter().any(|arg| arg.as_str() == permit.to_str())
+                            })
+                        })
+                    });
+                let owned_generation = permit
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|s| s.to_str());
+                let owned_project = permit
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .and_then(|s| s.to_str());
+                let owns_metadata = pane["tokens"]["hfb_owner"] == "dauerbot"
+                    && pane["tokens"]["hfb_generation"].as_str() == owned_generation
+                    && pane["tokens"]["hfb_project"].as_str() == owned_project;
+                if owns_gate || owns_metadata {
+                    close_matching_pane(config, pane).await?;
+                }
+            }
+        }
+        Err(error) if missing_pane(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    close_matching_pane(config, &workspace["root_pane"]).await?;
+    Ok(())
 }
 
 /// Save the execution before releasing this gate. No Agent can call MCP earlier.
@@ -369,8 +468,7 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         }
         Err(error) => return Err(error),
     };
-    let native_agent = match rpc(config, "agent.get", json!({"target":execution.terminal_id})).await
-    {
+    let native_agent = match rpc(config, "agent.get", json!({"target":execution.pane_id})).await {
         Ok(v) => v["agent"].clone(),
         Err(error)
             if error
@@ -410,7 +508,8 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         .cloned()
         .unwrap_or(Value::Null);
     let agent_label = native_agent["agent"].as_str().unwrap_or("");
-    let pending = !p.ready && (agent_label.is_empty() || is_shell(&foreground));
+    let pending =
+        !p.ready && ((p.agent != "custom" && agent_label.is_empty()) || is_shell(&foreground));
     let state = if processes.is_empty() {
         "finished"
     } else {
@@ -422,7 +521,7 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         "native_session":native_agent.get("agent_session").cloned().unwrap_or(Value::Null),
         "interactive_ready":native_agent["interactive_ready"].as_bool().unwrap_or(!pending),
         "launch_pending":pending,"completion_seq":native_agent["completion_seq"],"state_change_seq":native_agent["state_change_seq"],
-        "execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"tokens":pane["tokens"],
+        "processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"tokens":pane["tokens"],
         "cwd":pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("")}),
     )
 }
@@ -494,6 +593,135 @@ pub fn check_identity(p: &Project, record: &Value) -> Result<()> {
     Ok(())
 }
 
+fn same_program(actual: &str, expected: &str) -> bool {
+    actual == expected
+        || (Path::new(actual).is_absolute()
+            && Path::new(expected).is_absolute()
+            && std::fs::canonicalize(actual)
+                .ok()
+                .zip(std::fs::canonicalize(expected).ok())
+                .is_some_and(|(a, b)| a == b))
+}
+
+/// Retirement requires the CLI itself in the foreground, not a tool subprocess
+/// beneath a stale HERDR agent label. Unrecognized launch wrappers stay warm.
+pub fn quiescent(p: &Project, record: &Value) -> bool {
+    if check_identity(p, record).is_err()
+        || !matches!(record["status"]["state"].as_str(), Some("idle" | "done"))
+    {
+        return false;
+    }
+    let Some(processes) = record["processes"].as_array().filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    processes.iter().all(|process| {
+        let args = process["argv"].as_array();
+        let name = process["name"].as_str().unwrap_or("");
+        // Our idle stdio MCP child shares the PTY process group but is not a
+        // background Agent job. Match its full generation-scoped credential path.
+        if args.is_some_and(|argv| {
+            let credential = ExecutionRef::from_project(p)
+                .ok()
+                .map(|execution| execution.launch_permit.with_file_name("credentials.json"));
+            argv.len() == 4
+                && argv[1] == "mcp"
+                && argv[2] == "--credentials"
+                && argv[3].as_str().map(Path::new) == credential.as_deref()
+                && argv[0].as_str().is_some_and(|program| {
+                    same_program(
+                        program,
+                        &std::env::current_exe()
+                            .unwrap_or_default()
+                            .to_string_lossy(),
+                    )
+                })
+        }) {
+            return true;
+        }
+        if p.agent == "custom" {
+            let literal_prefix: Vec<_> = p
+                .extra_args
+                .iter()
+                .take_while(|arg| !arg.contains('{'))
+                .collect();
+            let python = |program: &str| {
+                Path::new(program)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.to_ascii_lowercase().starts_with("python"))
+            };
+            // macOS can expose only the framework Python process name, omitting
+            // KERN_PROCARGS2 entirely. The direct-command root PID is immutable;
+            // only this configured interpreter root can use the fallback.
+            if args.is_none()
+                && literal_prefix.len() > 1
+                && process["pid"] == record["pid"]
+                && python(name)
+                && python(literal_prefix[0])
+            {
+                return true;
+            }
+            return !literal_prefix.is_empty()
+                && args.is_some_and(|argv| {
+                    literal_prefix.iter().enumerate().all(|(index, arg)| {
+                        argv.get(index)
+                            .and_then(Value::as_str)
+                            .is_some_and(|actual| {
+                                if index == 0 {
+                                    same_program(actual, arg)
+                                        || (literal_prefix.len() > 1
+                                            && process["pid"] == record["pid"]
+                                            && python(actual)
+                                            && python(arg))
+                                } else {
+                                    actual == arg.as_str()
+                                }
+                            })
+                    })
+                });
+        }
+        let executable = Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(name);
+        let expected = |name: &str| match p.agent.as_str() {
+            "codex" => name == "codex" || name.starts_with("codex-"),
+            "claude" => matches!(name, "claude" | "claude.exe" | "claude-code"),
+            "pi" => name == "pi",
+            "agy" => matches!(name, "agy" | "antigravity" | "antigravity-cli"),
+            _ => false,
+        };
+        if expected(executable)
+            || process["argv0"]
+                .as_str()
+                .and_then(|arg| Path::new(arg).file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(expected)
+        {
+            return true;
+        }
+        if !matches!(executable, "node" | "bun" | "deno") {
+            return false;
+        }
+        args.and_then(|argv| argv.get(1))
+            .and_then(Value::as_str)
+            .is_some_and(|script| {
+                let script_name = Path::new(script)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                expected(script_name)
+                    || match p.agent.as_str() {
+                        "claude" => script.contains("/@anthropic-ai/claude-code/"),
+                        "pi" => script.contains("/pi-coding-agent/"),
+                        "agy" => script.contains("/antigravity-cli/"),
+                        "codex" => script.contains("/@openai/codex/"),
+                        _ => false,
+                    }
+            })
+    })
+}
+
 pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
     let record = observe(config, p).await?;
     check_identity(p, &record)?;
@@ -509,7 +737,7 @@ pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
         rpc(
             config,
             "agent.prompt",
-            json!({"target":execution.terminal_id,"text":text}),
+            json!({"target":execution.pane_id,"text":text}),
         )
         .await?;
     }
@@ -519,7 +747,27 @@ pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
 pub async fn stop(config: &Config, p: &Project) -> Result<()> {
     let record = observe(config, p).await?;
     if record["state"] == "finished" {
-        return Ok(());
+        let execution = ExecutionRef::from_project(p)?;
+        // Exited direct-command panes remain in HERDR. Their immutable terminal
+        // identity and generation tokens still establish ownership without a PID.
+        let pane = match rpc(config, "pane.get", json!({"pane_id":execution.pane_id})).await {
+            Ok(value) => value["pane"].clone(),
+            Err(error) if missing_pane(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if pane["tokens"]["hfb_owner"] != "dauerbot"
+            || pane["tokens"]["hfb_project"] != p.id
+            || pane["tokens"]["hfb_generation"] != p.generation
+            || pane["tokens"]["hfb_execution"] != execution.managed_name
+        {
+            bail!("HERDR exited execution metadata changed; the pane was preserved");
+        }
+        return close_matching_pane(
+            config,
+            &json!({"pane_id":execution.pane_id,
+            "terminal_id":execution.terminal_id,"workspace_id":execution.workspace_id}),
+        )
+        .await;
     }
     match check_execution_identity(p, &record) {
         Ok(()) => {}
@@ -620,7 +868,7 @@ pub fn launch_network_env(
 /// Recognize only the native workspace trust screen already authorized by the user.
 pub fn is_project_trust(p: &Project, t: &Value, screen: &str) -> bool {
     if p.ready
-        || p.agent != "agy"
+        || !matches!(p.agent.as_str(), "agy" | "claude")
         || t["cwd"] != p.path
         || t["status"]["state"] != "blocked"
         || check_execution_identity(p, t).is_err()
@@ -628,11 +876,23 @@ pub fn is_project_trust(p: &Project, t: &Value, screen: &str) -> bool {
         return false;
     }
     let lines: Vec<_> = screen.lines().map(str::trim).collect();
-    lines.contains(&p.path.as_str())
-        && lines.contains(&"Accessing workspace:")
-        && lines.contains(&"Do you trust the contents of this project?")
-        && lines.contains(&"> Yes, I trust this folder")
-        && lines.contains(&"No, exit")
+    if !lines.contains(&p.path.as_str()) {
+        return false;
+    }
+    match p.agent.as_str() {
+        "agy" => {
+            lines.contains(&"Accessing workspace:")
+                && lines.contains(&"Do you trust the contents of this project?")
+                && lines.contains(&"> Yes, I trust this folder")
+                && lines.contains(&"No, exit")
+        }
+        "claude" => {
+            lines.contains(&"Quick safety check: Is this a project you created or one you trust?")
+                && lines.contains(&"❯ 1. Yes, I trust this folder")
+                && lines.contains(&"2. No, exit")
+        }
+        _ => false,
+    }
 }
 
 pub async fn confirm_project_trust(config: &Config, p: &Project) -> Result<()> {
@@ -717,4 +977,150 @@ pub async fn install_integration(config: &Config, agent: &str) -> Result<Value> 
         bail!("The {agent} session hook is not ready after installation");
     }
     Ok(installed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_observation_and_prompt_use_public_pane_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = Config {
+            herdr_session: dir.path().to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let db = crate::db::Db::open(&dir.path().join("db")).unwrap();
+        let mut p = db
+            .create(crate::db::ProjectInput {
+                name: "Native target".into(),
+                path: dir.path().to_string_lossy().into_owned(),
+                agent: "codex".into(),
+                chat_id: String::new(),
+                native_session: String::new(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        p.generation = uuid::Uuid::new_v4().to_string();
+        p.terminal = Some("term_uuid".into());
+        p.terminal_pid = Some(100);
+        p.ready = true;
+        let name = managed_name(&p.generation).unwrap();
+        p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_uuid","managed_name":name,"generation":p.generation,"shell_pid":100,"launch_permit":dir.path().join("launch.permit")});
+        let pane = json!({"pane_id":"w1:p1","workspace_id":"w1","terminal_id":"term_uuid","agent":"codex","agent_status":"idle","tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":p.generation,"hfb_execution":name}});
+        let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
+        let worker = tokio::spawn(async move {
+            for expected in ["pane.get", "agent.get", "pane.process_info", "agent.prompt"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (input, mut output) = stream.into_split();
+                let request: Value = serde_json::from_str(
+                    &BufReader::new(input)
+                        .lines()
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["method"], expected);
+                if expected.starts_with("agent.") {
+                    assert_eq!(
+                        request["params"]["target"], "w1:p1",
+                        "Agent targets do not accept terminal UUIDs"
+                    );
+                }
+                let result = match expected {
+                    "pane.get" => json!({"pane":pane}),
+                    "agent.get" => json!({"agent":pane}),
+                    "pane.process_info" => {
+                        json!({"process_info":{"shell_pid":100,"foreground_processes":[{"pid":100,"name":"codex","argv":["codex"]}]}})
+                    }
+                    _ => json!({"agent":pane}),
+                };
+                output
+                    .write_all(
+                        format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            send(&cfg, &p, "test prompt").await.unwrap()["submitted"],
+            true
+        );
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_cleanup_preserves_unrelated_panes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = Config {
+            // A fake socket transport requires no real HERDR server or user config.
+            herdr_session: dir.path().to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
+        let permit = dir.path().join("project/generation/launch.permit");
+        let initial =
+            json!({"pane_id":"initial","terminal_id":"initial-terminal","workspace_id":"owned"});
+        let gated = json!({"pane_id":"gated","terminal_id":"gate-terminal","workspace_id":"owned"});
+        let user = json!({"pane_id":"user","terminal_id":"user-terminal","workspace_id":"owned"});
+        let workspace = json!({"workspace":{"workspace_id":"owned"},"root_pane":initial});
+        let expected_permit = permit.clone();
+        let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = closed.clone();
+        let worker = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (input, mut output) = stream.into_split();
+                let request: Value = serde_json::from_str(
+                    &BufReader::new(input)
+                        .lines()
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                let pane = match request["params"]["pane_id"].as_str() {
+                    Some("initial") => initial.clone(),
+                    Some("gated") => gated.clone(),
+                    _ => user.clone(),
+                };
+                let result = match request["method"].as_str().unwrap() {
+                    "pane.list" => json!({"panes":[initial,gated,user]}),
+                    "pane.get" => json!({"pane":pane}),
+                    "pane.process_info" => {
+                        let argv = if pane["pane_id"] == "gated" {
+                            json!(["/bin/sh", "dauerbot-launch", expected_permit])
+                        } else {
+                            json!(["/bin/sh"])
+                        };
+                        json!({"process_info":{"foreground_processes":[{"argv":argv}]}})
+                    }
+                    "pane.close" => {
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push(request["params"]["pane_id"].as_str().unwrap().to_owned());
+                        json!({})
+                    }
+                    method => panic!("Unexpected request: {method}"),
+                };
+                output
+                    .write_all(
+                        format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        cleanup_preparation(&cfg, &workspace, &permit)
+            .await
+            .unwrap();
+        worker.abort();
+        assert_eq!(*closed.lock().unwrap(), ["gated", "initial"]);
+    }
 }

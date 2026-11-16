@@ -141,6 +141,59 @@ async fn process_and_generation_are_required_before_typing() {
 }
 
 #[tokio::test]
+async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db.create(input(&dir, "Quiescence", "")).await.unwrap();
+    let mut record = legacy_record(&mut p, 100);
+    record["processes"] = json!([{"name":"codex","argv":["codex"]}]);
+    assert!(herdr::quiescent(&p, &record));
+    record["processes"] = json!([
+        {"name":"codex","argv":["codex"]},
+        {"name":"hfb","argv":[std::env::current_exe().unwrap(),"mcp","--credentials","/private/fixture/credentials.json"]}
+    ]);
+    assert!(
+        herdr::quiescent(&p, &record),
+        "The generation's parked MCP child is not active background work"
+    );
+    record["processes"][1]["argv"][3] = json!("/another/generation/credentials.json");
+    assert!(!herdr::quiescent(&p, &record));
+    for processes in [
+        json!([{"name":"bash","argv":["bash","-c","long task"]}]),
+        json!([{"name":"codex","argv":["codex"]},{"name":"python3","argv":["python3","task.py"]}]),
+        json!([{"name":"node","argv":["node","unknown-wrapper.js"]}]),
+        json!([]),
+    ] {
+        record["processes"] = processes;
+        assert!(!herdr::quiescent(&p, &record));
+    }
+    p.agent = "custom".into();
+    p.extra_args = vec![
+        "/usr/local/bin/python3".into(),
+        "/private/fixture/agent.py".into(),
+        "{credentials}".into(),
+    ];
+    record["processes"] = json!([{"pid":100,"name":"Python","argv":["/Frameworks/Python.app/Contents/MacOS/Python","/private/fixture/agent.py","credentials"]}]);
+    assert!(
+        herdr::quiescent(&p, &record),
+        "macOS Python launchers exec the framework binary"
+    );
+    record["processes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("argv");
+    assert!(
+        herdr::quiescent(&p, &record),
+        "macOS may omit the framework interpreter argv entirely"
+    );
+    record["processes"][0]["pid"] = json!(101);
+    assert!(
+        !herdr::quiescent(&p, &record),
+        "A child interpreter cannot inherit the root launcher exemption"
+    );
+}
+
+#[tokio::test]
 async fn attachments_cannot_escape_project_via_path_or_symlink() {
     let root = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
@@ -347,8 +400,24 @@ async fn workspace_trust_requires_exact_project_identity_and_selected_yes() {
         *invalid.pointer_mut(pointer).unwrap() = value;
         assert!(!herdr::is_project_trust(&p, &invalid, &screen), "{pointer}");
     }
+    p.agent = "claude".into();
+    let claude = format!(
+        "Quick safety check: Is this a project you created or one you trust?\n{}\n❯ 1. Yes, I trust this folder\n  2. No, exit\n",
+        p.path
+    );
+    assert!(herdr::is_project_trust(&p, &record, &claude));
+    assert!(!herdr::is_project_trust(
+        &p,
+        &record,
+        &claude.replace("❯ 1.", "  1.")
+    ));
+    assert!(!herdr::is_project_trust(
+        &p,
+        &record,
+        &claude.replace(&p.path, "/another/project")
+    ));
     p.ready = true;
-    assert!(!herdr::is_project_trust(&p, &record, &screen));
+    assert!(!herdr::is_project_trust(&p, &record, &claude));
 }
 
 #[tokio::test]

@@ -264,6 +264,18 @@ def main():
         config = wait_for(lambda: json.loads((run / "config.json").read_text()) if (run / "config.json").exists() else None, "no daemon config")
         base = f"http://127.0.0.1:{port}"
 
+        def legacy_rpc(method, params=None):
+            target = Path(runtime_dir.name) / "herdr" / "sessions" / session / "herdr.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+                stream.settimeout(5)
+                stream.connect(str(target))
+                request_id = uuid.uuid4().hex
+                stream.sendall((json.dumps({"id": request_id, "method": method, "params": params or {}}) + "\n").encode())
+                with stream.makefile("r") as reader:
+                    response = json.loads(reader.readline())
+                assert "error" not in response, response
+                return response["result"]
+
         def api(path, data=None, method=None, auth=True):
             headers = {"Content-Type": "application/json"}
             if auth:
@@ -378,12 +390,14 @@ def main():
         wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "execution did not become idle")
         age_idle_execution()
         wait_for(lambda: project_state()["terminal"] is None, "idle execution was not retired")
+        assert not legacy_rpc("workspace.list")["workspaces"], "idle retirement left an owned workspace"
         checks.append("finished fixture execution retires after the persisted ten-minute warm deadline")
         count = len(FIXTURE.messages)
         FIXTURE.emit(message("om_wakeup", "wake sleeping project"))
         wait_for(lambda: any(m["source_id"] == "om_wakeup" and m["status"] == "acknowledged" for m in api(f"/projects/{key}")["messages"]), "new message did not wake the fixture")
         wait_for(settled, "wakeup run did not finish")
         assert project_state()["terminal"] != old_terminal and len(FIXTURE.messages) > count
+        assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "wake leaked a workspace"
         checks.append("Feishu message wakes a fresh execution with the explicit fixture resume marker")
 
         wait_for(lambda: api(f"/projects/{key}/work")["execution"]["status"] == "idle", "woken execution did not idle")
@@ -395,12 +409,23 @@ def main():
         wait_for(lambda: "scheduled-wakeup" in str(FIXTURE.messages), "timer did not wake the fixture and deliver its result")
         wait_for(settled, "timer run did not finish")
         assert project_state()["terminal"] is not None
+        assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "timer wake leaked a workspace"
         checks.append("durable one-shot timer wakes a sleeping fixture through the common task inbox")
         cli = subprocess.run([str(binary), "--data-dir", str(run), "project", "list"], capture_output=True, text=True, timeout=10)
         assert cli.returncode == 0 and "端到端验证项目" in cli.stdout
         checks.append("CLI and UI API share the same project state")
+        # A user-added terminal in the same workspace must survive project stop.
+        user_tab = legacy_rpc("layout.apply", {"workspace_id": project_state()["execution"]["workspace_id"],
+                    "focus": False, "root": {"type": "pane", "cwd": str(workspace),
+                    "command": [sys.executable, "-c", "import time; time.sleep(120)"], "label": "Unrelated fixture terminal"}})
+        user_pane = user_tab["layout"]["root"]["pane_id"]
+        user_identity = legacy_rpc("pane.get", {"pane_id": user_pane})["pane"]["terminal_id"]
         # Stopped sessions must retain later messages rather than execute them in a shell.
         api(f"/projects/{key}/stop", {}, "POST")
+        assert legacy_rpc("pane.get", {"pane_id": user_pane})["pane"]["terminal_id"] == user_identity
+        assert len(legacy_rpc("workspace.list")["workspaces"]) == 1
+        checks.append("project stop preserves unrelated user-added terminals in its workspace")
+        legacy_rpc("pane.close", {"pane_id": user_pane})
         FIXTURE.emit(message("om_stopped", "do not deliver to a stopped terminal"))
         wait_for(lambda: any(m["source_id"] == "om_stopped" and m["status"] == "queued" for m in api(f"/projects/{key}")["messages"]), "stopped-session message was not queued")
         checks.append("stopped agent does not consume later messages")
