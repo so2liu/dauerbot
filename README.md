@@ -162,7 +162,7 @@ Schedules support once, interval and UNIX five-field cron expressions with IANA 
 
 Managed MCP exposes exactly `send_md`, `send_file`, and `schedule_run`; unmanaged sessions expose no project tools. MCP privately authenticates the project, generation and HERDR pane at startup. Stable request IDs deduplicate sends and schedule creation. Background execution belongs to HERDR and the Agent. There is no separate Dauerbot task or job registry.
 
-Normal database upgrades preserve messages, schedule IDs, occurrence history and uncertain outcomes. Legacy journal containers remain internal for their foreign-key relationships. Previously submitted or uncertain input is never requeued by this upgrade. API protocol 5 and application version 0.4.5 identify the changed contract; incompatible desktop/daemon combinations must reconnect using matching builds.
+Normal database upgrades preserve messages, schedule IDs, occurrence history and uncertain outcomes. Legacy journal containers remain internal for their foreign-key relationships. Previously submitted or uncertain input is never requeued by this upgrade. API protocol 6 and application version 0.4.6 identify private workspace creation and verified handoff retirement; incompatible desktop/daemon combinations must reconnect using matching builds.
 
 ## Updates and releases
 

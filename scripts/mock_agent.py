@@ -46,7 +46,7 @@ else:
     import uuid
     marker.write_text(str(uuid.uuid4()))
 with (Path.cwd() / ".fixture-launches").open("a") as launches:
-    launches.write(json.dumps({"resume": expected, "native": marker.read_text(), "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}) + "\n")
+    launches.write(json.dumps({"resume": expected, "native": marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}) + "\n")
 proc = subprocess.Popen([sys.argv[1], "mcp", "--credentials", sys.argv[2]],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 sequence = 0

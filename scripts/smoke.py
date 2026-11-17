@@ -347,6 +347,18 @@ def main():
                 raise RuntimeError(f"{path}: {error.read().decode()}") from error
 
         wait_for(lambda: api("/state"), "daemon not ready")
+        if not real_agent:
+            managed = api("/projects", {"name": "../../私有 工作区", "agent": "codex"})
+            managed_path = Path(managed["path"])
+            assert managed_path.parent == fixture_home / ".dauerbot/agents", managed_path
+            assert managed_path.name.startswith("私有-工作区-")
+            assert len(managed_path.name.rsplit("-", 1)[1]) == 4
+            assert managed_path.stat().st_mode & 0o777 == 0o700
+            assert "HANDOFF.md" in (managed_path / "AGENTS.md").read_text()
+            api(f"/projects/{managed['id']}", method="DELETE")
+            checks.append("default project creation provisions a private owned workspace and concise AGENTS.md")
+        (workspace / "AGENTS.md").write_text("Fixture user instructions: preserve these rules.\n")
+
         if real_agent=="pi":
             extra_args=["--approve"]
         elif real_agent=="codex":
@@ -358,6 +370,8 @@ def main():
         project = api("/projects", {"name": "端到端验证项目", "path": str(workspace), "agent": real_agent or "custom",
                                    "extra_args": extra_args})
         key = project["id"]
+        assert (workspace / "AGENTS.md").read_text() == "Fixture user instructions: preserve these rules.\n"
+
         assert api("/state")["projects"][0]["bot"] is None, "a new project inherited a bot"
         api(f"/projects/{key}/bot", {"app_id":"cli_fixture","app_secret":"fixture-secret"}, "PUT")
         wait_for(lambda: FIXTURE.connections, "SDK did not establish WebSocket")
@@ -379,11 +393,20 @@ def main():
                 marker = workspace / ".fixture-session"
                 if not marker.exists():
                     return False
+                launches_path = workspace / ".fixture-launches"
+                if not launches_path.exists():
+                    return False
+                launch = json.loads(launches_path.read_text().splitlines()[-1])
                 native = marker.read_text()
+                if launch["native"] != native:
+                    return False
                 with sqlite3.connect(run / "bridge.sqlite3") as conn:
-                    conn.execute("UPDATE projects SET native_session=?,execution=json_set(execution,'$.native_confirmed',json('true')) WHERE id=?",
-                                 (native, key))
-                    conn.execute("UPDATE work_executions SET native_session=? WHERE project_id=?", (native,key))
+                    current = conn.execute("SELECT generation,terminal FROM projects WHERE id=?", (key,)).fetchone()
+                    if not current or current[0] != launch["generation"] or current[1] is None:
+                        return False
+                    conn.execute("UPDATE projects SET native_session=?,execution=json_set(execution,'$.native_confirmed',json('true')) WHERE id=? AND generation=?",
+                                 (native, key, launch["generation"]))
+                    conn.execute("UPDATE work_executions SET native_session=? WHERE project_id=? AND generation=?", (native,key,launch["generation"]))
                 return True
             wait_for(fixture_continuity, "fixture did not persist its resume marker")
 
@@ -573,8 +596,30 @@ def main():
 
         wait_for(lambda: any(e["status"] == "settled" for e in api(f"/projects/{key}/work")["runs"]), "no completed run")
         wait_for(native_idle, "execution did not become idle")
+        if not real_agent:
+            mode = workspace / ".fixture-handoff-mode"
+            mode.write_text("hold")
+            (workspace / "HANDOFF.md").write_text("Old handoff, not evidence for the pending request.\n<!-- dauerbot-handoff:old -->\n")
+            age_idle_execution()
+            def latest_handoff():
+                with sqlite3.connect(run / "bridge.sqlite3") as conn:
+                    return conn.execute("SELECT id,status FROM idle_handoffs WHERE project_id=? ORDER BY rowid DESC LIMIT 1", (key,)).fetchone()
+            wait_for(lambda: latest_handoff() and latest_handoff()[1] == "requested", "handoff was not requested")
+            wait_for(lambda: "MOCK_HANDOFF_HELD" in api(f"/projects/{key}/screen")["text"], "fixture did not hold handoff while working")
+            handoff_generation = project_state()["generation"]
+            FIXTURE.emit(message("om_handoff_steer", "Immediately steer while writing handoff"))
+            wait_for(lambda: any(e["source_id"] == "om_handoff_steer" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "input waited for handoff completion")
+            assert latest_handoff()[1] == "cancelled"
+            assert project_state()["generation"] == handoff_generation
+            assert project_state()["terminal"] is not None
+            mode.unlink()
+            wait_for(native_idle, "steered handoff did not return to idle")
+            with sqlite3.connect(run / "bridge.sqlite3") as conn:
+                conn.execute("UPDATE idle_handoffs SET requested_at=requested_at-601000 WHERE project_id=? AND status='cancelled'", (key,))
+            checks.append("Feishu input cancels an in-flight handoff and steers the same native execution despite a stale artifact")
         age_idle_execution()
         wait_for(lambda: project_state()["terminal"] is None, "idle execution was not retired")
+        assert project_state()["native_session"] == "", "successful handoff retained the old native pointer"
         assert not legacy_rpc("workspace.list")["workspaces"], "idle retirement left an owned workspace"
         checks.append("finished fixture execution retires after the persisted ten-minute warm deadline")
         count = len(FIXTURE.messages)
@@ -642,7 +687,10 @@ def main():
         FIXTURE.emit(message("om_interrupted", "fixture-hold-for-steer"))
         wait_for(lambda: any(e["source_id"] == "om_interrupted" and e["status"] == "submitted" for e in api(f"/projects/{key}/work")["events"]), "fixture did not begin the interrupted run")
         stopped_generation = project_state()["generation"]
+        if not real_agent:
+            fixture_continuity()
         stopped_native = project_state()["native_session"]
+        assert stopped_native, "explicit recovery requires a known native session"
         api(f"/projects/{key}/stop", {}, "POST")
         assert legacy_rpc("pane.get", {"pane_id": user_pane})["pane"]["terminal_id"] == user_identity
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1
@@ -652,9 +700,10 @@ def main():
         FIXTURE.emit(message("om_after_stop", "wake automatically after stop"))
         wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "stopped execution did not automatically wake for new input")
         assert project_state()["generation"] != stopped_generation
+        assert project_state()["native_session"] == stopped_native
         if not real_agent:
-            fixture_continuity()
-            assert project_state()["native_session"] != stopped_native
+            launches = [json.loads(line) for line in (workspace / ".fixture-launches").read_text().splitlines()]
+            assert launches[-1]["resume"] == stopped_native
         assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
         checks.append("new messages automatically resume a stopped execution without replaying its uncertain interrupted work")
         api(f"/projects/{key}/pause", {"paused": True})
@@ -666,6 +715,8 @@ def main():
         wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "unpause did not automatically resume delivery")
         checks.append("only an explicit pause holds new messages; resuming activity automatically wakes the Agent")
         wait_for(native_idle, "old uncertain work pinned the new execution")
+        before_final_handoff = project_state()["native_session"]
+        assert before_final_handoff
         age_idle_execution()
         wait_for(lambda: project_state()["terminal"] is None, "new execution could not retire with old uncertain history")
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
@@ -673,7 +724,9 @@ def main():
         wait_for(lambda: "independent-after-stop" in str(FIXTURE.messages), "old uncertain history blocked independent scheduled wakeup")
         if not real_agent:
             fixture_continuity()
-            assert project_state()["native_session"] != stopped_native
+            assert project_state()["native_session"] != before_final_handoff
+            launches = [json.loads(line) for line in (workspace / ".fixture-launches").read_text().splitlines()]
+            assert launches[-1]["resume"] == ""
         assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
         checks.append("old uncertain history stays recorded without pinning a new execution or blocking independent timer wakeup")
         (results / "smoke.json").write_text(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Bundle the supported HERDR 0.9.5 runtime in the native app and provision it offline when no supported runtime is installed. Preserve explicit runtime choices and expose the app-owned runtime to Agent tools (#47).
+- Create private project folders under `~/.dauerbot/agents` by default, with concise `AGENTS.md` instructions. Keep existing-folder selection and preserve user instructions (#48).
+
+### Changed
+
+- Request an updated `HANDOFF.md` after ten verified native idle minutes. Require the current request marker, a changed artifact and a later idle transition before retirement, then wake into a fresh session that reads project instructions and the handoff. New input cancels a pending handoff and steers the live Agent (#48).
+- Keep native recovery after handoff failures, interrupted execution and uncertain delivery. Bound housekeeping prompts and preserve terminal takeover, pauses and scheduling (#48).
+- Advance the app and daemon to 0.4.6, bundle build 11 and API protocol 6. An API 5 background service cannot satisfy the new workspace/handoff contract; replacement retains the trusted-install and downgrade checks.
+
 ## 0.4.5 — 2026-11-16
 
 ### Changed
