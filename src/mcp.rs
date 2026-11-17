@@ -16,7 +16,43 @@ pub struct Credentials {
     pub project: String,
     pub token: String,
     pub generation: String,
+    /// Stable Agent wire contract, independent of the desktop/service API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_contract: Option<u64>,
 }
+/// Contract 1 is the three-tool wire protocol. Engine revisions may change
+/// without changing this identity. A new required tool field requires a new contract.
+pub const CONTRACT: u64 = 1;
+
+/// Published 0.4.7 predates explicit contract metadata. Its startup probe and
+/// registration require public API 7, even though its operation shapes are stable.
+pub fn generation_contract(execution: &Value) -> Option<u64> {
+    match execution.get("mcp_contract") {
+        Some(value) => value.as_u64().filter(|contract| *contract == CONTRACT),
+        None if execution["api_protocol"].as_u64() == Some(7) => Some(CONTRACT),
+        None => None,
+    }
+}
+
+/// Admission runs on the authenticated owner's snapshot before activation. It
+/// does not open the database, mutate readiness or replace a native execution.
+pub fn check_activation(projects: &[Value], target_api: u64) -> Result<()> {
+    for project in projects.iter().filter(|p| p["terminal"].is_string()) {
+        let execution = &project["execution"];
+        anyhow::ensure!(
+            generation_contract(execution).is_some(),
+            "Project {} has an unsupported Agent MCP contract; keep the current service running",
+            project["name"].as_str().unwrap_or("unknown")
+        );
+        anyhow::ensure!(
+            execution.get("mcp_contract").is_some() || target_api == 7,
+            "Project {} uses a published MCP startup probe requiring public API 7; keep the current service running",
+            project["name"].as_str().unwrap_or("unknown")
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct BridgeMcp {
     credentials: Credentials,
@@ -104,12 +140,12 @@ impl BridgeMcp {
         let registration = self
             .post(
                 "register",
-                json!({"generation":self.credentials.generation,"terminal":terminal}),
+                json!({"generation":self.credentials.generation,"terminal":terminal,"mcp_contract":self.credentials.mcp_contract}),
             )
             .await?;
         anyhow::ensure!(
-            registration["api_protocol"].as_u64() == Some(crate::api::PROTOCOL),
-            "The Dauerbot daemon uses an incompatible API protocol"
+            registration["mcp_contract"].as_u64() == Some(CONTRACT),
+            "The Dauerbot daemon uses an incompatible Agent MCP contract"
         );
         Ok(registration)
     }
@@ -257,7 +293,14 @@ pub async fn serve(path: &Path) -> Result<()> {
     if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
         bail!("MCP credentials may connect only to a local daemon");
     }
-    historical_dispatch(path, &credentials).await?;
+    if let Some(contract) = credentials.mcp_contract {
+        anyhow::ensure!(
+            contract == CONTRACT,
+            "Unsupported Agent MCP contract {contract}"
+        );
+    } else {
+        historical_dispatch(path, &credentials).await?;
+    }
     let server = BridgeMcp {
         credentials,
         http: reqwest::Client::builder()
