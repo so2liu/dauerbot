@@ -1085,7 +1085,7 @@ impl Desktop {
                         .py_2()
                         .text_xs()
                         .text_color(rgb(0xa7b5c2))
-                        .child(self.tr("Viewing only · Take control to type or scroll history")),
+                        .child(self.tr("Viewing only · Take control to scroll app history")),
                 );
             }
         } else {
