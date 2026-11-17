@@ -264,7 +264,7 @@ impl Language {
             "App Updates" => "应用更新",
             "Environment" => "本地环境",
             "For example: personal website" => "例如：个人网站",
-            "Choose the project folder" => "选择项目文件夹",
+            "Leave empty to create a private project folder" => "留空以创建私有项目文件夹",
             "Stored only on this Mac" => "仅保存在本机",
             "Starting the local service..." => "正在启动本地服务…",
             "Local service ready. Connect a bot or create a local project." => {
@@ -403,14 +403,18 @@ impl Language {
             }
             "Selected:" => "已选择：",
             "Project name" => "项目名称",
-            "Project folder (or enter an absolute path)" => "项目文件夹（也可输入绝对路径）",
+            "Project folder (optional existing folder)" => "项目文件夹（可选已有文件夹）",
+            "Private workspace" => "私有工作区",
+            "By default, Dauerbot creates a folder in ~/.dauerbot/agents with project instructions. You can also choose an existing folder." => {
+                "默认在 ~/.dauerbot/agents 下创建文件夹和项目说明，也可选择已有文件夹。"
+            }
             "Choose a folder..." => "选择文件夹…",
             "Automatic binding" => "自动绑定",
             "Your first project becomes this bot's fixed owner. You do not need to select chats or enter IDs. Direct and group messages both reach this project." => {
                 "首个项目会自动绑定机器人，无需选择聊天或填写 ID。私聊与群聊消息均进入该项目。"
             }
             "Create project →" => "创建项目 →",
-            "Enter a project name and choose a folder" => "请输入项目名称并选择文件夹",
+            "Enter a project name" => "请输入项目名称",
             "Project created. Start the main session to begin." => "项目已创建，可以启动主会话了。",
             "WORKSPACE" => "工作区",
             "Projects" => "项目",

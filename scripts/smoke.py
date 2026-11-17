@@ -354,7 +354,7 @@ def main():
         elif real_agent:
             extra_args=[]
         else:
-            extra_args=[sys.executable,str(ROOT/"scripts/mock_agent.py"),"{bridge_exe}","{credentials}","{native_session}"]
+            extra_args=[sys.executable,str(ROOT/"scripts/mock_agent.py"),"{bridge_exe}","{credentials}","{native_session}","{instructions}"]
         project = api("/projects", {"name": "端到端验证项目", "path": str(workspace), "agent": real_agent or "custom",
                                    "extra_args": extra_args})
         key = project["id"]
@@ -583,7 +583,13 @@ def main():
         wait_for(settled, "wakeup run did not finish")
         assert project_state()["terminal"] != old_terminal and len(FIXTURE.messages) > count
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "wake leaked a workspace"
-        checks.append("Feishu message wakes a fresh execution with the explicit fixture resume marker")
+        if not real_agent:
+            launches = [json.loads(line) for line in (workspace / ".fixture-launches").read_text().splitlines()]
+            assert launches[-1]["resume"] == "", "handoff wake resumed the old conversation"
+            assert launches[-1]["native"] != launches[-2]["native"]
+            assert "AGENTS.md and HANDOFF.md" in launches[-1]["instructions"]
+            assert (workspace / "HANDOFF.md").is_file()
+        checks.append("verified handoff retirement wakes a fresh native session instructed to read AGENTS.md/HANDOFF.md")
 
         wait_for(native_idle, "woken execution did not idle")
         age_idle_execution()
@@ -646,7 +652,9 @@ def main():
         FIXTURE.emit(message("om_after_stop", "wake automatically after stop"))
         wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "stopped execution did not automatically wake for new input")
         assert project_state()["generation"] != stopped_generation
-        assert project_state()["native_session"] == stopped_native
+        if not real_agent:
+            fixture_continuity()
+            assert project_state()["native_session"] != stopped_native
         assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
         checks.append("new messages automatically resume a stopped execution without replaying its uncertain interrupted work")
         api(f"/projects/{key}/pause", {"paused": True})
@@ -663,7 +671,9 @@ def main():
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
         api(f"/projects/{key}/timers", {"name":"Independent scheduled work","prompt":"independent-after-stop","kind":"once","at":due.isoformat(),"timezone":"UTC","to":"oc_fixture"})
         wait_for(lambda: "independent-after-stop" in str(FIXTURE.messages), "old uncertain history blocked independent scheduled wakeup")
-        assert project_state()["native_session"] == stopped_native
+        if not real_agent:
+            fixture_continuity()
+            assert project_state()["native_session"] != stopped_native
         assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
         checks.append("old uncertain history stays recorded without pinning a new execution or blocking independent timer wakeup")
         (results / "smoke.json").write_text(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))

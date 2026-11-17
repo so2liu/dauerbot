@@ -73,14 +73,16 @@ cargo clippy --locked --release --manifest-path desktop/Cargo.toml --all-targets
 python3 scripts/smoke.py --binary "$PWD/desktop/target/release/hfb"
 ```
 
-The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, daemon restarts, embedded terminal connections, warm retirement and message/timer wakeup. It uses private XDG configuration and HERDR sessions, with no real bot or model account. The custom fixture uses its persisted resume marker as test-only continuity metadata; it does not prove native CLI hooks or real-model acceptance. Test artifacts stay in ignored directories.
+The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, daemon restarts, embedded terminal connections, warm retirement and message/timer wakeup. It uses private XDG configuration and HERDR sessions, with no real bot or model account. The custom fixture records fresh launches and explicit native resume as test-only continuity metadata; it does not prove native CLI hooks or real-model acceptance. Test artifacts stay in ignored directories.
 
 Live sending is opt-in: `tests/live_feishu.rs` reads `.local/live.json` with `app_id`, `app_secret`, and `chat_id`. Run `cargo test --test live_feishu -- --ignored` only for an explicitly selected bot and recipient, then remove the temporary credentials. It sends a test Markdown message and a small file without opening a competing event listener.
 
 ## CLI and HERDR sessions
 
 ```sh
-hfb project add my-project --path /absolute/path/to/repo --agent codex
+hfb project add my-project --agent codex
+# Or use an existing project folder:
+hfb project add existing-project --path /absolute/path/to/repo --agent codex
 hfb project list
 hfb session start my-project
 hfb session screen my-project
@@ -92,6 +94,8 @@ hfb project unpause my-project
 hfb session stop my-project
 hfb session resume my-project
 ```
+
+Without `--path`, project creation allocates a private folder under `~/.dauerbot/agents/<project-name>-<four-random-letters>`. The desktop uses this default too; choosing an existing folder remains available. App-created folders receive a concise `AGENTS.md` for durable rules. Dauerbot never seeds or rewrites instructions in an existing folder. Keep current progress in `HANDOFF.md`.
 
 `--data-dir` is a global argument. For an isolated daemon, use `hfb --data-dir /absolute/private-data serve --port 49322 --herdr-session my-bridge`.
 
@@ -140,7 +144,7 @@ Restarts preserve uncertain operations instead of blindly resending. PTY input a
 
 ## Sessions and scheduled runs
 
-The supervisor observes native HERDR identity, activity, foreground processes and manual control. A verified idle session starts a ten-minute warm period. New messages reuse a warm Agent or resume a sleeping one. Stopping a session ends its current process; later messages wake a fresh execution of the same native conversation. Explicitly pausing automatic activity holds new input. An uncertain delivery stays recorded without blocking fresh messages, independent schedules or native idle retirement. Native idle describes execution state, not proof of successful business work or a completed external effect.
+The supervisor observes native HERDR identity, activity, foreground processes and manual control. A verified idle session starts a ten-minute warm period. After ten idle minutes, Dauerbot asks the Agent to update `HANDOFF.md` with its goal, completed work, decisions, relevant files/commits, pending issues and next actions. Retirement requires an updated artifact bearing that request’s marker and a later verified native idle transition. New input cancels a pending handoff and steers the live Agent; input arriving after the retirement boundary wakes a fresh session immediately. The fresh session must read `AGENTS.md` and `HANDOFF.md` before new work. A failed or timed-out handoff preserves native recovery and never retries automatically; cancelled requests can try again after another idle period, at most three times per execution. Stopping a session ends its current process; later messages wake a fresh execution of the same native conversation. Explicitly pausing automatic activity holds new input. An uncertain delivery stays recorded without blocking fresh messages or independent schedules. Uncertainty in the current execution prevents automatic handoff retirement; uncertainty from an older execution does not pin a fresh one. Native idle describes execution state, not proof of successful business work or a completed external effect.
 
 ```sh
 hfb timer add my-project "Daily review" "Review project changes" --kind cron --cron '0 9 * * 1-5' --timezone Asia/Shanghai

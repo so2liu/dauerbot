@@ -99,7 +99,7 @@ impl Desktop {
             cx.new(|cx| InputState::new(window, cx).placeholder(setup.language.text(placeholder)))
         };
         let name = input("For example: personal website", cx);
-        let path = input("Choose the project folder", cx);
+        let path = input("Leave empty to create a private project folder", cx);
         let app_id = input("cli_…", cx);
         let secret = cx.new(|cx| {
             InputState::new(window, cx)
@@ -733,7 +733,8 @@ impl Desktop {
         div().flex().flex_col().gap_4()
             .child(self.title("ADD PROJECT", "Add project", "One bot belongs to one project. Direct and group messages reach its active agent, which you can switch in the workspace."))
             .child(self.field("Project name", &self.name))
-            .child(self.field("Project folder (or enter an absolute path)", &self.path))
+            .child(self.card("Private workspace", "By default, Dauerbot creates a folder in ~/.dauerbot/agents with project instructions. You can also choose an existing folder."))
+            .child(self.field("Project folder (optional existing folder)", &self.path))
             .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("{} {picked}", self.tr("Selected:")))))
             .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
@@ -743,7 +744,7 @@ impl Desktop {
                 let manual = this.path.read(cx).value().to_string();
                 let path = if manual.trim().is_empty() { this.picked_path.clone() } else { manual };
                 let name = this.name.read(cx).value().to_string();
-                if name.trim().is_empty() || path.is_empty() { this.notice = "Enter a project name and choose a folder".into(); this.error = true; return; }
+                if name.trim().is_empty() { this.notice = "Enter a project name".into(); this.error = true; return; }
                 let agent = ["codex","claude","pi","agy"][this.agent];
                 this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":""})), "Project created. Connect its bot or continue locally.");
             }, cx).primary())
@@ -1528,7 +1529,7 @@ impl Render for Desktop {
                                 this.setup.language = this.setup.language.other();
                                 this.go(this.setup.page);
                                 this.name.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("For example: personal website"), window, cx));
-                                this.path.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Choose the project folder"), window, cx));
+                                this.path.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Leave empty to create a private project folder"), window, cx));
                                 this.secret.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Stored only on this Mac"), window, cx));
                                 set_menus(this.setup.language, cx);
                                 cx.notify();

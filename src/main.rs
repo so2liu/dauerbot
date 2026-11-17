@@ -107,7 +107,7 @@ enum Projects {
     Add {
         name: String,
         #[arg(long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
         #[arg(long, default_value = "codex")]
         agent: String,
         #[arg(long, default_value = "")]
@@ -484,7 +484,7 @@ async fn main() -> Result<()> {
         Commands::Status=>client.request("GET","/state",None).await?,
         Commands::Project{command}=>match command{
             Projects::List=>client.request("GET","/state",None).await?["projects"].clone(),
-            Projects::Add{name,path,agent,chat_id,native_session,args}=>client.request("POST","/projects",Some(json!({"name":name,"path":path,"agent":agent,"chat_id":chat_id,"native_session":native_session,"extra_args":args}))).await?,
+            Projects::Add{name,path,agent,chat_id,native_session,args}=>client.request("POST","/projects",Some(json!({"name":name,"path":path.unwrap_or_default(),"agent":agent,"chat_id":chat_id,"native_session":native_session,"extra_args":args}))).await?,
             Projects::Show{project}=>{let id=client.id(&project).await?;client.request("GET",&format!("/projects/{id}"),None).await?}
             Projects::Pause{project}=>{
                 let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/pause"),Some(json!({"paused":true}))).await?
