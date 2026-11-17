@@ -759,9 +759,11 @@ pub fn quiescent(p: &Project, record: &Value) -> bool {
                 && argv[0].as_str().is_some_and(|program| {
                     same_program(
                         program,
-                        &std::env::current_exe()
-                            .unwrap_or_default()
-                            .to_string_lossy(),
+                        p.execution["companion"].as_str().unwrap_or(
+                            &std::env::current_exe()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                        ),
                     )
                 })
         }) {

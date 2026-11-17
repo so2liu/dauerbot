@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Retain each daemon's hfb companion at a private version, protocol and SHA-256 pinned path. App replacement cannot change new or recovered Agent commands. Historical daemons can use their original signed companion from the updater's preserved bundle; missing backups report `update_required` (#46).
+- Hold input for incompatible live Agent generations after a service handoff and offer an explicit project recovery action. Preserve native continuity, queued messages, uncertain effects and unrelated terminals; compatible generations remain running (#46).
+
 ### Added
 
 - Bundle the supported HERDR 0.9.5 runtime in the native app and provision it offline when no supported runtime is installed. Preserve explicit runtime choices and expose the app-owned runtime to Agent tools (#47).

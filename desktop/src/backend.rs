@@ -195,7 +195,7 @@ impl Backend {
                                     let _ = replies.send(Reply::Done {
                                         path: "/service/restart".into(),
                                         value: Value::Null,
-                                        message: "Background service updated. Agent sessions were preserved.".into(),
+                                        message: "Background service updated. Compatible Agents keep running; other projects show a recovery action.".into(),
                                     });
                                 }
                                 Err(error) => { let _ = replies.send(Reply::Error(format!("{error:#}"))); }
@@ -309,6 +309,9 @@ async fn ensure_service(
 ) -> Result<()> {
     match request(probe, cfg, "GET", "/state", None).await {
         Ok(state) => {
+            if state["projects"].is_array() {
+                herdr_feishu_bridge::update::record_service(data, &state)?;
+            }
             if !restart
                 && state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL)
             {

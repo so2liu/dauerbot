@@ -50,9 +50,7 @@ pub fn launch_args(
                     )
                     .replace(
                         "{bridge_exe}",
-                        &std::env::current_exe()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
+                        mcp_entry["command"].as_str().unwrap_or_default(),
                     )
                     .replace("{instructions}", instructions)
                     .replace("{native_session}", &p.native_session)

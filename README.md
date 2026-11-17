@@ -75,6 +75,14 @@ python3 scripts/smoke.py --binary "$PWD/desktop/target/release/hfb"
 
 The smoke test uses real SDK WebSockets, an isolated HERDR terminal, MCP stdio, and local Feishu fixtures. It checks delivery, files, deduplication, reconnection, daemon restarts, embedded terminal connections, warm retirement and message/timer wakeup. It uses private XDG configuration and HERDR sessions, with no real bot or model account. The custom fixture records fresh launches and explicit native resume as test-only continuity metadata; it does not prove native CLI hooks or real-model acceptance. Test artifacts stay in ignored directories.
 
+The cross-version regression uses the published, signed 0.4.4 app as the old daemon, replaces its bundle executable with the new build, and exercises the actual old and new MCP contracts:
+
+```sh
+python3 scripts/upgrade-smoke.py --old-app /path/to/extracted-0.4.4/Dauerbot.app --binary "$PWD/desktop/target/release/hfb"
+```
+
+It covers historical companion dispatch, missing-backup failure, a live old MCP across an incompatible daemon handoff, explicit native recovery, queued input delivered once, uncertain work retained, unrelated panes preserved, and compatible live-session reuse. Its private fixture Agent establishes native identity through HERDR and uses each published MCP contract normally; the harness does not acknowledge messages, patch the database, or replay effects.
+
 Live sending is opt-in: `tests/live_feishu.rs` reads `.local/live.json` with `app_id`, `app_secret`, and `chat_id`. Run `cargo test --test live_feishu -- --ignored` only for an explicitly selected bot and recipient, then remove the temporary credentials. It sends a test Markdown message and a small file without opening a competing event listener.
 
 ## CLI and HERDR sessions
@@ -168,7 +176,13 @@ Normal database upgrades preserve messages, schedule IDs, occurrence history and
 
 The native app checks GitHub Releases at startup and every six hours while open. The stable channel accepts stable versions; preview also accepts prereleases. Selection uses semantic version order, not upload time or the Latest badge. Automatic updates download and replace the app in the background; the current desktop and HERDR agent keep running until you restart the desktop. The new desktop safely reconnects to a daemon using the same data directory.
 
-Reopening or updating the desktop reuses an authenticated daemon with the same API protocol, even when its version differs. The Updates view shows both versions. Choose **Update background service** to switch the daemon to the bundled version when ready; this briefly reconnects Feishu and local tools while HERDR and Agent sessions keep running. A protocol-incompatible daemon still requires a trusted installed app to replace it. This is service reuse, not zero-downtime daemon replacement; unknown delivery results remain uncertain instead of being retried.
+Reopening or updating the desktop reuses an authenticated daemon with the same API protocol, even when its version differs. The Updates view shows both versions. Choose **Update background service** to switch the daemon to the bundled version when ready; this briefly reconnects Feishu and local tools. Compatible Agent sessions remain running. A protocol-incompatible daemon still requires a trusted installed app to replace it, and incompatible live Agent generations show **Agent update required**. Select the project and choose **Recover Agent after update** to replace only that managed execution and resume its saved native session. If no native session ID was saved, the notice explains that recovery starts fresh. Saved input continues automatically when delivery is enabled; interrupted or uncertain effects are retained for review.
+
+Before accepting requests, the daemon retains its hfb executable under its private data directory at `runtime/hfb/<version>-api<protocol>/<sha256>/hfb`. MCP configurations, global managed MCP entries and custom `{bridge_exe}` commands use that path. Publication is atomic and never overwrites a retained inode; ownership, permissions, content hash and executable identity are checked. Retained executables are not automatically deleted because live children and saved configurations may outlive the daemon or app bundle.
+
+Already-running older daemons cannot acquire pinning logic retroactively. When one launches the new hfb through a replaced bundle path, the new MCP authenticates the local daemon, verifies its version and generation, and dispatches to the matching original executable from `updates/installed.json`'s preserved signed bundle. The historical executable must pass Apple Team, bundle and exact-version checks before retention. The new MCP does not implement retired lifecycle tools. If neither that backup nor a valid retained historical companion survives, startup fails with actionable `update_required`; open the installed app and recover the affected project after its service handoff. Historical desktop binaries cannot be retroactively given the new recovery UI.
+
+The desktop captures the authenticated prior service protocol before a handoff. This lets generations without protocol metadata remain usable when that known protocol matches; records are applied only to the captured project, generation and terminal. A generation with neither its own protocol nor a matching prior record requires explicit recovery because compatibility cannot be verified safely. Service replacement never silently converts an old live MCP child or restarts unrelated terminals.
 
 App Updates supports manual checks, installation, disabling automatic updates, channel selection, and rollback. Rollback pauses automatic updates so the reverted version stays installed. Version 0.2.0 requires one manual installation of an updater-enabled version.
 

@@ -21,11 +21,10 @@ async fn project_tools_are_generation_scoped_and_cannot_manage_other_projects() 
     let a = app.db.create(project(dir.path(), "A")).await.unwrap();
     let b = app.db.create(project(dir.path(), "B")).await.unwrap();
     app.db
-        .set_session(
+        .save_execution(
             &a.id,
-            Some("legacy-terminal".into()),
-            Some(1),
-            "active-generation".into(),
+            json!({"terminal_id":"legacy-terminal","shell_pid":1,"api_protocol":api::PROTOCOL}),
+            "active-generation",
         )
         .await
         .unwrap();

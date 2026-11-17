@@ -246,6 +246,7 @@ pub async fn serve(path: &Path) -> Result<()> {
     if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
         bail!("MCP credentials may connect only to a local daemon");
     }
+    historical_dispatch(path, &credentials).await?;
     let server = BridgeMcp {
         credentials,
         http: reqwest::Client::builder()
@@ -277,6 +278,94 @@ pub async fn serve(path: &Path) -> Result<()> {
         .waiting()
         .await?;
     Ok(())
+}
+
+/// An already-running old daemon still writes the mutable bundle path. Dispatch
+/// to its original signed executable; do not emulate retired MCP tool contracts.
+async fn historical_dispatch(path: &Path, credentials: &Credentials) -> Result<()> {
+    let Some(data) = path.ancestors().nth(4) else {
+        return Ok(());
+    };
+    if path
+        .ancestors()
+        .nth(3)
+        .and_then(Path::file_name)
+        .is_none_or(|n| n != "sessions")
+    {
+        return Ok(());
+    }
+    // Never Config::load or App::new here: those can change config and recover a live DB.
+    let cfg: crate::config::Config =
+        serde_json::from_slice(&std::fs::read(data.join("config.json"))?)?;
+    anyhow::ensure!(
+        credentials.url.trim_end_matches('/') == cfg.url(),
+        "MCP daemon address differs from its private configuration"
+    );
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let state: Value = http
+        .get(format!("{}/api/state", cfg.url()))
+        .bearer_auth(&cfg.token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let protocol = state["api_protocol"]
+        .as_u64()
+        .context("Daemon protocol is missing")?;
+    if protocol == crate::api::PROTOCOL {
+        return Ok(());
+    }
+    let version = state["version"]
+        .as_str()
+        .context("Daemon version is missing")?;
+    anyhow::ensure!(
+        !crate::update::is_newer(version, crate::update::CURRENT)?,
+        "update_required: The daemon is newer than this MCP; open the matching newer app"
+    );
+    let project = state["projects"]
+        .as_array()
+        .and_then(|ps| {
+            ps.iter().find(|p| {
+                p["id"] == credentials.project && p["generation"] == credentials.generation
+            })
+        })
+        .context("The authenticated daemon no longer owns this generation")?;
+    anyhow::ensure!(
+        project["terminal"].is_string(),
+        "The historical execution is no longer live"
+    );
+    crate::update::record_service(data, &state)?;
+    let retained = match crate::update::historical_companion(data, version, protocol) {
+        Ok(path) => path,
+        Err(error) => {
+            let message = format!(
+                "update_required: Cannot reconnect this Agent to Dauerbot {version} (API {protocol}): {error:#}. Open the installed Dauerbot app, update its background service, then choose Recover Agent after update. Saved messages and uncertain results are preserved."
+            );
+            let mut status = crate::update::Status::new(crate::update::Preferences::load(data)?);
+            status.phase = "update_required".into();
+            status.message = message.clone();
+            status.save(data)?;
+            bail!("{message}");
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(retained)
+            .args(["mcp", "--credentials"])
+            .arg(path)
+            .exec();
+        Err(error).context("Cannot execute the retained historical MCP")
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = retained;
+        bail!("Historical MCP recovery requires the native macOS app")
+    }
 }
 
 #[cfg(test)]
