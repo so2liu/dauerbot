@@ -51,6 +51,7 @@ use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
+use crate::scroll::{ScrollAccumulator, TerminalScroll, cell_at};
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as CellPoint};
@@ -401,7 +402,8 @@ pub struct TerminalView {
     selecting: bool,
     marked: Rc<RefCell<Option<String>>>,
     writable: bool,
-    scroll_callback: Option<Arc<dyn Fn(i32) + Send + Sync>>,
+    scroll_callback: Option<Arc<dyn Fn(TerminalScroll) + Send + Sync>>,
+    scroll_accumulator: ScrollAccumulator,
     /// The terminal state managing the grid and VTE parser
     state: TerminalState,
 
@@ -567,6 +569,7 @@ impl TerminalView {
             marked: Rc::new(RefCell::new(None)),
             writable: false,
             scroll_callback: None,
+            scroll_accumulator: ScrollAccumulator::default(),
             state,
             renderer,
             focus_handle,
@@ -765,13 +768,17 @@ impl TerminalView {
     /// is consumed and not sent to the terminal.
     pub fn set_writable(&mut self, writable: bool, cx: &mut Context<Self>) {
         self.writable = writable;
+        self.scroll_accumulator.reset();
         if !writable {
             *self.marked.borrow_mut() = None;
         }
         cx.notify();
     }
 
-    pub fn with_scroll_callback(mut self, callback: impl Fn(i32) + Send + Sync + 'static) -> Self {
+    pub fn with_scroll_callback(
+        mut self,
+        callback: impl Fn(TerminalScroll) + Send + Sync + 'static,
+    ) -> Self {
         self.scroll_callback = Some(Arc::new(callback));
         self
     }
@@ -921,17 +928,68 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta = event
-            .delta
-            .pixel_delta(self.geometry.borrow().cell.height.max(px(1.0)));
-        let lines = (f32::from(delta.y) / f32::from(self.geometry.borrow().cell.height).max(1.0))
-            .round() as i32;
-        if lines != 0
-            && let Some(callback) = &self.scroll_callback
-        {
-            callback(lines);
-        }
         cx.stop_propagation();
+        // Rendered frames contain repaint instructions, not source terminal modes/history.
+        // Application scrolling must go through the explicitly enabled host controller.
+        if self.remote_frames && !self.writable {
+            self.scroll_accumulator.reset();
+            return;
+        }
+        let geo = self.geometry.borrow();
+        let Some(bounds) = geo.bounds else {
+            return;
+        };
+        let Some((column, row)) = cell_at(
+            f32::from(event.position.x - bounds.origin.x - self.config.padding.left),
+            f32::from(event.position.y - bounds.origin.y - self.config.padding.top),
+            f32::from(geo.cell.width),
+            f32::from(geo.cell.height),
+            self.state.cols(),
+            self.state.rows(),
+        ) else {
+            self.scroll_accumulator.reset();
+            return;
+        };
+        let (rows, precise) = match event.delta {
+            ScrollDelta::Pixels(delta) => (
+                f64::from(f32::from(delta.y)) / f64::from(f32::from(geo.cell.height).max(1.0)),
+                true,
+            ),
+            ScrollDelta::Lines(delta) => (f64::from(delta.y), false),
+        };
+        drop(geo);
+        let lines = self.scroll_accumulator.steps(
+            rows,
+            precise,
+            matches!(event.touch_phase, TouchPhase::Started),
+            matches!(event.touch_phase, TouchPhase::Ended),
+        );
+        if lines == 0 {
+            return;
+        }
+        if let Some(callback) = &self.scroll_callback {
+            callback(TerminalScroll {
+                lines,
+                column,
+                row,
+                size: (self.state.cols(), self.state.rows()),
+                modifiers: u8::from(event.modifiers.shift)
+                    | (u8::from(event.modifiers.control) << 1)
+                    | (u8::from(event.modifiers.alt) << 2)
+                    | (u8::from(event.modifiers.platform) << 3),
+            });
+        } else if !self.remote_frames {
+            // A raw byte stream can retain genuine primary-screen scrollback locally.
+            self.state.with_term_mut(|term| {
+                if !term
+                    .mode()
+                    .intersects(TermMode::ALT_SCREEN | TermMode::MOUSE_MODE)
+                {
+                    term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+                }
+            });
+            cx.notify();
+        }
     }
 
     /// Process pending terminal events.

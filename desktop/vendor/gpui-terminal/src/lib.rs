@@ -342,6 +342,7 @@ pub mod event;
 pub mod input;
 pub mod mouse;
 pub mod render;
+mod scroll;
 pub mod terminal;
 pub mod view;
 
@@ -349,6 +350,7 @@ pub mod view;
 pub use colors::{ColorPalette, ColorPaletteBuilder};
 pub use event::{GpuiEventProxy, TerminalEvent};
 pub use render::TerminalRenderer;
+pub use scroll::{MAX_SCROLL_STEPS, TerminalScroll};
 pub use terminal::TerminalState;
 pub use view::{
     BellCallback, ClipboardStoreCallback, ExitCallback, KeyHandler, ResizeCallback, TerminalConfig,

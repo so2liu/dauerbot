@@ -1,7 +1,9 @@
 //! Native terminal transport for one existing legacy HERDR execution.
 use base64::Engine;
 use gpui::{AppContext, Context, Entity};
-use gpui_terminal::{TerminalConfig, TerminalFrame, TerminalView};
+use gpui_terminal::{
+    MAX_SCROLL_STEPS, TerminalConfig, TerminalFrame, TerminalScroll, TerminalView,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -42,7 +44,7 @@ fn default_session() -> String {
 enum Control {
     Input(Vec<u8>),
     Resize(usize, usize),
-    Scroll(i32),
+    Scroll(TerminalScroll),
 }
 
 pub struct Bridge {
@@ -99,8 +101,8 @@ impl Bridge {
             .with_resize_callback(move |cols, rows| {
                 let _ = resize.try_send(Control::Resize(cols, rows));
             })
-            .with_scroll_callback(move |lines| {
-                let _ = scroll.try_send(Control::Scroll(lines));
+            .with_scroll_callback(move |event| {
+                let _ = scroll.try_send(Control::Scroll(event));
             })
         });
         Self {
@@ -354,14 +356,11 @@ fn supervise(
                     input.flush()?;
                 }
             }
-            Ok(Control::Scroll(lines)) if controlling && mode.load(Ordering::Acquire) => {
+            Ok(Control::Scroll(event))
+                if controlling && mode.load(Ordering::Acquire) && pending_resize.is_none() =>
+            {
                 if let Some(input) = &mut connection.input {
-                    writeln!(
-                        input,
-                        "{}",
-                        json!({"type":"terminal.scroll","direction":if lines > 0 {"up"} else {"down"},"lines":lines.unsigned_abs().min(100),"source":"wheel"})
-                    )?;
-                    input.flush()?;
+                    write_scroll(input, event, (cols, rows), &mode)?;
                 }
             }
             Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -369,6 +368,40 @@ fn supervise(
         }
     }
     Ok(())
+}
+
+fn write_scroll(
+    input: &mut impl Write,
+    event: TerminalScroll,
+    viewport: (usize, usize),
+    controlling: &AtomicBool,
+) -> io::Result<()> {
+    // Ignore queued gestures hit-tested against a frame predating a resize.
+    if event.size != viewport
+        || usize::from(event.column) >= viewport.0
+        || usize::from(event.row) >= viewport.1
+    {
+        return Ok(());
+    }
+    // HERDR 0.9.5 applies `lines` only to host scrollback. Its mouse and 1007
+    // branches send one native event, so preserve magnitude as bounded unit events.
+    // Let HERDR inspect source modes; the local repaint emulator cannot do that.
+    let command = json!({
+        "type": "terminal.scroll",
+        "direction": if event.lines > 0 { "up" } else { "down" },
+        "lines": 1,
+        "source": "wheel",
+        "column": event.column,
+        "row": event.row,
+        "modifiers": event.modifiers,
+    });
+    for _ in 0..event.lines.unsigned_abs().min(MAX_SCROLL_STEPS as u32) {
+        if !controlling.load(Ordering::Acquire) {
+            break;
+        }
+        writeln!(input, "{command}")?;
+    }
+    input.flush()
 }
 
 fn decode_frame(frame: &Value) -> Result<Option<TerminalFrame>, String> {
@@ -405,6 +438,88 @@ fn decode_frame(frame: &Value) -> Result<Option<TerminalFrame>, String> {
 mod tests {
     use super::*;
     use gpui_terminal::{GpuiEventProxy, TerminalState};
+
+    #[test]
+    fn native_wheel_units_preserve_geometry_and_never_forward_without_control() {
+        let event = TerminalScroll {
+            lines: -20,
+            column: 17,
+            row: 9,
+            size: (80, 24),
+            modifiers: 7,
+        };
+        let mode = AtomicBool::new(false);
+        let mut output = Vec::new();
+        write_scroll(&mut output, event, (80, 24), &mode).unwrap();
+        assert!(
+            output.is_empty(),
+            "Observation must not inject wheel or keys"
+        );
+        mode.store(true, Ordering::Release);
+        write_scroll(&mut output, event, (100, 30), &mode).unwrap();
+        assert!(
+            output.is_empty(),
+            "A stale frame must not target resized cells"
+        );
+        write_scroll(&mut output, event, (80, 24), &mode).unwrap();
+        let commands: Vec<Value> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(
+            commands.len(),
+            20,
+            "Application wheel count must survive legacy HERDR"
+        );
+        assert!(commands.iter().all(|command| command
+            == &json!({
+                "type": "terminal.scroll", "direction": "down", "lines": 1,
+                "source": "wheel", "column": 17, "row": 9, "modifiers": 7
+            })));
+        output.clear();
+        write_scroll(
+            &mut output,
+            TerminalScroll {
+                lines: i32::MAX,
+                ..event
+            },
+            (80, 24),
+            &mode,
+        )
+        .unwrap();
+        assert_eq!(
+            output.iter().filter(|byte| **byte == b'\n').count(),
+            MAX_SCROLL_STEPS as usize
+        );
+
+        struct ReleaseAfterFirst<'a> {
+            bytes: Vec<u8>,
+            mode: &'a AtomicBool,
+        }
+        impl Write for ReleaseAfterFirst<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                if bytes.contains(&b'\n') {
+                    self.mode.store(false, Ordering::Release);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = ReleaseAfterFirst {
+            bytes: Vec::new(),
+            mode: &mode,
+        };
+        write_scroll(&mut writer, event, (80, 24), &mode).unwrap();
+        assert_eq!(
+            writer.bytes.iter().filter(|byte| **byte == b'\n').count(),
+            1,
+            "Releasing control must stop the remainder of a wheel burst"
+        );
+    }
 
     #[test]
     fn rendered_frame_resizes_before_wide_unicode_is_parsed() {

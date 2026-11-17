@@ -213,8 +213,8 @@ impl Language {
             "Take control" => "接管操作",
             "Release control" => "交还控制",
             "Reconnect" => "重新连接",
-            "Viewing only · Take control to type or scroll history" => {
-                "只读查看 · 接管后可输入及滚动历史"
+            "Viewing only · Take control to scroll app history" => {
+                "只读查看 · 接管后可滚动应用历史"
             }
             "Choose a project to view its agent" => "选择项目，查看智能体",
             "Ready for messages. The Agent starts automatically when needed." => {
