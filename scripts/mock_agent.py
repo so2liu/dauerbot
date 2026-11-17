@@ -6,6 +6,7 @@ import json
 import datetime
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -33,6 +34,10 @@ def status(state):
 
 
 status("idle")
+resolved_herdr = shutil.which("herdr")
+assert resolved_herdr, "Native Agent tools cannot find HERDR in PATH"
+assert subprocess.check_output([resolved_herdr, "--version"], text=True, timeout=5).strip() == "herdr 0.9.5"
+(Path.cwd() / ".fixture-herdr").write_text(resolved_herdr)
 marker = Path.cwd() / ".fixture-session"
 expected = sys.argv[3] if len(sys.argv) > 3 else ""
 if marker.exists():

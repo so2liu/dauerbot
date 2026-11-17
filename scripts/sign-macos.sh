@@ -7,6 +7,8 @@ identity="${2:?Specify a signing identity, or - for an ad-hoc signature}"
 args=(--force --sign "$identity")
 if [[ -n "${3:-}" ]]; then args+=(--keychain "$3"); fi
 if [[ "$identity" != "-" ]]; then args+=(--timestamp --options runtime); fi
+codesign "${args[@]}" "$bundle/Contents/MacOS/herdr"
+python3 "$(dirname "$0")/bundle-herdr.py" manifest "$bundle"
 codesign "${args[@]}" "$bundle/Contents/MacOS/hfb"
 codesign "${args[@]}" "$bundle"
 codesign --verify --deep --strict "$bundle"

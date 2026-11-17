@@ -425,7 +425,7 @@ async fn request(
     }
     Ok(value)
 }
-fn environment(_cfg: &Config, dir: &std::path::Path) -> Vec<(String, String)> {
+fn environment(cfg: &Config, dir: &std::path::Path) -> Vec<(String, String)> {
     let mut result = vec![];
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -437,7 +437,11 @@ fn environment(_cfg: &Config, dir: &std::path::Path) -> Vec<(String, String)> {
         ("Pi", "pi"),
         ("Antigravity", "agy"),
     ] {
-        let mut candidates = vec![PathBuf::from(executable)];
+        let mut candidates = if name == "HERDR" {
+            vec![PathBuf::from(&cfg.herdr)]
+        } else {
+            vec![PathBuf::from(executable)]
+        };
         for root in [
             home.join(".local/bin"),
             home.join(".cargo/bin"),
@@ -450,7 +454,13 @@ fn environment(_cfg: &Config, dir: &std::path::Path) -> Vec<(String, String)> {
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .map(|p| p.join(executable)),
         );
-        let resolved = candidates.into_iter().find(|p| p.is_file());
+        let resolved = if name == "HERDR" {
+            PathBuf::from(&cfg.herdr)
+                .is_file()
+                .then(|| PathBuf::from(&cfg.herdr))
+        } else {
+            candidates.into_iter().find(|p| p.is_file())
+        };
         result.push((
             name.into(),
             resolved

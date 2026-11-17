@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import sqlite3
 import selectors
@@ -236,13 +237,14 @@ def message(source, text, kind="text", content=None, chat_type="group", chat_id=
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, help="use an already built bridge executable")
+    parser.add_argument("--bundled-runtime", action="store_true", help="hide user HERDR and verify offline app-owned provisioning")
     parser.add_argument("--real-pi", action="store_true", help="one real model turn using the locally configured Pi account")
     parser.add_argument("--real-agent",choices=["codex","claude","pi","agy"],help="one real CLI/model turn; may incur model charges")
     parser.add_argument("--real-steering", action="store_true", help="verify busy-turn steering with --real-agent; may incur model charges")
     args = parser.parse_args()
     real_agent=args.real_agent or ("pi" if args.real_pi else None)
     assert not args.real_steering or real_agent, "--real-steering requires a native Agent"
-    binary = args.binary or ROOT / "target/debug/hfb"
+    binary = (args.binary or ROOT / "target/debug/hfb").resolve()
     assert binary.exists(), "run cargo build first"
     run = ROOT / ".local" / ("smoke-" + uuid.uuid4().hex[:8])
     run.mkdir(parents=True, mode=0o700)
@@ -263,6 +265,10 @@ def main():
         fixture_home = Path(runtime_dir.name) / "home"
         fixture_home.mkdir()
         env.update(HOME=str(fixture_home), SHELL="/bin/sh")
+    if args.bundled_runtime:
+        assert not real_agent, "bundled-runtime uses private fixture Agents only"
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        assert not any((Path(p) / "herdr").exists() for p in env["PATH"].split(":"))
     FIXTURE.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=FIXTURE.server.serve_forever, daemon=True).start()
     sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
@@ -276,11 +282,44 @@ def main():
         backup.write_bytes(agy_original)
         backup.chmod(0o600)
     try:
+        if args.bundled_runtime:
+            def initialize(data, fixture_env=env):
+                subprocess.run([str(binary), "--data-dir", str(data), "init"], env=fixture_env,
+                               check=True, capture_output=True, text=True, timeout=20)
+                return json.loads((data / "config.json").read_text())
+            initial = initialize(run)
+            installed = Path(initial["herdr"])
+            original = installed.read_bytes()
+            installed.write_bytes(b"interrupted copy")
+            assert initialize(run)["herdr"] == str(installed)
+            assert installed.read_bytes() == original
+            installed.chmod(0o600)
+            initialize(run)
+            assert os.access(installed, os.X_OK), "matching bytes without execute mode were not repaired"
+            before = installed.stat().st_mtime_ns
+            initialize(run)
+            assert installed.stat().st_mtime_ns == before, "repeated init rewrote the runtime"
+            reuse_env = dict(env, PATH=str(installed.parent) + ":" + env["PATH"])
+            assert initialize(run / "reuse", reuse_env)["herdr"] == str(installed)
+            explicit_dir = run / "explicit"
+            explicit_dir.mkdir()
+            custom = explicit_dir / "user-herdr"
+            shutil.copyfile(installed, custom)
+            custom.chmod(0o700)
+            (explicit_dir / "config.json").write_text(json.dumps({"herdr": str(custom.resolve())}))
+            assert initialize(explicit_dir)["herdr"] == str(custom.resolve())
+            assert custom.read_bytes() == original
+            checks.append("persisted corrupt and non-executable copies repaired; repeated init stable; discovered compatible and explicit installs preserved")
         def boot():
             return subprocess.Popen([str(binary), "--data-dir", str(run), "serve", "--port", str(port), "--herdr-session", session,
                                      "--feishu-base", f"http://127.0.0.1:{FIXTURE.server.server_port}"], env=env, stdout=log, stderr=log)
         daemon = boot()
         config = wait_for(lambda: json.loads((run / "config.json").read_text()) if (run / "config.json").exists() else None, "no daemon config")
+        if args.bundled_runtime:
+            installed = Path(config["herdr"])
+            assert installed.is_relative_to(run.resolve() / "runtime/herdr/0.9.5"), installed
+            assert installed.is_file()
+            checks.append("offline automatic HERDR install with private HOME/XDG and HERDR hidden from PATH")
         base = f"http://127.0.0.1:{port}"
 
         def legacy_rpc(method, params=None):
@@ -326,6 +365,12 @@ def main():
         api(f"/projects/{key}/start", {}, "POST")
         wait_for(lambda: api(f"/projects/{key}")["project"]["ready"], "real MCP did not register readiness",timeout=100 if real_agent else 35)
         checks.append("isolated real HERDR terminal + real MCP initialize/tools/list with exactly three tools")
+        if args.bundled_runtime:
+            actual = wait_for(lambda: (workspace / ".fixture-herdr").read_text() if (workspace / ".fixture-herdr").exists() else None, "no Agent runtime PATH evidence")
+            assert actual == config["herdr"], (actual, config["herdr"])
+            descriptor = api(f"/projects/{key}/terminal")
+            assert descriptor["herdr"] == config["herdr"], descriptor
+            checks.append("Agent subprocess PATH and native terminal descriptor use the resolved private HERDR")
         if not real_agent:
             # Custom fixtures have no supported CLI-native session hook. Seed
             # only their verified persisted marker, never a real user's store.
@@ -635,7 +680,8 @@ def main():
     finally:
         if daemon and daemon.poll() is None:
             daemon.terminate(); daemon.wait(timeout=15)
-        subprocess.run(["herdr", "--session", session, "server", "stop"], env=env, capture_output=True, timeout=15)
+        if daemon is not None:
+            subprocess.run([config["herdr"], "--session", session, "server", "stop"], env=env, capture_output=True, timeout=15)
         FIXTURE.disconnect(); FIXTURE.server.shutdown(); log.close()
         runtime_dir.cleanup()
         if real_agent == "agy":

@@ -1,0 +1,15 @@
+HERDR 0.9.5 — https://github.com/herdrdev/herdr/tree/v0.9.5
+Official Apple Silicon release: herdr-macos-aarch64
+https://github.com/herdrdev/herdr/releases/tag/v0.9.5
+Original size: 22536176 bytes
+Original SHA-256: fb77c2232a05a8035421382c894392f4174e4e38a18e48af3dd0290157c3a7e2
+
+HERDR is distributed under Apache License 2.0; see LICENSE copied from the
+exact upstream v0.9.5 tag. That tag has no top-level NOTICE file. Applicable
+vendored portable-pty and libghostty-vt licenses from the same tag accompany
+this payload. Dauerbot is independent of HERDR and its authors.
+
+Dauerbot adds its own macOS code signature to the executable; this changes
+the upstream bytes. herdr-runtime.json records the resulting signed payload
+checksum before the enclosing app is signed. The executable is otherwise
+unmodified. Native Agent CLIs and their accounts remain user supplied.

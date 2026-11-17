@@ -36,6 +36,7 @@ def main():
             if tomllib.load(source)["package"]["version"] != version:
                 raise ValueError(f"{name}: package version differs from tag")
     app = ROOT / "dist/Dauerbot.app"
+    subprocess.run(["python3", str(ROOT / "scripts/bundle-herdr.py"), "verify", str(app)], check=True)
     with (app / "Contents/Info.plist").open("rb") as source:
         info = plistlib.load(source)
     if info["CFBundleShortVersionString"] != version:
@@ -91,7 +92,7 @@ def main():
     (output / "release-notes.md").write_text(
         f"Dauerbot {version}\n\n{notes}\n\n"
         "Download the Apple Silicon zip, extract it, and move the app to Applications. "
-        "Install legacy HERDR 0.9.5 (herdr) and sign in to your Agent CLI first.\n\n"
+        "HERDR 0.9.5 is included and installed automatically. Sign in to your Agent CLI first.\n\n"
         "Signed with Developer ID Application, accepted by Apple notarization, "
         "and verified with Gatekeeper. The app includes its notarization ticket.\n\n"
         "Updater-enabled clients verify the manifest signature, SHA-256, Apple Team, and bundle ID. "

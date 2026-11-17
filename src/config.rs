@@ -26,7 +26,7 @@ impl Default for Config {
         Self {
             port: 49321,
             token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
-            herdr: find_program("herdr"),
+            herdr: "herdr".into(),
             herdr_session: "dauerbot".into(),
             herdr_config: String::new(),
             feishu_base: "https://open.feishu.cn".into(),
@@ -36,7 +36,7 @@ impl Default for Config {
     }
 }
 
-fn find_program(name: &str) -> String {
+pub(crate) fn program_path(name: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|p| {
@@ -48,15 +48,15 @@ fn find_program(name: &str) -> String {
             })
             .find(|p| p.is_file())
     }) {
-        return path.to_string_lossy().into_owned();
+        return Some(path);
     }
     if let Some(home) = directories::BaseDirs::new() {
         let path = home.home_dir().join(".local/bin").join(name);
         if path.is_file() {
-            return path.to_string_lossy().into_owned();
+            return Some(path);
         }
     }
-    name.into()
+    None
 }
 
 pub fn default_dir() -> PathBuf {
@@ -126,14 +126,25 @@ impl Config {
                 .into_owned();
         }
         let owned_config = Path::new(&cfg.herdr_config);
+        if !owned_config.exists() && owned_config != canonical.join("legacy-herdr.toml") {
+            bail!(
+                "Configured HERDR settings file is missing: {}. Restore it or clear herdr_config to use Dauerbot settings",
+                owned_config.display()
+            );
+        }
         if !owned_config.exists() {
             write_private(
                 owned_config,
                 b"onboarding = false\n[session]\nresume_agents_on_restore = false\n",
             )?;
         }
+        let previous_runtime = cfg.herdr.clone();
+        crate::herdr::runtime::resolve(&mut cfg, &canonical)?;
         cfg.validate()?;
-        if !path.exists() || raw.get("herdr_session").is_none() || raw.get("herdr_config").is_none()
+        if cfg.herdr != previous_runtime
+            || !path.exists()
+            || raw.get("herdr_session").is_none()
+            || raw.get("herdr_config").is_none()
         {
             cfg.save(dir)?;
         }

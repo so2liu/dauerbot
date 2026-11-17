@@ -19,6 +19,8 @@ use tokio::{
     sync::Mutex,
 };
 
+pub mod runtime;
+
 pub use crate::adapter::{launch_args, merge_mcp};
 const PROTOCOL: u64 = 22;
 static START_LOCK: Mutex<()> = Mutex::const_new(());
@@ -365,11 +367,7 @@ pub async fn prepare_execution(
         "dauerbot-launch".into(),
         permit.to_string_lossy().into_owned(),
     ];
-    if p.agent == "custom" {
-        command.extend(argv.to_vec());
-    } else {
-        command.extend(login_shell_args(argv.to_vec()));
-    }
+    command.extend(execution_args(config, p.agent != "custom", argv.to_vec())?);
     let result: Result<Value> = async {
     // Add a command tab rather than replacing the initial tab: a user may have
     // split or added a pane since workspace.create returned.
@@ -994,6 +992,30 @@ pub fn login_shell_args(argv: Vec<String>) -> Vec<String> {
     ];
     out.extend(argv);
     out
+}
+
+/// Apply the resolved runtime after login-shell startup, which may reset PATH.
+fn execution_args(config: &Config, login: bool, argv: Vec<String>) -> Result<Vec<String>> {
+    let parent = Path::new(&config.herdr)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+    let mut effective = if let Some(parent) = parent {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"PATH="$1:$PATH"; export PATH; shift; exec "$@""#.into(),
+            "dauerbot-runtime".into(),
+            parent.to_string_lossy().into_owned(),
+        ]
+    } else {
+        vec![]
+    };
+    effective.extend(argv);
+    Ok(if login {
+        login_shell_args(effective)
+    } else {
+        effective
+    })
 }
 
 pub fn launch_network_env(
