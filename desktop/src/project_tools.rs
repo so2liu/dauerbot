@@ -77,6 +77,10 @@ impl ProjectTools {
                         }
                         let response = request.send().await?;
                         let status = response.status();
+                        anyhow::ensure!(
+                            status != reqwest::StatusCode::NOT_FOUND,
+                            "Project controls are not available yet."
+                        );
                         let mut value: Value = response.json().await?;
                         anyhow::ensure!(
                             status.is_success(),
@@ -225,7 +229,12 @@ impl Render for ProjectTools {
                     ),
             );
         }
-        let mut documents = div().flex().gap_2();
+        let mut documents = div().flex().flex_wrap().items_center().gap_2().child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x74808c))
+                .child(self.language.text("Project files")),
+        );
         for (index, document) in [Document::Handoff, Document::Agents]
             .into_iter()
             .enumerate()
@@ -345,7 +354,9 @@ fn display_markdown(source: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Ticket, accept_reply, display_markdown};
+    use herdr_feishu_bridge::project_documents::Document;
+    use serde_json::json;
     #[test]
     fn stale_project_document_and_reload_replies_are_ignored() {
         let ticket = Ticket {
