@@ -100,3 +100,50 @@ created explicit-contract MCP client. A post-commit rollback must therefore chec
 all current generations before switching ownership back, or retain a compatible
 engine. Restoring an old bundle is not sufficient proof of runtime compatibility.
 Pre-commit rollback leaves the original legacy generations and old service intact.
+
+## Automatic service handover
+
+Handover-capable services expose authenticated operator endpoints under
+`/api/service/activation/{prepare,commit,status,abort}`. These are desktop/update
+coordination endpoints, not additional Agent MCP tools. The public API remains 7;
+`/state.service_activation.capability` advertises the independent handover contract.
+
+Preparation starts the verified candidate with inherited duplicates of the bound
+loopback listener and daemon lock, plus an anonymous control socketpair. Descriptor
+inheritance is resealed before the candidate can start children. The candidate
+validates/migrates a private SQLite snapshot and checks native MCP compatibility;
+it never constructs the live App or performs crash recovery during preparation.
+The configuration fence comes from that exact snapshot, not a later live read.
+
+Feishu officially supports clustered long connections: one connected client is
+chosen for each event. Candidate transports may warm while both sets of callbacks
+commit through the old single journal owner. A small exact-version OpenLark patch
+reports the actual WebSocket upgrade handshake. Its event/ACK behavior is unchanged:
+ACK200 follows synchronous journal ingestion; relay failure withholds success.
+After cutover, warmed connections remain supervised and reconnect normally.
+
+The old owner closes effect admission and drains existing operations. Mutating
+HTTP work runs in owned tasks so losing its response waiter cannot release an
+in-flight effect permit. Scheduler, native reconciliation, outbox and collection
+work share the same outer barrier. Read-only MCP probes remain available; newly
+arriving mutations wait, then proxy with their original IDs and authority to the
+new owner. At the 95-second admission deadline an unadmitted request receives a
+retryable error. A forwarded operation with a lost response remains uncertain;
+that case must not be described as never accepted.
+
+`service-activation.json` atomically records the transaction and a separate nested
+`serving_owner` fact. New preparations preserve the previous owner; commit replaces
+it with a fresh epoch. The candidate opens the latest live journal only after that
+boundary. Abandoned transient records become uncertain after old effects drain,
+not during preparation. A public request must confirm the expected new owner PID
+before the old process exits. Listener address, token, project generations, native
+sessions, timer occurrence keys and immutable MCP commands remain unchanged.
+
+Failure before commit leaves the old owner serving. Failure after commit never
+restores an old snapshot or reopens old writers: the retained descriptors supervise
+bounded restarts of the verified new executable with a fresh epoch and latest-store
+crash recovery. A normal later restart must match the recorded owner executable.
+The GUI coordinator owns signed bundle rollback and the explicit legacy bootstrap
+claim. Published 0.4.7 lacks this transfer protocol; its first upgrade has a bounded
+reconnect boundary. Unsupported future service/MCP/schema contracts are refused
+before cutover rather than being treated as automatically compatible.

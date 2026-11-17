@@ -292,34 +292,61 @@ pub struct Inbound {
 }
 impl EventHandler for Inbound {
     fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let v: Value = serde_json::from_slice(payload)?;
-        if let Some((chat, source, text, attachment)) = normalize(&v)? {
-            if v["header"]["app_id"]
-                .as_str()
-                .is_some_and(|id| id != self.binding.app_id)
-            {
-                return Err(anyhow::anyhow!("The Feishu event belongs to a different bot").into());
-            }
-            self.app.db.ingest_bot(
-                &self.binding.project_id,
-                &self.binding.app_id,
-                &chat,
-                &source,
-                &text,
-                &attachment,
+        if self
+            .app
+            .service
+            .relay
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let cfg = self.app.config.blocking_read().clone();
+            crate::service::relay(
+                &cfg,
+                &crate::service::Ingest {
+                    project: self.binding.project_id.clone(),
+                    app_id: self.binding.app_id.clone(),
+                    payload: serde_json::from_slice(payload)?,
+                },
             )?;
-            if let Ok(mut runtime) = self.app.runtime.try_write() {
-                runtime.feishu = "receiving".into();
-                runtime.feishu_error.clear();
-                if let Some(state) = runtime.bots.get_mut(&self.binding.project_id) {
-                    state["status"] = json!("receiving");
-                    state["error"] = json!("");
-                }
-            }
-            self.app.notify.notify_one();
+            return Ok(());
         }
+        let _permit =
+            self.app.service.gate.enter().ok_or_else(|| {
+                anyhow::anyhow!("Service ownership is changing; retry this event")
+            })?;
+        ingest(&self.app, &self.binding, payload)?;
         Ok(())
     }
+}
+pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
+    let v: Value = serde_json::from_slice(payload)?;
+    if let Some((chat, source, text, attachment)) = normalize(&v)? {
+        if v["header"]["app_id"]
+            .as_str()
+            .is_some_and(|id| id != binding.app_id)
+        {
+            return Err(anyhow::anyhow!(
+                "The Feishu event belongs to a different bot"
+            ));
+        }
+        app.db.ingest_bot(
+            &binding.project_id,
+            &binding.app_id,
+            &chat,
+            &source,
+            &text,
+            &attachment,
+        )?;
+        if let Ok(mut runtime) = app.runtime.try_write() {
+            runtime.feishu = "receiving".into();
+            runtime.feishu_error.clear();
+            if let Some(state) = runtime.bots.get_mut(&binding.project_id) {
+                state["status"] = json!("receiving");
+                state["error"] = json!("");
+            }
+        }
+        app.notify.notify_one();
+    }
+    Ok(())
 }
 
 pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
@@ -388,9 +415,118 @@ fn collect_text(v: &Value, out: &mut String) {
 }
 
 pub async fn websocket(app: Arc<App>) {
+    websocket_with_warm(app, None).await
+}
+type Connections = std::collections::HashMap<String, (Binding, tokio::task::JoinHandle<()>)>;
+pub struct WarmIngress {
+    workers: Option<Connections>,
+    target: Arc<std::sync::RwLock<Option<Arc<App>>>>,
+}
+impl WarmIngress {
+    pub fn is_ready(&self) -> bool {
+        self.workers
+            .as_ref()
+            .is_some_and(|workers| workers.values().all(|(_, task)| !task.is_finished()))
+    }
+    pub async fn activate(&mut self, app: Arc<App>) {
+        *self.target.write().unwrap() = Some(app.clone());
+        if let Some(workers) = &self.workers {
+            for (binding, _) in workers.values() {
+                connection_state(&app, binding, "awaiting_events", "").await;
+            }
+        }
+    }
+}
+impl Drop for WarmIngress {
+    fn drop(&mut self) {
+        if let Some(workers) = self.workers.take() {
+            for (_, (_, worker)) in workers {
+                worker.abort();
+            }
+        }
+    }
+}
+struct WarmingInbound {
+    cfg: Config,
+    binding: Binding,
+    target: Arc<std::sync::RwLock<Option<Arc<App>>>>,
+}
+impl EventHandler for WarmingInbound {
+    fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let app = self.target.read().unwrap().clone();
+        if let Some(app) = app {
+            Inbound {
+                app,
+                binding: self.binding.clone(),
+            }
+            .handle(payload)
+        } else {
+            crate::service::relay(
+                &self.cfg,
+                &crate::service::Ingest {
+                    project: self.binding.project_id.clone(),
+                    app_id: self.binding.app_id.clone(),
+                    payload: serde_json::from_slice(payload)?,
+                },
+            )?;
+            Ok(())
+        }
+    }
+}
+/// Cluster transports may overlap, but all callbacks commit to one journal owner.
+/// Actual SDK WebSocket upgrade completion, rather than task launch, is readiness.
+pub async fn warm_ingress(cfg: Config, bindings: Vec<Binding>) -> Result<WarmIngress> {
+    let mut warm = WarmIngress {
+        workers: Some(Connections::new()),
+        target: Arc::new(std::sync::RwLock::new(None)),
+    };
+    let mut ready = Vec::new();
+    for binding in bindings {
+        let handler = EventDispatcherHandler::builder()
+            .register_raw(
+                "im.message.receive_v1",
+                WarmingInbound {
+                    cfg: cfg.clone(),
+                    binding: binding.clone(),
+                    target: warm.target.clone(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!(e))?
+            .build();
+        let config = open_lark::Config::builder()
+            .app_id(&binding.app_id)
+            .app_secret(&binding.app_secret)
+            .base_url(&cfg.feishu_base)
+            .max_response_size(2 * 1024 * 1024)
+            .build();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let _ = LarkWsClient::open_with_ready(Arc::new(config), handler, tx).await;
+        });
+        warm.workers
+            .as_mut()
+            .unwrap()
+            .insert(binding.project_id.clone(), (binding, worker));
+        ready.push(rx);
+    }
+    tokio::time::timeout(Duration::from_secs(25), async {
+        for ready in ready {
+            ready
+                .await
+                .context("Candidate bot transport did not connect")?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    anyhow::ensure!(warm.is_ready(), "Candidate bot transport disconnected");
+    Ok(warm)
+}
+pub async fn websocket_with_warm(app: Arc<App>, mut warm: Option<WarmIngress>) {
     let mut revision = app.settings_tx.subscribe();
-    let mut workers: std::collections::HashMap<String, (Binding, tokio::task::JoinHandle<()>)> =
-        std::collections::HashMap::new();
+    let mut workers: Connections = warm
+        .as_mut()
+        .and_then(|warm| warm.workers.take())
+        .unwrap_or_default();
     loop {
         let bindings = match app.db.bots().await {
             Ok(bindings) => bindings,
@@ -439,6 +575,7 @@ pub async fn websocket(app: Arc<App>) {
         tokio::select! {
             _ = app.shutdown.cancelled() => break,
             _ = revision.changed() => {},
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
         }
     }
     for (_, (_, worker)) in workers {
@@ -487,16 +624,23 @@ async fn websocket_for(app: Arc<App>, binding: Binding) {
             .max_response_size(2 * 1024 * 1024)
             .build();
         let started = Instant::now();
-        connection_state(&app, &binding, "awaiting_events", "").await;
-        tokio::select! {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let connection = LarkWsClient::open_with_ready(Arc::new(config), handler, ready_tx);
+        tokio::pin!(connection);
+        let result = tokio::select! {
             _ = app.shutdown.cancelled() => return,
-            result = LarkWsClient::open(Arc::new(config), handler) => {
-                let reason = if result.is_ok() { "Connection ended" } else {
-                    "Connection lost or authentication failed; check this project's bot credentials and event subscriptions"
-                };
-                connection_state(&app, &binding, "reconnecting", reason).await;
-            }
-        }
+            ready = ready_rx => {
+                if ready.is_ok() {connection_state(&app,&binding,"awaiting_events","").await;}
+                tokio::select! {_=app.shutdown.cancelled()=>return,result=&mut connection=>result}
+            },
+            result=&mut connection=>result,
+        };
+        let reason = if result.is_ok() {
+            "Connection ended"
+        } else {
+            "Connection lost or authentication failed; check this project's bot credentials and event subscriptions"
+        };
+        connection_state(&app, &binding, "reconnecting", reason).await;
         if started.elapsed() > Duration::from_secs(60) {
             delay = 1;
         }

@@ -37,3 +37,4 @@ tray-icon = { version = "0.21", default-features = false }
 
 [patch.crates-io]
 gpui = { path = "vendor/gpui" }
+openlark-client = { path = "../vendor/openlark-client" }
