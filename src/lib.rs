@@ -308,10 +308,6 @@ impl App {
         self.stop_inner(&p).await
     }
     pub(crate) async fn stop_inner(&self, p: &Project) -> Result<()> {
-        let id = p.id.clone();
-        self.db
-            .call(move |c| cli_switch::cancel(c, &id, "Stopped explicitly by the user"))
-            .await?;
         if p.terminal.is_some() {
             let cfg = self.config.read().await.clone();
             herdr::stop(&cfg, p).await?;
@@ -319,19 +315,7 @@ impl App {
         let id = p.id.clone();
         let generation_id = p.generation.clone();
         self.db
-            .call(move |c| {
-                work::finish_execution(
-                    c,
-                    &id,
-                    &generation_id,
-                    "stopped",
-                    "Stopped by the user",
-                    db::now(),
-                )
-            })
-            .await?;
-        self.db
-            .set_session(&p.id, None, None, String::new())
+            .call(move |c| cli_switch::stopped(c, &id, &generation_id))
             .await?;
         Ok(())
     }
@@ -357,7 +341,11 @@ impl App {
         );
         let id = p.id.clone();
         self.db
-            .call(move |c| cli_switch::cancel(c, &id, "CLI changed explicitly by the user"))
+            .call(move |c| {
+                anyhow::ensure!(!cli_switch::holds_input(c, &id)?,
+                    "A CLI switch holds pending input. Stop the project to abandon it, or retry the selected CLI.");
+                Ok(())
+            })
             .await?;
         if p.agent == agent {
             return Ok(p);
@@ -879,11 +867,14 @@ impl App {
             }
             return Ok(());
         }
-        if self.cli_switch_waits_for_mcp(&p).await? {
-            if !self
+        if self.cli_switch_holds_input(&p).await? {
+            let advancing = self
                 .advance_cli_switch(&p, Some(&cfg), Some(&record))
-                .await?
-            {
+                .await?;
+            if !self.cli_switch_holds_input(&p).await? {
+                self.notify.notify_one();
+                self.set_phase(&p, "ready", record).await;
+            } else if !advancing {
                 self.set_phase(&p, "needs_attention", record).await;
             }
             return Ok(());

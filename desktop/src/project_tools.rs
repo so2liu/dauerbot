@@ -117,8 +117,7 @@ impl ProjectTools {
                                     }
                                 }
                             }
-                            Ok(value) => {
-                                this.project = value;
+                            Ok(_) => {
                                 this.message = "CLI handoff requested.".into();
                             }
                             Err(error) => {
@@ -327,6 +326,11 @@ impl Render for ProjectTools {
             .gap_3()
             .child(choices)
             .child(documents);
+        if transition["holds_input"] == true {
+            view = view.child(div().text_xs().text_color(rgb(0x74808c)).child(
+                self.language.text("Messages wait for the selected CLI. Stop pauses the project and cancels the switch."),
+            ));
+        }
         if !status.is_empty() {
             view = view.child(div().text_sm().child(self.language.text(status)));
         }

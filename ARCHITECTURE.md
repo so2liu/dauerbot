@@ -24,6 +24,10 @@ Feishu messages and fired schedules enter a SQLite inbox. A per-project lock ser
 
 Incoming conversation messages have priority and steer the current native Agent immediately, including while it is working. Native paste-and-Enter submission preserves ongoing tools and uses the CLI's steering behavior. Explicit pause, takeover and native login/permission prompts suspend automatic input. Scheduled runs dispatch when the native Agent is idle. Uncertain input stays recorded for explicit review and never blocks fresh user direction or independent schedules.
 
+An accepted explicit CLI switch is an exception to immediate steering: the latest switch request holds every unclaimed message and scheduled event, including input queued before acceptance. Delivery claims check this durable hold in their transaction. Already-submitted old work settles under the old Agent; new input neither reaches it nor changes the handoff nonce. Only the exact selected request/generation with authenticated MCP registration and observed native readiness releases the hold. Failure, restart, pause and takeover preserve pending input. An explicit successful Stop atomically cancels the switch and pauses the project; a failed stop leaves the hold intact. Timer occurrence journaling and uncertain outcomes remain independent of delivery.
+
+The additive upgrade gives outstanding older transitions a delivery hold. Historical settled `failed`, `ready` and `cancelled` requests remain free: the old CLI may already have continued under the earlier behavior. Every newly accepted request explicitly holds input, including after failure.
+
 Outbound sends use stable request IDs. A repeated request must match its original content and destination; uncertain sends never receive an automatic retry. The managed MCP surface contains exactly `send_md`, `send_file` and `schedule_run`. Questions and their answers travel as ordinary Feishu messages. Agents manage their own background execution through HERDR and native facilities.
 
 ## Wakeup and retirement

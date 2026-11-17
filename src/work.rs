@@ -565,7 +565,7 @@ fn claim(
     steering_only: bool,
 ) -> Result<Option<Run>> {
     transaction(c, |c| {
-        if has_takeover(c, project, generation)? {
+        if has_takeover(c, project, generation)? || crate::cli_switch::holds_input(c, project)? {
             return Ok(None);
         }
         let message = c.query_row(

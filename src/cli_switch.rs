@@ -12,7 +12,6 @@ use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
 
 const BUDGET_MS: i64 = 180_000;
-const ATTEMPTS: i64 = 4;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -26,6 +25,7 @@ pub struct Request {
     pub revision: String,
     pub created_at: i64,
     pub attempts: i64,
+    pub holds_input: bool,
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS cli_switch_requests (
@@ -34,13 +34,25 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
       nonce TEXT NOT NULL DEFAULT '',baseline TEXT NOT NULL DEFAULT '',sequence INTEGER NOT NULL DEFAULT 0,
       revision TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS cli_switch_project ON cli_switch_requests(project_id,created_at);")?;
+    let has_hold = c
+        .prepare("PRAGMA table_info(cli_switch_requests)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "holds_input");
+    if !has_hold {
+        // Pre-hold failed requests were settled and may have resumed the old CLI.
+        // Only outstanding transitions gain a hold during this schema upgrade.
+        c.execute_batch("ALTER TABLE cli_switch_requests ADD COLUMN holds_input INTEGER NOT NULL DEFAULT 0;
+          UPDATE cli_switch_requests SET holds_input=1 WHERE phase IN ('preparing','requested','switching','starting','startup_failed','uncertain');")?;
+    }
     if recover {
         c.execute("UPDATE cli_switch_requests SET phase=CASE WHEN phase='switching' THEN 'uncertain' ELSE 'failed' END,error='The service restarted during the CLI handoff; the saved native conversation and input are preserved.' WHERE phase IN ('preparing','requested','switching')", [])?;
     }
     Ok(())
 }
 pub fn latest(c: &Connection, project: &str) -> Result<Option<Request>> {
-    Ok(c.query_row("SELECT id,target,phase,error,generation,nonce,baseline,sequence,revision,created_at,attempts FROM cli_switch_requests WHERE project_id=? ORDER BY rowid DESC LIMIT 1",[project],|r|Ok(Request{id:r.get(0)?,target:r.get(1)?,phase:r.get(2)?,error:r.get(3)?,generation:r.get(4)?,nonce:r.get(5)?,baseline:r.get(6)?,sequence:r.get(7)?,revision:r.get(8)?,created_at:r.get(9)?,attempts:r.get(10)?})).optional()?)
+    Ok(c.query_row("SELECT id,target,phase,error,generation,nonce,baseline,sequence,revision,created_at,attempts,holds_input FROM cli_switch_requests WHERE project_id=? ORDER BY rowid DESC LIMIT 1",[project],|r|Ok(Request{id:r.get(0)?,target:r.get(1)?,phase:r.get(2)?,error:r.get(3)?,generation:r.get(4)?,nonce:r.get(5)?,baseline:r.get(6)?,sequence:r.get(7)?,revision:r.get(8)?,created_at:r.get(9)?,attempts:r.get(10)?,holds_input:r.get(11)?})).optional()?)
 }
 pub fn active(r: &Request) -> bool {
     matches!(
@@ -51,11 +63,34 @@ pub fn active(r: &Request) -> bool {
 pub fn revision(c: &Connection, project: &str) -> Result<String> {
     Ok(c.query_row("SELECT COALESCE((SELECT MAX(rowid) FROM messages WHERE project_id=?1 AND direction='in'),0)||':'||COALESCE((SELECT MAX(rowid) FROM work_events WHERE project_id=?1),0)",[project],|r|r.get(0))?)
 }
-fn pending_input(c: &Connection, project: &str) -> Result<bool> {
-    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?1 AND direction='in' AND status='queued') OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status='queued')",[project],|r|r.get(0))?)
+/// Called inside each delivery claim transaction, not just by reconciliation.
+pub fn holds_input(c: &Connection, project: &str) -> Result<bool> {
+    Ok(latest(c, project)?.is_some_and(|r| r.holds_input))
 }
 pub fn cancel(c: &Connection, project: &str, error: &str) -> Result<()> {
-    c.execute("UPDATE cli_switch_requests SET phase='cancelled',error=? WHERE project_id=? AND phase IN ('preparing','requested','switching','starting','startup_failed','uncertain')",params![error,project])?;
+    c.execute("UPDATE cli_switch_requests SET phase='cancelled',holds_input=0,error=? WHERE project_id=? AND (holds_input=1 OR phase IN ('preparing','requested','switching','starting','startup_failed','uncertain'))",params![error,project])?;
+    Ok(())
+}
+/// Only after a verified stop: abandon the transition and pause atomically, so
+/// releasing its delivery hold cannot automatically wake the old CLI.
+pub fn stopped(c: &Connection, project: &str, generation: &str) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    let held = holds_input(&tx, project)?;
+    work::finish_execution(
+        &tx,
+        project,
+        generation,
+        "stopped",
+        "Stopped by the user",
+        db::now(),
+    )?;
+    cancel(
+        &tx,
+        project,
+        "Stopped explicitly by the user; pending input is paused",
+    )?;
+    ensure!(tx.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null',paused=CASE WHEN ? THEN 1 ELSE paused END WHERE id=? AND generation=?",params![held,project,generation])?==1,"Execution changed before stop completion");
+    tx.commit()?;
     Ok(())
 }
 fn phase(c: &Connection, id: &str, value: &str, error: &str) -> Result<()> {
@@ -74,10 +109,7 @@ pub fn proof(r: &Request, text: Option<&str>, sequence: Option<i64>) -> bool {
 }
 pub fn claim(c: &Connection, project: &str, r: &Request, accepted_hash: &str) -> Result<bool> {
     let tx = c.unchecked_transaction()?;
-    if revision(&tx, project)? != r.revision
-        || pending_input(&tx, project)?
-        || work::has_takeover(&tx, project, &r.generation)?
-    {
+    if work::has_takeover(&tx, project, &r.generation)? {
         return Ok(false);
     }
     let valid: bool = tx.query_row(
@@ -88,7 +120,17 @@ pub fn claim(c: &Connection, project: &str, r: &Request, accepted_hash: &str) ->
     if !valid {
         return Ok(false);
     }
-    let changed=tx.execute("UPDATE cli_switch_requests SET phase='switching',baseline=? WHERE id=? AND phase='requested' AND nonce=?",params![accepted_hash,r.id,r.nonce])?;
+    let changed=tx.execute("UPDATE cli_switch_requests SET phase='switching',baseline=? WHERE id=? AND phase='requested' AND nonce=? AND holds_input=1 AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![accepted_hash,r.id,r.nonce,project])?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+fn ready(c: &Connection, project: &str, generation: &str, r: &Request) -> Result<bool> {
+    let tx = c.unchecked_transaction()?;
+    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id=? AND generation=? AND agent=? AND terminal IS NOT NULL AND ready=1 AND paused=0 AND json_extract(execution,'$.cli_switch_request')=? AND json_extract(execution,'$.mcp_registered')=1)",params![project,generation,r.target,r.id],|v|v.get(0))?;
+    if !valid || work::has_takeover(&tx, project, generation)? {
+        return Ok(false);
+    }
+    let changed=tx.execute("UPDATE cli_switch_requests SET phase='ready',error='',holds_input=0 WHERE id=? AND phase IN ('starting','startup_failed') AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![r.id,project])?;
     tx.commit()?;
     Ok(changed == 1)
 }
@@ -109,7 +151,7 @@ fn complete(c: &Connection, project: &str, r: &Request) -> Result<()> {
 }
 fn prompt(r: &Request) -> String {
     format!(
-        "<dauerbot_cli_switch request_id=\"{}\" handoff_nonce=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle current work and JOIN/SETTLE every native subagent and external worker before acknowledging. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, include this exact line: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Handle incoming user input immediately; it invalidates this request and a newer handoff request will follow. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
+        "<dauerbot_cli_switch request_id=\"{}\" handoff_nonce=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle already-delivered work and JOIN/SETTLE every native subagent and external worker before acknowledging. New messages and scheduled input are held for the selected successor; they will not be delivered to you and do not invalidate this handoff. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, include this exact line: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
         r.id, r.nonce, r.target, r.nonce
     )
 }
@@ -137,18 +179,11 @@ impl App {
             },
         )
     }
-    /// A new target may report native idle while still displaying login. Do not
-    /// submit preserved input until its authenticated managed MCP has connected.
-    pub(crate) async fn cli_switch_waits_for_mcp(&self, p: &Project) -> Result<bool> {
-        if p.execution["mcp_registered"] == true {
-            return Ok(false);
-        }
+    /// Input belongs to the selected successor from acceptance through readiness,
+    /// including while the old Agent prepares its handoff or the request fails.
+    pub(crate) async fn cli_switch_holds_input(&self, p: &Project) -> Result<bool> {
         let id = p.id.clone();
-        let r = self.db.call(move |c| latest(c, &id)).await?;
-        Ok(r.is_some_and(|r| {
-            matches!(r.phase.as_str(), "starting" | "startup_failed")
-                && p.execution["cli_switch_request"] == r.id
-        }))
+        self.db.call(move |c| holds_input(c, &id)).await
     }
     pub(crate) async fn cli_switch_launch_id(&self, p: &Project) -> Result<Option<String>> {
         let id = p.id.clone();
@@ -204,7 +239,7 @@ impl App {
         let id = p.id.clone();
         let target = target.to_owned();
         let generation = p.generation.clone();
-        self.db.call(move|c|{c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at) VALUES(?,?,?,?,?,?)",params![db::id(),id,target,initial_phase,generation,db::now()])?;Ok(())}).await?;
+        self.db.call(move|c|{let tx=c.unchecked_transaction()?;tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input) VALUES(?,?,?,?,?,?,1)",params![db::id(),id,target,initial_phase,generation,db::now()])?;tx.commit()?;Ok(())}).await?;
         self.notify.notify_one();
         Ok(p)
     }
@@ -217,14 +252,20 @@ impl App {
         record: Option<&Value>,
     ) -> Result<bool> {
         let id = p.id.clone();
-        let Some(mut r) = self.db.call(move |c| latest(c, &id)).await?.filter(|r| {
-            active(r)
-                || (r.phase == "startup_failed"
-                    && p.execution["cli_switch_request"] == r.id
-                    && p.terminal.is_some())
-        }) else {
+        let Some(mut r) = self.db.call(move |c| latest(c, &id)).await? else {
             return Ok(false);
         };
+        if !(active(&r)
+            || (r.phase == "startup_failed"
+                && p.execution["cli_switch_request"] == r.id
+                && p.terminal.is_some()))
+        {
+            if r.holds_input && (p.terminal.is_none() || record.is_some()) {
+                self.set_phase(p, "needs_attention", Value::Null).await;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         let id = p.id.clone();
         let generation = p.generation.clone();
         let takeover = self
@@ -244,8 +285,8 @@ impl App {
                 .await;
                 return Ok(true);
             }
-            self.fail_cli_switch(&r,"CLI handoff cancelled because the project was paused or terminal input was taken over.").await?;
-            return Ok(false);
+            self.fail_cli_switch(&r,"CLI handoff paused by project or terminal controls. Messages remain pending; select the target CLI again after releasing these controls.").await?;
+            return Ok(true);
         }
         if r.phase == "startup_failed" {
             if p.execution["mcp_registered"] == true
@@ -256,8 +297,11 @@ impl App {
                     )
                 })
             {
-                let id = r.id;
-                self.db.call(move |c| phase(c, &id, "ready", "")).await?;
+                let project = p.id.clone();
+                let generation = p.generation.clone();
+                self.db
+                    .call(move |c| ready(c, &project, &generation, &r))
+                    .await?;
             }
             return Ok(false);
         }
@@ -356,8 +400,11 @@ impl App {
                     Some("idle" | "done" | "working")
                 )
             {
-                let id = r.id;
-                self.db.call(move |c| phase(c, &id, "ready", "")).await?;
+                let project = p.id.clone();
+                let generation = p.generation.clone();
+                self.db
+                    .call(move |c| ready(c, &project, &generation, &r))
+                    .await?;
                 return Ok(false);
             }
             if db::now() - r.created_at > BUDGET_MS {
@@ -375,13 +422,7 @@ impl App {
             .await?;
             return Ok(false);
         }
-        let id = p.id.clone();
-        let current = self.db.call(move |c| revision(c, &id)).await?;
-        if r.phase == "preparing" || current != r.revision {
-            if r.attempts >= ATTEMPTS {
-                self.fail_cli_switch(&r,"New input kept changing the handoff. The current CLI was kept; select the new CLI again when ready.").await?;
-                return Ok(false);
-            }
+        if r.phase == "preparing" {
             let text = match artifact(p).await {
                 Ok(text) => text,
                 Err(error) => {
@@ -402,17 +443,15 @@ impl App {
             })?;
             let id = p.id.clone();
             let rid = r.id.clone();
-            let revision = current.clone();
             let baseline2 = baseline.clone();
             let nonce2 = nonce.clone();
-            let saved=self.db.call(move|c|{if self::revision(c,&id)?!=revision{return Ok(false)};c.execute("UPDATE cli_switch_requests SET phase='requested',nonce=?,baseline=?,sequence=?,revision=?,attempts=attempts+1 WHERE id=?",params![nonce2,baseline2,sequence,revision,rid])?;Ok(true)}).await?;
+            let saved=self.db.call(move|c|{let revision=self::revision(c,&id)?;Ok(c.execute("UPDATE cli_switch_requests SET phase='requested',nonce=?,baseline=?,sequence=?,revision=?,attempts=attempts+1 WHERE id=? AND phase='preparing' AND holds_input=1",params![nonce2,baseline2,sequence,revision,rid])?==1)}).await?;
             if !saved {
                 return Ok(true);
             }
             r.nonce = nonce;
             r.baseline = baseline;
             r.sequence = sequence;
-            r.revision = current;
             r.phase = "requested".into();
             match herdr::send(cfg,p,&prompt(&r)).await {Ok(v)=>{let id=r.id.clone();let seq=v["native_seq"].as_i64().unwrap_or(sequence);self.db.call(move|c|{c.execute("UPDATE cli_switch_requests SET sequence=? WHERE id=?",params![seq,id])?;Ok(())}).await?;},Err(e)=>self.fail_cli_switch(&r,&format!("The handoff request could not be confirmed: {e}. The current CLI was kept.")).await?}
             self.set_phase(p, "preparing_handoff", record.clone()).await;
@@ -572,6 +611,29 @@ mod tests {
         Ok(latest(c, &p.id)?.unwrap())
     }
     #[tokio::test]
+    async fn migration_holds_outstanding_transitions_but_not_historical_settled_failures() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "pi").await.unwrap();
+        app.db
+            .sync(|c| {
+                let r = latest(c, &p.id)?.unwrap();
+                c.execute_batch("ALTER TABLE cli_switch_requests DROP COLUMN holds_input")?;
+                phase(c, &r.id, "failed", "historical settled failure")?;
+                migrate(c, false)?;
+                assert!(!holds_input(c, &p.id)?);
+                c.execute_batch("ALTER TABLE cli_switch_requests DROP COLUMN holds_input")?;
+                phase(c, &r.id, "requested", "")?;
+                migrate(c, true)?;
+                assert_eq!(latest(c, &p.id)?.unwrap().phase, "failed");
+                assert!(
+                    holds_input(c, &p.id)?,
+                    "an interrupted outstanding request remains held after restart"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
     async fn explicit_request_is_idempotent_and_never_stops_active_agent() {
         let (_dir, app, p) = fixture().await;
         app.request_cli_switch(&p.id, "pi").await.unwrap();
@@ -590,7 +652,7 @@ mod tests {
         app.db.pause(&p.id, true).await.unwrap();
         assert!(app.request_cli_switch(&p.id, "pi").await.is_err());
         assert!(
-            !app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
+            app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
                 .await
                 .unwrap()
         );
@@ -602,30 +664,98 @@ mod tests {
             "failed"
         );
     }
+    fn queue(c: &Connection, p: &Project, id: &str, now: i64) -> Result<()> {
+        c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES(?,?,'in',?,'pending direction','queued',?,?)",params![id,p.id,id,now,now])?;
+        work::sync_inbound(c)?;
+        Ok(())
+    }
     #[tokio::test]
-    async fn inbound_revision_fences_claim_and_later_input_survives_atomic_cli_flip() {
+    async fn accepted_switch_holds_all_unclaimed_input_without_invalidating_handoff() {
         let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| {
+                queue(c, &p, "already-submitted", 1)?;
+                let run = work::claim_steering(c, &p.id, &p.generation, 2)?.unwrap();
+                work::delivery(c, &run.id, "submitted", "", 2)?;
+                queue(c, &p, "pending-before", 3)
+            })
+            .unwrap();
         app.request_cli_switch(&p.id, "pi").await.unwrap();
         app.db.sync(|c|{
-            let stale=requested(c,&p)?;
-            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('before',?,'in','before','new input','queued',1,1)",[&p.id])?;
-            assert!(!claim(c,&p.id,&stale,"accepted")?);
-            c.execute("UPDATE messages SET status='delivered' WHERE id='before'",[])?;
-            let fresh=requested(c,&p)?;
-            assert!(claim(c,&p.id,&fresh,"accepted")?);
-            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('after',?,'in','after','new input','queued',2,2)",[&p.id])?;
-            complete(c,&p.id,&fresh)?;
-            assert_eq!(c.query_row("SELECT status FROM messages WHERE id='after'",[],|r|r.get::<_,String>(0))?,"queued");
+            let r=requested(c,&p)?;
+            queue(c,&p,"pending-after",4)?;
+            let timer=work::create_timer(c,&p.id,serde_json::from_value(serde_json::json!({"name":"While switching","prompt":"scheduled input","kind":"once","at":5}))?,0)?;
+            assert_eq!(work::fire_due(c,6)?.len(),1);
+            assert!(work::claim_steering(c,&p.id,&p.generation,7)?.is_none());
+            assert!(work::claim_next(c,&p.id,&p.generation,7)?.is_none());
+            assert_eq!(latest(c,&p.id)?.unwrap().nonce,r.nonce);
+            assert!(claim(c,&p.id,&r,"accepted")?,"queued input cannot invalidate the handoff");
+            complete(c,&p.id,&r)?;
+            assert!(holds_input(c,&p.id)?);
+            assert_eq!(work::event(c,&p.id,"already-submitted")?.status,"uncertain");
+            // Old registration and a wrong observed generation cannot unlock input.
+            assert!(!ready(c,&p.id,&p.generation,&r)?);
+            c.execute("UPDATE projects SET generation='new-gen',terminal='new-pane',ready=1,execution=json_object('cli_switch_request',?,'mcp_registered',json('true')) WHERE id=?",params![r.id,p.id])?;
+            assert!(!ready(c,&p.id,"stale-generation",&r)?);
+            assert!(ready(c,&p.id,"new-gen",&r)?);
+            assert!(!holds_input(c,&p.id)?);
+            for expected in ["pending-before","pending-after"] {
+                let run=work::claim_steering(c,&p.id,"new-gen",8)?.unwrap();
+                assert_eq!(work::event(c,&p.id,&run.event_id)?.source_id,expected);
+                work::delivery(c,&run.id,"submitted","",8)?;
+            }
+            let scheduled=work::claim_next(c,&p.id,"new-gen",9)?.unwrap();
+            assert_eq!(c.query_row("SELECT count(*) FROM work_occurrences WHERE timer_id=?",[timer.id],|v|v.get::<_,i64>(0))?,1);
+            work::delivery(c,&scheduled.id,"submitted","",9)?;
+            assert!(work::claim_next(c,&p.id,"new-gen",10)?.is_none());
             Ok(())
         }).unwrap();
         let changed = app.db.project(&p.id).await.unwrap();
         assert_eq!(changed.agent, "pi");
-        assert!(
-            changed.terminal.is_none()
-                && changed.native_session.is_empty()
-                && changed.extra_args.is_empty()
-        );
+        assert!(changed.native_session.is_empty() && changed.extra_args.is_empty());
         assert_eq!(changed.path, p.path);
+    }
+    #[tokio::test]
+    async fn failed_restart_pause_retry_and_explicit_stop_never_leak_pending_input() {
+        let (dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "pi").await.unwrap();
+        app.db
+            .sync(|c| {
+                queue(c, &p, "held", 1)?;
+                let r = latest(c, &p.id)?.unwrap();
+                phase(c, &r.id, "failed", "handoff failed")?;
+                assert!(work::claim_steering(c, &p.id, &p.generation, 2)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert!(app.switch_agent(&p.id, "claude").await.is_err());
+        app.db.pause(&p.id, true).await.unwrap();
+        app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
+            .await
+            .unwrap();
+        assert!(app.db.sync(|c| holds_input(c, &p.id)).unwrap());
+        app.db.pause(&p.id, false).await.unwrap();
+        app.request_cli_switch(&p.id, "pi").await.unwrap();
+        assert!(app.db.sync(|c| holds_input(c, &p.id)).unwrap());
+        drop(app);
+        let db = crate::db::Db::open(&dir.path().join("bridge.sqlite3")).unwrap();
+        db.sync(|c| {
+            assert_eq!(latest(c, &p.id)?.unwrap().phase, "failed");
+            assert!(holds_input(c, &p.id)?);
+            assert!(work::claim_next(c, &p.id, &p.generation, 3)?.is_none());
+            assert!(stopped(c, &p.id, "stale-generation").is_err());
+            assert!(holds_input(c, &p.id)?);
+            stopped(c, &p.id, &p.generation)?;
+            assert!(!holds_input(c, &p.id)?);
+            assert_eq!(latest(c, &p.id)?.unwrap().phase, "cancelled");
+            assert!(
+                c.query_row("SELECT paused FROM projects WHERE id=?", [&p.id], |v| v
+                    .get::<_, bool>(0))?
+            );
+            assert_eq!(work::event(c, &p.id, "held")?.status, "queued");
+            Ok(())
+        })
+        .unwrap();
     }
     #[tokio::test]
     async fn lost_source_execution_cannot_be_mistaken_for_an_originally_sleeping_project() {
@@ -658,12 +788,12 @@ mod tests {
             })
             .unwrap();
         assert!(
-            !app.cli_switch_waits_for_mcp(&p).await.unwrap(),
-            "old generation must keep receiving steering"
+            app.cli_switch_holds_input(&p).await.unwrap(),
+            "old generation must not receive pending input"
         );
         app.db.sync(|c|{c.execute("UPDATE projects SET agent='pi',generation='new-gen',execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?) WHERE id=?",params![id,p.id])?;c.execute("UPDATE cli_switch_requests SET phase='starting',created_at=0 WHERE id=?",[&id])?;Ok(())}).unwrap();
         let waiting = app.db.project(&p.id).await.unwrap();
-        assert!(app.cli_switch_waits_for_mcp(&waiting).await.unwrap());
+        assert!(app.cli_switch_holds_input(&waiting).await.unwrap());
         assert!(!app.advance_cli_switch(&waiting, None, None).await.unwrap());
         assert_eq!(
             app.db
@@ -686,7 +816,7 @@ mod tests {
         app.db.pause(&p.id, false).await.unwrap();
         app.db.sync(|c|{c.execute("UPDATE projects SET execution=json_set(execution,'$.mcp_registered',json('true')) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
         let connected = app.db.project(&p.id).await.unwrap();
-        assert!(!app.cli_switch_waits_for_mcp(&connected).await.unwrap());
+        assert!(app.cli_switch_holds_input(&connected).await.unwrap());
         assert!(
             !app.advance_cli_switch(
                 &connected,
@@ -704,10 +834,10 @@ mod tests {
         );
         app.db.sync(|c|{phase(c,&id,"startup_failed","old attempt")?;c.execute("UPDATE projects SET generation='unrelated',execution=json_object('api_protocol',7,'mcp_contract',1) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
         assert!(
-            !app.cli_switch_waits_for_mcp(&app.db.project(&p.id).await.unwrap())
+            !app.cli_switch_holds_input(&app.db.project(&p.id).await.unwrap())
                 .await
                 .unwrap(),
-            "unrelated later generation is outside this transition"
+            "the completed request has released its hold"
         );
     }
     #[tokio::test]
