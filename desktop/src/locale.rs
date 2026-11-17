@@ -43,13 +43,33 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
-            "Background service updated. Compatible Agents keep running; other projects show a recovery action." => "后台服务已更新。兼容的 Agent 会继续运行；其他项目会显示恢复操作。",
+            "Update pending" => "更新待完成",
+            "This project is waiting for a compatible update. Its conversation and saved messages are preserved." => {
+                "项目正在等待兼容的更新，会话和已保存的消息均已保留。"
+            }
+            "Finishing the update. Your projects keep running." => {
+                "正在完成更新，你的项目会继续运行。"
+            }
+            "Signed updates are verified and applied automatically. Your projects and conversations stay in place." => {
+                "验证签名后自动完成更新，保留项目和会话。"
+            }
+            "Background service updated. Compatible Agents keep running; other projects show a recovery action." => {
+                "后台服务已更新。兼容的 Agent 会继续运行；其他项目会显示恢复操作。"
+            }
             "update_required" | "Agent update required" => "Agent 需要更新",
             "Recover Agent after update" => "更新后恢复 Agent",
-            herdr_feishu_bridge::UPDATE_RESUME_NOTICE => "后台服务的 Agent 协议已变更。点击“更新后恢复 Agent”，仅重启此 Agent 并恢复已保存的原生会话。排队消息和结果不确定的操作将保留。",
-            herdr_feishu_bridge::UPDATE_FRESH_NOTICE => "后台服务的 Agent 协议已变更。点击“更新后恢复 Agent”，仅重启此 Agent。由于未保存原生会话 ID，将启动全新会话。排队消息和结果不确定的操作将保留。",
-            "Agent recovery started with the saved native session. Saved messages continue when automatic activity is enabled." => "正在使用已保存的原生会话恢复 Agent。启用自动运行后，已保存的消息会继续投递。",
-            "Agent recovery started with a fresh session because no native session ID was saved. Saved messages continue when automatic activity is enabled." => "未保存原生会话 ID，正在使用全新会话恢复 Agent。启用自动运行后，已保存的消息会继续投递。",
+            herdr_feishu_bridge::UPDATE_RESUME_NOTICE => {
+                "后台服务的 Agent 协议已变更。点击“更新后恢复 Agent”，仅重启此 Agent 并恢复已保存的原生会话。排队消息和结果不确定的操作将保留。"
+            }
+            herdr_feishu_bridge::UPDATE_FRESH_NOTICE => {
+                "后台服务的 Agent 协议已变更。点击“更新后恢复 Agent”，仅重启此 Agent。由于未保存原生会话 ID，将启动全新会话。排队消息和结果不确定的操作将保留。"
+            }
+            "Agent recovery started with the saved native session. Saved messages continue when automatic activity is enabled." => {
+                "正在使用已保存的原生会话恢复 Agent。启用自动运行后，已保存的消息会继续投递。"
+            }
+            "Agent recovery started with a fresh session because no native session ID was saved. Saved messages continue when automatic activity is enabled." => {
+                "未保存原生会话 ID，正在使用全新会话恢复 Agent。启用自动运行后，已保存的消息会继续投递。"
+            }
             "Background service" => "后台服务",
             "Service update available" => "后台服务可更新",
             "Update background service" => "更新后台服务",

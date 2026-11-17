@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use herdr_feishu_bridge::{
     App, api,
     config::{self, Config},
-    db, mcp,
+    db, mcp, update,
 };
 use serde_json::{Value, json};
 use std::{fs::OpenOptions, path::PathBuf, time::Duration};
@@ -464,9 +464,10 @@ async fn main() -> Result<()> {
             .open(dir.join("daemon.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .context("A daemon is already running for this data directory")?;
+        if let Some(id) = update::activation::claim_bootstrap(&dir, &std::env::current_exe()?)? {
+            herdr_feishu_bridge::service::claim_bootstrap_restart(&dir, &id)?;
+        }
         herdr_feishu_bridge::service::claim_restart(&dir)?;
-        // The desktop activation coordinator claims legacy bootstrap ownership
-        // here, after the lock and before any live-store initialization.
         let listener = std::net::TcpListener::bind(("127.0.0.1", cfg.port))
             .context("The management port is already in use")?;
         listener.set_nonblocking(true)?;

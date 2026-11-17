@@ -69,6 +69,33 @@ fn native_window(window: &Window) -> Option<Retained<NSWindow>> {
     unsafe { handle.ns_view.cast::<NSView>().as_ref().window() }
 }
 
+pub fn window_frame(window: &Window) -> Option<[f64; 4]> {
+    let frame = native_window(window)?.frame();
+    Some([
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height,
+    ])
+}
+pub fn restore_frame(window: &Window, values: [f64; 4]) {
+    if !values.iter().all(|value| value.is_finite()) || values[2] < 800. || values[3] < 600. {
+        return;
+    }
+    if let Some(window) = native_window(window) {
+        let mut frame = window.frame();
+        frame.origin.x = values[0];
+        frame.origin.y = values[1];
+        frame.size.width = values[2];
+        frame.size.height = values[3];
+        window.setFrame_display(frame, false);
+    }
+}
+
+pub fn window_visible(window: &Window) -> bool {
+    native_window(window).is_some_and(|window| window.isVisible())
+}
+
 pub fn hide_window(window: &Window) {
     if let Some(window) = native_window(window) {
         window.orderOut(None);
