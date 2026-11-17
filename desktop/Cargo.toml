@@ -34,3 +34,6 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 raw-window-handle = "0.6"
 tray-icon = { version = "0.21", default-features = false }
+
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
