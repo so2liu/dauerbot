@@ -1,18 +1,21 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- Advance the daemon contract to API protocol 7 so the desktop cannot silently reuse an API 6 service without managed runtime and child-aware retirement semantics. Existing incompatible native executions require the established explicit recovery action.
+## 0.4.7 — 2026-11-17
 
 ### Fixed
 
-- Require fresh, generation- and native-session-matched child coverage before idle handoff retirement. Child activity, revision changes and unknown coverage reset eligibility and cancel pending handoff; a shared native dispatch gate fences the final stop. Unsupported CLI child observation retains sessions instead of inferring safety from parent idle (#57).
+- Prevent the macOS menu-bar popup and normal window from deadlocking during focus changes by releasing the GPUI window mutex before the synchronous AppKit callback (#56).
+- Preserve fractional trackpad movement, discrete wheel ticks, pointer cells, modifiers and source dimensions when scrolling terminal applications. Bounded unit events restore legacy HERDR wheel magnitude; explicit takeover remains required for application-owned history, including Codex virtual transcripts (#60).
+- Require fresh, generation- and native-session-matched child coverage before idle handoff retirement. Child activity, changed or unknown coverage resets eligibility and cancels pending handoff. A shared dispatch gate fences the final stop, and unknown coverage remains authoritative across adapter reloads (#57).
 
 ### Added
 
-- Load the pinned official Pi subprocess subagent extension explicitly for managed Pi 1.5.1 sessions, preserving global plugins, authentication and selected models. Native same-CLI delegation is preferred, with Herdr for cross-CLI/model work. External plugins or incomplete discovery make retirement coverage unknown; the foreground child tool can delay the root model's response to steering (#57).
+- Support explicit Feishu topic replies for text and files. The Agent receives trusted message/thread context and selects the discussion anchor; independent notifications start with one actual message. Preserve the existing delivery journal, destination validation, request IDs and uncertain outcomes without automatic discussion grouping or extra ID mappings (#59).
+- Load the pinned official Pi subprocess subagent extension only for managed Pi 1.5.1 sessions, preserving global plugins, authentication and selected models. Native same-CLI delegation is preferred, with Herdr for cross-CLI/model work. External plugins and unsupported CLI child coverage retain sessions; the foreground child tool can delay the root model's response to steering (#57).
+
+### Changed
+
+- Advance the app and daemon to 0.4.7, bundle build 12 and API protocol 7. API 6 services cannot satisfy the child-aware retirement contract; incompatible native executions use the existing explicit recovery action.
 
 ## 0.4.6 — 2026-11-17
 
