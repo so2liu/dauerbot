@@ -22,7 +22,7 @@ sys.stdout.flush()
 def status(state):
     request = {"id": "fixture-status", "method": "pane.report_agent", "params": {
         "pane_id": os.environ["HERDR_PANE_ID"], "source": "dauerbot-fixture",
-        "agent": "fixture-agent", "state": state, "seq": time.time_ns(),
+        "agent": sys.argv[5] if len(sys.argv)>5 else "fixture-agent", "state": state, "seq": time.time_ns(),
     }}
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(3)
@@ -93,6 +93,20 @@ try:
             text, buffer = buffer.split(end, 1)
             text = text.removeprefix(b"\x1b[200~").decode()
             event = ET.fromstring(text)
+            if event.tag == "dauerbot_cli_switch":
+                status("working")
+                mode = Path.cwd() / ".fixture-switch-mode"
+                if mode.exists() and mode.read_text() == "hold":
+                    (Path.cwd() / ".fixture-switch-held").write_text(event.attrib["request_id"])
+                    continue
+                import re
+                nonce = re.search(r"dauerbot-switch-ready:([a-zA-Z0-9-]+)", event.text).group(1)
+                text = "# CLI handoff\n\nAll native children and external workers have been settled. Continue the current fixture goal from this workspace. Preserve completed effects and never replay earlier replies.\n"
+                if not mode.exists() or mode.read_text() != "stale":
+                    text += "<!-- dauerbot-switch-ready:" + nonce + " -->\n"
+                (Path.cwd() / "HANDOFF.md").write_text(text)
+                status("idle")
+                continue
             if event.tag == "dauerbot_handoff":
                 status("working")
                 request = event.attrib["request_id"]
