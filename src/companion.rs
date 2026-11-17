@@ -1,11 +1,99 @@
 //! Retained executables whose paths cannot be overwritten by app replacement.
 use anyhow::{Context, Result, ensure};
+use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
+
+mod collection;
+pub use collection::{collect, remember_integration};
+
+/// The lease bridges publication to durable references, and historical exec.
+/// The descriptor is close-on-exec; the OS executable check then protects it.
+pub struct Retained {
+    path: PathBuf,
+    _lease: fs::File,
+}
+
+impl AsRef<Path> for Retained {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Retained {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Old MCP executables do not know about leases. Inherit the locked open
+    /// file description across exec so their entire lifetime is protected.
+    #[cfg(unix)]
+    pub fn inherit_across_exec(&self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
+        }
+        let fd = self._lease.as_raw_fd();
+        let flags = unsafe { fcntl(fd, 1) }; // F_GETFD
+        ensure!(flags >= 0, "Cannot read companion lease flags");
+        ensure!(
+            unsafe { fcntl(fd, 2, flags & !1) } >= 0,
+            "Cannot inherit companion lease"
+        ); // F_SETFD, FD_CLOEXEC
+        Ok(())
+    }
+}
+
+fn lock_file(path: &Path) -> Result<fs::File> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "Invalid companion lock"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ensure!(
+                meta.uid() == fs::metadata(path.parent().context("Missing parent")?)?.uid(),
+                "Invalid companion lock owner"
+            );
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+fn store_lock(data: &Path) -> Result<fs::File> {
+    private_directory(&data.join("runtime"))?;
+    private_directory(&data.join("runtime/hfb"))?;
+    lock_file(&data.join("runtime/hfb/.collection.lock"))
+}
+
+fn lease(path: &Path) -> Result<Retained> {
+    validate(path)?;
+    let file = lock_file(&path.with_file_name(".lease"))?;
+    FileExt::lock_shared(&file)?;
+    Ok(Retained {
+        path: path.into(),
+        _lease: file,
+    })
+}
+
+pub fn retain(data: &Path, path: &Path) -> Result<Retained> {
+    let lock = store_lock(data)?;
+    lock.lock_exclusive()?;
+    lease(path)
+}
 
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -30,8 +118,9 @@ fn private_directory(path: &Path) -> Result<()> {
 }
 
 /// Publish once without overwriting an inode, even if its bytes are corrupt.
-/// Never automatically collect these paths: saved configurations can outlive daemons.
-pub fn pin(data: &Path, source: &Path, version: &str, protocol: u64) -> Result<PathBuf> {
+pub fn pin(data: &Path, source: &Path, version: &str, protocol: u64) -> Result<Retained> {
+    let lock = store_lock(data)?;
+    lock.lock_exclusive()?;
     ensure!(
         semver::Version::parse(version)?.to_string() == version,
         "Invalid companion version"
@@ -56,7 +145,7 @@ pub fn pin(data: &Path, source: &Path, version: &str, protocol: u64) -> Result<P
     let target = directory.join("hfb");
     if fs::symlink_metadata(&target).is_ok() {
         validate(&target)?;
-        return Ok(target);
+        return lease(&target);
     }
     let temporary = directory.join(format!(".install-{}", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
@@ -82,7 +171,7 @@ pub fn pin(data: &Path, source: &Path, version: &str, protocol: u64) -> Result<P
     })();
     let _ = fs::remove_file(temporary);
     result?;
-    Ok(target)
+    lease(&target)
 }
 
 pub fn validate(path: &Path) -> Result<()> {
@@ -115,14 +204,14 @@ pub fn validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn current(data: &Path) -> Result<PathBuf> {
+pub fn current(data: &Path) -> Result<Retained> {
     let path = pin(
         data,
         &std::env::current_exe()?,
         crate::update::CURRENT,
         crate::api::PROTOCOL,
     )?;
-    let output = std::process::Command::new(&path)
+    let output = std::process::Command::new(path.path())
         .arg("companion-identity")
         .output()?;
     let identity: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -146,7 +235,7 @@ mod tests {
         let old = pin(data.path(), &source, "0.4.6", 6).unwrap();
         fs::write(&source, b"N+1").unwrap();
         let new = pin(data.path(), &source, "0.4.7", 7).unwrap();
-        assert_ne!(old, new);
+        assert_ne!(old.path(), new.path());
         assert_eq!(fs::read(old).unwrap(), b"N");
         #[cfg(unix)]
         {

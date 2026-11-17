@@ -52,7 +52,7 @@ pub struct App {
     pub shutdown: CancellationToken,
     project_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     outbound_lock: Mutex<()>,
-    companion: std::sync::OnceLock<PathBuf>,
+    companion: std::sync::OnceLock<companion::Retained>,
 }
 
 impl App {
@@ -88,8 +88,8 @@ impl App {
             let _ = self.companion.set(companion::current(&self.dir)?);
         }
         let path = self.companion.get().context("Companion was not retained")?;
-        companion::validate(path)?;
-        Ok(path)
+        companion::validate(path.path())?;
+        Ok(path.path())
     }
     pub fn update_required(p: &Project) -> bool {
         p.terminal.is_some() && p.execution["api_protocol"].as_u64() != Some(api::PROTOCOL)
@@ -184,6 +184,12 @@ impl App {
             &serde_json::to_vec_pretty(&json!({"mcpServers":{"herdr_feishu":entry}}))?,
         )?;
         if p.agent == "pi" {
+            let data = self.dir.clone();
+            let integration = PathBuf::from(&p.path).join(".pi/mcp.json");
+            tokio::task::spawn_blocking(move || {
+                companion::remember_integration(&data, &integration)
+            })
+            .await??;
             let mut pi_entry = entry.clone();
             pi_entry["exposure"] = json!("direct");
             herdr::merge_mcp(&PathBuf::from(&p.path).join(".pi/mcp.json"), &pi_entry)?;
@@ -1048,6 +1054,27 @@ impl App {
         Ok(status == "submitted")
     }
     pub fn workers(self: &Arc<Self>) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let worker = app.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    // Establish the daemon's lifetime lease before collection.
+                    worker.companion()?;
+                    companion::collect(&worker.dir, &worker.db)
+                })
+                .await;
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::debug!("Companion collection skipped: {error}"),
+                    Err(error) => tracing::warn!("Companion collection worker: {error}"),
+                }
+                tokio::select! {
+                    _ = app.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                }
+            }
+        });
         tokio::spawn(feishu::websocket(self.clone()));
         let app = self.clone();
         tokio::spawn(async move {

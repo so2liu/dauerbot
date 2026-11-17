@@ -355,7 +355,8 @@ async fn historical_dispatch(path: &Path, credentials: &Credentials) -> Result<(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let error = std::process::Command::new(retained)
+        retained.inherit_across_exec()?;
+        let error = std::process::Command::new(retained.path())
             .args(["mcp", "--credentials"])
             .arg(path)
             .exec();
