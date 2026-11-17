@@ -1,10 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.4.9 — 2026-11-17
 
 ### Fixed
 
 - Hold unclaimed messages and scheduled input for the selected CLI from switch acceptance through authenticated readiness. Keep input pending on failure, pause, takeover and restart; retry without leaking to the old Agent. Explicit Stop cancels the switch and pauses delivery after a verified stop (#79).
+
+### Changed
+
+- Advance both application crates to 0.4.9 and bundle build 14. Keep API protocol 7 and the three Agent tools unchanged.
 
 ## 0.4.8 — 2026-11-17
 
