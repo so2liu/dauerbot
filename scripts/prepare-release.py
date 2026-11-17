@@ -96,7 +96,7 @@ def main():
         "Signed with Developer ID Application, accepted by Apple notarization, "
         "and verified with Gatekeeper. The app includes its notarization ticket.\n\n"
         "Updater-enabled clients verify the manifest signature, SHA-256, Apple Team, and bundle ID. "
-        "The app updates in the background and takes effect on next launch without ending the HERDR session.\n"
+        "Capable clients activate updates automatically after readiness and ownership checks, preserving supported Agent sessions.\n"
     )
     print(f"Prepared {version}: {package.stat().st_size} bytes; signed update manifest.")
 
