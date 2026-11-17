@@ -96,6 +96,7 @@ class Fixture:
         self.connection_bots = {}
         self.lock = threading.Lock()
         self.messages = []
+        self.message_destinations = {}
         self.uploads = []
         self.acks = 0
         self.connects = 0
@@ -103,6 +104,8 @@ class Fixture:
 
     def emit(self, event, app_id="cli_fixture"):
         with self.lock:
+            message = event["event"]["message"]
+            self.message_destinations[(app_id, message["message_id"])] = message["chat_id"]
             for conn in self.connections[:]:
                 if self.connection_bots.get(conn) != app_id:
                     continue
@@ -155,9 +158,19 @@ class Handler(BaseHTTPRequestHandler):
             assert self.headers.get("Authorization") in {"Bearer fixture-token-cli_fixture", "Bearer fixture-token-cli_second"}
             value = json.loads(data)
             value["fixture_app_id"] = self.headers["Authorization"].removeprefix("Bearer fixture-token-")
+            anchor = None
+            if self.path.endswith("/reply"):
+                anchor = self.path.split("/")[-2]
+                assert value["reply_in_thread"] is True
+                value["fixture_reply_to"] = anchor
+                value["receive_id"] = FIXTURE.message_destinations[(value["fixture_app_id"], anchor)]
             assert value["receive_id"] in {"oc_fixture", "oc_private", "ou_fixture", "oc_new_group"}, value
             FIXTURE.messages.append(value)
-            self.reply({"code": 0, "data": {"message_id": "om_sent_" + str(len(FIXTURE.messages))}})
+            sent = "om_sent_" + str(len(FIXTURE.messages))
+            FIXTURE.message_destinations[(value["fixture_app_id"], sent)] = value["receive_id"]
+            self.reply({"code": 0, "data": {"message_id": sent,
+                "chat_id": "oc_private" if value["receive_id"] == "ou_fixture" else value["receive_id"],
+                **({"thread_id": "omt_" + anchor, "root_id": anchor, "parent_id": anchor} if anchor else {})}})
         else:
             self.reply({"code": 404, "msg": "unimplemented fixture endpoint"})
 

@@ -435,6 +435,8 @@ struct Outbox {
     content: String,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    reply_to_message_id: Option<String>,
 }
 async fn outbox(
     State(app): State<Arc<App>>,
@@ -454,24 +456,29 @@ async fn outbox(
     let to = input.to.as_deref().unwrap_or(&p.chat_id);
     feishu::recipient_type(to)?;
     attachment["to"] = json!(to);
+    if let Some(anchor) = input.reply_to_message_id {
+        attachment["reply_to_message_id"] = json!(anchor);
+    }
     if input.request_id.is_empty() || input.request_id.len() > 200 {
         return Err(anyhow::anyhow!("request_id must contain 1 to 200 characters").into());
     }
     let authority = authority(session);
-    let message_id=app.db.call(move |c|{
-        authorize_session(c,&authority,&p.id)?;
-        let binding=crate::bot::get(c,&p.id)?.context("Connect a Feishu bot to this project first")?;
-        attachment["bot_app_id"]=json!(binding.app_id);
-        c.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
-          VALUES(?,?,'out',?,?,'pending',?,?,?)",rusqlite::params![db::id(),p.id,input.request_id,input.content,attachment.to_string(),db::now(),db::now()])?;
-        let (id,content,saved):(String,String,String)=c.query_row("SELECT id,content,attachment FROM messages WHERE project_id=? AND direction='out' AND source_id=?",
-          rusqlite::params![p.id,input.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        let mut saved:Value=serde_json::from_str(&saved)?;
-        if let Some(saved)=saved.as_object_mut(){saved.remove("sent_message_id");}
-        anyhow::ensure!(content==input.content&&saved==attachment,
-          "This request_id refers to different content or recipient; use a new ID");
-        Ok(id)
-    }).await?;
+    let message_id = app
+        .db
+        .call(move |c| {
+            authorize_session(c, &authority, &p.id)?;
+            let binding =
+                crate::bot::get(c, &p.id)?.context("Connect a Feishu bot to this project first")?;
+            db::enqueue_out_request(
+                c,
+                &p.id,
+                &binding.app_id,
+                &input.request_id,
+                &input.content,
+                attachment,
+            )
+        })
+        .await?;
     app.send_out(&message_id).await?;
     let m = app.db.message(&message_id).await?;
     Ok(Json(serde_json::to_value(m).unwrap()))

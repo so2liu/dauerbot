@@ -84,7 +84,30 @@ pub async fn api_json(response: reqwest::Response) -> Result<Value> {
     Ok(v)
 }
 
-pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String> {
+#[derive(Debug)]
+pub struct SendReceipt {
+    pub message_id: String,
+    pub chat_id: String,
+    pub thread_id: String,
+    pub root_id: String,
+}
+impl SendReceipt {
+    fn from_response(value: &Value) -> Result<Self> {
+        let data = &value["data"];
+        Ok(Self {
+            message_id: data["message_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .context("Missing message_id in the response")?
+                .into(),
+            chat_id: data["chat_id"].as_str().unwrap_or("").into(),
+            thread_id: data["thread_id"].as_str().unwrap_or("").into(),
+            root_id: data["root_id"].as_str().unwrap_or("").into(),
+        })
+    }
+}
+
+pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendReceipt> {
     let cfg = app.config.read().await.clone();
     let binding = app.db.bot(&m.project_id).await?;
     if m.attachment["bot_app_id"]
@@ -141,21 +164,53 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<String>
             json!({"zh_cn":{"title":"","content":[[{"tag":"md","text":m.content}]]}}),
         )
     };
-    let body = json!({"receive_id":to,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
+    let Some(anchor) = m.attachment["reply_to_message_id"].as_str() else {
+        // A message without an anchor starts a new discussion at the explicit
+        // destination. The Agent chooses anchors; the daemon never guesses one.
+        let body =
+            json!({"receive_id":to,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
+        let value = api_json(
+            app.http
+                .post(format!("{}/open-apis/im/v1/messages", cfg.feishu_base))
+                .query(&[("receive_id_type", receive_id_type)])
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+        )
+        .await?;
+        return SendReceipt::from_response(&value);
+    };
+    let body =
+        json!({"msg_type":kind,"content":content.to_string(),"uuid":m.id,"reply_in_thread":true});
     let v = api_json(
         app.http
-            .post(format!("{}/open-apis/im/v1/messages", cfg.feishu_base))
-            .query(&[("receive_id_type", receive_id_type)])
+            .post(format!(
+                "{}/open-apis/im/v1/messages/{anchor}/reply",
+                cfg.feishu_base
+            ))
             .bearer_auth(token)
             .json(&body)
             .send()
             .await?,
     )
     .await?;
-    Ok(v["data"]["message_id"]
-        .as_str()
-        .context("Missing message_id in the response")?
-        .into())
+    let receipt = SendReceipt::from_response(&v)?;
+    if receipt.thread_id.is_empty() {
+        // Acceptance without a topic is a platform/protocol mismatch, not a
+        // safe retry or an invitation to send an ordinary message.
+        let id = m.id.clone();
+        let sent = receipt.message_id.clone();
+        app.db.call(move |c| {
+            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.sent_message_id',?),updated_at=? WHERE id=?",
+                rusqlite::params![sent,db::now(),id])?;
+            Ok(())
+        }).await?;
+        bail!(
+            "Topic reply was accepted without thread_id; verify the recorded message before retrying"
+        );
+    }
+    Ok(receipt)
 }
 
 pub fn allowed_file(p: &db::Project, path: &Path, data_dir: &Path) -> Result<PathBuf> {
@@ -308,7 +363,7 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
         );
     }
     attachment["source"] = json!({"chat_id":chat,"chat_type":msg["chat_type"],"message_type":kind,
-        "sender":event["sender"]["sender_id"],"mentions":msg["mentions"],"root_id":msg["root_id"],"parent_id":msg["parent_id"],"create_time":msg["create_time"]});
+        "sender":event["sender"]["sender_id"],"mentions":msg["mentions"],"thread_id":msg["thread_id"],"root_id":msg["root_id"],"parent_id":msg["parent_id"],"create_time":msg["create_time"]});
     Ok(Some((chat, source, text, attachment)))
 }
 fn collect_text(v: &Value, out: &mut String) {
