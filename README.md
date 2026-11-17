@@ -107,7 +107,11 @@ hfb session stop my-project
 hfb session resume my-project
 ```
 
-Without `--path`, project creation allocates a private folder under `~/.dauerbot/agents/<project-name>-<four-random-letters>`. The desktop uses this default too; choosing an existing folder remains available. App-created folders receive a concise `AGENTS.md` for durable rules. Dauerbot never seeds or rewrites instructions in an existing folder. Keep current progress in `HANDOFF.md`.
+Without `--path`, project creation allocates a private folder under `~/.dauerbot/agents/<project-name>-<four-random-letters>`. The desktop uses this default too; choosing an existing folder remains available. App-created folders receive a concise `AGENTS.md` for durable rules. Keep current progress in `HANDOFF.md`.
+
+New workspaces and normal session launches install a project-local Herdr delegation skill at `.dauerbot/skills/herdr-cli-subagents/SKILL.md`. A small marked block in `AGENTS.md` points to it and asks the main Agent to delegate substantial work while staying responsive. Existing user instructions outside that block remain unchanged, including in selected existing folders. Native responsive subagents are preferred for same-CLI work; Herdr serves cross-CLI/model collaboration or cases native delegation cannot cover. This private skill needs no global installation or native discovery registration: the project instructions and session bootstrap explicitly point to it. User-edited or unowned skill collisions stop preparation with an actionable error instead of being overwritten.
+
+The skill does not add child-observation coverage or an idle-retirement pin for external Herdr workers. The parent remains responsible for their results, cleanup and handoff records; parent idle alone cannot prove those panes have settled.
 
 `--data-dir` is a global argument. For an isolated daemon, use `hfb --data-dir /absolute/private-data serve --port 49322 --herdr-session my-bridge`.
 

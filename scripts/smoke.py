@@ -368,6 +368,7 @@ def main():
             assert len(managed_path.name.rsplit("-", 1)[1]) == 4
             assert managed_path.stat().st_mode & 0o777 == 0o700
             assert "HANDOFF.md" in (managed_path / "AGENTS.md").read_text()
+            assert (managed_path / ".dauerbot/skills/herdr-cli-subagents/SKILL.md").is_file()
             api(f"/projects/{managed['id']}", method="DELETE")
             checks.append("default project creation provisions a private owned workspace and concise AGENTS.md")
         (workspace / "AGENTS.md").write_text("Fixture user instructions: preserve these rules.\n")
@@ -391,6 +392,12 @@ def main():
         checks.append("real SDK WebSocket endpoint discovery and handshake")
         api(f"/projects/{key}/start", {}, "POST")
         wait_for(lambda: api(f"/projects/{key}")["project"]["ready"], "real MCP did not register readiness",timeout=100 if real_agent else 35)
+        instructions = (workspace / "AGENTS.md").read_text()
+        assert instructions.startswith("Fixture user instructions: preserve these rules.\n")
+        assert instructions.count("<!-- dauerbot:delegation:begin -->") == 1
+        local_skill = workspace / ".dauerbot/skills/herdr-cli-subagents/SKILL.md"
+        assert "External Herdr panes are not covered" in local_skill.read_text()
+        checks.append("existing project startup preserves user rules and installs one project-local delegation block and skill")
         checks.append("isolated real HERDR terminal + real MCP initialize/tools/list with exactly three tools")
         if args.bundled_runtime:
             actual = wait_for(lambda: (workspace / ".fixture-herdr").read_text() if (workspace / ".fixture-herdr").exists() else None, "no Agent runtime PATH evidence")

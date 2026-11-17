@@ -594,21 +594,31 @@ mod tests {
     #[test]
     fn inherited_lease_survives_exec_of_an_unmodified_child() {
         use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
         let (dir, db, global) = fixture();
         let retained = publish(dir.path(), b"old-companion", 4);
         let executable = retained.path().to_owned();
-        retained.inherit_across_exec().unwrap();
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        // Clear CLOEXEC only in this child. Other tests can spawn concurrently
+        // without accidentally inheriting this fixture's companion lease.
+        unsafe {
+            command.pre_exec(move || {
+                retained
+                    .inherit_across_exec()
+                    .map_err(std::io::Error::other)
+            });
+        }
+        let mut child = command
             .args(["-c", "echo ready; exec /bin/sleep 60"])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        drop(command);
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
         assert_eq!(line.trim(), "ready");
-        drop(retained);
         let kept = collect_with(dir.path(), &db, &global, |_| Ok(true));
         child.kill().unwrap();
         child.wait().unwrap();
