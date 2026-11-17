@@ -179,17 +179,17 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
     let mut p = db.create(input(&dir, "Quiescence", "")).await.unwrap();
     let mut record = legacy_record(&mut p, 100);
     record["processes"] = json!([{"name":"codex","argv":["codex"]}]);
-    assert!(herdr::quiescent(&p, &record));
+    assert!(herdr::foreground_quiescent(&p, &record));
     record["processes"] = json!([
         {"name":"codex","argv":["codex"]},
         {"name":"hfb","argv":[std::env::current_exe().unwrap(),"mcp","--credentials","/private/fixture/credentials.json"]}
     ]);
     assert!(
-        herdr::quiescent(&p, &record),
+        herdr::foreground_quiescent(&p, &record),
         "The generation's parked MCP child is not active background work"
     );
     record["processes"][1]["argv"][3] = json!("/another/generation/credentials.json");
-    assert!(!herdr::quiescent(&p, &record));
+    assert!(!herdr::foreground_quiescent(&p, &record));
     p.execution["launch_permit"] = json!("/private/app/sessions/project/generation/launch.permit");
     record["processes"][1]["argv"] = json!([
         std::env::current_exe().unwrap(),
@@ -197,9 +197,9 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
         "/private/app",
         "mcp"
     ]);
-    assert!(herdr::quiescent(&p, &record));
+    assert!(herdr::foreground_quiescent(&p, &record));
     record["processes"][1]["argv"][2] = json!("/another/installation");
-    assert!(!herdr::quiescent(&p, &record));
+    assert!(!herdr::foreground_quiescent(&p, &record));
     for processes in [
         json!([{"name":"bash","argv":["bash","-c","long task"]}]),
         json!([{"name":"codex","argv":["codex"]},{"name":"python3","argv":["python3","task.py"]}]),
@@ -207,7 +207,7 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
         json!([]),
     ] {
         record["processes"] = processes;
-        assert!(!herdr::quiescent(&p, &record));
+        assert!(!herdr::foreground_quiescent(&p, &record));
     }
     #[cfg(target_os = "macos")]
     {
@@ -222,13 +222,13 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
             {"pid":inhibitor.id(),"name":"caffeinate","argv":["caffeinate","-i","-t","2"]}
         ]);
         assert!(
-            herdr::quiescent(&p, &record),
+            herdr::foreground_quiescent(&p, &record),
             "Claude's verified system sleep inhibitor performs no Agent work"
         );
         record["processes"][1]["argv"] =
             json!(["caffeinate", "-i", "-t", "2", "python3", "task.py"]);
         assert!(
-            !herdr::quiescent(&p, &record),
+            !herdr::foreground_quiescent(&p, &record),
             "caffeinate wrapping a command is active work"
         );
         let _ = inhibitor.kill();
@@ -242,7 +242,7 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
     ];
     record["processes"] = json!([{"pid":100,"name":"Python","argv":["/Frameworks/Python.app/Contents/MacOS/Python","/private/fixture/agent.py","credentials"]}]);
     assert!(
-        herdr::quiescent(&p, &record),
+        herdr::foreground_quiescent(&p, &record),
         "macOS Python launchers exec the framework binary"
     );
     record["processes"][0]
@@ -250,12 +250,12 @@ async fn idle_label_does_not_retire_foreground_tool_or_unknown_wrapper() {
         .unwrap()
         .remove("argv");
     assert!(
-        herdr::quiescent(&p, &record),
+        herdr::foreground_quiescent(&p, &record),
         "macOS may omit the framework interpreter argv entirely"
     );
     record["processes"][0]["pid"] = json!(101);
     assert!(
-        !herdr::quiescent(&p, &record),
+        !herdr::foreground_quiescent(&p, &record),
         "A child interpreter cannot inherit the root launcher exemption"
     );
 }

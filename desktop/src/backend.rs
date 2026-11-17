@@ -575,16 +575,20 @@ mod connection_tests {
     }
 
     #[tokio::test]
-    async fn api_five_service_cannot_satisfy_workspace_and_handoff_contract() {
+    async fn older_services_cannot_satisfy_workspace_and_native_child_contract() {
         let data = tempfile::tempdir().unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let (config, worker) =
-            service_fixture("200 OK", json!({"version":"0.4.5", "api_protocol":5}));
-        let error = ensure_service(data.path(), &config, &client, false)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("trusted installed Dauerbot app"));
-        worker.join().unwrap();
+        for (version, protocol) in [("0.4.5", 5), ("0.4.6", 6)] {
+            let (config, worker) = service_fixture(
+                "200 OK",
+                json!({"version":version, "api_protocol":protocol}),
+            );
+            let error = ensure_service(data.path(), &config, &client, false)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("trusted installed Dauerbot app"));
+            worker.join().unwrap();
+        }
     }
 
     #[tokio::test]

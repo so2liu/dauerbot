@@ -35,7 +35,9 @@ impl IntoResponse for ApiError {
     }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
-pub const PROTOCOL: u64 = 6;
+// API 7 adds managed Pi child evidence and conservative retirement semantics.
+// API 6 services cannot satisfy this contract, even when HTTP shapes overlap.
+pub const PROTOCOL: u64 = 7;
 
 pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()
