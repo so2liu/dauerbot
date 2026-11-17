@@ -11,6 +11,7 @@ pub mod handoff;
 pub mod herdr;
 pub mod mcp;
 pub mod native_children;
+pub mod project_documents;
 pub mod service;
 pub mod update;
 pub mod work;
@@ -320,6 +321,14 @@ impl App {
         Ok(())
     }
     pub async fn switch_agent(self: &Arc<Self>, key: &str, agent: &str) -> Result<Project> {
+        self.switch_agent_mode(key, agent, false).await
+    }
+    pub async fn switch_agent_mode(
+        self: &Arc<Self>,
+        key: &str,
+        agent: &str,
+        standby_only: bool,
+    ) -> Result<Project> {
         if !["codex", "claude", "pi", "agy"].contains(&agent) {
             bail!("Choose Codex, Claude Code, Pi, or Antigravity")
         }
@@ -327,6 +336,10 @@ impl App {
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
         let p = self.db.project(&p.id).await?;
+        anyhow::ensure!(
+            !standby_only || p.terminal.is_none(),
+            "This project has started working. Switch its CLI when it is in standby."
+        );
         if p.agent == agent {
             return Ok(p);
         }

@@ -1,0 +1,395 @@
+//! Compact project controls and read-only native continuity documents.
+use crate::locale::Language;
+use gpui::{prelude::*, *};
+use gpui_component::{Disableable, Selectable, Sizable, button::*, text::TextView};
+use herdr_feishu_bridge::{
+    config::Config,
+    project_documents::{Content, Document},
+};
+use serde_json::{Value, json};
+use std::{path::PathBuf, sync::mpsc, time::Duration};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ticket {
+    project: String,
+    document: Option<Document>,
+    revision: u64,
+}
+enum Work {
+    Document(Ticket),
+    Switch(Ticket, String),
+}
+struct Reply {
+    ticket: Ticket,
+    result: Result<Value, String>,
+}
+pub struct ProjectTools {
+    project: Value,
+    language: Language,
+    tx: mpsc::Sender<Work>,
+    document: Option<Document>,
+    ticket: Option<Ticket>,
+    revision: u64,
+    content: Option<Content>,
+    pending_cli: Option<String>,
+    message: String,
+}
+impl ProjectTools {
+    pub fn new(data: PathBuf, cx: &mut Context<Self>) -> Self {
+        let (tx, requests) = mpsc::channel();
+        let (replies, rx) = flume::unbounded::<Reply>();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(runtime) = runtime else { return };
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(12))
+                .build();
+            let Ok(http) = http else { return };
+            while let Ok(work) = requests.recv() {
+                let (ticket, method, suffix, body) = match work {
+                    Work::Document(ticket) => {
+                        let suffix = format!("documents/{}", ticket.document.unwrap().key());
+                        (ticket, "GET", suffix, None)
+                    }
+                    Work::Switch(ticket, agent) => (
+                        ticket,
+                        "POST",
+                        "agent/standby".into(),
+                        Some(json!({"agent":agent})),
+                    ),
+                };
+                let result = runtime
+                    .block_on(async {
+                        // Read existing configuration; never provision or rewrite it.
+                        let cfg: Config =
+                            serde_json::from_slice(&std::fs::read(data.join("config.json"))?)?;
+                        let mut request = http
+                            .request(
+                                method.parse()?,
+                                format!("{}/api/projects/{}/{}", cfg.url(), ticket.project, suffix),
+                            )
+                            .bearer_auth(&cfg.token);
+                        if let Some(body) = body {
+                            request = request.json(&body);
+                        }
+                        let response = request.send().await?;
+                        let status = response.status();
+                        let mut value: Value = response.json().await?;
+                        anyhow::ensure!(
+                            status.is_success(),
+                            "{}",
+                            value["error"]
+                                .as_str()
+                                .unwrap_or("Cannot reach this project")
+                        );
+                        if ticket.document.is_some() && value["status"] == "available" {
+                            value["text"] =
+                                json!(display_markdown(value["text"].as_str().unwrap_or(""))?);
+                        }
+                        Ok::<_, anyhow::Error>(value)
+                    })
+                    .map_err(|error| error.to_string());
+                if replies.send(Reply { ticket, result }).is_err() {
+                    break;
+                }
+            }
+        });
+        cx.spawn(async move |entity, cx| {
+            while let Ok(reply) = rx.recv_async().await {
+                if entity.update(cx, |this, cx| {
+                    if !accept_reply(&this.project, this.ticket.as_ref(), &reply.ticket) { return; }
+                    match reply.result {
+                        Ok(value) if reply.ticket.document.is_some() => {
+                            match serde_json::from_value(value) {
+                                Ok(content) => this.content = Some(content),
+                                Err(_) => this.message = "Cannot read this document response".into(),
+                            }
+                        }
+                        Ok(value) => {
+                            this.project = value;
+                            this.message = "CLI saved. The next wake uses this CLI and the current workspace handoff.".into();
+                        }
+                        Err(error) => {
+                            this.pending_cli = None;
+                            this.message = error;
+                        }
+                    }
+                    this.ticket = None;
+                    cx.notify();
+                }).is_err() { break; }
+            }
+        }).detach();
+        Self {
+            project: Value::Null,
+            language: Language::default(),
+            tx,
+            document: None,
+            ticket: None,
+            revision: 0,
+            content: None,
+            pending_cli: None,
+            message: String::new(),
+        }
+    }
+    pub fn select(&mut self, project: &Value, language: Language, cx: &mut Context<Self>) {
+        let changed = self.project != *project || self.language != language;
+        if self.project["id"] != project["id"] {
+            self.document = None;
+            self.content = None;
+            self.ticket = None;
+            self.pending_cli = None;
+            self.message.clear();
+            self.revision += 1;
+        }
+        if self
+            .pending_cli
+            .as_deref()
+            .is_some_and(|agent| project["agent"] == agent)
+        {
+            self.pending_cli = None;
+        }
+        self.project = project.clone();
+        self.language = language;
+        if changed {
+            cx.notify();
+        }
+    }
+    fn request(
+        &mut self,
+        document: Option<Document>,
+        agent: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.revision += 1;
+        let ticket = Ticket {
+            project: self.project["id"].as_str().unwrap_or("").into(),
+            document,
+            revision: self.revision,
+        };
+        self.ticket = Some(ticket.clone());
+        self.message.clear();
+        let sent = if let Some(agent) = agent {
+            self.pending_cli = Some(agent.clone());
+            self.tx.send(Work::Switch(ticket, agent))
+        } else {
+            self.document = document;
+            self.content = None;
+            self.tx.send(Work::Document(ticket))
+        };
+        if sent.is_err() {
+            self.ticket = None;
+            self.pending_cli = None;
+            self.message = "The project viewer is unavailable. Reopen the app to reconnect.".into();
+        }
+        cx.notify();
+    }
+}
+fn accept_reply(project: &Value, current: Option<&Ticket>, incoming: &Ticket) -> bool {
+    project["id"].as_str() == Some(incoming.project.as_str()) && current == Some(incoming)
+}
+impl Render for ProjectTools {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let standby = self.project["terminal"].is_null();
+        let busy = self.ticket.is_some();
+        let agent = self
+            .pending_cli
+            .as_deref()
+            .or(self.project["agent"].as_str())
+            .unwrap_or("");
+        let mut choices = div().flex().flex_wrap().gap_2().items_center().child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x74808c))
+                .child(self.language.text("CLI")),
+        );
+        for (index, (key, label)) in [
+            ("codex", "Codex"),
+            ("claude", "Claude Code"),
+            ("pi", "Pi"),
+            ("agy", "Antigravity"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            choices = choices.child(
+                Button::new(("standby-cli", index))
+                    .small()
+                    .label(label)
+                    .selected(agent == key)
+                    .disabled(!standby || busy || agent == key)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.request(None, Some(key.into()), cx)),
+                    ),
+            );
+        }
+        let mut documents = div().flex().gap_2();
+        for (index, document) in [Document::Handoff, Document::Agents]
+            .into_iter()
+            .enumerate()
+        {
+            documents = documents.child(
+                Button::new(("project-document", index))
+                    .small()
+                    .label(document.filename())
+                    .selected(self.document == Some(document))
+                    .disabled(busy)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.request(Some(document), None, cx)),
+                    ),
+            );
+        }
+        if self.document.is_some() {
+            documents = documents.child(
+                Button::new("close-project-document")
+                    .small()
+                    .label(self.language.text("Close"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.document = None;
+                        this.content = None;
+                        this.ticket = None;
+                        this.revision += 1;
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut view = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(choices)
+            .child(documents);
+        if !standby {
+            view = view.child(
+                div().text_xs().text_color(rgb(0x74808c)).child(
+                    self.language
+                        .text("Switch the CLI when this project is in standby."),
+                ),
+            );
+        }
+        if !self.message.is_empty() {
+            view = view.child(div().text_sm().child(self.message.clone()));
+        }
+        if let Some(document) = self.document {
+            let mut pane = div()
+                .id("project-document-pane")
+                .border_1()
+                .border_color(rgb(0xe6e9ec))
+                .rounded_md()
+                .p_4();
+            if let Some(content) = &self.content {
+                if content.status == "available" {
+                    let id = SharedString::from(format!(
+                        "project-markdown-{}-{}",
+                        self.project["id"].as_str().unwrap_or(""),
+                        document.key()
+                    ));
+                    pane = pane.h(px(360.)).child(
+                        TextView::markdown(id, content.text.clone(), window, cx)
+                            .selectable(true)
+                            .scrollable(true)
+                            .size_full(),
+                    );
+                } else {
+                    pane = pane.child(content.message.clone());
+                }
+            } else if self.ticket.is_some() {
+                pane = pane.child(self.language.text("Loading document…"));
+            } else {
+                pane = pane.child(
+                    self.language
+                        .text("Document unavailable. Select it again to retry."),
+                );
+            }
+            view = view.child(pane);
+        }
+        view
+    }
+}
+
+/// The pinned native renderer has no image-disable switch. Remove parsed image
+/// and HTML nodes before handing it Markdown, so rendering never fetches remote
+/// images or opens local image files. Ordinary links remain click-only.
+fn display_markdown(source: &str) -> anyhow::Result<String> {
+    use markdown::{ParseOptions, mdast::Node};
+    fn ranges(node: &Node, out: &mut Vec<std::ops::Range<usize>>) {
+        if matches!(
+            node,
+            Node::Image(_) | Node::ImageReference(_) | Node::Html(_)
+        ) {
+            if let Some(position) = node.position() {
+                out.push(position.start.offset..position.end.offset);
+            }
+        } else if let Some(children) = node.children() {
+            for child in children {
+                ranges(child, out);
+            }
+        }
+    }
+    let tree = markdown::to_mdast(source, &ParseOptions::gfm())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut excluded = Vec::new();
+    ranges(&tree, &mut excluded);
+    let mut result = source.to_owned();
+    for range in excluded.into_iter().rev() {
+        anyhow::ensure!(
+            result.is_char_boundary(range.start) && result.is_char_boundary(range.end),
+            "Cannot render this document safely"
+        );
+        result.replace_range(range, " (embedded content omitted) ");
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stale_project_document_and_reload_replies_are_ignored() {
+        let ticket = Ticket {
+            project: "one".into(),
+            document: Some(Document::Agents),
+            revision: 1,
+        };
+        assert!(accept_reply(&json!({"id":"one"}), Some(&ticket), &ticket));
+        assert!(!accept_reply(&json!({"id":"two"}), Some(&ticket), &ticket));
+        let newer = Ticket {
+            revision: 2,
+            ..ticket.clone()
+        };
+        assert!(!accept_reply(&json!({"id":"one"}), Some(&newer), &ticket));
+        let handoff = Ticket {
+            document: Some(Document::Handoff),
+            ..ticket.clone()
+        };
+        assert!(!accept_reply(&json!({"id":"one"}), Some(&handoff), &ticket));
+    }
+    #[test]
+    fn markdown_keeps_structure_without_automatic_external_content() {
+        let source = "# 标题\n\n- item\n\n| A | B |\n| - | - |\n| x | y |\n\n```rust\nlet x = 1;\n```\n\n![secret](https://host/image.png) ![local][img]\n\n[img]: file:///private/image.png\n\n<img src=\"https://host/raw.png\">\n\n[Open](https://example.com)";
+        let rendered = display_markdown(source).unwrap();
+        let tree = markdown::to_mdast(&rendered, &markdown::ParseOptions::gfm()).unwrap();
+        fn safe(node: &markdown::mdast::Node) {
+            assert!(!matches!(
+                node,
+                markdown::mdast::Node::Image(_)
+                    | markdown::mdast::Node::ImageReference(_)
+                    | markdown::mdast::Node::Html(_)
+            ));
+            if let Some(children) = node.children() {
+                for child in children {
+                    safe(child);
+                }
+            }
+        }
+        safe(&tree);
+        assert!(
+            rendered.contains("# 标题")
+                && rendered.contains("| A | B |")
+                && rendered.contains("```rust")
+                && rendered.contains("[Open](https://example.com)")
+        );
+    }
+}

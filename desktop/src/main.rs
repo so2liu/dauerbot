@@ -5,6 +5,7 @@ mod backend;
 mod locale;
 #[cfg(target_os = "macos")]
 mod menubar;
+mod project_tools;
 mod terminal;
 mod updater;
 
@@ -79,6 +80,7 @@ struct Desktop {
     terminal_key: String,
     terminal_error: String,
     timers: Value,
+    project_tools: Entity<project_tools::ProjectTools>,
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
@@ -128,6 +130,7 @@ impl Desktop {
             }
         })
         .detach();
+        let project_tools = cx.new(|cx| project_tools::ProjectTools::new(backend.dir.clone(), cx));
         Self {
             backend,
             independent_data,
@@ -155,6 +158,7 @@ impl Desktop {
             terminal_key: String::new(),
             terminal_error: String::new(),
             timers: Value::Null,
+            project_tools,
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
@@ -991,7 +995,7 @@ impl Desktop {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr("Active agent")),
+                    .child(self.tr("Project CLI")),
             );
             let mut agents = div().flex().flex_wrap().gap_2();
             for (index, agent) in ["codex", "claude", "pi", "agy"].into_iter().enumerate() {
@@ -1000,12 +1004,12 @@ impl Desktop {
                     Button::new(("agent", index))
                         .label(agent_name(agent))
                         .selected(project["agent"] == agent)
-                        .disabled(self.busy || project["agent"] == agent)
+                        .disabled(self.busy || project["terminal"].is_string() || project["agent"] == agent)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.release_terminal();
                             this.api(
                                 "POST",
-                                format!("/projects/{project_id}/agent"),
+                                format!("/projects/{project_id}/agent/standby"),
                                 Some(json!({"agent":agent})),
                                 "Agent switched. The bot and project binding are preserved.",
                             );
@@ -1225,6 +1229,9 @@ impl Desktop {
                 )
                 .into_any_element();
         };
+        self.project_tools.update(cx, |tools, cx| {
+            tools.select(project, self.setup.language, cx)
+        });
         let timers = visible_timers(&self.timers);
         let mut content = div()
             .flex()
@@ -1242,6 +1249,7 @@ impl Desktop {
                     .text_color(rgb(MUTED))
                     .child(self.tr(project_status(project))),
             )
+            .child(self.project_tools.clone())
             .child(
                 div()
                     .mt_4()

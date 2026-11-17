@@ -911,6 +911,7 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "fs2",
+ "libc",
  "openlark",
  "reqwest",
  "rmcp",
