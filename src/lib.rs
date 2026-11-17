@@ -93,7 +93,7 @@ impl App {
         Ok(path.path())
     }
     pub fn update_required(p: &Project) -> bool {
-        p.terminal.is_some() && p.execution["api_protocol"].as_u64() != Some(api::PROTOCOL)
+        p.terminal.is_some() && mcp::generation_contract(&p.execution).is_none()
     }
     pub async fn recover_after_update(self: &Arc<Self>, key: &str) -> Result<Project> {
         let p = self.db.project(key).await?;
@@ -172,8 +172,7 @@ impl App {
         let generation = db::id();
         let session_dir = self.dir.join("sessions").join(&p.id).join(&generation);
         config::private_dir(&session_dir)?;
-        let credentials =
-            json!({"url":cfg.url(),"project":p.id,"token":p.mcp_token,"generation":generation});
+        let credentials = json!({"url":cfg.url(),"project":p.id,"token":p.mcp_token,"generation":generation,"mcp_contract":mcp::CONTRACT});
         config::write_private(
             &session_dir.join("credentials.json"),
             &serde_json::to_vec_pretty(&credentials)?,
@@ -239,6 +238,7 @@ impl App {
             execution["child_adapter"] = json!(dir);
         }
         execution["api_protocol"] = json!(api::PROTOCOL);
+        execution["mcp_contract"] = json!(mcp::CONTRACT);
         execution["companion"] = json!(self.companion()?);
         self.db
             .save_execution(&p.id, execution, &generation)

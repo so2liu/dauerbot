@@ -69,3 +69,34 @@ The product supports fresh stores and normal upgrades from schema 4 onward. Sche
 API protocol 5 and application version 0.4.5 mark the incompatible Agent/daemon contract. Desktop and CLI check protocol compatibility. The private MCP registration endpoint also checks protocol before exposing project tools, so an old daemon cannot silently accept the new lifecycle. Older desktops see the newer version and must not replace its daemon with an older build; the schema guard rejects attempts to open a newer store. Bundle identity, data directory and update signing keys stay stable.
 
 Product execution uses legacy `herdr` 0.9.5. There is no hc/Core runtime adapter or Core archive. Source, documentation, default UI and commits use English; the desktop supports persistent English and Simplified Chinese preferences.
+
+## Agent wire compatibility during activation
+
+The Agent MCP wire contract is independent of the desktop/service API. New
+executions and their private credentials carry `mcp_contract: 1`. Contract 1
+provides exactly `send_md`, `send_file`, and `schedule_run`, including topic
+anchors, schedule purpose, generation-scoped authentication, native registration,
+request deduplication, and uncertain-effect preservation. Registration must return
+the negotiated `mcp_contract`; matching tool names alone do not establish support.
+The service advertises supported identities through `mcp_contracts` in `/api/state`.
+
+`mcp::check_activation(projects, target_api)` checks the authenticated owner's
+project snapshot before ownership changes. It accepts explicit contract 1 across
+engine revisions. Published 0.4.7 generations without explicit metadata are also
+supported with public API 7: their original startup probe requires that exact API
+before private registration. Published API 5/6 and unknown contracts are not
+admitted merely because their tool names overlap. Unsupported active generations
+keep the old service serving. Sleeping records do not hold an active MCP process.
+
+A supported activation preserves the original pane, native conversation,
+generation, project token, credentials, and immutable companion. It does not stop
+and resume the native CLI or hot-swap an existing stdio MCP child. Legacy
+registration receives its generation's API value; modern registration negotiates
+the stable wire identity independently and reports the current service API
+separately. Existing execution metadata is never relabeled to claim compatibility.
+
+An unmodified 0.4.7 service does not return `mcp_contract` and cannot host a newly
+created explicit-contract MCP client. A post-commit rollback must therefore check
+all current generations before switching ownership back, or retain a compatible
+engine. Restoring an old bundle is not sufficient proof of runtime compatibility.
+Pre-commit rollback leaves the original legacy generations and old service intact.

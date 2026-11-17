@@ -234,7 +234,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         records.push(record);
     }
     Ok(Json(
-        json!({"projects":records,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL}),
+        json!({"projects":records,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL,"mcp_contracts":[crate::mcp::CONTRACT]}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {
@@ -487,6 +487,8 @@ async fn outbox(
 struct Registration {
     generation: String,
     terminal: String,
+    #[serde(default)]
+    mcp_contract: Option<u64>,
 }
 async fn register(
     State(app): State<Arc<App>>,
@@ -499,6 +501,12 @@ async fn register(
     {
         return Err(anyhow::anyhow!("Session identity does not match").into());
     }
+    let contract =
+        crate::mcp::generation_contract(&p.execution).context("Unsupported Agent MCP contract")?;
+    if input.mcp_contract.is_some_and(|value| value != contract) {
+        return Err(anyhow::anyhow!("Agent MCP contract differs from its execution").into());
+    }
+    let registration_api = p.execution["api_protocol"].as_u64().unwrap_or(PROTOCOL);
     let cfg = app.config.read().await.clone();
     // MCP can be ready just before HERDR's native-agent detection tick.
     // Keep this request alive briefly rather than requiring a model to recover
@@ -540,7 +548,7 @@ async fn register(
     app.notify.notify_one();
 
     Ok(Json(
-        json!({"ok":true,"project":name,"api_protocol":PROTOCOL}),
+        json!({"ok":true,"project":name,"api_protocol":registration_api,"mcp_contract":contract,"service_api_protocol":PROTOCOL}),
     ))
 }
 async fn retry(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
