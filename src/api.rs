@@ -70,6 +70,8 @@ pub fn router(app: Arc<App>) -> Router {
             post(recover_after_update),
         )
         .route("/projects/{id}/agent", post(switch_agent))
+        .route("/projects/{id}/agent/standby", post(switch_standby_agent))
+        .route("/projects/{id}/documents/{document}", get(project_document))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
         .route("/projects/{id}/show", post(show))
@@ -487,6 +489,27 @@ async fn switch_agent(
     Json(input): Json<AgentSelection>,
 ) -> ApiResult {
     Ok(Json(json!(app.switch_agent(&id, &input.agent).await?)))
+}
+async fn switch_standby_agent(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<AgentSelection>,
+) -> ApiResult {
+    Ok(Json(json!(
+        app.switch_agent_mode(&id, &input.agent, true).await?
+    )))
+}
+async fn project_document(
+    State(app): State<Arc<App>>,
+    Path((id, document)): Path<(String, crate::project_documents::Document)>,
+) -> ApiResult {
+    let project = app.db.project(&id).await?;
+    let content = tokio::task::spawn_blocking(move || {
+        crate::project_documents::read(std::path::Path::new(&project.path), document)
+    })
+    .await
+    .map_err(anyhow::Error::from)?;
+    Ok(Json(json!(content)))
 }
 async fn delete_project(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let p = app.db.project(&id).await?;

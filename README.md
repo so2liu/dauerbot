@@ -22,7 +22,7 @@ Each project has its own App ID, App Secret, event connection and connection sta
 
 From the CLI, bind and validate a project's bot with `hfb feishu set <project> --app-id cli_...` (the secret is read from stdin) and `hfb feishu check <project>`. `hfb feishu disconnect <project>` disconnects only that project. Existing singleton installations keep their bot on its recorded project when upgrading; other projects remain unbound.
 
-Switch the active CLI in project settings or with `hfb session switch`. Switching closes the old execution and preserves the project files, bot binding, schedules and message history. The next input starts a new native conversation in the selected CLI. You can also inject a local message with `hfb message inject` before connecting Feishu.
+Choose Codex, Claude Code, Pi or Antigravity in the project view while the project is in standby. The next message wakes the chosen CLI in the same workspace, with its current instructions and handoff. Changing the CLI clears the previous CLI's native conversation reference; project files, bot settings, pauses and scheduled runs remain in place. The advanced `hfb session switch` command can also explicitly stop an active execution. You can inject a local message with `hfb message inject` before connecting Feishu.
 
 Avoid running another long-connection listener for the same Feishu app: the platform distributes events between listeners, so another program may receive the message instead.
 
@@ -31,6 +31,8 @@ Avoid running another long-connection listener for the same Feishu app: the plat
 The desktop renders native GPUI controls. There is no browser interface, WebView, Node.js runtime, or frontend build step. Dauerbot starts in the macOS menu bar: click its icon to see project states, add a project, or open the full app. Selecting a project opens its details. Closing the window returns to the menu bar and leaves the daemon and HERDR Agent running; Quit exits the desktop.
 
 The full window has projects on the left and scheduled runs in the center. The selected Agent's native terminal is a debugging tool on the right, collapsed by default. Expand it to observe; **Take control** enables direct input, login, model selection, and native prompts. **Release control** returns the session to automatic dispatch. Viewing does not prevent idle sleep. Explicit control pins the execution until released, protecting unsent input even if the desktop crashes. Hiding the terminal or closing the window releases control and disconnects the terminal bridge. Send instructions and ask the Agent to schedule work in Feishu; the desktop lists schedules and lets you pause or enable them. Agent execution steps and manual schedule forms are not part of the main view. Settings contains bot setup, permissions and updates.
+
+Open `HANDOFF.md` or `AGENTS.md` directly in the project view to read rendered Markdown without opening Terminal or an editor. Views are read-only and accept regular UTF-8 files up to 256 KiB. Embedded images and raw HTML are omitted; links open only when clicked. Missing documents have an explicit empty state.
 
 Choose **Take control** before scrolling application history. Fullscreen Codex owns its transcript, so wheel gestures must reach Codex through the native terminal; read-only observation cannot reveal messages Codex has not rendered. Wheel input preserves the pointer cell and modifiers, and HERDR routes it according to the application's mouse and alternate-scroll modes. Observation never silently takes control or sends wheel events.
 
