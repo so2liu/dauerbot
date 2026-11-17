@@ -215,6 +215,9 @@ enum Messages {
         to: Option<String>,
         #[arg(long)]
         request_id: Option<String>,
+        /// Trusted message ID for the discussion; omit to start a new topic.
+        #[arg(long)]
+        reply_to_message_id: Option<String>,
     },
     File {
         project: String,
@@ -223,6 +226,9 @@ enum Messages {
         to: Option<String>,
         #[arg(long)]
         request_id: Option<String>,
+        /// Trusted message ID for the discussion; omit to start a new topic.
+        #[arg(long)]
+        reply_to_message_id: Option<String>,
     },
     Retry {
         id: String,
@@ -552,8 +558,8 @@ async fn main() -> Result<()> {
         },
         Commands::Message{command}=>match command{
             Messages::Inject{project,text}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/messages"),Some(json!({"content":text}))).await?}
-            Messages::Send{project,text,request_id,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"content":text,"to":to,"request_id":request_id.unwrap_or_else(db::id)}))).await?}
-            Messages::File{project,path,request_id,to}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"path":std::fs::canonicalize(path)?,"to":to,"request_id":request_id.unwrap_or_else(db::id)}))).await?}
+            Messages::Send{project,text,request_id,to,reply_to_message_id}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"content":text,"to":to,"request_id":request_id.unwrap_or_else(db::id),"reply_to_message_id":reply_to_message_id}))).await?}
+            Messages::File{project,path,request_id,to,reply_to_message_id}=>{let id=client.id(&project).await?;client.request("POST",&format!("/projects/{id}/outbox"),Some(json!({"path":std::fs::canonicalize(path)?,"to":to,"request_id":request_id.unwrap_or_else(db::id),"reply_to_message_id":reply_to_message_id}))).await?}
             Messages::Retry{id}=>client.request("POST",&format!("/messages/{id}/retry"),None).await?,
             Messages::Dismiss{id}=>client.request("POST",&format!("/messages/{id}/dismiss"),None).await?,
         },

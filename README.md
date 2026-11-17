@@ -128,8 +128,8 @@ The managed CLI starts `hfb mcp --credentials <private-file>` automatically.
 
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
-| `send_md` | `to`, `text`, `request_id` | Send Markdown to the chosen chat or user |
-| `send_file` | `to`, `path`, `request_id` | Stream a local file, up to 100 MB |
+| `send_md` | `to`, `text`, `request_id`, optional `reply_to_message_id` | Reply with Markdown in the chosen discussion |
+| `send_file` | `to`, `path`, `request_id`, optional `reply_to_message_id` | Reply with a local file in the chosen discussion, up to 100 MB |
 | `schedule_run` | `request_id`, `name`, `prompt`, `kind`, `timezone`, schedule fields, `purpose` for new schedules, optional `to` | Persist a once, interval, or cron run; classify user work or internal follow-ups |
 
 `to` is mandatory for MCP sends: `oc_…` identifies a chat and `ou_…` a user Open ID. The agent follows user intent and may reply somewhere other than the source chat. Reuse `request_id` only when retrying the same content and destination. Only `status=sent` means the API confirmed the send. Files must resolve inside the project or Dauerbot cache; symlinks cannot escape those directories.
@@ -149,6 +149,12 @@ SQLite stores incoming and outgoing messages. Incoming messages persist before S
 | `dismissed` | Manually excluded from blocking delivery |
 
 Restarts preserve uncertain operations instead of blindly resending. PTY input and Feishu have no atomic transaction, so Dauerbot does not promise exactly-once delivery. It checks legacy metadata, root PID, generation, and foreground program identity before typing; exited agents and replacement shells do not receive queued input.
+
+All text/file replies use Feishu topics when the Agent supplies their anchor. For a normal reply, pass the trusted incoming `message_id` as `reply_to_message_id`; reuse that original discussion anchor for related updates and attachments even when another message steers the Agent. The daemon validates the anchor against the project, bot and explicit `to`. A P2P user `ou_` recipient can match a trusted private-chat anchor; a group message never becomes permission to reply to its sender privately. Previously sent messages can also anchor follow-ups. Incoming envelopes retain `thread_id`, `root_id` and `parent_id`.
+
+Omitting the anchor sends an independent initial message directly to `to`; its `sent_message_id` can anchor later replies. This is the default for independent scheduled notifications and new destinations. The Agent chooses whether work belongs to an existing discussion; the daemon doesn't infer relationships, create preview stubs or maintain an ID mapping. The existing outbox records the chosen anchor alongside the content and destination for stable retries. Pre-upgrade requests without an anchor retain their identity. An unsupported topic reply fails visibly without an ordinary-message fallback; an accepted response without a thread ID stays uncertain for review.
+
+Topics group Feishu's visible conversation; they don't remove existing native Agent context. Dauerbot doesn't reload the entire thread on each incoming message. Bot P2P support for Markdown and uploaded files was verified against an owner-selected private chat on November 17, 2026. Other tenants and chat modes remain subject to platform permissions, bot membership and topic visibility. Group @-only event permissions don't guarantee delivery of subsequent unmentioned replies; natural follow-ups need the corresponding group-message permission or another explicit @.
 
 ## Sessions and scheduled runs
 

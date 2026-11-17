@@ -57,10 +57,11 @@ pub fn render(message: &Message, context: &Value, attachment: Option<&Path>) -> 
         "local"
     };
     let mut xml = format!(
-        "<feishu_message version=\"1\" message_id=\"{}\">\n<source platform=\"{platform}\" chat_type=\"{}\" chat_id=\"{}\" root_id=\"{}\" parent_id=\"{}\" create_time=\"{}\"/>\n<sender open_id=\"{}\" user_id=\"{}\" union_id=\"{}\" name=\"{}\"/>",
+        "<feishu_message version=\"1\" message_id=\"{}\">\n<source platform=\"{platform}\" chat_type=\"{}\" chat_id=\"{}\" thread_id=\"{}\" root_id=\"{}\" parent_id=\"{}\" create_time=\"{}\"/>\n<sender open_id=\"{}\" user_id=\"{}\" union_id=\"{}\" name=\"{}\"/>",
         escape(&message.source_id),
         attr(source, "chat_type"),
         attr(source, "chat_id"),
+        attr(source, "thread_id"),
         attr(source, "root_id"),
         attr(source, "parent_id"),
         attr(source, "create_time"),

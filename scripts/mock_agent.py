@@ -125,7 +125,8 @@ try:
             else:
                 source = event.attrib["source"] + ":" + event.attrib["event_id"]
                 to = "oc_fixture"
-            tool("send_md", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + source})
+            reply_anchor = {"reply_to_message_id": source} if envelope is not None and to == envelope.find("source").attrib["chat_id"] else {}
+            tool("send_md", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + source, **reply_anchor})
             if body == "fixture-create-schedule":
                 due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
                 tool("schedule_run", {"request_id":"fixture-schedule-run", "name":"MCP schedule", "prompt":"scheduled-via-mcp",
@@ -137,7 +138,7 @@ try:
                 tool("schedule_run", scheduled)
                 tool("schedule_run", scheduled)
             if "send-file" in text:
-                tool("send_file", {"to": to, "path": str(Path.cwd() / "report.txt"), "request_id": "file-" + source})
+                tool("send_file", {"to": to, "path": str(Path.cwd() / "report.txt"), "request_id": "file-" + source, **reply_anchor})
             if body == "fixture-steer-release":
                 assert held is not None, "Steering arrived without a live original run"
                 held = None

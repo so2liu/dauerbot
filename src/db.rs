@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
@@ -7,6 +7,94 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+
+/// Store the Agent's explicit destination and optional reply anchor unchanged.
+/// Callers authorize the current session inside this same database operation.
+pub(crate) fn enqueue_out_request(
+    c: &Connection,
+    project: &str,
+    app_id: &str,
+    request_id: &str,
+    content: &str,
+    mut attachment: serde_json::Value,
+) -> Result<String> {
+    use serde_json::{Value, json};
+    anyhow::ensure!(
+        !request_id.is_empty() && request_id.len() <= 200,
+        "request_id must contain 1 to 200 characters"
+    );
+    if attachment["reply_to_message_id"].is_null()
+        && let Some(object) = attachment.as_object_mut()
+    {
+        object.remove("reply_to_message_id");
+    }
+    let to = attachment["to"].as_str().context("Provide a recipient")?;
+    crate::feishu::recipient_type(to)?;
+    let previous: Option<(String, String, String)> = c
+        .query_row(
+            "SELECT id,content,attachment FROM messages
+         WHERE project_id=? AND direction='out' AND source_id=?",
+            params![project, request_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if previous.is_none()
+        && let Some(anchor) = attachment["reply_to_message_id"].as_str()
+    {
+        anyhow::ensure!(
+            anchor.starts_with("om_")
+                && anchor.len() <= 200
+                && anchor
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+            "Provide a valid reply_to_message_id from trusted message metadata"
+        );
+        // The reply endpoint ignores `to`; check one existing source/receipt so
+        // an accidental anchor cannot silently send into another conversation.
+        let known: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?
+             AND json_extract(attachment,'$.bot_app_id')=? AND (
+              (direction='in' AND (source_id=? OR json_extract(attachment,'$.source.root_id')=?
+                OR json_extract(attachment,'$.source.parent_id')=?) AND (
+                json_extract(attachment,'$.source.chat_id')=? OR (
+                  json_extract(attachment,'$.source.chat_type')='p2p' AND
+                  json_extract(attachment,'$.source.sender.open_id')=?))) OR
+              (direction='out' AND json_extract(attachment,'$.sent_message_id')=? AND (
+                json_extract(attachment,'$.to')=? OR json_extract(attachment,'$.sent_chat_id')=?))))",
+            params![project,app_id,anchor,anchor,anchor,to,to,anchor,to,to], |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            known,
+            "reply_to_message_id must belong to this project's bot and the explicit to recipient; use the original chat ID, or omit the anchor for a new discussion"
+        );
+    }
+    attachment["bot_app_id"] = json!(app_id);
+    if let Some((id, saved_content, raw)) = previous {
+        let mut saved: Value = serde_json::from_str(&raw)?;
+        if let Some(object) = saved.as_object_mut() {
+            for key in [
+                "sent_message_id",
+                "sent_chat_id",
+                "sent_thread_id",
+                "sent_root_id",
+            ] {
+                object.remove(key);
+            }
+        }
+        anyhow::ensure!(
+            saved_content == content && saved == attachment,
+            "This request_id refers to different content, recipient or reply anchor; use a new ID"
+        );
+        return Ok(id);
+    }
+    let key = id();
+    c.execute(
+        "INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
+         VALUES(?,?,'out',?,?,'pending',?,?,?)",
+        params![key,project,request_id,content,attachment.to_string(),now(),now()],
+    )?;
+    Ok(key)
+}
 
 pub fn now() -> i64 {
     SystemTime::now()
