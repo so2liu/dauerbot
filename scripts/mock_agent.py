@@ -47,6 +47,8 @@ else:
     marker.write_text(str(uuid.uuid4()))
 with (Path.cwd() / ".fixture-launches").open("a") as launches:
     launches.write(json.dumps({"resume": expected, "native": marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}) + "\n")
+while (Path.cwd() / ".fixture-mcp-hold").exists():
+    time.sleep(0.05)
 proc = subprocess.Popen([sys.argv[1], "mcp", "--credentials", sys.argv[2]],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 sequence = 0
@@ -66,8 +68,6 @@ def rpc(method, params=None):
     raise RuntimeError("MCP closed unexpectedly")
 
 
-while (Path.cwd() / ".fixture-mcp-hold").exists():
-    time.sleep(0.05)
 rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-fixture", "version": "2"}, "capabilities": {}})
 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 proc.stdin.flush()
