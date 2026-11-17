@@ -650,7 +650,16 @@ def main():
         FIXTURE.emit(message("om_schedule_tool", "fixture-create-schedule"))
         wait_for(lambda: "scheduled-via-mcp" in str(FIXTURE.messages), "schedule_run tool did not persist and fire its schedule")
         wait_for(settled, "MCP scheduled input did not settle through native idle")
+        assert next(t for t in api(f"/projects/{key}/timers") if t["name"] == "MCP schedule")["purpose"] == "user"
         checks.append("schedule_run creates a durable one-shot through real MCP and native idle releases its occurrence")
+        FIXTURE.emit(message("om_internal_schedule", "fixture-create-internal-schedule"))
+        wait_for(lambda: "scheduled-internal-via-mcp" in str(FIXTURE.messages), "internal schedule did not execute")
+        wait_for(settled, "internal scheduled input did not settle through native idle")
+        internal = [t for t in api(f"/projects/{key}/timers") if t["purpose"] == "internal"]
+        assert len(internal) == 1 and internal[0]["next_fire"] is None, internal
+        events = api(f"/projects/{key}/work")["events"]
+        assert len([e for e in events if e["payload"].get("timer_id") == internal[0]["id"]]) == 1
+        checks.append("explicit internal MCP one-shot executes and deduplicates retries while introspection preserves its purpose and occurrence")
 
         api(f"/projects/{key}/pause", {"paused":True})
         due = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=120)

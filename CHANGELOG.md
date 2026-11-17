@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Keep Agent-internal follow-ups and exhausted one-shots out of the desktop schedule list and count. Preserve paused future reminders, legacy unclassified schedules, execution history and creation retry IDs; classify new scheduled work through explicit purpose metadata (#54).
 - Automatically collect obsolete retained hfb companions in the background. Preserve active executions, persistent managed MCP commands, running binaries and the exact signed rollback companion; retired session archives no longer retain old executables (#52).
 - Retain each daemon's hfb companion at a private version, protocol and SHA-256 pinned path. App replacement cannot change new or recovered Agent commands. Historical daemons can use their original signed companion from the updater's preserved bundle; missing backups report `update_required` (#46).
 - Hold input for incompatible live Agent generations after a service handoff and offer an explicit project recovery action. Preserve native continuity, queued messages, uncertain effects and unrelated terminals; compatible generations remain running (#46).

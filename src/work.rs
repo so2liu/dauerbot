@@ -27,6 +27,9 @@ pub struct TimerInput {
     pub to: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
+    /// user for user-requested work, internal for Agent follow-ups; empty is unclassified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
 }
 fn utc() -> String {
     "UTC".into()
@@ -99,6 +102,8 @@ pub struct Timer {
     pub revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub purpose: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -174,7 +179,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
           interval_seconds INTEGER, cron TEXT NOT NULL DEFAULT '', timezone TEXT NOT NULL,
           to_id TEXT NOT NULL DEFAULT '', next_fire INTEGER, enabled INTEGER NOT NULL DEFAULT 1,
           revision INTEGER NOT NULL DEFAULT 1, request_id TEXT, request_payload TEXT NOT NULL DEFAULT '',
-          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, purpose TEXT NOT NULL DEFAULT '');
         CREATE UNIQUE INDEX IF NOT EXISTS work_timer_request ON work_timers(project_id,request_id) WHERE request_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS work_timer_due ON work_timers(enabled,next_fire);
         CREATE TABLE IF NOT EXISTS work_occurrences(
@@ -196,6 +201,19 @@ pub fn migrate(c: &Connection) -> Result<()> {
           PRIMARY KEY(project_id,generation));
         ",
     )?;
+    let has_purpose: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_timers') WHERE name='purpose')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_purpose {
+        // Legacy reminders stay unclassified and operational. Do not infer
+        // purpose from names, languages, recurrence kinds or occurrence history.
+        c.execute(
+            "ALTER TABLE work_timers ADD COLUMN purpose TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     let has_sequence: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_runs') WHERE name='native_seq')",
         [],
@@ -297,9 +315,10 @@ fn timer_row(r: &Row<'_>) -> rusqlite::Result<Timer> {
         revision: r.get(13)?,
         created_at: r.get(14)?,
         updated_at: r.get(15)?,
+        purpose: r.get(16)?,
     })
 }
-const TIMER: &str = "id,project_id,task_id,name,prompt,kind,at_ms,interval_seconds,cron,timezone,to_id,next_fire,enabled,revision,created_at,updated_at";
+const TIMER: &str = "id,project_id,task_id,name,prompt,kind,at_ms,interval_seconds,cron,timezone,to_id,next_fire,enabled,revision,created_at,updated_at,purpose";
 fn attention_row(r: &Row<'_>) -> rusqlite::Result<Attention> {
     Ok(Attention {
         id: r.get(0)?,
@@ -736,6 +755,10 @@ fn parse_at(value: &Value) -> Result<i64> {
 type TimerFields = (Option<i64>, Option<i64>, String, Option<i64>);
 fn timer_fields(input: &TimerInput, now: i64) -> Result<TimerFields> {
     ensure!(
+        matches!(input.purpose.as_str(), "" | "user" | "internal"),
+        "Schedule purpose must be user or internal"
+    );
+    ensure!(
         !input.name.trim().is_empty() && input.name.len() <= 240,
         "Schedule name must contain 1 to 240 bytes"
     );
@@ -809,9 +832,9 @@ pub fn create_timer(c: &Connection, project: &str, input: TimerInput, now: i64) 
         c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,to_id,status,created_at,updated_at)
             VALUES(?,?,?,?,?,'scheduled',?,?)", params![task,project,input.name.trim(),input.prompt,input.to.as_deref().unwrap_or(""),now,now])?;
         let id = crate::db::id();
-        c.execute("INSERT INTO work_timers(id,project_id,task_id,name,prompt,kind,at_ms,interval_seconds,cron,timezone,to_id,next_fire,request_id,request_payload,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![id,project,task,input.name.trim(),input.prompt,input.kind,at,interval,cron,input.timezone,
-          input.to.as_deref().unwrap_or(""),next,input.request_id,request_payload,now,now])?;
+        c.execute("INSERT INTO work_timers(id,project_id,task_id,name,prompt,kind,at_ms,interval_seconds,cron,timezone,to_id,next_fire,request_id,request_payload,created_at,updated_at,purpose)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![id,project,task,input.name.trim(),input.prompt,input.kind,at,interval,cron,input.timezone,
+          input.to.as_deref().unwrap_or(""),next,input.request_id,request_payload,now,now,input.purpose])?;
         timer(c, project, &id)
     })
 }
@@ -843,8 +866,13 @@ pub fn update_timer(
     transaction(c, |c| {
         let old = timer(c, project, id)?;
         cancel_timer_queue(c, id, old.revision, now)?;
-        c.execute("UPDATE work_timers SET name=?,prompt=?,kind=?,at_ms=?,interval_seconds=?,cron=?,timezone=?,to_id=?,next_fire=?,enabled=1,revision=revision+1,updated_at=? WHERE id=?",
-          params![input.name.trim(),input.prompt,input.kind,at,interval,cron,input.timezone,input.to.as_deref().unwrap_or(""),next,now,id])?;
+        let purpose = if input.purpose.is_empty() {
+            &old.purpose
+        } else {
+            &input.purpose
+        };
+        c.execute("UPDATE work_timers SET name=?,prompt=?,kind=?,at_ms=?,interval_seconds=?,cron=?,timezone=?,to_id=?,next_fire=?,enabled=1,revision=revision+1,updated_at=?,purpose=? WHERE id=?",
+          params![input.name.trim(),input.prompt,input.kind,at,interval,cron,input.timezone,input.to.as_deref().unwrap_or(""),next,now,purpose,id])?;
         c.execute(
             "UPDATE work_tasks SET title=?,instructions=?,to_id=?,updated_at=? WHERE id=?",
             params![

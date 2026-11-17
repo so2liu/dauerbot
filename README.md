@@ -130,7 +130,7 @@ The managed CLI starts `hfb mcp --credentials <private-file>` automatically.
 | --- | --- | --- |
 | `send_md` | `to`, `text`, `request_id` | Send Markdown to the chosen chat or user |
 | `send_file` | `to`, `path`, `request_id` | Stream a local file, up to 100 MB |
-| `schedule_run` | `request_id`, `name`, `prompt`, `kind`, `timezone`, schedule fields, optional `to` | Persist a once, interval, or cron run |
+| `schedule_run` | `request_id`, `name`, `prompt`, `kind`, `timezone`, schedule fields, `purpose` for new schedules, optional `to` | Persist a once, interval, or cron run; classify user work or internal follow-ups |
 
 `to` is mandatory for MCP sends: `oc_…` identifies a chat and `ou_…` a user Open ID. The agent follows user intent and may reply somewhere other than the source chat. Reuse `request_id` only when retrying the same content and destination. Only `status=sent` means the API confirmed the send. Files must resolve inside the project or Dauerbot cache; symlinks cannot escape those directories.
 
@@ -166,7 +166,11 @@ hfb event retry EVENT_ID
 hfb event dismiss EVENT_ID
 ```
 
-Schedules support once, interval and UNIX five-field cron expressions with IANA timezones. Recurring schedules coalesce missed occurrences after downtime and avoid overlap while their own input remains pending. Editing, disabling or deleting a timer cancels unsubmitted occurrences of its old revision. The native timer view retains enable/disable/delete controls.
+Schedules support once, interval and UNIX five-field cron expressions with IANA timezones. Recurring schedules coalesce missed occurrences after downtime and avoid overlap while their own input remains pending. Editing, disabling or deleting a timer cancels unsubmitted occurrences of its old revision.
+
+For new `schedule_run` requests, set `purpose` to `user` for work the user asked to schedule or `internal` for the Agent's own follow-up checks. Internal schedules execute and deduplicate normally. The desktop schedule rows and count show user work and unclassified legacy reminders that have a next occurrence; they omit internal follow-ups and exhausted one-shots. Paused future reminders remain visible with an Enable action. API/CLI listings and execution history retain all records.
+
+Legacy schedules have an empty, unclassified purpose. Migration leaves their names, enabled state, next occurrence, revisions and history intact; it never guesses purpose from titles, language or schedule kind, so existing future one-shots remain visible. Missing or empty purpose is accepted for compatible clients and retries and omitted from the canonical creation payload. Reuse the original payload and `request_id` on retries, including after an upgrade; adding an explicit purpose to a previous request is a different payload. Edits that omit purpose preserve the existing classification.
 
 Managed MCP exposes exactly `send_md`, `send_file`, and `schedule_run`; unmanaged sessions expose no project tools. MCP privately authenticates the project, generation and HERDR pane at startup. Stable request IDs deduplicate sends and schedule creation. Background execution belongs to HERDR and the Agent. There is no separate Dauerbot task or job registry.
 

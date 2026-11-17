@@ -1161,7 +1161,7 @@ impl Desktop {
                 )
                 .into_any_element();
         };
-        let timers = records(&self.timers, "timers");
+        let timers = visible_timers(&self.timers);
         let mut content = div()
             .flex()
             .flex_col()
@@ -1634,6 +1634,14 @@ fn timer_time(value: &Value, timezone: &str) -> String {
         .or_else(|| value.as_str().map(str::to_owned))
         .unwrap_or_default()
 }
+/// Missing/empty legacy purpose stays visible. Pause keeps next_fire so future
+/// reminders retain their Enable action; exhausted and deleted timers do not.
+fn visible_timers(value: &Value) -> Vec<Value> {
+    records(value, "timers")
+        .into_iter()
+        .filter(|timer| timer["purpose"] != "internal" && timer["next_fire"].as_i64().is_some())
+        .collect()
+}
 fn timer_description(timer: &Value, language: Language) -> String {
     let timezone = timer["timezone"].as_str().unwrap_or("UTC");
     let schedule = match timer["kind"].as_str().unwrap_or("") {
@@ -1827,5 +1835,31 @@ mod preference_tests {
         assert_eq!(reloaded.language, Language::Zh);
         assert_eq!(reloaded.page, 3);
         assert!(reloaded.bots.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::visible_timers;
+    use serde_json::json;
+
+    #[test]
+    fn rows_and_count_keep_paused_and_legacy_reminders_without_guessing_from_titles() {
+        let timers = json!([
+            {"id":"legacy-once","name":"Internal follow-up","kind":"once","enabled":true,"next_fire":100},
+            {"id":"legacy-empty","purpose":"","kind":"once","enabled":true,"next_fire":100},
+            {"id":"paused-user","purpose":"user","kind":"once","enabled":false,"next_fire":200},
+            {"id":"user-cron","purpose":"user","kind":"cron","enabled":true,"next_fire":300},
+            {"id":"internal","name":"Daily report","purpose":"internal","kind":"interval","enabled":true,"next_fire":100},
+            {"id":"internal-paused","purpose":"internal","kind":"once","enabled":false,"next_fire":100},
+            {"id":"completed-once","purpose":"user","kind":"once","enabled":false,"next_fire":null},
+            {"id":"legacy-completed","kind":"once","enabled":false,"next_fire":null},
+            {"id":"deleted-recurring","purpose":"user","kind":"cron","enabled":false,"next_fire":null}
+        ]);
+        let rows = visible_timers(&timers);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.iter().map(|t| t["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["legacy-once", "legacy-empty", "paused-user", "user-cron"]);
+        assert_eq!(rows[2]["enabled"], false, "The paused future reminder still has a usable Enable action");
     }
 }
