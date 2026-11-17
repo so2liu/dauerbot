@@ -25,6 +25,8 @@ struct Cli {
 enum Commands {
     #[command(hide = true)]
     CompanionIdentity,
+    #[command(hide = true)]
+    ServicePreflight,
     /// Initialize the private local data directory
     Init,
     /// Run the daemon in the foreground (or use launchd/systemd)
@@ -37,6 +39,14 @@ enum Commands {
         herdr_session: Option<String>,
         #[arg(long, hide = true)]
         feishu_base: Option<String>,
+        #[arg(long, hide = true)]
+        handover_control_fd: Option<i32>,
+        #[arg(long, hide = true)]
+        handover_listener_fd: Option<i32>,
+        #[arg(long, hide = true)]
+        handover_lock_fd: Option<i32>,
+        #[arg(long, hide = true)]
+        handover_id: Option<String>,
     },
     /// Show daemon, Feishu, and project status
     Status,
@@ -314,6 +324,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let dir = cli.data_dir.unwrap_or_else(config::default_dir);
+    #[cfg(unix)]
+    if let Commands::Serve {
+        handover_control_fd: Some(control),
+        handover_listener_fd: Some(listener),
+        handover_lock_fd: Some(lock),
+        handover_id: Some(id),
+        ..
+    } = &cli.command
+    {
+        return herdr_feishu_bridge::service::standby(dir, *control, *listener, *lock, id.clone())
+            .await;
+    }
+    if matches!(cli.command, Commands::ServicePreflight) {
+        print(&herdr_feishu_bridge::service::preflight(&dir)?);
+        return Ok(());
+    }
     config::private_dir(&dir)?;
     let dir = std::fs::canonicalize(dir).context("Cannot resolve the data directory")?;
     if let Commands::Ui = cli.command {
@@ -415,6 +441,7 @@ async fn main() -> Result<()> {
         herdr,
         herdr_session,
         feishu_base,
+        ..
     } = cli.command
     {
         if let Some(port) = port {
@@ -437,12 +464,18 @@ async fn main() -> Result<()> {
             .open(dir.join("daemon.lock"))?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .context("A daemon is already running for this data directory")?;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port))
-            .await
+        herdr_feishu_bridge::service::claim_restart(&dir)?;
+        // The desktop activation coordinator claims legacy bootstrap ownership
+        // here, after the lock and before any live-store initialization.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", cfg.port))
             .context("The management port is already in use")?;
+        listener.set_nonblocking(true)?;
         cfg.save(&dir)?;
         let app = App::new(dir.clone(), cfg.clone())?;
         app.companion()?;
+        app.service.attach(&listener, &lock)?;
+        app.service.started()?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
         app.workers();
         eprintln!(
             "Dauerbot {} · {} · data directory {}",
@@ -456,6 +489,7 @@ async fn main() -> Result<()> {
         );
         let shutdown = app.shutdown.clone();
         let stop = app.shutdown.clone();
+        let accept_stop = app.service.accept_stop.clone();
         let signal = async move {
             #[cfg(unix)]
             {
@@ -469,11 +503,15 @@ async fn main() -> Result<()> {
             }
             shutdown.cancel();
         };
-        axum::serve(listener, api::router(app))
+        axum::serve(listener, api::router(app.clone()))
             .with_graceful_shutdown(async move {
-                tokio::select! { _ = signal => {}, _ = stop.cancelled() => {} }
+                tokio::select! { _ = signal => {}, _ = stop.cancelled() => {}, _ = accept_stop.cancelled() => {} }
             })
             .await?;
+        if app.service.relay.load(std::sync::atomic::Ordering::SeqCst) {
+            app.shutdown.cancelled().await;
+        }
+        app.shutdown.cancel();
         drop(lock);
         return Ok(());
     }
@@ -582,7 +620,7 @@ async fn main() -> Result<()> {
             println!("[Unit]\nDescription=HERDR Feishu Bridge\nAfter=network-online.target\n\n[Service]\nExecStart=\"{}\" --data-dir \"{}\" serve\nRestart=on-failure\n\n[Install]\nWantedBy=default.target",exe.display(),dir.display());
             return Ok(())
         }
-        Commands::Serve{..}|Commands::Mcp{..}|Commands::Update{..}|Commands::Ui|Commands::CompanionIdentity=>unreachable!(),
+        Commands::Serve{..}|Commands::Mcp{..}|Commands::Update{..}|Commands::Ui|Commands::CompanionIdentity|Commands::ServicePreflight=>unreachable!(),
     };
     print(&value);
     Ok(())

@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, bail};
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, Request, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -43,6 +43,14 @@ pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()
         .route("/state", get(state))
         .route("/service/shutdown", post(shutdown_service))
+        .route("/service/activation/prepare", post(activation_prepare))
+        .route("/service/activation/commit", post(activation_commit))
+        .route("/service/activation/abort", post(activation_abort))
+        .route("/service/activation/status", get(activation_status))
+        .route(
+            "/service/activation/ingest",
+            post(activation_ingest).layer(DefaultBodyLimit::max(3 * 1024 * 1024)),
+        )
         .route("/settings", get(settings))
         .route("/conversations", get(conversations))
         .route("/projects", post(create_project))
@@ -87,6 +95,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/messages/{id}/retry", post(retry))
         .route("/messages/{id}/dismiss", post(dismiss))
+        .route_layer(middleware::from_fn_with_state(app.clone(), admission))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .nest("/api", api)
@@ -185,6 +194,136 @@ async fn auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Resp
     )
         .into_response()
 }
+async fn admission(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    let control = matches!(
+        req.uri().path(),
+        "/api/service/activation/prepare"
+            | "/api/service/activation/commit"
+            | "/api/service/activation/abort"
+            | "/api/service/activation/status"
+            | "/service/activation/prepare"
+            | "/service/activation/commit"
+            | "/service/activation/abort"
+            | "/service/activation/status"
+    );
+    if control {
+        return match tokio::spawn(async move {next.run(req).await}).await {
+            Ok(response)=>response,
+            Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":"Activation interrupted; inspect its durable status before retrying"}))).into_response(),
+        };
+    }
+    // Read-only probes remain available while an existing operation drains.
+    // Published MCP startup performs these before its registration request.
+    if req.method() == axum::http::Method::GET {
+        return next.run(req).await;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(95);
+    loop {
+        if let Some(permit) = app.service.gate.enter() {
+            return match crate::service::admitted(permit,async move {next.run(req).await}).await {
+                Ok(response)=>response,
+                Err(_)=>(StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":"The admitted operation ended without a result; verify its recorded outcome before retrying"}))).into_response(),
+            };
+        }
+        if app.service.relay.load(std::sync::atomic::Ordering::SeqCst) {
+            let state = app.service.state();
+            // Ownership may commit before the candidate opens its listener.
+            // Wait for serving ACK before forwarding an old accepted request.
+            if state["phase"] == "serving" {
+                return proxy_to_owner(app, req).await;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER,"1")], Json(json!({"error":"Service activation has not admitted this request; retry with the same request ID"}))).into_response();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+async fn proxy_to_owner(app: Arc<App>, req: Request) -> Response {
+    let cfg = app.config.read().await.clone();
+    let (parts, body) = req.into_parts();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let path = if path.starts_with("/api/") {
+        path.to_owned()
+    } else {
+        format!("/api{path}")
+    };
+    let mut request = app
+        .http
+        .request(parts.method, format!("{}{path}", cfg.url()))
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    for (name, value) in parts.headers.iter() {
+        if name != header::HOST && name != header::CONNECTION {
+            request = request.header(name, value);
+        }
+    }
+    match request.send().await {
+        Ok(response)=>{
+            let status=response.status();
+            let headers=response.headers().clone();
+            let mut result=Response::new(axum::body::Body::from_stream(response.bytes_stream()));
+            *result.status_mut()=status;
+            for (name,value) in headers.iter() {
+                if name!=header::CONNECTION && name!=header::TRANSFER_ENCODING {result.headers_mut().insert(name,value.clone());}
+            }
+            result
+        }
+        Err(_)=>(StatusCode::BAD_GATEWAY,Json(json!({"error":"The committed service did not return a result; preserve this request ID and verify its recorded outcome"}))).into_response(),
+    }
+}
+
+async fn activation_prepare(
+    State(app): State<Arc<App>>,
+    Json(input): Json<crate::service::Prepare>,
+) -> ApiResult {
+    Ok(Json(json!(crate::service::prepare(&app, input).await?)))
+}
+async fn activation_commit(
+    State(app): State<Arc<App>>,
+    Json(input): Json<crate::service::Activation>,
+) -> ApiResult {
+    Ok(Json(json!(
+        crate::service::commit(&app, &input.activation_id).await?
+    )))
+}
+async fn activation_abort(
+    State(app): State<Arc<App>>,
+    Json(input): Json<crate::service::Activation>,
+) -> ApiResult {
+    Ok(Json(json!(
+        crate::service::abort(&app, &input.activation_id).await?
+    )))
+}
+async fn activation_status(
+    State(app): State<Arc<App>>,
+    Query(input): Query<crate::service::Activation>,
+) -> ApiResult {
+    let mut value = json!(app.service.receipt(&input.activation_id)?);
+    value["owner_pid"] = json!(std::process::id());
+    Ok(Json(value))
+}
+async fn activation_ingest(
+    State(app): State<Arc<App>>,
+    Json(input): Json<crate::service::Ingest>,
+) -> ApiResult {
+    let binding = app
+        .db
+        .bots()
+        .await?
+        .into_iter()
+        .find(|b| b.project_id == input.project && b.app_id == input.app_id)
+        .context("The bot binding changed")?;
+    crate::feishu::ingest(
+        &app,
+        &binding,
+        &serde_json::to_vec(&input.payload).map_err(anyhow::Error::from)?,
+    )?;
+    Ok(Json(json!({"committed":true})))
+}
 async fn headers(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;
     let h = response.headers_mut();
@@ -234,7 +373,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         records.push(record);
     }
     Ok(Json(
-        json!({"projects":records,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL,"mcp_contracts":[crate::mcp::CONTRACT]}),
+        json!({"projects":records,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL,"mcp_contracts":[crate::mcp::CONTRACT],"service_activation":app.service.state()}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {

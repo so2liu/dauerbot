@@ -45,3 +45,6 @@ tempfile = "3"
 lto = "thin"
 strip = true
 codegen-units = 1
+
+[patch.crates-io]
+openlark-client = { path = "vendor/openlark-client" }

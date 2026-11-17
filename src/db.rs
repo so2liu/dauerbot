@@ -201,6 +201,13 @@ const MESSAGE: &str = "id,project_id,direction,source_id,content,status,error,at
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_mode(path, true)
+    }
+    /// A drained ownership transfer has no abandoned effects to reclassify.
+    pub fn open_handover(path: &Path) -> Result<Self> {
+        Self::open_mode(path, false)
+    }
+    fn open_mode(path: &Path, recover: bool) -> Result<Self> {
         let conn = Connection::open(path)?;
         #[cfg(unix)]
         {
@@ -251,7 +258,9 @@ impl Db {
         }
         crate::conversation::migrate(&migration)?;
         crate::bot::migrate(&migration)?;
-        migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
+        if recover {
+            migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
+        }
         crate::work::migrate(&migration)?;
         crate::handoff::migrate(&migration)?;
         migration.pragma_update(None, "user_version", 7)?;

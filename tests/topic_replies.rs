@@ -137,8 +137,10 @@ async fn explicit_anchors_keep_concurrent_text_and_file_replies_in_the_selected_
             Some("oc_elsewhere")
         ),
     );
-    assert_eq!(text.unwrap().status, "sent");
-    assert_eq!(file.unwrap().status, "sent");
+    let text = text.unwrap();
+    let file = file.unwrap();
+    assert_eq!(text.status, "sent", "{}", text.error);
+    assert_eq!(file.status, "sent", "{}", file.error);
     app.outbox_to(
         &project.id,
         "text",

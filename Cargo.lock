@@ -1536,8 +1536,6 @@ dependencies = [
 [[package]]
 name = "openlark-client"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "038c5a3adec75d491930ede8a9ae5bd77e0e83f13db40418a9aa3b2da8b97587"
 dependencies = [
  "base64 0.22.1",
  "futures-util",

@@ -11,6 +11,7 @@ pub mod handoff;
 pub mod herdr;
 pub mod mcp;
 pub mod native_children;
+pub mod service;
 pub mod update;
 pub mod work;
 pub mod workspace;
@@ -54,12 +55,24 @@ pub struct App {
     project_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     outbound_lock: Mutex<()>,
     companion: std::sync::OnceLock<companion::Retained>,
+    pub service: service::Service,
 }
 
 impl App {
-    pub fn new(dir: PathBuf, mut cfg: Config) -> Result<Arc<Self>> {
+    pub fn new(dir: PathBuf, cfg: Config) -> Result<Arc<Self>> {
+        Self::new_mode(dir, cfg, false)
+    }
+    pub fn new_handover(dir: PathBuf, cfg: Config) -> Result<Arc<Self>> {
+        Self::new_mode(dir, cfg, true)
+    }
+    fn new_mode(dir: PathBuf, mut cfg: Config, handover: bool) -> Result<Arc<Self>> {
         config::private_dir(&dir.join("files"))?;
-        let db = Db::open(&dir.join("bridge.sqlite3"))?;
+        let path = dir.join("bridge.sqlite3");
+        let db = if handover {
+            Db::open_handover(&path)?
+        } else {
+            Db::open(&path)?
+        };
         update::inherit_service_protocol(&dir, &db)?;
         if db.import_bot(&cfg.app_id, &cfg.app_secret)? {
             cfg.app_id.clear();
@@ -68,6 +81,7 @@ impl App {
         }
         let (settings_tx, _) = watch::channel(0);
         Ok(Arc::new(Self {
+            service: service::Service::new(&dir),
             dir,
             db,
             config: RwLock::new(cfg),
@@ -1112,11 +1126,18 @@ impl App {
         Ok(status == "submitted")
     }
     pub fn workers(self: &Arc<Self>) {
+        self.workers_with_ingress(None);
+    }
+    pub fn workers_with_ingress(self: &Arc<Self>, warm: Option<feishu::WarmIngress>) {
         let app = self.clone();
         tokio::spawn(async move {
             loop {
+                let Some(_permit) = app.service.gate.enter() else {
+                    break;
+                };
                 let worker = app.clone();
                 let result = tokio::task::spawn_blocking(move || {
+                    let _permit = _permit;
                     // Establish the daemon's lifetime lease before collection.
                     worker.companion()?;
                     companion::collect(&worker.dir, &worker.db)
@@ -1133,7 +1154,7 @@ impl App {
                 }
             }
         });
-        tokio::spawn(feishu::websocket(self.clone()));
+        tokio::spawn(feishu::websocket_with_warm(self.clone(), warm));
         let app = self.clone();
         tokio::spawn(async move {
             loop {
@@ -1161,6 +1182,9 @@ impl App {
         tokio::spawn(async move {
             loop {
                 tokio::select! {_=app.shutdown.cancelled()=>break,_=app.notify.notified()=>{},_=tokio::time::sleep(Duration::from_secs(2))=>{}}
+                let Some(_permit) = app.service.gate.enter() else {
+                    continue;
+                };
                 if let Err(error) = app
                     .db
                     .call(|c| {
@@ -1176,6 +1200,9 @@ impl App {
                     for p in projects {
                         let app = app.clone();
                         tokio::spawn(async move {
+                            let Some(_permit) = app.service.gate.enter() else {
+                                return;
+                            };
                             if let Err(error) = app.reconcile(&p.id).await {
                                 app.runtime
                                     .write()
@@ -1195,6 +1222,9 @@ impl App {
         tokio::spawn(async move {
             loop {
                 tokio::select! {_=app.shutdown.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
+                let Some(_permit) = app.service.gate.enter() else {
+                    continue;
+                };
                 if let Ok(messages) = app.db.pending("out").await {
                     for message in messages {
                         let _ = app.send_out(&message.id).await;
