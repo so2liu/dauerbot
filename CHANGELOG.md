@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Bundle a project-local Herdr delegation skill and maintain a small `AGENTS.md` delegation block for new workspaces and session launches. Preserve user instructions and edited or unowned resource collisions; prefer responsive native same-CLI delegation without changing global settings (#72).
+
 ## 0.4.7 — 2026-11-17
 
 ### Fixed

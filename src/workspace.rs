@@ -1,4 +1,4 @@
-//! App-owned workspaces. Existing folders are never seeded or modified.
+//! App-owned workspace allocation and initial durable instructions.
 use anyhow::{Context, Result, bail};
 use std::{
     fs,
@@ -47,6 +47,7 @@ fn create_under(root: &Path, name: &str, mut suffix: impl FnMut() -> String) -> 
             created_file = true;
             file.write_all(INSTRUCTIONS.as_bytes())?;
             file.sync_all()?;
+            crate::project_instructions::ensure(&path)?;
             Ok(())
         })();
         if let Err(error) = seeded {
@@ -101,9 +102,14 @@ mod tests {
             fs::read_to_string(existing.join("AGENTS.md")).unwrap(),
             "user rules"
         );
-        assert_eq!(
-            fs::read_to_string(path.join("AGENTS.md")).unwrap(),
-            INSTRUCTIONS
+        assert!(
+            fs::read_to_string(path.join("AGENTS.md"))
+                .unwrap()
+                .starts_with(INSTRUCTIONS)
+        );
+        assert!(
+            path.join(".dauerbot/skills/herdr-cli-subagents/SKILL.md")
+                .is_file()
         );
         assert_eq!(slug(" /../💬 "), "project");
         #[cfg(unix)]
