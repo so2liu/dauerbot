@@ -160,7 +160,7 @@ impl ProjectTools {
         }
         if matches!(
             project["cli_transition"]["phase"].as_str(),
-            Some("failed" | "uncertain")
+            Some("failed" | "startup_failed" | "uncertain" | "cancelled")
         ) {
             self.pending_cli = None;
         }
@@ -172,6 +172,11 @@ impl ProjectTools {
             self.pending_cli = None;
         }
         self.project = project.clone();
+        if project["cli_transition"]["phase"].is_string()
+            && self.message == "CLI handoff requested."
+        {
+            self.message.clear();
+        }
         self.language = language;
         if changed {
             cx.notify();
@@ -213,10 +218,11 @@ fn accept_reply(project: &Value, current: Option<&Ticket>, incoming: &Ticket) ->
 impl Render for ProjectTools {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let transition = &self.project["cli_transition"];
-        let switching = matches!(
-            transition["phase"].as_str(),
-            Some("preparing" | "requested" | "switching" | "starting" | "uncertain")
-        );
+        let switching = self.pending_cli.is_some()
+            || matches!(
+                transition["phase"].as_str(),
+                Some("preparing" | "requested" | "switching" | "starting" | "uncertain")
+            );
         let unavailable =
             self.project["paused"] == true || self.project["lifecycle"] == "taken_over";
         let status = match transition["phase"].as_str() {
@@ -228,7 +234,7 @@ impl Render for ProjectTools {
             {
                 "Selected CLI is ready."
             }
-            Some("failed" | "uncertain") => transition["error"]
+            Some("failed" | "startup_failed" | "uncertain") => transition["error"]
                 .as_str()
                 .unwrap_or("CLI handoff did not finish."),
             _ => "",
@@ -265,9 +271,20 @@ impl Render for ProjectTools {
                     ),
             );
         }
-        if transition["phase"]=="failed" && self.project["terminal"].is_null() && transition["target"]==self.project["agent"] {
-            let target=self.project["agent"].as_str().unwrap_or("").to_owned();
-            choices=choices.child(Button::new("retry-cli-start").small().label("Retry startup").disabled(unavailable||busy).on_click(cx.listener(move|this,_,_,cx|this.request(None,Some(target.clone()),cx))));
+        if transition["phase"] == "startup_failed"
+            && self.project["terminal"].is_null()
+            && transition["target"] == self.project["agent"]
+        {
+            let target = self.project["agent"].as_str().unwrap_or("").to_owned();
+            choices = choices.child(
+                Button::new("retry-cli-start")
+                    .small()
+                    .label(self.language.text("Retry startup"))
+                    .disabled(unavailable || busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request(None, Some(target.clone()), cx)
+                    })),
+            );
         }
         let mut documents = div().flex().flex_wrap().items_center().gap_2().child(
             div()
@@ -311,7 +328,7 @@ impl Render for ProjectTools {
             .child(choices)
             .child(documents);
         if !status.is_empty() {
-            view = view.child(div().text_sm().child(status.to_owned()));
+            view = view.child(div().text_sm().child(self.language.text(status)));
         }
         if unavailable {
             view =
@@ -320,7 +337,7 @@ impl Render for ProjectTools {
                 ));
         }
         if !self.message.is_empty() {
-            view = view.child(div().text_sm().child(self.message.clone()));
+            view = view.child(div().text_sm().child(self.language.text(&self.message)));
         }
         if let Some(document) = self.document {
             let mut pane = div()

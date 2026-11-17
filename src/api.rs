@@ -720,7 +720,7 @@ async fn register(
         authorize_session(c,&authority,&p.id)?;
         let terminal=p.terminal.as_deref().context("Execution is not running")?;
         let changed=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,
-          execution=CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END
+          execution=json_set(CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END,'$.mcp_registered',json('true'))
           WHERE id=?2 AND generation=?3 AND terminal=?4",rusqlite::params![native,p.id,input.generation,terminal])?;
         anyhow::ensure!(changed==1,"Session identity changed; reconnect MCP");
         if !native.is_empty(){

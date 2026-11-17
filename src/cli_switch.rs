@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
 
 const BUDGET_MS: i64 = 180_000;
@@ -55,7 +55,7 @@ fn pending_input(c: &Connection, project: &str) -> Result<bool> {
     Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?1 AND direction='in' AND status='queued') OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status='queued')",[project],|r|r.get(0))?)
 }
 pub fn cancel(c: &Connection, project: &str, error: &str) -> Result<()> {
-    c.execute("UPDATE cli_switch_requests SET phase='failed',error=? WHERE project_id=? AND phase IN ('preparing','requested','switching','starting','uncertain')",params![error,project])?;
+    c.execute("UPDATE cli_switch_requests SET phase='cancelled',error=? WHERE project_id=? AND phase IN ('preparing','requested','switching','starting','startup_failed','uncertain')",params![error,project])?;
     Ok(())
 }
 fn phase(c: &Connection, id: &str, value: &str, error: &str) -> Result<()> {
@@ -72,7 +72,7 @@ pub fn proof(r: &Request, text: Option<&str>, sequence: Option<i64>) -> bool {
             && handoff::fingerprint(Some(t)) != r.baseline
     }) && sequence.is_some_and(|s| s > r.sequence)
 }
-pub fn claim(c: &Connection, project: &str, r: &Request) -> Result<bool> {
+pub fn claim(c: &Connection, project: &str, r: &Request, accepted_hash: &str) -> Result<bool> {
     let tx = c.unchecked_transaction()?;
     if revision(&tx, project)? != r.revision
         || pending_input(&tx, project)?
@@ -88,7 +88,7 @@ pub fn claim(c: &Connection, project: &str, r: &Request) -> Result<bool> {
     if !valid {
         return Ok(false);
     }
-    let changed=tx.execute("UPDATE cli_switch_requests SET phase='switching' WHERE id=? AND phase='requested' AND nonce=?",params![r.id,r.nonce])?;
+    let changed=tx.execute("UPDATE cli_switch_requests SET phase='switching',baseline=? WHERE id=? AND phase='requested' AND nonce=?",params![accepted_hash,r.id,r.nonce])?;
     tx.commit()?;
     Ok(changed == 1)
 }
@@ -109,8 +109,8 @@ fn complete(c: &Connection, project: &str, r: &Request) -> Result<()> {
 }
 fn prompt(r: &Request) -> String {
     format!(
-        "<dauerbot_cli_switch request_id=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle current work and JOIN/SETTLE every native subagent and external worker before acknowledging. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, include this exact line: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Handle incoming user input immediately; it invalidates this request and a newer handoff request will follow. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
-        r.id, r.target, r.nonce
+        "<dauerbot_cli_switch request_id=\"{}\" handoff_nonce=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle current work and JOIN/SETTLE every native subagent and external worker before acknowledging. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, include this exact line: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Handle incoming user input immediately; it invalidates this request and a newer handoff request will follow. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
+        r.id, r.nonce, r.target, r.nonce
     )
 }
 async fn artifact(p: &Project) -> Result<Option<String>> {
@@ -129,11 +129,34 @@ impl App {
     pub(crate) async fn cli_switch_bootstrap(&self, project: &str) -> Result<String> {
         let id = project.to_owned();
         let r = self.db.call(move |c| latest(c, &id)).await?;
-        Ok(if r.is_some_and(|r| r.phase == "starting") {
-            " The user explicitly switched this project's CLI now. Read this project's AGENTS.md and HANDOFF.md before continuing the current goal. If HANDOFF.md is absent, this is a fresh workspace: use the project instructions and await user input. Preserve completed effects and request IDs; do not replay already delivered messages or work merely because this is a fresh native conversation.".into()
-        } else {
-            String::new()
+        Ok(
+            if r.is_some_and(|r| matches!(r.phase.as_str(), "starting" | "startup_failed")) {
+                " The user explicitly switched this project's CLI now. Read this project's AGENTS.md and HANDOFF.md before continuing the current goal. If HANDOFF.md is absent, this is a fresh workspace: use the project instructions and await user input. Preserve completed effects and request IDs; do not replay already delivered messages or work merely because this is a fresh native conversation.".into()
+            } else {
+                String::new()
+            },
+        )
+    }
+    /// A new target may report native idle while still displaying login. Do not
+    /// submit preserved input until its authenticated managed MCP has connected.
+    pub(crate) async fn cli_switch_waits_for_mcp(&self, p: &Project) -> Result<bool> {
+        if p.execution["mcp_registered"] == true {
+            return Ok(false);
+        }
+        let id = p.id.clone();
+        let r = self.db.call(move |c| latest(c, &id)).await?;
+        Ok(r.is_some_and(|r| {
+            matches!(r.phase.as_str(), "starting" | "startup_failed")
+                && p.execution["cli_switch_request"] == r.id
+        }))
+    }
+    pub(crate) async fn cli_switch_launch_id(&self, p: &Project) -> Result<Option<String>> {
+        let id = p.id.clone();
+        let r = self.db.call(move |c| latest(c, &id)).await?;
+        Ok(r.filter(|r| {
+            matches!(r.phase.as_str(), "starting" | "startup_failed") && r.target == p.agent
         })
+        .map(|r| r.id))
     }
     pub async fn request_cli_switch(self: &Arc<Self>, key: &str, target: &str) -> Result<Project> {
         ensure!(
@@ -173,7 +196,7 @@ impl App {
             && p.terminal.is_none()
             && previous
                 .as_ref()
-                .is_some_and(|r| r.phase == "failed" && r.target == target);
+                .is_some_and(|r| r.phase == "startup_failed" && r.target == target);
         if p.agent == target && !retry {
             return Ok(p);
         }
@@ -194,7 +217,12 @@ impl App {
         record: Option<&Value>,
     ) -> Result<bool> {
         let id = p.id.clone();
-        let Some(mut r) = self.db.call(move |c| latest(c, &id)).await?.filter(active) else {
+        let Some(mut r) = self.db.call(move |c| latest(c, &id)).await?.filter(|r| {
+            active(r)
+                || (r.phase == "startup_failed"
+                    && p.execution["cli_switch_request"] == r.id
+                    && p.terminal.is_some())
+        }) else {
             return Ok(false);
         };
         let id = p.id.clone();
@@ -204,7 +232,10 @@ impl App {
             .call(move |c| work::has_takeover(c, &id, &generation))
             .await?;
         if p.paused || takeover {
-            if matches!(r.phase.as_str(), "uncertain" | "switching" | "starting") {
+            if matches!(
+                r.phase.as_str(),
+                "uncertain" | "switching" | "starting" | "startup_failed"
+            ) {
                 self.set_phase(
                     p,
                     if p.paused { "paused" } else { "taken_over" },
@@ -216,6 +247,20 @@ impl App {
             self.fail_cli_switch(&r,"CLI handoff cancelled because the project was paused or terminal input was taken over.").await?;
             return Ok(false);
         }
+        if r.phase == "startup_failed" {
+            if p.execution["mcp_registered"] == true
+                && record.is_some_and(|v| {
+                    matches!(
+                        v["status"]["state"].as_str(),
+                        Some("idle" | "done" | "working")
+                    )
+                })
+            {
+                let id = r.id;
+                self.db.call(move |c| phase(c, &id, "ready", "")).await?;
+            }
+            return Ok(false);
+        }
         if r.phase == "uncertain" {
             // A lost stop response or restart after the claim cannot be retried.
             // Only a verified closed original execution permits target launch.
@@ -225,6 +270,12 @@ impl App {
                 && let Ok(observed) = herdr::observe(&cfg, p).await
                 && observed["state"] == "finished"
             {
+                let text = artifact(p).await?;
+                if handoff::fingerprint(text.as_deref()) != r.baseline {
+                    let id = r.id.clone();
+                    self.db.call(move|c|phase(c,&id,"uncertain","The accepted handoff changed after the stop boundary. The selected CLI has not been started; review HANDOFF.md and the saved execution.")).await?;
+                    return Ok(true);
+                }
                 let id = p.id.clone();
                 let rr = r.clone();
                 self.db.call(move |c| complete(c, &id, &rr)).await?;
@@ -236,7 +287,7 @@ impl App {
             return Ok(true);
         }
         if r.phase == "starting" && db::now() - r.created_at > BUDGET_MS {
-            self.fail_cli_switch(&r,"The selected CLI started but is not ready. Check its login or permissions in Terminal.").await?;
+            self.fail_cli_start(&r,"The selected CLI started but is not ready. Check its login or permissions in Terminal.").await?;
             return Ok(false);
         }
         if r.phase != "starting" && db::now() - r.created_at > BUDGET_MS {
@@ -244,6 +295,10 @@ impl App {
             return Ok(false);
         }
         if p.terminal.is_none() {
+            if r.phase != "starting" && !r.generation.is_empty() {
+                self.fail_cli_switch(&r,"The current Agent exited before its handoff was verified. Its CLI and saved native continuity were kept.").await?;
+                return Ok(false);
+            }
             if r.phase == "starting" {
                 self.start_cli_target(p, &r).await?;
                 return Ok(true);
@@ -295,6 +350,7 @@ impl App {
                 return Ok(false);
             }
             if p.ready
+                && p.execution["mcp_registered"] == true
                 && matches!(
                     record["status"]["state"].as_str(),
                     Some("idle" | "done" | "working")
@@ -305,7 +361,7 @@ impl App {
                 return Ok(false);
             }
             if db::now() - r.created_at > BUDGET_MS {
-                self.fail_cli_switch(&r,"The selected CLI started but is not ready. Check its login or permissions in Terminal.").await?;
+                self.fail_cli_start(&r,"The selected CLI started but is not ready. Check its login or permissions in Terminal.").await?;
                 return Ok(false);
             }
             self.set_phase(p, "switching_cli", record.clone()).await;
@@ -326,7 +382,19 @@ impl App {
                 self.fail_cli_switch(&r,"New input kept changing the handoff. The current CLI was kept; select the new CLI again when ready.").await?;
                 return Ok(false);
             }
-            let text = artifact(p).await?;
+            let text = match artifact(p).await {
+                Ok(text) => text,
+                Err(error) => {
+                    self.fail_cli_switch(
+                        &r,
+                        &format!(
+                            "Cannot read a safe project handoff: {error}. The current CLI was kept."
+                        ),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+            };
             let baseline = handoff::fingerprint(text.as_deref());
             let nonce = db::id();
             let sequence = record["state_change_seq"].as_i64().ok_or_else(|| {
@@ -360,7 +428,19 @@ impl App {
         self.db
             .call(move |c| work::observe_idle(c, &id, &generation, seq, db::now()))
             .await?;
-        let text = artifact(p).await?;
+        let text = match artifact(p).await {
+            Ok(text) => text,
+            Err(error) => {
+                self.fail_cli_switch(
+                    &r,
+                    &format!(
+                        "Cannot read a safe project handoff: {error}. The current CLI was kept."
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
         if !proof(&r, text.as_deref(), record["state_change_seq"].as_i64()) {
             return Ok(true);
         }
@@ -390,9 +470,24 @@ impl App {
         {
             return Ok(true);
         }
+        let final_text = artifact(p).await?;
+        if handoff::fingerprint(final_text.as_deref()) != handoff::fingerprint(text.as_deref())
+            || !proof(
+                &r,
+                final_text.as_deref(),
+                final_check["state_change_seq"].as_i64(),
+            )
+        {
+            return Ok(true);
+        }
         let id = p.id.clone();
         let rr = r.clone();
-        if !self.db.call(move |c| claim(c, &id, &rr)).await? {
+        let accepted_hash = handoff::fingerprint(final_text.as_deref());
+        if !self
+            .db
+            .call(move |c| claim(c, &id, &rr, &accepted_hash))
+            .await?
+        {
             return Ok(true);
         }
         if let Err(e) = herdr::stop(cfg, p).await {
@@ -418,6 +513,13 @@ impl App {
         self.notify.notify_one();
         Ok(true)
     }
+    async fn fail_cli_start(&self, r: &Request, error: &str) -> Result<()> {
+        let id = r.id.clone();
+        let error = error.to_owned();
+        self.db
+            .call(move |c| phase(c, &id, "startup_failed", &error))
+            .await
+    }
     async fn fail_cli_switch(&self, r: &Request, error: &str) -> Result<()> {
         let id = r.id.clone();
         let error = error.to_owned();
@@ -435,7 +537,7 @@ impl App {
             return Ok(());
         }
         if let Err(e) = self.start_inner(&p.id, false).await {
-            self.fail_cli_switch(r,&format!("The CLI selection was saved, but startup failed: {e}. Workspace files and saved input are preserved.")).await?;
+            self.fail_cli_start(r,&format!("The CLI selection was saved, but startup failed: {e}. Workspace files and saved input are preserved.")).await?;
             self.attention(p, "startup", &e.to_string()).await?;
         }
         self.set_phase(p, "switching_cli", Value::Null).await;
@@ -507,10 +609,10 @@ mod tests {
         app.db.sync(|c|{
             let stale=requested(c,&p)?;
             c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('before',?,'in','before','new input','queued',1,1)",[&p.id])?;
-            assert!(!claim(c,&p.id,&stale)?);
+            assert!(!claim(c,&p.id,&stale,"accepted")?);
             c.execute("UPDATE messages SET status='delivered' WHERE id='before'",[])?;
             let fresh=requested(c,&p)?;
-            assert!(claim(c,&p.id,&fresh)?);
+            assert!(claim(c,&p.id,&fresh,"accepted")?);
             c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('after',?,'in','after','new input','queued',2,2)",[&p.id])?;
             complete(c,&p.id,&fresh)?;
             assert_eq!(c.query_row("SELECT status FROM messages WHERE id='after'",[],|r|r.get::<_,String>(0))?,"queued");
@@ -526,13 +628,96 @@ mod tests {
         assert_eq!(changed.path, p.path);
     }
     #[tokio::test]
+    async fn lost_source_execution_cannot_be_mistaken_for_an_originally_sleeping_project() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "pi").await.unwrap();
+        app.db
+            .set_session(&p.id, None, None, String::new())
+            .await
+            .unwrap();
+        let exited = app.db.project(&p.id).await.unwrap();
+        assert!(!app.advance_cli_switch(&exited, None, None).await.unwrap());
+        assert_eq!(app.db.project(&p.id).await.unwrap().agent, "codex");
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
+                .unwrap(),
+            "failed"
+        );
+    }
+    #[tokio::test]
+    async fn selected_generation_waits_for_mcp_and_late_registration_resolves_startup_error() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "pi").await.unwrap();
+        let id = app
+            .db
+            .sync(|c| {
+                let r = latest(c, &p.id)?.unwrap();
+                phase(c, &r.id, "starting", "")?;
+                Ok(r.id)
+            })
+            .unwrap();
+        assert!(
+            !app.cli_switch_waits_for_mcp(&p).await.unwrap(),
+            "old generation must keep receiving steering"
+        );
+        app.db.sync(|c|{c.execute("UPDATE projects SET agent='pi',generation='new-gen',execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?) WHERE id=?",params![id,p.id])?;c.execute("UPDATE cli_switch_requests SET phase='starting',created_at=0 WHERE id=?",[&id])?;Ok(())}).unwrap();
+        let waiting = app.db.project(&p.id).await.unwrap();
+        assert!(app.cli_switch_waits_for_mcp(&waiting).await.unwrap());
+        assert!(!app.advance_cli_switch(&waiting, None, None).await.unwrap());
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
+                .unwrap(),
+            "startup_failed"
+        );
+        app.db.pause(&p.id, true).await.unwrap();
+        assert!(
+            app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
+                .unwrap(),
+            "startup_failed"
+        );
+        app.db.pause(&p.id, false).await.unwrap();
+        app.db.sync(|c|{c.execute("UPDATE projects SET execution=json_set(execution,'$.mcp_registered',json('true')) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
+        let connected = app.db.project(&p.id).await.unwrap();
+        assert!(!app.cli_switch_waits_for_mcp(&connected).await.unwrap());
+        assert!(
+            !app.advance_cli_switch(
+                &connected,
+                None,
+                Some(&serde_json::json!({"status":{"state":"idle"}}))
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
+                .unwrap(),
+            "ready"
+        );
+        app.db.sync(|c|{phase(c,&id,"startup_failed","old attempt")?;c.execute("UPDATE projects SET generation='unrelated',execution=json_object('api_protocol',7,'mcp_contract',1) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
+        assert!(
+            !app.cli_switch_waits_for_mcp(&app.db.project(&p.id).await.unwrap())
+                .await
+                .unwrap(),
+            "unrelated later generation is outside this transition"
+        );
+    }
+    #[tokio::test]
     async fn pause_after_claim_keeps_uncertain_execution_fenced_without_startup() {
         let (_dir, app, p) = fixture().await;
         app.request_cli_switch(&p.id, "pi").await.unwrap();
         app.db
             .sync(|c| {
                 let r = requested(c, &p)?;
-                assert!(claim(c, &p.id, &r)?);
+                assert!(claim(c, &p.id, &r, "accepted")?);
                 phase(c, &r.id, "uncertain", "Lost stop response")?;
                 Ok(())
             })
@@ -559,8 +744,8 @@ mod tests {
             let r=requested(c,&p)?;let text=format!("# Handoff\n{}\n<!-- dauerbot-switch-ready:fresh -->","Settled all children and external work; continue the current user goal without replaying completed effects. ".repeat(2));
             assert!(!proof(&r,Some(&text),Some(10)));assert!(proof(&r,Some(&text),Some(11)));
             assert!(!proof(&r,Some(&text.replace("fresh","stale")),Some(11)));
-            work::set_takeover(c,&p.id,&p.generation,true,1)?;assert!(!claim(c,&p.id,&r)?);work::set_takeover(c,&p.id,&p.generation,false,2)?;
-            assert!(claim(c,&p.id,&r)?);Ok(())
+            work::set_takeover(c,&p.id,&p.generation,true,1)?;assert!(!claim(c,&p.id,&r,"accepted")?);work::set_takeover(c,&p.id,&p.generation,false,2)?;
+            assert!(claim(c,&p.id,&r,"accepted")?);Ok(())
         }).unwrap();
         drop(app);
         let reopened = crate::db::Db::open(&dir.path().join("bridge.sqlite3")).unwrap();

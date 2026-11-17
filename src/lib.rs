@@ -260,6 +260,9 @@ impl App {
         if let Some(dir) = child_adapter {
             execution["child_adapter"] = json!(dir);
         }
+        if let Some(request) = self.cli_switch_launch_id(&p).await? {
+            execution["cli_switch_request"] = json!(request);
+        }
         execution["api_protocol"] = json!(api::PROTOCOL);
         execution["mcp_contract"] = json!(mcp::CONTRACT);
         execution["companion"] = json!(self.companion()?);
@@ -873,6 +876,15 @@ impl App {
                 .is_some_and(|e| db::now() - e.created_at > 90_000);
             if old {
                 self.attention(&p,"not_ready","The Agent has not connected to Dauerbot yet. Check login and MCP setup in its terminal.").await?;
+            }
+            return Ok(());
+        }
+        if self.cli_switch_waits_for_mcp(&p).await? {
+            if !self
+                .advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?
+            {
+                self.set_phase(&p, "needs_attention", record).await;
             }
             return Ok(());
         }

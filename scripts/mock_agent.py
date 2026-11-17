@@ -66,6 +66,8 @@ def rpc(method, params=None):
     raise RuntimeError("MCP closed unexpectedly")
 
 
+while (Path.cwd() / ".fixture-mcp-hold").exists():
+    time.sleep(0.05)
 rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-fixture", "version": "2"}, "capabilities": {}})
 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 proc.stdin.flush()
@@ -99,8 +101,7 @@ try:
                 if mode.exists() and mode.read_text() == "hold":
                     (Path.cwd() / ".fixture-switch-held").write_text(event.attrib["request_id"])
                     continue
-                import re
-                nonce = re.search(r"dauerbot-switch-ready:([a-zA-Z0-9-]+)", event.text).group(1)
+                nonce = event.attrib["handoff_nonce"]
                 text = "# CLI handoff\n\nAll native children and external workers have been settled. Continue the current fixture goal from this workspace. Preserve completed effects and never replay earlier replies.\n"
                 if not mode.exists() or mode.read_text() != "stale":
                     text += "<!-- dauerbot-switch-ready:" + nonce + " -->\n"
