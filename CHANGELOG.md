@@ -1,10 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.4.8 — 2026-11-17
 
 ### Added
 
 - Bundle a project-local Herdr delegation skill and maintain a small `AGENTS.md` delegation block for new workspaces and session launches. Preserve user instructions and edited or unowned resource collisions; prefer responsive native same-CLI delegation without changing global settings (#72).
+- Switch Codex, Claude Code, Pi or Antigravity immediately from the project view. The current Agent settles its work and children, writes a fresh `HANDOFF.md`, then the selected CLI starts in the same workspace. Preserve files, schedules, bot settings and queued input; deliver input after the selected CLI establishes its authenticated MCP connection (#70, #76).
+- Read rendered `HANDOFF.md` and `AGENTS.md` directly in the native project view, with clear states for missing or unreadable documents (#70).
+
+### Fixed
+
+- Activate signed updates automatically after the new native window and service pass readiness checks. Preserve the latest window state and drafts, transfer service ownership, then publish the new interface and retire the old processes. Precommit failures restore the previous app; committed updates recover through the successor and latest journal (#66).
+- Keep supported Agent MCP processes and native conversations running across service updates. Separate the stable three-tool MCP contract from the desktop API, and defer activation when an active contract cannot be hosted safely (#67).
+- Transfer the existing listener and exclusive journal/effect ownership to a prepared successor. Warm Feishu transports before capable handover, drain accepted work, and preserve queued input, deduplication and uncertain effects (#68).
+
+### Changed
+
+- Simplify Updates to progress, results and normal update actions. The first launch after a published 0.4.7 update performs a bounded automatic bootstrap; later capable versions use verified handover (#66).
+- Keep explicit CLI switching cooperative: require a fresh ready acknowledgement and a later native idle transition, retain the supported managed Pi dispatch fence, and leave automatic idle retirement's stricter child-coverage checks unchanged (#76).
+- Advance both application crates to 0.4.8 and bundle build 13. Keep API protocol 7 and the three Agent tools unchanged.
 
 ## 0.4.7 — 2026-11-17
 
