@@ -30,6 +30,7 @@ def digest(path):
 
 def verify_app(version):
     app = ROOT / "dist/Dauerbot.app"
+    subprocess.run(["python3", str(ROOT / "scripts/bundle-herdr.py"), "verify", str(app)], check=True)
     with (app / "Contents/Info.plist").open("rb") as source:
         info = plistlib.load(source)
     if (info["CFBundleShortVersionString"], info["CFBundleIdentifier"]) != (

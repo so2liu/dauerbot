@@ -10,5 +10,6 @@ cp packaging/Info.plist "$bundle/Contents/Info.plist"
 cp desktop/target/release/HerdrBridge "$bundle/Contents/MacOS/HerdrBridge"
 cp desktop/target/release/hfb "$bundle/Contents/MacOS/hfb"
 if [[ -f packaging/AppIcon.icns ]]; then cp packaging/AppIcon.icns "$bundle/Contents/Resources/AppIcon.icns"; fi
+python3 scripts/bundle-herdr.py fetch "$bundle"
 ./scripts/sign-macos.sh "$bundle" "${1:--}" "${2:-}"
 printf 'Built: %s\n' "$bundle"

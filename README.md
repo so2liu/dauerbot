@@ -6,11 +6,11 @@ One bot belongs to one project with one active agent. Direct messages and group 
 
 ## Install
 
-Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. Version 0.4.0 requires **`herdr` 0.9.5** and embeds its terminal directly. Earlier Dauerbot releases used HERDR Core (`hc`) and Herdr App; that execution backend is no longer supported. Sign in to the native Agent CLI you want to use; Dauerbot keeps its existing login and model settings.
+Download the Apple Silicon package from [GitHub Releases](https://github.com/so2liu/dauerbot/releases), extract it, and move `Dauerbot.app` to Applications. The app includes the supported **HERDR 0.9.5** runtime and provisions it offline on first use when HERDR is missing. No separate HERDR installation is needed. Compatible existing installations continue to work; explicit `herdr` paths and `herdr_config` settings are preserved. An incompatible configured runtime produces a diagnostic instead of restarting an existing server. Sign in to the native Agent CLI you want to use; Dauerbot keeps its existing login and model settings.
 
 Starting with 0.3.2, releases require Developer ID Application signing, Apple notarization, a stapled ticket, and Gatekeeper acceptance before publication. Intel builds and the minimum supported macOS version have not been verified.
 
-Dauerbot uses the MIT license. It is an independent project with no official affiliation with HERDR, Feishu, or the CLI vendors.
+Dauerbot uses the MIT license. Bundled HERDR uses Apache-2.0; its attribution and applicable vendored licenses are included in `Contents/Resources/herdr/`. It is an independent project with no official affiliation with HERDR, Feishu, or the CLI vendors.
 
 ## Connect your bot
 
@@ -46,7 +46,7 @@ Use `--data-dir` for an independent instance. Its window shows an independent-in
 open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
 ```
 
-Each data directory derives its own dedicated HERDR session. Normal schema upgrades preserve existing projects, credentials, native history references, messages and explicit pauses. Product execution uses only legacy herdr 0.9.5.
+Each data directory derives its own dedicated HERDR session. App-managed runtime copies live under `runtime/herdr/0.9.5/<signed-payload-sha256>/herdr` in that directory. Installation uses a process lock and atomic rename, preserves older runtime paths across app updates/moves, and does not edit shell profiles or global PATH. Each Agent execution receives the resolved runtime directory in its own PATH after login-shell startup. Missing or corrupt owned copies are repaired from the verified bundle; symlink targets are rejected. User-owned executables and configuration files are never replaced. Normal schema upgrades preserve existing projects, credentials, native history references, messages and explicit pauses. Product execution uses only legacy herdr 0.9.5.
 
 ## Build and develop
 
