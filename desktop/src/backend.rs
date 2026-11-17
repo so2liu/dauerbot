@@ -4,7 +4,11 @@ use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -34,7 +38,7 @@ pub enum CommandRequest {
     Folder(PathBuf),
     Database(PathBuf),
     Environment,
-    RestartService,
+    Update(crate::updater::Action),
     UpdatePreferences {
         automatic: bool,
         channel: String,
@@ -67,13 +71,20 @@ pub enum Reply {
     Connection(Option<String>),
     Update(Value),
     Restart,
+    ActivationFreeze {
+        reply: mpsc::Sender<Result<Value>>,
+        freeze: bool,
+    },
+    ActivationResume,
 }
 
 pub struct Backend {
     pub tx: mpsc::Sender<CommandRequest>,
     pub rx: mpsc::Receiver<Reply>,
     pub dir: PathBuf,
-    pub updates: mpsc::Sender<crate::updater::Action>,
+    pub activation_pause: Arc<AtomicBool>,
+    pub frontend_ready: Arc<AtomicBool>,
+    pub candidate_ready: Option<Arc<AtomicBool>>,
 }
 impl Backend {
     /// Preserve ordering with an in-flight acquisition, while keeping shutdown bounded.
@@ -92,12 +103,39 @@ impl Backend {
         receiver
     }
     pub fn start(dir: PathBuf) -> Self {
+        Self::start_mode(dir, None)
+    }
+    pub fn start_mode(
+        dir: PathBuf,
+        candidate: Option<(Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>)>,
+    ) -> Self {
+        let candidate_ready = candidate.as_ref().map(|candidate| candidate.2.clone());
         let (tx, requests) = mpsc::channel();
         let (replies, rx) = mpsc::channel();
-        let updates = crate::updater::start(dir.clone(), replies.clone());
+        let startup_updates = Arc::new(AtomicBool::new(false));
+        let update_ready = startup_updates.clone();
+        let updates = crate::updater::start(
+            dir.clone(),
+            replies.clone(),
+            Some(
+                candidate
+                    .as_ref()
+                    .map(|c| c.1.clone())
+                    .unwrap_or(startup_updates),
+            ),
+        );
         let updater = updates.clone();
+        let activation_pause = Arc::new(AtomicBool::new(false));
+        let pause = activation_pause.clone();
+        let frontend_ready = Arc::new(AtomicBool::new(false));
+        let ready = frontend_ready.clone();
         let data = dir.clone();
         std::thread::spawn(move || {
+            if let Some((gate, _, _)) = &candidate {
+                while !gate.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
             let runtime = tokio::runtime::Runtime::new().expect("runtime");
             let result = runtime.block_on(async {
                 config::private_dir(&data)?;
@@ -120,7 +158,15 @@ impl Backend {
                     .connect_timeout(Duration::from_secs(1))
                     .timeout(Duration::from_secs(3))
                     .build()?;
-                ensure_service(&data, &cfg, &probe, false).await?;
+                while !ready.load(Ordering::Acquire) { tokio::time::sleep(Duration::from_millis(25)).await; }
+                match ensure_service(&data, &cfg, &probe, false).await {
+                    Ok(()) => update_ready.store(true, Ordering::Release),
+                    Err(error) => {
+                        // Keep observing: preparation, transport readiness or an uncertain
+                        // control ACK must not permanently disable the desktop worker.
+                        let _ = replies.send(Reply::Error(format!("{error:#}")));
+                    }
+                }
                 let mut connection = ConnectionState::default();
                 let mut last_restart = std::time::Instant::now() - Duration::from_secs(10);
                 let mut last_state = Value::Null;
@@ -128,6 +174,20 @@ impl Backend {
                 let mut lease_checked = std::time::Instant::now();
                 loop {
                     match requests.recv_timeout(Duration::from_millis(1200)) {
+                        Ok(CommandRequest::Update(action)) => {
+                            let retry = async {
+                                let executable = std::env::current_exe()?.with_file_name("hfb");
+                                if authorize_bootstrap_retry(&data, &executable)? {
+                                    ensure_service(&data, &cfg, &probe, false).await?;
+                                    update_ready.store(true, Ordering::Release);
+                                }
+                                Ok::<(), anyhow::Error>(())
+                            }.await;
+                            match retry {
+                                Ok(()) => { let _ = updater.send(action); }
+                                Err(error) => { let _ = replies.send(Reply::Update(json!({"phase":"error","message":format!("{error:#}")}))); }
+                            }
+                        }
                         Ok(CommandRequest::Api {
                             method,
                             path,
@@ -188,19 +248,6 @@ impl Backend {
                         Ok(CommandRequest::Environment) => {
                             let _ = replies.send(Reply::Environment(environment(&cfg, &data)));
                         }
-                        Ok(CommandRequest::RestartService) => {
-                            match ensure_service(&data, &cfg, &probe, true).await {
-                                Ok(()) => {
-                                    last_state = Value::Null;
-                                    let _ = replies.send(Reply::Done {
-                                        path: "/service/restart".into(),
-                                        value: Value::Null,
-                                        message: "Background service updated. Compatible Agents keep running; other projects show a recovery action.".into(),
-                                    });
-                                }
-                                Err(error) => { let _ = replies.send(Reply::Error(format!("{error:#}"))); }
-                            }
-                        }
                         Ok(CommandRequest::UpdatePreferences { automatic, channel }) => {
                             let result =
                                 herdr_feishu_bridge::update::Preferences { automatic, channel }
@@ -236,6 +283,7 @@ impl Backend {
                     }
                     match request(&probe, &cfg, "GET", "/state", None).await {
                         Ok(state) => {
+                            if service_healthy(&state) { update_ready.store(true, Ordering::Release); }
                             if let Some(reply) = connection.observe(None) {
                                 let _ = replies.send(reply);
                             }
@@ -248,7 +296,7 @@ impl Backend {
                             if let Some(reply) = connection.observe(Some(format!("{e:#}"))) {
                                 let _ = replies.send(reply);
                             }
-                            if connection_refused(&e)
+                            if !pause.load(Ordering::Acquire) && connection_refused(&e)
                                 && last_restart.elapsed() >= Duration::from_secs(10)
                             {
                                 last_restart = std::time::Instant::now();
@@ -257,7 +305,7 @@ impl Backend {
                                     cfg = current;
                                 }
                                 if request(&probe, &cfg, "GET", "/state", None).await.is_err()
-                                    && let Err(error) = spawn_service(&data)
+                                    && let Err(error) = ensure_service(&data, &cfg, &probe, false).await
                                     && let Some(reply) = connection
                                         .observe(Some(format!("Daemon restart failed: {error:#}")))
                                 {
@@ -277,7 +325,9 @@ impl Backend {
             tx,
             rx,
             dir,
-            updates,
+            activation_pause,
+            frontend_ready,
+            candidate_ready,
         }
     }
 }
@@ -299,8 +349,8 @@ fn connection_refused(error: &anyhow::Error) -> bool {
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_connect)
 }
-// Reopening the desktop must not interrupt an authenticated, compatible daemon.
-// An explicit service update opts into a bounded stop/start and its reconnection gap.
+// Source builds only attach. Trusted installed applications activate a prepared
+// successor automatically; published services use the explicit bootstrap boundary.
 async fn ensure_service(
     data: &std::path::Path,
     cfg: &Config,
@@ -309,66 +359,353 @@ async fn ensure_service(
 ) -> Result<()> {
     match request(probe, cfg, "GET", "/state", None).await {
         Ok(state) => {
-            if state["projects"].is_array() {
-                herdr_feishu_bridge::update::record_service(data, &state)?;
-            }
-            if !restart
-                && state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL)
-            {
-                return Ok(());
-            }
-            if let Some(version) = state["version"].as_str() {
-                anyhow::ensure!(
-                    !herdr_feishu_bridge::update::is_newer(
-                        version,
-                        herdr_feishu_bridge::update::CURRENT
-                    )?,
-                    "The running background service is newer than this app. Use the newer app instead of downgrading its service."
-                );
-                if version == herdr_feishu_bridge::update::CURRENT
-                    && state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL)
-                {
-                    return Ok(());
-                }
-            }
             let signed = herdr_feishu_bridge::update::bundle().is_some_and(|bundle| {
                 herdr_feishu_bridge::update::verify_bundle(&bundle, None).is_ok()
             });
-            if !signed {
-                bail!(
-                    "Updating the background service requires a trusted installed Dauerbot app. Quit an incompatible daemon before starting this build, or use --data-dir for an independent instance."
-                );
+            let protocol_matches =
+                state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL);
+            if !restart && protocol_matches && !signed {
+                return Ok(());
             }
-            herdr_feishu_bridge::update::stop_service(data, cfg).await?;
+            let current = herdr_feishu_bridge::update::CURRENT;
+            if let Some(version) = state["version"].as_str() {
+                anyhow::ensure!(
+                    !herdr_feishu_bridge::update::is_newer(version, current)?,
+                    "The running background service is newer than this app. Use the newer app instead of downgrading its service."
+                );
+                if version == current
+                    && protocol_matches
+                    && state["service_activation"]["capability"] == 1
+                {
+                    return wait_for_service(data, cfg, probe, None).await;
+                }
+            }
+            anyhow::ensure!(
+                signed,
+                "Updating the background service requires a trusted installed Dauerbot app. Use --data-dir for an independent development instance."
+            );
+            let projects = state["projects"]
+                .as_array()
+                .context("The current app did not provide its session state")?;
+            herdr_feishu_bridge::mcp::check_activation(
+                projects,
+                herdr_feishu_bridge::api::PROTOCOL,
+            )?;
+            herdr_feishu_bridge::update::record_service(data, &state)?;
+            if state["service_activation"]["capability"] == 1 {
+                let id = uuid::Uuid::new_v4().to_string();
+                let executable = std::env::current_exe()?.with_file_name("hfb");
+                let control = reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(Duration::from_secs(2))
+                    .timeout(Duration::from_secs(110))
+                    .build()?;
+                request(
+                    &control,
+                    cfg,
+                    "POST",
+                    "/service/activation/prepare",
+                    Some(json!({"activation_id":id,"candidate_executable":executable})),
+                )
+                .await?;
+                let receipt = request(
+                    &control,
+                    cfg,
+                    "POST",
+                    "/service/activation/commit",
+                    Some(json!({"activation_id":id})),
+                )
+                .await;
+                let receipt = match receipt {
+                    Ok(value) => value,
+                    Err(_) => {
+                        request(
+                            probe,
+                            cfg,
+                            "GET",
+                            &format!("/service/activation/status?activation_id={id}"),
+                            None,
+                        )
+                        .await?
+                    }
+                };
+                anyhow::ensure!(
+                    receipt["owner_committed"] == true && receipt["phase"] == "serving",
+                    "The update is still finishing. Your current projects are preserved."
+                );
+                return Ok(());
+            }
+            return bootstrap_service(data, cfg, probe, &state).await;
         }
         Err(error) if connection_refused(&error) => {}
         Err(error) => return Err(error),
     }
+    let binary = std::env::current_exe()?.with_file_name("hfb");
+    if let Some(receipt) = herdr_feishu_bridge::update::activation::Bootstrap::load(data)?
+        && receipt.owner_committed
+        && receipt.target_digest
+            == herdr_feishu_bridge::update::activation::executable_digest(&binary)?
+    {
+        let mut child = spawn_service(data)?;
+        return wait_for_service(data, cfg, probe, Some(&mut child)).await;
+    }
+    if let Some(journal) = herdr_feishu_bridge::update::activation::load(data)?
+        && journal.version == herdr_feishu_bridge::update::CURRENT
+        && !journal.owner_committed
+        && !matches!(journal.phase.as_str(), "failed" | "complete")
+    {
+        // The old owner may have exited during disk preparation. Explicitly
+        // preflight and commit the candidate; generic startup cannot assume ownership.
+        herdr_feishu_bridge::update::verify_bundle(&journal.backup, None)?;
+        let identity = Command::new(journal.backup.join("Contents/MacOS/hfb"))
+            .arg("companion-identity")
+            .output()?;
+        anyhow::ensure!(
+            identity.status.success(),
+            "The prior update owner could not be verified"
+        );
+        let prior: Value = serde_json::from_slice(&identity.stdout)?;
+        return bootstrap_service(data, cfg, probe, &prior).await;
+    }
     let mut child = spawn_service(data)?;
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Ok(state) = request(probe, cfg, "GET", "/state", None).await {
-                anyhow::ensure!(
-                    state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL),
-                    "The local daemon uses an incompatible API protocol"
-                );
-                return Ok::<_, anyhow::Error>(());
+    wait_for_service(data, cfg, probe, Some(&mut child)).await
+}
+pub(super) fn service_healthy(state: &Value) -> bool {
+    state["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL)
+        && state["version"] == herdr_feishu_bridge::update::CURRENT
+        && state["service_activation"]["capability"] == 1
+        && state["mcp_contracts"]
+            .as_array()
+            .is_some_and(|contracts| contracts.iter().any(|contract| contract == 1))
+        && state["projects"].as_array().is_some_and(|projects| {
+            projects.iter().all(|p| {
+                p["bot"].is_null()
+                    || p["bot"]["app_id"].as_str().is_none_or(str::is_empty)
+                    || matches!(
+                        state["runtime"]["bots"][p["id"].as_str().unwrap_or("")]["status"].as_str(),
+                        Some("awaiting_events" | "receiving")
+                    )
+            })
+        })
+}
+async fn wait_for_service(
+    data: &std::path::Path,
+    cfg: &Config,
+    probe: &reqwest::Client,
+    mut child: Option<&mut std::process::Child>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Ok(state) = request(probe, cfg, "GET", "/state", None).await
+            && service_healthy(&state)
+        {
+            if let Some(mut receipt) =
+                herdr_feishu_bridge::update::activation::Bootstrap::load(data)?
+                && receipt.owner_committed
+            {
+                receipt.phase = "complete".into();
+                receipt.save(data)?;
             }
-            if let Some(status) = child.try_wait()? {
-                bail!(
-                    "The local daemon exited ({status}). Check {}",
-                    data.join("desktop-service.log").display()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            return Ok(());
         }
-    })
-    .await
-    .context("Local daemon startup timed out. Check desktop-service.log.")?
+        if let Some(child) = child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            bail!("The updated app could not start ({status}). Your saved work is preserved.");
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "The update is still connecting. Your projects and conversations are preserved."
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+// Only an explicit update intent grants a single retry of a failed bootstrap.
+pub(super) fn authorize_bootstrap_retry(
+    data: &std::path::Path,
+    executable: &std::path::Path,
+) -> Result<bool> {
+    use herdr_feishu_bridge::update::activation;
+    let _lock = activation::lock(data)?;
+    let Some(mut receipt) = activation::Bootstrap::load(data)? else {
+        return Ok(false);
+    };
+    if receipt.owner_committed || receipt.phase != "failed" {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        receipt.target_digest == activation::executable_digest(executable)?,
+        "The prepared update changed; check again from the current app"
+    );
+    receipt.phase = "retry_authorized".into();
+    receipt.save(data)?;
+    Ok(true)
+}
+async fn bootstrap_service(
+    data: &std::path::Path,
+    cfg: &Config,
+    probe: &reqwest::Client,
+    state: &Value,
+) -> Result<()> {
+    let executable = std::env::current_exe()?.with_file_name("hfb");
+    bootstrap_service_configured(data, cfg, probe, state, &executable, |_| {}).await
+}
+pub(super) async fn bootstrap_service_configured(
+    data: &std::path::Path,
+    cfg: &Config,
+    probe: &reqwest::Client,
+    state: &Value,
+    executable: &std::path::Path,
+    configure: impl Fn(&mut Command),
+) -> Result<()> {
+    use herdr_feishu_bridge::update::{self, activation::Bootstrap};
+    let digest = update::activation::executable_digest(executable)?;
+    if let Some(previous) = Bootstrap::load(data)? {
+        anyhow::ensure!(
+            previous.target_digest != digest
+                || matches!(previous.phase.as_str(), "complete" | "retry_authorized"),
+            "The update is waiting to finish safely. Your existing projects keep their saved state."
+        );
+    }
+    let preflight = Command::new(executable)
+        .arg("--data-dir")
+        .arg(data)
+        .arg("service-preflight")
+        .stdin(Stdio::null())
+        .output()
+        .context("The update could not be prepared")?;
+    anyhow::ensure!(
+        preflight.status.success(),
+        "The update could not be prepared; the current app keeps running"
+    );
+    let ready: Value = serde_json::from_slice(&preflight.stdout)?;
+    anyhow::ensure!(
+        ready["schema_compatible"] == true
+            && ready["store_readable"] == true
+            && ready["mcp_compatible"] == true
+            && ready["version"] == update::CURRENT
+            && ready["api_protocol"].as_u64() == Some(herdr_feishu_bridge::api::PROTOCOL),
+        "The update cannot safely take over the current work yet"
+    );
+    let old_version = state["version"]
+        .as_str()
+        .context("The current app version is unknown")?;
+    let old_protocol = state["api_protocol"]
+        .as_u64()
+        .context("The current app contract is unknown")?;
+    let previous = update::historical_companion(data, old_version, old_protocol)?;
+    let _update_lock = update::activation::lock(data)?;
+    anyhow::ensure!(
+        update::activation::executable_digest(executable)? == digest,
+        "The prepared app changed; keeping the current app running"
+    );
+    let retry_id = Bootstrap::load(data)?
+        .filter(|receipt| receipt.phase == "retry_authorized" && receipt.target_digest == digest)
+        .map(|receipt| receipt.id);
+    let mut receipt = Bootstrap {
+        id: retry_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        target_version: update::CURRENT.into(),
+        target_digest: digest,
+        previous_executable: previous.path().to_owned(),
+        previous_version: old_version.into(),
+        owner_committed: false,
+        phase: "prepared".into(),
+    };
+    // No model/pane restart: API7 and the three-tool contract stay unchanged.
+    receipt.save(data)?;
+    let mut child = None;
+    let mut shutdown_attempted = false;
+    let mut old_released = false;
+    let result = async {
+        match request(probe, cfg, "GET", "/state", None).await {
+            Ok(_) => {
+                shutdown_attempted = true;
+                update::stop_service(data, cfg).await?;
+                #[cfg(test)]
+                if LOSE_BOOTSTRAP_SHUTDOWN_ACK.swap(false, Ordering::SeqCst) {
+                    bail!("Injected lost shutdown ACK");
+                }
+            }
+            Err(error) if connection_refused(&error) => update::wait_service_exit(data).await?,
+            Err(error) => return Err(error),
+        }
+        old_released = true;
+        receipt.phase = "starting".into();
+        receipt.save(data)?;
+        #[cfg(test)]
+        if FAIL_BOOTSTRAP_SPAWN.swap(false, Ordering::SeqCst) {
+            bail!("Injected successor spawn failure");
+        }
+        child = Some(spawn_service_configured(data, executable, &configure)?);
+        let mut result = wait_for_service(data, cfg, probe, child.as_mut()).await;
+        if result.is_err()
+            && Bootstrap::load(data)?.is_some_and(|r| r.owner_committed)
+            && child
+                .as_mut()
+                .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+        {
+            child = Some(spawn_service_configured(data, executable, &configure)?);
+            result = wait_for_service(data, cfg, probe, child.as_mut()).await;
+        }
+        result
+    }
+    .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let committed = Bootstrap::load(data)?.is_some_and(|r| r.owner_committed);
+            if !committed {
+                if let Some(child) = &mut child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if shutdown_attempted || old_released {
+                    // Even a service that answers once may already be draining after
+                    // a lost shutdown ACK. Its released lock is the recovery fence.
+                    update::wait_service_exit(data).await?;
+                    let mut rescue = spawn_service_configured(data, previous.path(), &configure)?;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                    loop {
+                        if request(probe, cfg, "GET", "/state", None)
+                            .await
+                            .is_ok_and(|s| {
+                                s["version"] == old_version
+                                    && s["api_protocol"].as_u64() == Some(old_protocol)
+                            })
+                        {
+                            break;
+                        }
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline && rescue.try_wait()?.is_none(),
+                            "The previous app is still reconnecting. Saved work is preserved."
+                        );
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                }
+                receipt.phase = "failed".into();
+                receipt.save(data)?;
+            }
+            // After the startup receipt, only the successor may reopen the latest
+            // journal. Never restore an old database or incompatible Agent contract.
+            Err(error)
+        }
+    }
 }
 
 fn spawn_service(data: &std::path::Path) -> Result<std::process::Child> {
-    let binary = std::env::current_exe()?.with_file_name("hfb");
+    spawn_service_at(data, &std::env::current_exe()?.with_file_name("hfb"))
+}
+fn spawn_service_at(
+    data: &std::path::Path,
+    binary: &std::path::Path,
+) -> Result<std::process::Child> {
+    spawn_service_configured(data, binary, |_| {})
+}
+fn spawn_service_configured(
+    data: &std::path::Path,
+    binary: &std::path::Path,
+    configure: impl Fn(&mut Command),
+) -> Result<std::process::Child> {
     anyhow::ensure!(
         binary.is_file(),
         "Bundled hfb executable missing. Reinstall the app."
@@ -389,19 +726,20 @@ fn spawn_service(data: &std::path::Path) -> Result<std::process::Child> {
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--data-dir")
         .arg(data)
         .arg("serve")
         .env("PATH", std::env::join_paths(paths)?)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
-        .context("Cannot start the local daemon")
+        .stderr(log);
+    configure(&mut command);
+    command.spawn().context("Cannot start the local daemon")
 }
 
-async fn request(
+pub(super) async fn request(
     http: &reqwest::Client,
     cfg: &Config,
     method: &str,
@@ -497,6 +835,11 @@ pub fn scopes(all_group_replies: bool) -> Value {
     }
     json!({"scopes":{"tenant":scopes,"user":[]}})
 }
+
+#[cfg(test)]
+pub(super) static FAIL_BOOTSTRAP_SPAWN: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(super) static LOSE_BOOTSTRAP_SHUTDOWN_ACK: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 mod connection_tests {

@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 mod access;
+mod activation;
 mod backend;
 mod locale;
 #[cfg(target_os = "macos")]
@@ -81,6 +82,8 @@ struct Desktop {
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
+    activation_frozen: bool,
+    restored: bool,
 }
 impl Desktop {
     fn tr(&self, text: &str) -> String {
@@ -155,6 +158,8 @@ impl Desktop {
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
+            activation_frozen: false,
+            restored: false,
         }
     }
     fn receive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -206,12 +211,35 @@ impl Desktop {
                 }
                 Reply::Update(status) => self.update_status = status,
                 Reply::Restart => self.quit(cx),
+                Reply::ActivationFreeze { reply, freeze } => {
+                    let snapshot = if self.takeover_requested
+                        || self.terminal.as_ref().is_some_and(|t| t.controlling)
+                    {
+                        Err(anyhow::anyhow!(
+                            "The update will finish after terminal input is released"
+                        ))
+                    } else {
+                        self.activation_frozen = freeze;
+                        self.backend
+                            .activation_pause
+                            .store(freeze, std::sync::atomic::Ordering::Release);
+                        Ok(self.activation_snapshot(window, cx))
+                    };
+                    let _ = reply.send(snapshot);
+                }
+                Reply::ActivationResume => {
+                    self.activation_frozen = false;
+                    self.backend
+                        .activation_pause
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
                 Reply::State(value) => {
                     if self.state.is_null() {
                         self.notice =
                             "Local service ready. Connect a bot or create a local project.".into();
                     }
-                    if self.state.is_null()
+                    if !self.restored
+                        && self.state.is_null()
                         && value["projects"]
                             .as_array()
                             .is_some_and(|projects| !projects.is_empty())
@@ -248,6 +276,11 @@ impl Desktop {
                         self.credentials_app_id = current_app_id;
                     }
                     self.state = value;
+                    if crate::backend::service_healthy(&self.state)
+                        && let Some(ready) = &self.backend.candidate_ready
+                    {
+                        ready.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     if let Some(timers) = self.state["work"][&self.selected]["timers"].as_array() {
                         self.timers = Value::Array(timers.clone());
                     }
@@ -317,6 +350,52 @@ impl Desktop {
             });
         }
         changed
+    }
+    fn activation_snapshot(&self, window: &Window, cx: &Context<Self>) -> Value {
+        #[cfg(target_os = "macos")]
+        let visible = menubar::window_visible(window);
+        #[cfg(target_os = "macos")]
+        let frame = menubar::window_frame(window);
+        #[cfg(not(target_os = "macos"))]
+        let frame: Option<[f64; 4]> = None;
+        #[cfg(not(target_os = "macos"))]
+        let visible = true;
+        serde_json::json!({"setup":self.setup,"selected":self.selected,"picked_path":self.picked_path,
+            "name":self.name.read(cx).value().to_string(),"path":self.path.read(cx).value().to_string(),
+            "app_id":self.app_id.read(cx).value().to_string(),"secret":self.secret.read(cx).value().to_string(),
+            "agent":self.agent,"credentials_project":self.credentials_project,"credentials_app_id":self.credentials_app_id,
+            "pending_secret":self.pending_secret,"credentials_checked":self.credentials_checked,"visible":visible,"frame":frame})
+    }
+    fn restore_activation(&mut self, snapshot: Value, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if let Ok(frame) = serde_json::from_value::<[f64; 4]>(snapshot["frame"].clone()) {
+            menubar::restore_frame(window, frame);
+        }
+
+        if let Ok(setup) = serde_json::from_value(snapshot["setup"].clone()) {
+            self.setup = setup;
+        }
+        self.selected = snapshot["selected"].as_str().unwrap_or("").into();
+        self.picked_path = snapshot["picked_path"].as_str().unwrap_or("").into();
+        self.agent = snapshot["agent"].as_u64().unwrap_or(0) as usize;
+        self.credentials_project = snapshot["credentials_project"]
+            .as_str()
+            .unwrap_or("")
+            .into();
+        self.credentials_app_id = snapshot["credentials_app_id"].as_str().unwrap_or("").into();
+        self.pending_secret = snapshot["pending_secret"].as_str().unwrap_or("").into();
+        self.credentials_checked = snapshot["credentials_checked"].as_bool().unwrap_or(false);
+        for (input, key) in [
+            (&self.name, "name"),
+            (&self.path, "path"),
+            (&self.app_id, "app_id"),
+            (&self.secret, "secret"),
+        ] {
+            input.update(cx, |input, cx| {
+                input.set_value(snapshot[key].as_str().unwrap_or("").to_owned(), window, cx)
+            });
+        }
+        self.restored = true;
     }
     fn release_terminal(&mut self) {
         if let Some(bridge) = self.terminal.take()
@@ -871,22 +950,7 @@ impl Desktop {
                     .child(self.btn("release-reservation", "Release reservation", move |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Takeover { project:project.clone(),generation:generation.clone(),active:false }); }, cx));
             }
             if project["lifecycle"] == "update_required" {
-                let recover = id.clone();
-                let has_native = project["native_session"].as_str().is_some_and(|s| !s.is_empty());
-                let notice = if has_native {
-                    herdr_feishu_bridge::UPDATE_RESUME_NOTICE
-                } else {
-                    herdr_feishu_bridge::UPDATE_FRESH_NOTICE
-                };
-                body = body.child(self.card("Agent update required", notice))
-                    .child(self.btn("recover-after-update", "Recover Agent after update", move |this, _, _| {
-                        let message = if has_native {
-                            "Agent recovery started with the saved native session. Saved messages continue when automatic activity is enabled."
-                        } else {
-                            "Agent recovery started with a fresh session because no native session ID was saved. Saved messages continue when automatic activity is enabled."
-                        };
-                        this.api("POST", format!("/projects/{recover}/recover-after-update"), None, message);
-                    }, cx));
+                body = body.child(self.card("Update pending", "This project is waiting for a compatible update. Its conversation and saved messages are preserved."));
             }
             let pause = id.clone();
             let paused = project["paused"].as_bool().unwrap_or(false);
@@ -1373,7 +1437,10 @@ impl Desktop {
     }
     fn updates_page(&self, cx: &mut Context<Self>) -> Div {
         let phase = self.update_status["phase"].as_str().unwrap_or("idle");
-        let running = matches!(phase, "checking" | "downloading" | "installing");
+        let running = matches!(
+            phase,
+            "checking" | "downloading" | "installing" | "activating"
+        );
         let automatic = self.update_status["preferences"]["automatic"]
             .as_bool()
             .unwrap_or(true);
@@ -1392,7 +1459,9 @@ impl Desktop {
                 self.tr("Downloading and verifying update"),
                 self.update_status["progress"].as_u64().unwrap_or(0)
             ),
-            "installed" => self.tr("Update installed. Restart the desktop to apply."),
+            "installed" | "activating" => {
+                self.tr("Finishing the update. Your projects keep running.")
+            }
             "current" => self.tr("You have the latest version on this channel"),
             "error" => format!(
                 "{}\n{}",
@@ -1402,29 +1471,17 @@ impl Desktop {
             _ => self.tr("Automatic checks run every six hours when enabled."),
         };
         div().flex().flex_col().gap_5()
-            .child(self.title("UPDATES", "App Updates", "Signed updates download in the background and take effect next time you open the app. Project files, bot settings, and active sessions stay intact."))
+            .child(self.title("UPDATES", "App Updates", "Signed updates are verified and applied automatically. Your projects and conversations stay in place."))
             .child(self.card("Current version", &format!("Dauerbot {} · {}", env!("CARGO_PKG_VERSION"), self.tr(if channel == "preview" { "Preview channel" } else { "Stable channel" }))))
-            .child(self.card("Background service", &format!("Dauerbot {}", self.state["version"].as_str().unwrap_or("Connecting..."))))
-            .when(self.state["version"].as_str().is_some_and(|version| herdr_feishu_bridge::update::is_newer(env!("CARGO_PKG_VERSION"), version).unwrap_or(false)), |page| {
-                page.child(self.card("Service update available", "The compatible background service keeps running when the desktop updates. Updating it briefly reconnects messages and tools; Agent sessions keep running."))
-                    .child(Button::new("update-service").label(self.tr("Update background service")).on_click(cx.listener(|this, _, _, cx| {
-                        let _ = this.backend.tx.send(CommandRequest::RestartService); cx.notify();
-                    })))
-            })
             .child(self.card("Update status", &message))
             .child(div().flex().gap_3().flex_wrap()
                 .child(Button::new("update-check").label(self.tr("Check for updates")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.backend.updates.send(updater::Action::Check); cx.notify();
+                    let _ = this.backend.tx.send(CommandRequest::Update(updater::Action::Check)); cx.notify();
                 })))
                 .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").label(self.tr("Download and install")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.backend.updates.send(updater::Action::Install); cx.notify();
+                    let _ = this.backend.tx.send(CommandRequest::Update(updater::Action::Install)); cx.notify();
                 }))))
-                .when(phase == "installed", |row| row.child(Button::new("update-restart").label(self.tr("Restart desktop now")).on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.backend.updates.send(updater::Action::Restart); cx.notify();
-                }))))
-                .when(self.update_status["rollback_available"].as_bool().unwrap_or(false), |row| row.child(Button::new("update-rollback").label(self.tr("Roll back")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.backend.updates.send(updater::Action::Rollback); cx.notify();
-                }))))
+
             )
             .child(div().flex().gap_3()
                 .child(Button::new("update-auto").label(self.tr(if automatic { "Disable automatic updates" } else { "Enable automatic updates" })).on_click(cx.listener(move |this, _, _, cx| {
@@ -1443,6 +1500,15 @@ impl Desktop {
 }
 impl Render for Desktop {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.activation_frozen {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(0xfafbf9))
+                .child(self.tr("Finishing the update. Your projects keep running."));
+        }
         let page = self.setup.page;
         let mut sidebar = div()
             .w(px(210.))
@@ -1728,9 +1794,34 @@ fn main() {
     } else {
         "Dauerbot"
     };
-    let backend = Backend::start(dir);
+    let activation_id = std::env::args().skip_while(|v| v != "--activation").nth(1);
+    let candidate = activation_id.as_deref().map(|id| {
+        activation::Candidate::connect(&dir, id).expect("Cannot prepare the updated app")
+    });
+    let backend = if let Some(candidate) = &candidate {
+        Backend::start_mode(
+            dir,
+            Some((
+                candidate.serving.clone(),
+                candidate.updates.clone(),
+                candidate.backend_ready.clone(),
+            )),
+        )
+    } else {
+        Backend::start(dir)
+    };
+    let frontend_ready = backend.frontend_ready.clone();
     let app = Application::new();
-    app.on_reopen(|cx| {
+    let published = candidate
+        .as_ref()
+        .map(|candidate| candidate.serving.clone());
+    app.on_reopen(move |cx| {
+        if published
+            .as_ref()
+            .is_some_and(|ready| !ready.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return;
+        }
         #[cfg(target_os = "macos")]
         menubar::open_main(None, 6, cx);
     });
@@ -1748,7 +1839,9 @@ fn main() {
             .and_then(|bytes| serde_json::from_slice::<Setup>(&bytes).ok())
             .map(|setup| setup.language)
             .unwrap_or_default();
-        set_menus(language, cx);
+        if candidate.is_none() {
+            set_menus(language, cx);
+        }
         let bounds = Bounds::centered(None, size(px(1180.), px(860.)), cx);
         let mut desktop_view = None;
         let main_window = cx
@@ -1765,11 +1858,22 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| Desktop::new(backend, window, cx));
+                    let view = cx.new(|cx| {
+                        let mut view = Desktop::new(backend, window, cx);
+                        if let Some(candidate) = &candidate {
+                            view.restore_activation(candidate.snapshot.clone(), window, cx);
+                            view.activation_frozen = true;
+                        }
+                        view
+                    });
                     desktop_view = Some(view.clone());
                     let quit_view = view.clone();
                     cx.on_action(move |_: &Quit, cx| {
-                        quit_view.update(cx, |this, cx| this.quit(cx));
+                        quit_view.update(cx, |this, cx| {
+                            if !this.activation_frozen {
+                                this.quit(cx);
+                            }
+                        });
                     });
                     let close_view = view.downgrade();
                     window.on_window_should_close(cx, move |window, cx| {
@@ -1788,6 +1892,9 @@ fn main() {
                     let settings_view = view.clone();
                     cx.on_action(move |_: &ShowSettings, cx| {
                         settings_view.update(cx, |this, cx| {
+                            if this.activation_frozen {
+                                return;
+                            }
                             this.go(8);
                             #[cfg(target_os = "macos")]
                             cx.defer(|cx| menubar::open_main(None, 8, cx));
@@ -1797,6 +1904,9 @@ fn main() {
                     let updates_view = view.clone();
                     cx.on_action(move |_: &ShowUpdates, cx| {
                         updates_view.update(cx, |this, cx| {
+                            if this.activation_frozen {
+                                return;
+                            }
                             this.go(7);
                             #[cfg(target_os = "macos")]
                             cx.defer(|cx| menubar::open_main(None, 7, cx));
@@ -1807,14 +1917,69 @@ fn main() {
                 },
             )
             .expect("Cannot create the desktop window");
-        #[cfg(target_os = "macos")]
-        if let Err(error) = menubar::install(desktop_view.expect("desktop view"), main_window, cx) {
-            eprintln!("{error:#}");
+        cx.defer(move |_| frontend_ready.store(true, std::sync::atomic::Ordering::Release));
+        let desktop_view = desktop_view.expect("desktop view");
+        if let Some(candidate) = candidate {
+            let serving = candidate.serving.clone();
+            let ready = candidate.menu_ready.clone();
+            let visible = candidate.visible.clone();
+            let ready_signal = candidate.ready.clone();
+            let refresh = candidate.refresh;
+            cx.defer(move |_| {
+                let _ = ready_signal.send(());
+            });
+            cx.spawn(async move |cx| {
+                while !serving.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Ok((snapshot, ack)) = refresh.try_recv() {
+                        visible.store(
+                            snapshot["visible"].as_bool().unwrap_or(false),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        let restored = main_window
+                            .update(cx, |_, window, cx| {
+                                desktop_view.update(cx, |this, cx| {
+                                    this.restore_activation(snapshot.clone(), window, cx);
+                                    activation::snapshot_restored(
+                                        &snapshot,
+                                        &this.activation_snapshot(window, cx),
+                                    )
+                                })
+                            })
+                            .unwrap_or(false);
+                        let _ = ack.send(restored);
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(25))
+                        .await;
+                }
+                let _ = cx.update(|cx| {
+                    set_menus(language, cx);
+                    desktop_view.update(cx, |this, cx| {
+                        this.activation_frozen = false;
+                        cx.notify();
+                    });
+                    #[cfg(target_os = "macos")]
+                    if menubar::install(desktop_view.clone(), main_window, cx).is_err() {
+                        return;
+                    }
+                    if visible.load(std::sync::atomic::Ordering::Acquire) {
+                        cx.activate(true);
+                        let _ = main_window.update(cx, |_, window, _| window.activate_window());
+                    }
+                    ready.store(true, std::sync::atomic::Ordering::Release);
+                });
+            })
+            .detach();
+        } else {
+            #[cfg(target_os = "macos")]
+            if let Err(error) = menubar::install(desktop_view, main_window, cx) {
+                eprintln!("{error:#}");
+                cx.activate(true);
+                let _ = main_window.update(cx, |_, window, _| window.activate_window());
+            }
+            #[cfg(not(target_os = "macos"))]
             cx.activate(true);
-            let _ = main_window.update(cx, |_, window, _| window.activate_window());
         }
-        #[cfg(not(target_os = "macos"))]
-        cx.activate(true);
     });
 }
 
@@ -1858,8 +2023,15 @@ mod schedule_tests {
         ]);
         let rows = visible_timers(&timers);
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows.iter().map(|t| t["id"].as_str().unwrap()).collect::<Vec<_>>(),
-            ["legacy-once", "legacy-empty", "paused-user", "user-cron"]);
-        assert_eq!(rows[2]["enabled"], false, "The paused future reminder still has a usable Enable action");
+        assert_eq!(
+            rows.iter()
+                .map(|t| t["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["legacy-once", "legacy-empty", "paused-user", "user-cron"]
+        );
+        assert_eq!(
+            rows[2]["enabled"], false,
+            "The paused future reminder still has a usable Enable action"
+        );
     }
 }

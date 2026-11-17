@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
+pub mod activation;
+
 pub const REPOSITORY: &str = "so2liu/dauerbot";
 pub const BUNDLE_ID: &str = "dev.herdr.feishu-bridge";
 pub const TEAM_ID: &str = "366ADQ28F6";
@@ -497,12 +499,16 @@ fn extract(archive: &Path, payload: &Path) -> Result<()> {
 fn swap(payload: &Path, app: &Path, backup: &Path) -> Result<()> {
     fs::rename(app, backup)
         .context("Cannot move the old app. Use a writable Applications directory.")?;
+    File::open(backup.parent().context("Invalid backup directory")?)?.sync_all()?;
+    File::open(app.parent().context("Invalid app directory")?)?.sync_all()?;
     if let Err(error) = fs::rename(payload, app) {
         fs::rename(backup, app).context(
             "App replacement and restoration failed. Restore from the backup directory.",
         )?;
         return Err(error).context("App replacement failed; the old version is restored");
     }
+    File::open(payload.parent().context("Invalid payload directory")?)?.sync_all()?;
+    File::open(app.parent().context("Invalid app directory")?)?.sync_all()?;
     Ok(())
 }
 #[derive(Serialize, Deserialize)]
@@ -650,14 +656,14 @@ pub fn inherit_service_protocol(data: &Path, db: &crate::db::Db) -> Result<()> {
         Ok(())
     })
 }
-pub async fn install(
+pub async fn prepare_install(
     client: &reqwest::Client,
     data: &Path,
     app: &Path,
     release: &Release,
     progress: impl Fn(u8),
     automatic: bool,
-) -> Result<()> {
+) -> Result<activation::Transaction> {
     verify_bundle(app, None).context("The current app is not a trusted signed installation; development builds cannot replace themselves")?;
     ensure!(
         is_newer(
@@ -668,9 +674,8 @@ pub async fn install(
     );
     let updates = data.join("updates");
     config::private_dir(&updates)?;
-    let lock = File::create(updates.join("update.lock"))?;
-    lock.try_lock_exclusive()
-        .context("Another update task is running")?;
+    let lock = activation::lock(data)?;
+    activation::ensure_not_suppressed(data, release.version(), automatic)?;
     let requested_preferences = Preferences::load(data)?;
     ensure!(
         requested_preferences.channel == "preview" || version(release.version())?.pre.is_empty(),
@@ -730,12 +735,18 @@ pub async fn install(
         backup: backup.clone(),
         version: release.version().into(),
     };
+    let mut transaction = activation::Transaction::prepare(
+        data,
+        app,
+        &backup,
+        release.version(),
+        previous.clone(),
+        lock,
+    )?;
     // Save recovery information before the first rename; disk errors cannot strand an unrecorded swap.
     config::write_private(&record_path, &serde_json::to_vec(&record)?)?;
     if let Err(error) = swap(&payload, app, &backup) {
-        if app.exists() {
-            restore_record(&record_path, previous.as_deref())?;
-        }
+        transaction.rollback(&format!("App replacement failed: {error:#}"))?;
         return Err(error);
     }
     let executable = app.join("Contents/MacOS/hfb");
@@ -746,13 +757,28 @@ pub async fn install(
         );
         Ok(())
     }) {
-        let failed = stage.join("failed");
-        fs::rename(app, failed)?;
-        fs::rename(&backup, app)?;
-        restore_record(&record_path, previous.as_deref())?;
-        let _ = fs::remove_dir_all(&stage);
+        transaction.rollback(&format!("New executable validation failed: {error:#}"))?;
         return Err(error).context("New executable validation failed; the old app is restored");
     }
+    transaction.prepared()?;
+    let _ = previous_record;
+    Ok(transaction)
+}
+
+pub async fn install(
+    client: &reqwest::Client,
+    data: &Path,
+    app: &Path,
+    release: &Release,
+    progress: impl Fn(u8),
+    automatic: bool,
+) -> Result<()> {
+    prepare_install(client, data, app, release, progress, automatic)
+        .await?
+        .finish_install_only()
+}
+
+fn cleanup_previous(previous_record: Option<InstallRecord>, app: &Path) {
     if let Some(old) = previous_record
         && old.app == app
         && let Some(parent) = old.backup.parent()
@@ -763,17 +789,28 @@ pub async fn install(
     {
         let _ = fs::remove_dir_all(parent);
     }
-    Ok(())
 }
 fn restore_record(path: &Path, previous: Option<&[u8]>) -> Result<()> {
     if let Some(bytes) = previous {
         config::write_private(path, bytes)?;
     } else {
-        fs::remove_file(path)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
 pub fn rollback(data: &Path) -> Result<PathBuf> {
+    // Legacy stop/start rollback cannot undo a committed service owner or host
+    // modern MCP children. Recovery always uses the latest journal.
+    ensure!(
+        !activation::load(data)?.is_some_and(|journal| journal.owner_committed)
+            && !activation::Bootstrap::load(data)?.is_some_and(|receipt| receipt.owner_committed),
+        "This update has already taken over active work. Keeping the current app and its latest recovery journal."
+    );
+
     let lock = File::create(data.join("updates/update.lock"))?;
     lock.try_lock_exclusive()
         .context("Another update task is running")?;
@@ -790,6 +827,21 @@ pub fn rollback(data: &Path) -> Result<PathBuf> {
         "This backup does not belong to the app"
     );
     verify_bundle(&record.backup, None)?;
+    if data.join("bridge.sqlite3").exists() {
+        let preflight = Command::new(record.backup.join("Contents/MacOS/hfb"))
+            .arg("--data-dir")
+            .arg(data)
+            .arg("service-preflight")
+            .output()?;
+        let supported: serde_json::Value =
+            serde_json::from_slice(&preflight.stdout).unwrap_or_default();
+        ensure!(
+            preflight.status.success()
+                && supported["mcp_compatible"] == true
+                && supported["schema_compatible"] == true,
+            "The previous app cannot safely take over current sessions; keeping the installed version"
+        );
+    }
     let mut prefs = Preferences::load(data)?;
     prefs.automatic = false;
     prefs.save(data)?;
@@ -799,6 +851,7 @@ pub fn rollback(data: &Path) -> Result<PathBuf> {
         fs::rename(&record.backup, &record.app)?;
     }
     fs::remove_file(path)?;
+    activation::legacy_rollback_completed(data, &record.app)?;
     Ok(record.app)
 }
 pub async fn rollback_and_restart(data: &Path) -> Result<()> {
@@ -903,6 +956,9 @@ pub async fn stop_service(data: &Path, cfg: &config::Config) -> Result<()> {
     } else {
         response.error_for_status()?;
     }
+    wait_service_exit(data).await
+}
+pub async fn wait_service_exit(data: &Path) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(110), async {
         loop {
             let lock = fs::OpenOptions::new()
