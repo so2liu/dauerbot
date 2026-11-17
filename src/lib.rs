@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod api;
 pub mod bot;
+pub mod cli_switch;
 pub mod companion;
 pub mod config;
 pub mod conversation;
@@ -231,6 +232,7 @@ impl App {
         let instructions = format!(
             "{instructions} Read the Dauerbot delegation block in AGENTS.md and its project-local Herdr skill before substantial work."
         );
+        let instructions = instructions + &self.cli_switch_bootstrap(&p.id).await?;
         let mut argv = herdr::launch_args(&p, &mcp_file, &entry, &instructions, resume)?;
         let assigned =
             (!resume && ["claude", "pi"].contains(&p.agent.as_str())).then(|| generation.clone());
@@ -257,6 +259,9 @@ impl App {
         let mut execution = herdr::prepare_execution(&cfg, &p, &argv, &generation).await?;
         if let Some(dir) = child_adapter {
             execution["child_adapter"] = json!(dir);
+        }
+        if let Some(request) = self.cli_switch_launch_id(&p).await? {
+            execution["cli_switch_request"] = json!(request);
         }
         execution["api_protocol"] = json!(api::PROTOCOL);
         execution["mcp_contract"] = json!(mcp::CONTRACT);
@@ -303,6 +308,10 @@ impl App {
         self.stop_inner(&p).await
     }
     pub(crate) async fn stop_inner(&self, p: &Project) -> Result<()> {
+        let id = p.id.clone();
+        self.db
+            .call(move |c| cli_switch::cancel(c, &id, "Stopped explicitly by the user"))
+            .await?;
         if p.terminal.is_some() {
             let cfg = self.config.read().await.clone();
             herdr::stop(&cfg, p).await?;
@@ -346,6 +355,10 @@ impl App {
             !standby_only || p.terminal.is_none(),
             "This project has started working. Switch its CLI when it is in standby."
         );
+        let id = p.id.clone();
+        self.db
+            .call(move |c| cli_switch::cancel(c, &id, "CLI changed explicitly by the user"))
+            .await?;
         if p.agent == agent {
             return Ok(p);
         }
@@ -578,6 +591,9 @@ impl App {
             return Ok(());
         };
         let mut p = self.db.project(key).await?;
+        if self.advance_cli_switch(&p, None, None).await? {
+            return Ok(());
+        }
         if Self::update_required(&p) {
             self.attention(
                 &p,
@@ -863,6 +879,15 @@ impl App {
             }
             return Ok(());
         }
+        if self.cli_switch_waits_for_mcp(&p).await? {
+            if !self
+                .advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?
+            {
+                self.set_phase(&p, "needs_attention", record).await;
+            }
+            return Ok(());
+        }
         // User input belongs to the current conversation, including while a run
         // is working or awaiting its receipt. Drain bursts without waiting for
         // native idle, or the periodic reconciliation tick.
@@ -886,6 +911,12 @@ impl App {
                 self.set_phase(&p, "busy", record).await;
                 return Ok(());
             }
+        }
+        if self
+            .advance_cli_switch(&p, Some(&cfg), Some(&record))
+            .await?
+        {
+            return Ok(());
         }
         if busy {
             self.set_phase(&p, "busy", record).await;

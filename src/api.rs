@@ -71,6 +71,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/projects/{id}/agent", post(switch_agent))
         .route("/projects/{id}/agent/standby", post(switch_standby_agent))
+        .route("/projects/{id}/agent/transition", post(transition_agent))
         .route("/projects/{id}/documents/{document}", get(project_document))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
@@ -353,6 +354,12 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         let id = p.id.clone();
         let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
         let mut record = json!(p);
+        let project_id = p.id.clone();
+        record["cli_transition"] = json!(
+            app.db
+                .call(move |c| crate::cli_switch::latest(c, &project_id))
+                .await?
+        );
         record["bot"] = bindings
             .iter()
             .find(|b| b.project_id == p.id)
@@ -498,6 +505,21 @@ async fn switch_standby_agent(
     Ok(Json(json!(
         app.switch_agent_mode(&id, &input.agent, true).await?
     )))
+}
+async fn transition_agent(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<AgentSelection>,
+) -> ApiResult {
+    let project = app.request_cli_switch(&id, &input.agent).await?;
+    let id = project.id.clone();
+    let transition = app
+        .db
+        .call(move |c| crate::cli_switch::latest(c, &id))
+        .await?;
+    let mut value = json!(project);
+    value["cli_transition"] = json!(transition);
+    Ok(Json(value))
 }
 async fn project_document(
     State(app): State<Arc<App>>,
@@ -698,7 +720,7 @@ async fn register(
         authorize_session(c,&authority,&p.id)?;
         let terminal=p.terminal.as_deref().context("Execution is not running")?;
         let changed=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,
-          execution=CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END
+          execution=json_set(CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END,'$.mcp_registered',json('true'))
           WHERE id=?2 AND generation=?3 AND terminal=?4",rusqlite::params![native,p.id,input.generation,terminal])?;
         anyhow::ensure!(changed==1,"Session identity changed; reconnect MCP");
         if !native.is_empty(){

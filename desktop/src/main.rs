@@ -1004,14 +1004,19 @@ impl Desktop {
                     Button::new(("agent", index))
                         .label(agent_name(agent))
                         .selected(project["agent"] == agent)
-                        .disabled(self.busy || project["terminal"].is_string() || project["agent"] == agent)
+                        .disabled(
+                            self.busy
+                                || project["paused"] == true
+                                || project["lifecycle"] == "taken_over"
+                                || project["agent"] == agent,
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.release_terminal();
                             this.api(
                                 "POST",
-                                format!("/projects/{project_id}/agent/standby"),
+                                format!("/projects/{project_id}/agent/transition"),
                                 Some(json!({"agent":agent})),
-                                "Agent switched. The bot and project binding are preserved.",
+                                "CLI handoff requested. The project binding is preserved.",
                             );
                             cx.notify();
                         })),

@@ -57,7 +57,7 @@ impl ProjectTools {
                     Work::Switch(ticket, agent) => (
                         ticket,
                         "POST",
-                        "agent/standby".into(),
+                        "agent/transition".into(),
                         Some(json!({"agent":agent})),
                     ),
                 };
@@ -103,29 +103,39 @@ impl ProjectTools {
         });
         cx.spawn(async move |entity, cx| {
             while let Ok(reply) = rx.recv_async().await {
-                if entity.update(cx, |this, cx| {
-                    if !accept_reply(&this.project, this.ticket.as_ref(), &reply.ticket) { return; }
-                    match reply.result {
-                        Ok(value) if reply.ticket.document.is_some() => {
-                            match serde_json::from_value(value) {
-                                Ok(content) => this.content = Some(content),
-                                Err(_) => this.message = "Cannot read this document response".into(),
+                if entity
+                    .update(cx, |this, cx| {
+                        if !accept_reply(&this.project, this.ticket.as_ref(), &reply.ticket) {
+                            return;
+                        }
+                        match reply.result {
+                            Ok(value) if reply.ticket.document.is_some() => {
+                                match serde_json::from_value(value) {
+                                    Ok(content) => this.content = Some(content),
+                                    Err(_) => {
+                                        this.message = "Cannot read this document response".into()
+                                    }
+                                }
+                            }
+                            Ok(value) => {
+                                this.project = value;
+                                this.message = "CLI handoff requested.".into();
+                            }
+                            Err(error) => {
+                                this.pending_cli = None;
+                                this.message = error;
                             }
                         }
-                        Ok(value) => {
-                            this.project = value;
-                            this.message = "CLI saved. The next wake uses this CLI and the current workspace handoff.".into();
-                        }
-                        Err(error) => {
-                            this.pending_cli = None;
-                            this.message = error;
-                        }
-                    }
-                    this.ticket = None;
-                    cx.notify();
-                }).is_err() { break; }
+                        this.ticket = None;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }).detach();
+        })
+        .detach();
         Self {
             project: Value::Null,
             language: Language::default(),
@@ -148,6 +158,12 @@ impl ProjectTools {
             self.message.clear();
             self.revision += 1;
         }
+        if matches!(
+            project["cli_transition"]["phase"].as_str(),
+            Some("failed" | "startup_failed" | "uncertain" | "cancelled")
+        ) {
+            self.pending_cli = None;
+        }
         if self
             .pending_cli
             .as_deref()
@@ -156,6 +172,11 @@ impl ProjectTools {
             self.pending_cli = None;
         }
         self.project = project.clone();
+        if project["cli_transition"]["phase"].is_string()
+            && self.message == "CLI handoff requested."
+        {
+            self.message.clear();
+        }
         self.language = language;
         if changed {
             cx.notify();
@@ -196,7 +217,28 @@ fn accept_reply(project: &Value, current: Option<&Ticket>, incoming: &Ticket) ->
 }
 impl Render for ProjectTools {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let standby = self.project["terminal"].is_null();
+        let transition = &self.project["cli_transition"];
+        let switching = self.pending_cli.is_some()
+            || matches!(
+                transition["phase"].as_str(),
+                Some("preparing" | "requested" | "switching" | "starting" | "uncertain")
+            );
+        let unavailable =
+            self.project["paused"] == true || self.project["lifecycle"] == "taken_over";
+        let status = match transition["phase"].as_str() {
+            Some("preparing" | "requested") => "Preparing handoff…",
+            Some("switching" | "starting") => "Switching CLI…",
+            Some("ready")
+                if self.project["ready"] == true
+                    && transition["target"] == self.project["agent"] =>
+            {
+                "Selected CLI is ready."
+            }
+            Some("failed" | "startup_failed" | "uncertain") => transition["error"]
+                .as_str()
+                .unwrap_or("CLI handoff did not finish."),
+            _ => "",
+        };
         let busy = self.ticket.is_some();
         let agent = self
             .pending_cli
@@ -223,10 +265,25 @@ impl Render for ProjectTools {
                     .small()
                     .label(label)
                     .selected(agent == key)
-                    .disabled(!standby || busy || agent == key)
+                    .disabled(unavailable || switching || busy || agent == key)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.request(None, Some(key.into()), cx)),
                     ),
+            );
+        }
+        if transition["phase"] == "startup_failed"
+            && self.project["terminal"].is_null()
+            && transition["target"] == self.project["agent"]
+        {
+            let target = self.project["agent"].as_str().unwrap_or("").to_owned();
+            choices = choices.child(
+                Button::new("retry-cli-start")
+                    .small()
+                    .label(self.language.text("Retry startup"))
+                    .disabled(unavailable || busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request(None, Some(target.clone()), cx)
+                    })),
             );
         }
         let mut documents = div().flex().flex_wrap().items_center().gap_2().child(
@@ -270,16 +327,17 @@ impl Render for ProjectTools {
             .gap_3()
             .child(choices)
             .child(documents);
-        if !standby {
-            view = view.child(
-                div().text_xs().text_color(rgb(0x74808c)).child(
-                    self.language
-                        .text("Switch the CLI when this project is in standby."),
-                ),
-            );
+        if !status.is_empty() {
+            view = view.child(div().text_sm().child(self.language.text(status)));
+        }
+        if unavailable {
+            view =
+                view.child(div().text_xs().text_color(rgb(0x74808c)).child(
+                    "Resume this project and release terminal input before changing its CLI.",
+                ));
         }
         if !self.message.is_empty() {
-            view = view.child(div().text_sm().child(self.message.clone()));
+            view = view.child(div().text_sm().child(self.language.text(&self.message)));
         }
         if let Some(document) = self.document {
             let mut pane = div()

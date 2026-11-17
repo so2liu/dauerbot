@@ -22,7 +22,7 @@ sys.stdout.flush()
 def status(state):
     request = {"id": "fixture-status", "method": "pane.report_agent", "params": {
         "pane_id": os.environ["HERDR_PANE_ID"], "source": "dauerbot-fixture",
-        "agent": "fixture-agent", "state": state, "seq": time.time_ns(),
+        "agent": sys.argv[5] if len(sys.argv)>5 else "fixture-agent", "state": state, "seq": time.time_ns(),
     }}
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(3)
@@ -47,6 +47,8 @@ else:
     marker.write_text(str(uuid.uuid4()))
 with (Path.cwd() / ".fixture-launches").open("a") as launches:
     launches.write(json.dumps({"resume": expected, "native": marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}) + "\n")
+while (Path.cwd() / ".fixture-mcp-hold").exists():
+    time.sleep(0.05)
 proc = subprocess.Popen([sys.argv[1], "mcp", "--credentials", sys.argv[2]],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 sequence = 0
@@ -93,6 +95,19 @@ try:
             text, buffer = buffer.split(end, 1)
             text = text.removeprefix(b"\x1b[200~").decode()
             event = ET.fromstring(text)
+            if event.tag == "dauerbot_cli_switch":
+                status("working")
+                mode = Path.cwd() / ".fixture-switch-mode"
+                if mode.exists() and mode.read_text() == "hold":
+                    (Path.cwd() / ".fixture-switch-held").write_text(event.attrib["request_id"])
+                    continue
+                nonce = event.attrib["handoff_nonce"]
+                text = "# CLI handoff\n\nAll native children and external workers have been settled. Continue the current fixture goal from this workspace. Preserve completed effects and never replay earlier replies.\n"
+                if not mode.exists() or mode.read_text() != "stale":
+                    text += "<!-- dauerbot-switch-ready:" + nonce + " -->\n"
+                (Path.cwd() / "HANDOFF.md").write_text(text)
+                status("idle")
+                continue
             if event.tag == "dauerbot_handoff":
                 status("working")
                 request = event.attrib["request_id"]

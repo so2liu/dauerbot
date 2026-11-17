@@ -20,6 +20,8 @@ impl Language {
         if self == Self::En {
             return match source {
                 "sleeping" => "Standby",
+                "preparing_handoff" => "Preparing handoff",
+                "switching_cli" => "Switching CLI",
                 "starting" => "Starting",
                 "ready" => "Ready",
                 "busy" | "running" => "Working",
@@ -43,6 +45,15 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "Preparing handoff…" | "preparing_handoff" => "正在准备交接…",
+            "Switching CLI…" | "switching_cli" => "正在切换 CLI…",
+            "Selected CLI is ready." => "所选 CLI 已就绪。",
+            "CLI handoff requested." => "已请求 CLI 交接。",
+            "Retry startup" => "重试启动",
+            "Resume this project and release terminal input before changing its CLI." => {
+                "切换 CLI 前，请先恢复项目并释放终端输入。"
+            }
+            "Project files" => "项目文件",
             "Update pending" => "更新待完成",
             "This project is waiting for a compatible update. Its conversation and saved messages are preserved." => {
                 "项目正在等待兼容的更新，会话和已保存的消息均已保留。"
