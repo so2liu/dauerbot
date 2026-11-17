@@ -40,11 +40,13 @@ assert subprocess.check_output([resolved_herdr, "--version"], text=True, timeout
 (Path.cwd() / ".fixture-herdr").write_text(resolved_herdr)
 marker = Path.cwd() / ".fixture-session"
 expected = sys.argv[3] if len(sys.argv) > 3 else ""
-if marker.exists():
+if expected:
     assert expected == marker.read_text(), "Fixture resume did not retain native identity"
 else:
-    assert not expected
-    marker.write_text("fixture-native-session")
+    import uuid
+    marker.write_text(str(uuid.uuid4()))
+with (Path.cwd() / ".fixture-launches").open("a") as launches:
+    launches.write(json.dumps({"resume": expected, "native": marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}) + "\n")
 proc = subprocess.Popen([sys.argv[1], "mcp", "--credentials", sys.argv[2]],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 sequence = 0
@@ -91,6 +93,20 @@ try:
             text, buffer = buffer.split(end, 1)
             text = text.removeprefix(b"\x1b[200~").decode()
             event = ET.fromstring(text)
+            if event.tag == "dauerbot_handoff":
+                status("working")
+                request = event.attrib["request_id"]
+                mode = Path.cwd() / ".fixture-handoff-mode"
+                if mode.exists() and mode.read_text() == "hold":
+                    sys.stdout.write("\r\nMOCK_HANDOFF_HELD\r\n")
+                    sys.stdout.flush()
+                    continue
+                text = ("# Handoff\n\nGoal: continue the fixture project.\nCompleted work: handled messages.\nKey decisions: use native sessions.\nRelevant files/commits: report.txt.\nPending issues: none.\nNext actions: process the next message.\n")
+                if not mode.exists() or mode.read_text() != "stale":
+                    text += "<!-- dauerbot-handoff:" + request + " -->\n"
+                (Path.cwd() / "HANDOFF.md").write_text(text)
+                status("idle")
+                continue
             assert event.tag == "dauerbot_event", event.tag
             status("working")
             body = event.findtext("feishu_message/body") or event.findtext("body") or ""

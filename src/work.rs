@@ -204,6 +204,17 @@ pub fn migrate(c: &Connection) -> Result<()> {
     if !has_sequence {
         c.execute("ALTER TABLE work_runs ADD COLUMN native_seq INTEGER", [])?;
     }
+    let has_idle_sequence: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_executions') WHERE name='idle_seq')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_idle_sequence {
+        c.execute(
+            "ALTER TABLE work_executions ADD COLUMN idle_seq INTEGER",
+            [],
+        )?;
+    }
     // Removed bookkeeping must never gate an upgraded session. Keep the journal,
     // messages, schedule IDs and occurrences; do not requeue submitted input.
     c.execute_batch("DROP TABLE IF EXISTS work_jobs; DROP TABLE IF EXISTS work_decisions;
@@ -1056,6 +1067,30 @@ pub fn has_takeover(c: &Connection, project: &str, generation: &str) -> Result<b
 
 /// Call only after the execution adapter has independently established native idle.
 /// A clean observation starts the warm period. The journal never proves business success.
+pub fn execution_idle_observed(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+    sequence: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = c.unchecked_transaction()?;
+    let previous: Option<i64> = tx
+        .query_row(
+            "SELECT idle_seq FROM work_executions WHERE project_id=? AND generation=?",
+            params![project, generation],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if previous != Some(sequence) {
+        tx.execute("UPDATE work_executions SET idle_seq=?,idle_since=NULL,warm_until=NULL WHERE project_id=? AND generation=?",params![sequence,project,generation])?;
+    }
+    let ready = execution_idle(&tx, project, generation, now)?;
+    tx.commit()?;
+    Ok(ready)
+}
+
 pub fn execution_idle(c: &Connection, project: &str, generation: &str, now: i64) -> Result<bool> {
     transaction(c, |c| {
         let Some(record) = execution(c, project, generation)? else {

@@ -35,7 +35,7 @@ impl IntoResponse for ApiError {
     }
 }
 type ApiResult = std::result::Result<Json<Value>, ApiError>;
-pub const PROTOCOL: u64 = 5;
+pub const PROTOCOL: u64 = 6;
 
 pub fn router(app: Arc<App>) -> Router {
     let api = Router::new()

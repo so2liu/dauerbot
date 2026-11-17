@@ -44,6 +44,7 @@ pub struct Project {
 #[derive(Debug, Deserialize)]
 pub struct ProjectInput {
     pub name: String,
+    #[serde(default)]
     pub path: String,
     #[serde(default = "default_agent")]
     pub agent: String,
@@ -164,6 +165,7 @@ impl Db {
         crate::bot::migrate(&migration)?;
         migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         crate::work::migrate(&migration)?;
+        crate::handoff::migrate(&migration)?;
         migration.pragma_update(None, "user_version", 7)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))
@@ -206,8 +208,16 @@ impl Db {
     }
     pub async fn create(&self, input: ProjectInput) -> Result<Project> {
         validate(&input)?;
-        let path =
-            std::fs::canonicalize(&input.path).context("Project directory does not exist")?;
+        let requested = input.path.clone();
+        let name = input.name.clone();
+        let path = tokio::task::spawn_blocking(move || -> Result<_> {
+            if requested.trim().is_empty() {
+                crate::workspace::create(&name)
+            } else {
+                std::fs::canonicalize(&requested).context("Project directory does not exist")
+            }
+        })
+        .await??;
         if !path.is_dir() {
             bail!("Project path must be a directory");
         }

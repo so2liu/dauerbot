@@ -572,6 +572,19 @@ mod connection_tests {
     }
 
     #[tokio::test]
+    async fn api_five_service_cannot_satisfy_workspace_and_handoff_contract() {
+        let data = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (config, worker) =
+            service_fixture("200 OK", json!({"version":"0.4.5", "api_protocol":5}));
+        let error = ensure_service(data.path(), &config, &client, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("trusted installed Dauerbot app"));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn authentication_failure_does_not_replace_the_running_service() {
         let (config, worker) = service_fixture("401 Unauthorized", json!({"error":"Unauthorized"}));
         let data = tempfile::tempdir().unwrap();
