@@ -3,7 +3,7 @@
 The target codex is a deterministic private shim, not a real model/login test.
 No user configuration or runtime is touched.
 """
-import argparse,json,os,shutil,socket,subprocess,sys,tempfile,threading,time,urllib.request
+import argparse,json,os,shutil,socket,sqlite3,subprocess,sys,tempfile,threading,time,urllib.request
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 import smoke
@@ -51,47 +51,74 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             before=next(p['cli_transition'] for p in api('/state')['projects'] if p['id']==key)
             again=api(f'/projects/{key}/agent/transition',{'agent':'codex'})
             assert again['cli_transition']['id']==before['id']
+            held_sources=['om_switch_pending_1','om_switch_pending_2']
+            for source in held_sources:
+                smoke.FIXTURE.emit(smoke.message(source,'new input during explicit CLI handoff'))
+            timer=api(f'/projects/{key}/timers',{'name':'During handoff','prompt':'scheduled-switch-input','kind':'once','at':int(time.time()*1000)+1000,'purpose':'user'})
+            def held_input(sources):
+                state=api(f'/projects/{key}/work')
+                events=[e for e in state['events'] if e['source_id'] in sources]
+                if len(events)!=len(sources):return None
+                assert all(e['status']=='queued' and not any(r['event_id']==e['id'] for r in state['runs']) for e in events),state
+                return state
+            smoke.wait_for(lambda:held_input(held_sources),'preclaim messages were not retained')
+            smoke.wait_for(lambda:any(e['source']=='timer' for e in api(f'/projects/{key}/work')['events']),'timer occurrence was not journaled')
+            time.sleep(2.2)
+            held_input(held_sources)
+            same=next(p['cli_transition'] for p in api('/state')['projects'] if p['id']==key)
+            assert same['id']==before['id'] and same['nonce']==before['nonce'] and same['attempts']==1 and same['holds_input'] is True,same
+            assert not (workspace/'.fixture-deliveries').exists(),'old CLI received held input'
+            checks.append('accepted switch holds messages and fired timer without old delivery or nonce refresh; retry reuses request')
+            # Pause fails the preclaim handoff but must retain the delivery fence even after resume.
+            api(f'/projects/{key}/pause',{'paused':True})
+            smoke.wait_for(lambda:next(p['cli_transition']['phase']=='failed' for p in api('/state')['projects'] if p['id']==key),'pause did not expose a held handoff failure')
+            api(f'/projects/{key}/pause',{'paused':False})
+            time.sleep(2.2)
+            held_input(held_sources)
+            assert not (workspace/'.fixture-deliveries').exists(),'failed handoff leaked messages to old CLI'
+            api(f'/projects/{key}/agent/transition',{'agent':'codex'})
+            retry=smoke.wait_for(lambda:next((p['cli_transition'] for p in api('/state')['projects'] if p['id']==key and p['cli_transition']['phase']=='requested' and p['cli_transition']['id']!=before['id']),None),'explicit retry did not prepare a new held handoff')
+            smoke.wait_for(lambda:(workspace/'.fixture-switch-held').read_text()==retry['id'],'retry prompt not observed by old fixture')
+            checks.append('failed handoff plus pause/resume holds all input; explicit target retry has no delivery gap')
             (workspace/'.fixture-mcp-hold').write_text('hold selected CLI registration')
             (workspace/'.fixture-switch-mode').unlink()
-            smoke.FIXTURE.emit(smoke.message('om_switch_steer','new input during explicit CLI handoff'))
-            def steered():
-                work=api(f'/projects/{key}/work');return any(e['source_id']=='om_switch_steer' and e['status'] in ('submitted','delivered') for e in work['events'])
-            smoke.wait_for(steered,'handoff blocked immediate Feishu steering',timeout=12)
-            assert api(f'/projects/{key}')['project']['generation']==old['generation']
-            checks.append('same-target retry reuses durable request; live Feishu input steers old generation during handoff')
+            (workspace/'.fixture-switch-release').write_text('settle current handoff without delivering a user message')
             smoke.wait_for(lambda:len((workspace/'.fixture-launches').read_text().splitlines())==2,'selected shim did not launch',timeout=35)
             pending=next(p for p in api('/state')['projects'] if p['id']==key)
             assert pending['agent']=='codex' and pending['cli_transition']['phase']=='starting' and pending['execution'].get('mcp_registered') is not True
+            assert not (workspace/'.fixture-deliveries').exists(),'old CLI received queued input before stop'
             smoke.FIXTURE.emit(smoke.message('om_switch_postclaim','input after retirement boundary'))
-            def held_input():
-                state=api(f'/projects/{key}/work');event=next((e for e in state['events'] if e['source_id']=='om_switch_postclaim'),None)
-                if not event:return None
-                assert event['status']=='queued' and not any(r['event_id']==event['id'] for r in state['runs']),state
-                return event
-            smoke.wait_for(held_input,'postclaim input was not retained')
+            held_sources.append('om_switch_postclaim')
+            smoke.wait_for(lambda:held_input(held_sources),'postclaim input was not retained')
             time.sleep(2.2)
-            held_input()
+            held_input(held_sources)
             (workspace/'.fixture-mcp-hold').unlink()
             def ready():
                 p=next(p for p in api('/state')['projects'] if p['id']==key)
                 return p if p['agent']=='codex' and p['ready'] and p['cli_transition']['phase']=='ready' else None
             current=smoke.wait_for(ready,'selected CLI did not start immediately',timeout=50)
-            assert current['generation']!=old['generation'] and current['native_session']=='' and current['execution']['mcp_registered'] is True
-            assert current['cli_transition']['nonce']!=before['nonce'] and current['cli_transition']['attempts']>=2
+            assert current['generation']!=old['generation'] and current['native_session']=='' and current['execution']['mcp_registered'] is True and current['cli_transition']['holds_input'] is False
+            assert current['cli_transition']['nonce']==retry['nonce'] and current['cli_transition']['attempts']==1
             launches=[json.loads(line) for line in (workspace/'.fixture-launches').read_text().splitlines()]
             assert len(launches)==2 and not launches[-1]['resume'] and launches[-1]['native']!=launches[0]['native'], launches
             assert 'user explicitly switched' in launches[-1]['instructions'] and 'do not replay already delivered' in launches[-1]['instructions']
             assert 'dauerbot-switch-ready:' in (workspace/'HANDOFF.md').read_text()
-            checks.append('fresh cooperative nonce handoff starts selected CLI now with fresh native context and explicit handoff continuation instructions')
-            work=api(f'/projects/{key}/work');events=[e for e in work['events'] if e['source_id']=='om_switch_steer'];assert len(events)==1
-            assert len([r for r in work['runs'] if r['event_id']==events[0]['id']])==1
             def delivered_new():
-                state=api(f'/projects/{key}/work');event=next((e for e in state['events'] if e['source_id']=='om_switch_postclaim'),None)
-                if not event:return None
-                runs=[r for r in state['runs'] if r['event_id']==event['id']]
-                return runs if len(runs)==1 and runs[0]['generation']==current['generation'] else None
-            smoke.wait_for(delivered_new,'postclaim input did not reach new registered generation once')
-            checks.append('old input is not replayed; postclaim input stays unclaimed until selected-generation MCP registration and is then delivered once')
+                state=api(f'/projects/{key}/work');events=[e for e in state['events'] if e['source_id'] in held_sources or e['source']=='timer']
+                if len(events)!=4:return None
+                for event in events:
+                    runs=[r for r in state['runs'] if r['event_id']==event['id']]
+                    if not runs:return None
+                    assert len(runs)==1 and runs[0]['generation']==current['generation'],state
+                lines=[json.loads(line) for line in (workspace/'.fixture-deliveries').read_text().splitlines()]
+                if len(lines)!=4:return None
+                assert [v['source'] for v in lines if v['source'].startswith('om_')]==held_sources,lines
+                assert all(v['generation']==current['generation'] for v in lines),lines
+                return state
+            final=smoke.wait_for(delivered_new,'held input did not reach registered target in order exactly once')
+            with sqlite3.connect(f'file:{data}/bridge.sqlite3?mode=ro',uri=True) as db:
+                assert db.execute('SELECT count(*) FROM work_occurrences WHERE timer_id=?',(timer['id'],)).fetchone()[0]==1
+            checks.append('all held messages arrive in order once only at authenticated target; timer occurrence remains one and is delivered there')
             # A terminal-free project has no old native state to wake merely to write a file.
             sleeping=base/'sleeping';sleeping.mkdir();p2=api('/projects',{'name':'Fresh sleeping switch','path':str(sleeping),'agent':'claude'});api(f'/projects/{p2["id"]}/agent/transition',{'agent':'codex'})
             fresh=smoke.wait_for(lambda:next((p for p in api('/state')['projects'] if p['id']==p2['id'] and p['agent']=='codex' and p['ready']),None),'sleeping CLI was not started now',timeout=40)

@@ -49,6 +49,9 @@ impl Language {
             "Switching CLI…" | "switching_cli" => "正在切换 CLI…",
             "Selected CLI is ready." => "所选 CLI 已就绪。",
             "CLI handoff requested." => "已请求 CLI 交接。",
+            "Messages wait for the selected CLI. Stop pauses the project and cancels the switch." => {
+                "消息将等待所选 CLI 就绪。停止会暂停项目并取消切换。"
+            }
             "Retry startup" => "重试启动",
             "Resume this project and release terminal input before changing its CLI." => {
                 "切换 CLI 前，请先恢复项目并释放终端输入。"

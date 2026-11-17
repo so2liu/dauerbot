@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Hold unclaimed messages and scheduled input for the selected CLI from switch acceptance through authenticated readiness. Keep input pending on failure, pause, takeover and restart; retry without leaking to the old Agent. Explicit Stop cancels the switch and pauses delivery after a verified stop (#79).
+
 ## 0.4.8 — 2026-11-17
 
 ### Added

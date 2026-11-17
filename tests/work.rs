@@ -14,6 +14,7 @@ fn store() -> Connection {
     )
     .unwrap();
     migrate(&c).unwrap();
+    herdr_feishu_bridge::cli_switch::migrate(&c, false).unwrap();
     c
 }
 fn submit(c: &Connection, source: &str, now: i64) -> Event {

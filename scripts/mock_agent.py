@@ -5,6 +5,7 @@ Its persisted marker checks fixture continuity, not any model's native resume.
 import json
 import datetime
 import os
+import select
 from pathlib import Path
 import shutil
 import socket
@@ -87,8 +88,28 @@ sys.stdout.write("\r\nMOCK_AGENT_READY\r\n")
 sys.stdout.flush()
 buffer = b""
 held = None
+switch_held = None
+
+
+def switch_handoff(event):
+    mode = Path.cwd() / ".fixture-switch-mode"
+    nonce = event.attrib["handoff_nonce"]
+    text = "# CLI handoff\n\nAll native children and external workers have been settled. Continue the current fixture goal from this workspace. Preserve completed effects and never replay earlier replies.\n"
+    if not mode.exists() or mode.read_text() != "stale":
+        text += "<!-- dauerbot-switch-ready:" + nonce + " -->\n"
+    (Path.cwd() / "HANDOFF.md").write_text(text)
+    status("idle")
+
+
 try:
     while True:
+        release = Path.cwd() / ".fixture-switch-release"
+        if switch_held is not None and release.exists():
+            release.unlink()
+            switch_handoff(switch_held)
+            switch_held = None
+        if not select.select([0], [], [], 0.05)[0]:
+            continue
         buffer += os.read(0, 65536)
         end = b"\x1b[201~\r"
         while end in buffer:
@@ -100,13 +121,9 @@ try:
                 mode = Path.cwd() / ".fixture-switch-mode"
                 if mode.exists() and mode.read_text() == "hold":
                     (Path.cwd() / ".fixture-switch-held").write_text(event.attrib["request_id"])
+                    switch_held = event
                     continue
-                nonce = event.attrib["handoff_nonce"]
-                text = "# CLI handoff\n\nAll native children and external workers have been settled. Continue the current fixture goal from this workspace. Preserve completed effects and never replay earlier replies.\n"
-                if not mode.exists() or mode.read_text() != "stale":
-                    text += "<!-- dauerbot-switch-ready:" + nonce + " -->\n"
-                (Path.cwd() / "HANDOFF.md").write_text(text)
-                status("idle")
+                switch_handoff(event)
                 continue
             if event.tag == "dauerbot_handoff":
                 status("working")
@@ -140,6 +157,8 @@ try:
             else:
                 source = event.attrib["source"] + ":" + event.attrib["event_id"]
                 to = "oc_fixture"
+            with (Path.cwd() / ".fixture-deliveries").open("a") as deliveries:
+                deliveries.write(json.dumps({"source": source, "generation": Path(sys.argv[2]).parent.name}) + "\n")
             reply_anchor = {"reply_to_message_id": source} if envelope is not None and to == envelope.find("source").attrib["chat_id"] else {}
             tool("send_md", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + source, **reply_anchor})
             if body == "fixture-create-schedule":
