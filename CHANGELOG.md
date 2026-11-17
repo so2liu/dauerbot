@@ -5,7 +5,7 @@
 ### Added
 
 - Bundle a project-local Herdr delegation skill and maintain a small `AGENTS.md` delegation block for new workspaces and session launches. Preserve user instructions and edited or unowned resource collisions; prefer responsive native same-CLI delegation without changing global settings (#72).
-- Choose Codex, Claude Code, Pi or Antigravity while a project is in standby. The next message starts the selected CLI in the same workspace, preserving files, schedules, bot settings and handoff instructions (#70).
+- Switch Codex, Claude Code, Pi or Antigravity immediately from the project view. The current Agent settles its work and children, writes a fresh `HANDOFF.md`, then the selected CLI starts in the same workspace. Preserve files, schedules, bot settings and queued input; deliver input after the selected CLI establishes its authenticated MCP connection (#70, #76).
 - Read rendered `HANDOFF.md` and `AGENTS.md` directly in the native project view, with clear states for missing or unreadable documents (#70).
 
 ### Fixed
@@ -17,6 +17,7 @@
 ### Changed
 
 - Simplify Updates to progress, results and normal update actions. The first launch after a published 0.4.7 update performs a bounded automatic bootstrap; later capable versions use verified handover (#66).
+- Keep explicit CLI switching cooperative: require a fresh ready acknowledgement and a later native idle transition, retain the supported managed Pi dispatch fence, and leave automatic idle retirement's stricter child-coverage checks unchanged (#76).
 - Advance both application crates to 0.4.8 and bundle build 13. Keep API protocol 7 and the three Agent tools unchanged.
 
 ## 0.4.7 — 2026-11-17
