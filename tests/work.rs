@@ -33,6 +33,7 @@ fn interval(seconds: i64) -> TimerInput {
         timezone: "Asia/Shanghai".into(),
         to: Some("ou_owner".into()),
         request_id: None,
+        purpose: String::new(),
     }
 }
 fn finish(c: &Connection, run: &Run, now: i64) {
@@ -379,4 +380,122 @@ fn schedule_request_ids_deduplicate_across_network_retries() {
     scheduled.prompt = "Different effects".into();
     assert!(create_timer(&c, "p", scheduled, 10_000).is_err());
     assert_eq!(snapshot(&c, "p").unwrap().timers.len(), 1);
+}
+
+#[test]
+fn legacy_purpose_migration_preserves_reminders_history_and_mcp_retry_payloads() {
+    let c = store();
+    // This is the canonical payload written before purpose existed, including
+    // the field order used for request_id deduplication.
+    let payload = r#"{"name":"Internal follow-up","prompt":"Check the project","kind":"once","at":"2026-11-18T00:00:00Z","interval_seconds":null,"cron":null,"timezone":"UTC","to":"ou_owner","request_id":"legacy-retry"}"#;
+    let input: TimerInput = serde_json::from_str(payload).unwrap();
+    let legacy = create_timer(&c, "p", input, 0).unwrap();
+    let paused = create_timer(&c, "p", interval(60), 0).unwrap();
+    let paused = set_timer_enabled(&c, "p", &paused.id, false, 1).unwrap();
+    let mut completed = interval(60);
+    completed.kind = "once".into();
+    completed.at = Some(json!(1));
+    let completed = create_timer(&c, "p", completed, 0).unwrap();
+    let occurrence = fire_due(&c, 1).unwrap().remove(0);
+    c.execute("ALTER TABLE work_timers DROP COLUMN purpose", [])
+        .unwrap();
+    migrate(&c).unwrap();
+    migrate(&c).unwrap();
+
+    let after = timer(&c, "p", &legacy.id).unwrap();
+    assert!(after.purpose.is_empty());
+    assert!(after.enabled);
+    assert_eq!(after.next_fire, legacy.next_fire);
+    assert_eq!(after.revision, legacy.revision);
+    let after_pause = timer(&c, "p", &paused.id).unwrap();
+    assert!(!after_pause.enabled);
+    assert_eq!(after_pause.next_fire, paused.next_fire);
+    assert_eq!(after_pause.revision, paused.revision);
+    let after_completed = timer(&c, "p", &completed.id).unwrap();
+    assert!(!after_completed.enabled && after_completed.next_fire.is_none());
+    assert_eq!(snapshot(&c, "p").unwrap().events[0].id, occurrence.id);
+    let stored: String = c
+        .query_row(
+            "SELECT request_payload FROM work_timers WHERE id=?",
+            [&legacy.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, payload);
+
+    for purpose in [None, Some("")] {
+        let mut request: serde_json::Value = serde_json::from_str(payload).unwrap();
+        if let Some(purpose) = purpose {
+            request["purpose"] = json!(purpose);
+        }
+        // Exercise the MCP-to-API serialization path as well as TimerInput.
+        let mcp: herdr_feishu_bridge::mcp::ScheduleRun = serde_json::from_value(request).unwrap();
+        let request = serde_json::to_value(mcp).unwrap();
+        assert!(request.get("purpose").is_none());
+        let retry: TimerInput = serde_json::from_value(request).unwrap();
+        assert_eq!(serde_json::to_string(&retry).unwrap(), payload);
+        assert_eq!(create_timer(&c, "p", retry, 2).unwrap().id, legacy.id);
+    }
+    let mut changed: TimerInput = serde_json::from_str(payload).unwrap();
+    changed.purpose = "internal".into();
+    assert!(create_timer(&c, "p", changed, 2).is_err());
+    // Migration did not disable the unclassified one-shot or erase the old event.
+    assert_eq!(fire_due(&c, legacy.next_fire.unwrap()).unwrap().len(), 1);
+    assert_eq!(snapshot(&c, "p").unwrap().events.len(), 2);
+    assert!(fire_due(&c, legacy.next_fire.unwrap()).unwrap().is_empty());
+}
+
+#[test]
+fn internal_schedules_fire_once_deduplicate_and_keep_purpose_on_legacy_edits() {
+    let c = store();
+    begin_execution(&c, "p", "g", 0).unwrap();
+    let mut input = interval(60);
+    input.kind = "once".into();
+    input.at = Some(json!(10));
+    input.request_id = Some("internal-request".into());
+    input.purpose = "internal".into();
+    let created = create_timer(&c, "p", input.clone(), 0).unwrap();
+    assert_eq!(
+        create_timer(&c, "p", input.clone(), 1).unwrap().id,
+        created.id
+    );
+    assert!(timer(&c, "other", &created.id).is_err());
+    let event = fire_due(&c, 10).unwrap().remove(0);
+    assert_eq!(event.payload["timer_id"], created.id);
+    assert!(fire_due(&c, 10).unwrap().is_empty());
+    let run = claim_next(&c, "p", "g", 11).unwrap().unwrap();
+    finish(&c, &run, 12);
+    let stored = timer(&c, "p", &created.id).unwrap();
+    assert_eq!(stored.purpose, "internal");
+    assert!(!stored.enabled && stored.next_fire.is_none());
+    assert!(set_timer_enabled(&c, "p", &created.id, true, 13).is_err());
+    let state = snapshot(&c, "p").unwrap();
+    assert_eq!(
+        state.timers.len(),
+        1,
+        "Introspection retains internal and exhausted schedules"
+    );
+    assert_eq!(state.events.len(), 1);
+    assert_eq!(state.runs.len(), 1);
+
+    input.purpose.clear();
+    input.at = Some(json!(20));
+    let edited = update_timer(&c, "p", &created.id, input.clone(), 14).unwrap();
+    assert_eq!(edited.purpose, "internal");
+    assert_eq!(edited.revision, created.revision + 1);
+    input.purpose = "user".into();
+    let edited = update_timer(&c, "p", &created.id, input.clone(), 15).unwrap();
+    assert_eq!(edited.purpose, "user");
+    assert_eq!(edited.revision, created.revision + 2);
+    input.purpose = "guess-from-title".into();
+    assert!(create_timer(&c, "p", input, 16).is_err());
+    assert_eq!(
+        c.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM work_occurrences WHERE timer_id=?",
+            [&created.id],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        1
+    );
 }

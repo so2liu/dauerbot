@@ -54,6 +54,10 @@ pub struct ScheduleRun {
     /// IANA timezone such as Asia/Shanghai or America/New_York.
     pub timezone: String,
     pub to: Option<String>,
+    /// user for work the user asked to schedule; internal for your own follow-up checks.
+    /// Set this explicitly for new schedules. Missing/empty is accepted for legacy retries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
 }
 impl BridgeMcp {
     async fn post(&self, operation: &str, body: Value) -> Result<Value> {
@@ -123,7 +127,7 @@ fn result(value: Result<Value>, must_sent: bool) -> Result<CallToolResult, Error
 #[tool_router]
 impl BridgeMcp {
     #[tool(
-        description = "Schedule future work: once with RFC3339 at, interval with interval_seconds, or cron with a five-field expression. Specify IANA timezone. The daemon persists the timer and wakes this Agent when due; no need to keep the process alive."
+        description = "Schedule future work: once with RFC3339 at, interval with interval_seconds, or cron with a five-field expression. Specify IANA timezone and purpose: user for work the user asked to schedule, internal for your own follow-up checks. Internal schedules execute normally but stay out of the desktop schedule list. Set purpose explicitly for new schedules; preserve the original payload and request_id on retries. The daemon persists the timer and wakes this Agent when due; no need to keep the process alive."
     )]
     async fn schedule_run(
         &self,
@@ -168,7 +172,7 @@ impl BridgeMcp {
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("You are the project’s Feishu session. Incoming messages steer your current work immediately. Reply and ask questions using send_md or send_file with the mandatory to field (oc_ chat ID or ou_ user Open ID). Terminal output alone does not deliver a reply. Use schedule_run for future once, interval, or cron runs. Native HERDR state manages the session lifecycle; no task bookkeeping is required. Preserve uncertain send outcomes and reuse request_id only for the same request.")
+            .with_instructions("You are the project’s Feishu session. Incoming messages steer your current work immediately. Reply and ask questions using send_md or send_file with the mandatory to field (oc_ chat ID or ou_ user Open ID). Terminal output alone does not deliver a reply. Use schedule_run for future once, interval, or cron runs. Set purpose=user for work the user asked to schedule and purpose=internal for your own follow-up checks; internal schedules run normally but stay out of the desktop schedule list. Preserve the original payload and request_id on retries. Native HERDR state manages the session lifecycle; no task bookkeeping is required. Preserve uncertain send outcomes and reuse request_id only for the same request.")
     }
 }
 

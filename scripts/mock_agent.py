@@ -129,7 +129,13 @@ try:
             if body == "fixture-create-schedule":
                 due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
                 tool("schedule_run", {"request_id":"fixture-schedule-run", "name":"MCP schedule", "prompt":"scheduled-via-mcp",
-                     "kind":"once", "at":due.isoformat(), "timezone":"UTC", "to":to})
+                     "kind":"once", "at":due.isoformat(), "timezone":"UTC", "to":to, "purpose":"user"})
+            if body == "fixture-create-internal-schedule":
+                due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
+                scheduled = {"request_id":"fixture-internal-run", "name":"Internal follow-up", "prompt":"scheduled-internal-via-mcp",
+                             "kind":"once", "at":due.isoformat(), "timezone":"UTC", "to":to, "purpose":"internal"}
+                tool("schedule_run", scheduled)
+                tool("schedule_run", scheduled)
             if "send-file" in text:
                 tool("send_file", {"to": to, "path": str(Path.cwd() / "report.txt"), "request_id": "file-" + source})
             if body == "fixture-steer-release":
