@@ -88,6 +88,25 @@ async fn missing_stale_malformed_and_wrong_generation_or_session_are_unknown() {
 }
 
 #[tokio::test]
+async fn durable_unknown_marker_vetoes_a_late_quiescent_snapshot() {
+    let (dir, _db, p) = fixture().await;
+    evidence(dir.path(), "quiescent", 2, 100);
+    let quiet = native_children::observe(&p, 100);
+    assert_eq!(quiet["state"], "quiescent");
+    fs::write(
+        dir.path().join("coverage.unknown"),
+        "Old adapter stopped with children",
+    )
+    .unwrap();
+    // A late old closure can publish a perfectly fresh but incomplete snapshot.
+    evidence(dir.path(), "quiescent", 3, 101);
+    let observed = native_children::observe(&p, 101);
+    assert_eq!(observed["state"], "unknown");
+    assert!(observed["revision"].is_null());
+    assert!(RetirementGate::acquire(&p, &quiet, 101).is_err());
+}
+
+#[tokio::test]
 async fn child_revision_active_and_unknown_reset_warm_window_and_cancel_handoff() {
     let (_dir, db, p) = fixture().await;
     db.sync(|c| {

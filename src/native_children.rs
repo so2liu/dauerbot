@@ -91,6 +91,12 @@ pub fn observe(p: &Project, now: i64) -> Value {
         return unknown();
     };
     let read = || -> Result<Evidence> {
+        // This generation's marker is authoritative even when an old adapter
+        // closure completes later and overwrites the latest child snapshot.
+        match fs::symlink_metadata(dir.join("coverage.unknown")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => anyhow::bail!("Native child coverage is permanently unknown for this execution"),
+        }
         let file = dir.join("children.json");
         let meta = fs::symlink_metadata(&file)?;
         ensure!(

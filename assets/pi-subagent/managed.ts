@@ -23,7 +23,7 @@ export default function managed(pi: ExtensionAPI) {
 		if (!session) return;
 		// Removing configuration does not unload a running plugin or its children.
 		// Once coverage is incomplete it stays so for this execution generation.
-		incomplete ||= externalExtensions(getAgentDir(), cwd, pi.getSettings(), config.mcp);
+		incomplete ||= fs.existsSync(unknown) || externalExtensions(getAgentDir(), cwd, pi.getSettings(), config.mcp);
 		if (incomplete && !fs.existsSync(unknown)) fs.writeFileSync(unknown, "Incomplete native child coverage\n", { mode: 0o600 });
 		const tmp = `${state}.${process.pid}.tmp`;
 		fs.writeFileSync(tmp, JSON.stringify({ schema: 1, generation: config.generation,

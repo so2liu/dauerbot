@@ -66,7 +66,19 @@ try {
  fs.writeFileSync(path.join(managed,'retiring'),'claimed');
  await assert.rejects(tool.execute('retired',{agent:'worker',task:'hold'},undefined,undefined,ctx));
  assert.equal(state().state,'quiescent'); fs.unlinkSync(path.join(managed,'retiring'));
- // Unknown external MCP/plugin coverage is sticky for the adapter lifetime.
+ // An old invocation can finish after its extension was shut down/reloaded.
+ // Its late finally callback must not overwrite durable unknown as quiescent.
+ const old=ext;
+ const finishing=tool.execute('old-after-reload',{agent:'worker',task:'hold old closure'},undefined,undefined,ctx);
+ await delay(20); assert.equal(state().state,'active');
+ for(const fn of old.handlers.get('session_shutdown')??[])await fn({type:'session_shutdown'},ctx);
+ const fresh=await loadExtensions([path.join(managed,'managed.ts')],tmp);
+ assert.deepEqual(fresh.errors,[]); fresh.runtime.getSettings=()=>({}); ext=fresh.extensions[0];
+ for(const fn of ext.handlers.get('session_start'))await fn({type:'session_start'},ctx);
+ assert.equal(state().state,'unknown');
+ await finishing;
+ assert.equal(state().state,'unknown','old wrapper completion after shutdown/reload must honor the durable marker');
+ // Unknown external MCP/plugin coverage is sticky for the execution generation.
  const projectMcp=path.join(tmp,'.pi','mcp.json');
  fs.mkdirSync(path.dirname(projectMcp),{recursive:true});
  fs.writeFileSync(projectMcp,JSON.stringify({mcpServers:{other:{command:'unobserved-native-provider'}}}));
