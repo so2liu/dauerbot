@@ -511,6 +511,116 @@ struct InstallRecord {
     backup: PathBuf,
     version: String,
 }
+/// The old updater saved this exact signed bundle before replacing the app.
+/// Do not search arbitrary backup directories or trust a version string alone.
+pub fn historical_companion(data: &Path, version: &str, protocol: u64) -> Result<PathBuf> {
+    let updates = data.join("updates");
+    config::private_dir(&updates)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(updates.join("update.lock"))?;
+    lock.try_lock_exclusive()
+        .context("An app update is still running; reopen the app after it completes")?;
+    let cache = data
+        .join("runtime/hfb")
+        .join(format!("{version}-api{protocol}"));
+    if cache.is_dir() {
+        for entry in fs::read_dir(&cache)? {
+            let executable = entry?.path().join("hfb");
+            if executable.is_file() {
+                crate::companion::validate(&executable)?;
+                verify_historical_executable(&executable, version)?;
+                return Ok(executable);
+            }
+        }
+    }
+    let record: InstallRecord = serde_json::from_slice(
+        &fs::read(updates.join("installed.json"))
+            .context("No preserved update bundle is available")?,
+    )?;
+    let stage = record.backup.parent().context("Invalid backup path")?;
+    ensure!(
+        record.app.is_absolute()
+            && record.backup.is_absolute()
+            && record.backup.file_name().is_some_and(|n| n == "old")
+            && stage.parent() == record.app.parent()
+            && stage
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".dauerbot-update-")),
+        "The backup does not belong to this app update"
+    );
+    verify_bundle(&record.backup, Some(version))?;
+    let source = record.backup.join("Contents/MacOS/hfb");
+    verify_historical_executable(&source, version)?;
+    let retained = crate::companion::pin(data, &source, version, protocol)?;
+    verify_historical_executable(&retained, version)?;
+    Ok(retained)
+}
+
+fn verify_historical_executable(path: &Path, version: &str) -> Result<()> {
+    let requirement =
+        format!("=anchor apple generic and certificate leaf[subject.OU] = \"{TEAM_ID}\"");
+    output(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict", "-R"])
+            .arg(requirement)
+            .arg(path),
+    )?;
+    ensure!(
+        output(Command::new(path).arg("--version"))? == format!("hfb {version}"),
+        "Historical companion version does not match the authenticated daemon"
+    );
+    Ok(())
+}
+
+/// Capture the authenticated service protocol for generations that predate
+/// execution metadata. Reading this file never opens or recovers the live DB.
+pub fn record_service(data: &Path, state: &serde_json::Value) -> Result<()> {
+    let protocol = state["api_protocol"]
+        .as_u64()
+        .context("Daemon protocol is missing")?;
+    let projects: Vec<_> = state["projects"].as_array().context("Daemon projects are missing")?
+        .iter().filter(|p| p["lifecycle"] != "update_required")
+        .map(|p| serde_json::json!({"id":p["id"],"generation":p["generation"],"terminal":p["terminal"]})).collect();
+    config::private_dir(&data.join("updates"))?;
+    config::write_private(
+        &data.join("updates/service-identity.json"),
+        &serde_json::to_vec(&serde_json::json!({"api_protocol":protocol,"projects":projects}))?,
+    )
+}
+
+pub fn inherit_service_protocol(data: &Path, db: &crate::db::Db) -> Result<()> {
+    let path = data.join("updates/service-identity.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let protocol = state["api_protocol"]
+        .as_u64()
+        .context("Saved service protocol is missing")?;
+    db.sync(|c| {
+        for p in state["projects"]
+            .as_array()
+            .context("Saved service projects are missing")?
+        {
+            c.execute(
+                "UPDATE projects SET execution=json_set(execution,'$.api_protocol',?1)
+                WHERE id=?2 AND generation=?3 AND terminal=?4 AND execution!='null'
+                AND json_extract(execution,'$.api_protocol') IS NULL",
+                rusqlite::params![
+                    i64::try_from(protocol)?,
+                    p["id"].as_str(),
+                    p["generation"].as_str(),
+                    p["terminal"].as_str()
+                ],
+            )?;
+        }
+        Ok(())
+    })
+}
 pub async fn install(
     client: &reqwest::Client,
     data: &Path,

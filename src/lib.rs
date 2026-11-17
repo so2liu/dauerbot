@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod api;
 pub mod bot;
+pub mod companion;
 pub mod config;
 pub mod conversation;
 pub mod db;
@@ -22,6 +23,9 @@ use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tokio_util::sync::CancellationToken;
+
+pub const UPDATE_RESUME_NOTICE: &str = "The background service changed its Agent protocol. Choose Recover Agent after update to restart only this Agent and resume its saved native session. Queued messages and uncertain results are preserved.";
+pub const UPDATE_FRESH_NOTICE: &str = "The background service changed its Agent protocol. Choose Recover Agent after update to restart only this Agent. A fresh session will start because no native session ID was saved. Queued messages and uncertain results are preserved.";
 
 #[derive(Default, Serialize)]
 pub struct Runtime {
@@ -48,12 +52,14 @@ pub struct App {
     pub shutdown: CancellationToken,
     project_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     outbound_lock: Mutex<()>,
+    companion: std::sync::OnceLock<PathBuf>,
 }
 
 impl App {
     pub fn new(dir: PathBuf, mut cfg: Config) -> Result<Arc<Self>> {
         config::private_dir(&dir.join("files"))?;
         let db = Db::open(&dir.join("bridge.sqlite3"))?;
+        update::inherit_service_protocol(&dir, &db)?;
         if db.import_bot(&cfg.app_id, &cfg.app_secret)? {
             cfg.app_id.clear();
             cfg.app_secret.clear();
@@ -74,7 +80,42 @@ impl App {
             shutdown: CancellationToken::new(),
             project_locks: Mutex::new(HashMap::new()),
             outbound_lock: Mutex::new(()),
+            companion: std::sync::OnceLock::new(),
         }))
+    }
+    pub fn companion(&self) -> Result<&std::path::Path> {
+        if self.companion.get().is_none() {
+            let _ = self.companion.set(companion::current(&self.dir)?);
+        }
+        let path = self.companion.get().context("Companion was not retained")?;
+        companion::validate(path)?;
+        Ok(path)
+    }
+    pub fn update_required(p: &Project) -> bool {
+        p.terminal.is_some() && p.execution["api_protocol"].as_u64() != Some(api::PROTOCOL)
+    }
+    pub async fn recover_after_update(self: &Arc<Self>, key: &str) -> Result<Project> {
+        let p = self.db.project(key).await?;
+        let lock = self.project_lock(&p.id).await;
+        let _guard = lock.lock().await;
+        let p = self.db.project(&p.id).await?;
+        anyhow::ensure!(
+            Self::update_required(&p),
+            "This Agent does not need update recovery"
+        );
+        self.stop_inner(&p).await?;
+        let recovered = self
+            .start_inner(&p.id, !p.native_session.is_empty())
+            .await?;
+        let id = p.id;
+        let generation = p.generation;
+        self.db
+            .call(move |c| {
+                work::resolve_attention_reason(c, &id, &generation, "update_required", db::now())?;
+                Ok(())
+            })
+            .await?;
+        Ok(recovered)
     }
     pub async fn project_lock(&self, key: &str) -> Arc<Mutex<()>> {
         self.project_locks
@@ -92,6 +133,10 @@ impl App {
     }
     async fn start_inner(&self, key: &str, resume: bool) -> Result<Project> {
         let mut p = self.db.project(key).await?;
+        anyhow::ensure!(
+            !Self::update_required(&p),
+            "update_required: Recover this Agent after the service update. Its native session and queued messages are preserved."
+        );
         let cfg = self.config.read().await.clone();
         herdr::ensure_server(&cfg).await?;
         if p.terminal.is_some() {
@@ -132,7 +177,7 @@ impl App {
             &session_dir.join("credentials.json"),
             &serde_json::to_vec_pretty(&credentials)?,
         )?;
-        let entry = json!({"command":std::env::current_exe()?,"args":["mcp","--credentials",session_dir.join("credentials.json")]});
+        let entry = json!({"command":self.companion()?,"args":["mcp","--credentials",session_dir.join("credentials.json")]});
         let mcp_file = session_dir.join("mcp.json");
         config::write_private(
             &mcp_file,
@@ -147,7 +192,7 @@ impl App {
             let home =
                 directories::BaseDirs::new().context("Cannot locate the user's home directory")?;
             let global_entry = json!({
-                "command":std::env::current_exe()?,
+                "command":self.companion()?,
                 "args":["--data-dir",self.dir,"mcp"]
             });
             herdr::merge_mcp(
@@ -165,7 +210,9 @@ impl App {
         if let Some(native) = &assigned {
             argv.splice(1..1, ["--session-id".into(), native.clone()]);
         }
-        let execution = herdr::prepare_execution(&cfg, &p, &argv, &generation).await?;
+        let mut execution = herdr::prepare_execution(&cfg, &p, &argv, &generation).await?;
+        execution["api_protocol"] = json!(api::PROTOCOL);
+        execution["companion"] = json!(self.companion()?);
         self.db
             .save_execution(&p.id, execution, &generation)
             .await?;
@@ -431,7 +478,12 @@ impl App {
                 rusqlite::params![attention_id,id,generation,reason,message,to,json!(["open_terminal","retry"]).to_string(),now,now])?;
             if !to.is_empty() && let Some(binding)=bot::get(&tx,&id)? {
                 feishu::recipient_type(&to)?;
-                let notice=format!("**{project_name} needs your attention**\n\n{message}\n\nOpen Dauerbot and select this project to continue in its terminal. Queued messages and scheduled runs remain saved.");
+                let action = if reason == "update_required" {
+                    "Open Dauerbot, select this project and choose Recover Agent after update. Saved messages continue automatically afterward."
+                } else {
+                    "Open Dauerbot and select this project to continue in its terminal. Queued messages and scheduled runs remain saved."
+                };
+                let notice=format!("**{project_name} needs your attention**\n\n{message}\n\n{action}");
                 tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
                     VALUES(?,?,'out',?,?,'pending',?,?,?)",rusqlite::params![db::id(),id,format!("attention-{attention_id}"),notice,json!({"to":to,"bot_app_id":binding.app_id}).to_string(),now,now])?;
             }
@@ -463,6 +515,20 @@ impl App {
             return Ok(());
         };
         let mut p = self.db.project(key).await?;
+        if Self::update_required(&p) {
+            self.attention(
+                &p,
+                "update_required",
+                if p.native_session.is_empty() {
+                    UPDATE_FRESH_NOTICE
+                } else {
+                    UPDATE_RESUME_NOTICE
+                },
+            )
+            .await?;
+            self.set_phase(&p, "update_required", Value::Null).await;
+            return Ok(());
+        }
         let id = p.id.clone();
         let state = self.db.call(move |c| work::snapshot(c, &id)).await?;
         let project_id = p.id.clone();

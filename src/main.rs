@@ -23,6 +23,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    CompanionIdentity,
     /// Initialize the private local data directory
     Init,
     /// Run the daemon in the foreground (or use launchd/systemd)
@@ -301,6 +303,10 @@ async fn main() -> Result<()> {
             }
         };
     }
+    if matches!(cli.command, Commands::CompanionIdentity) {
+        print(&json!({"version":env!("CARGO_PKG_VERSION"),"api_protocol":api::PROTOCOL}));
+        return Ok(());
+    }
     let dir = cli.data_dir.unwrap_or_else(config::default_dir);
     config::private_dir(&dir)?;
     let dir = std::fs::canonicalize(dir).context("Cannot resolve the data directory")?;
@@ -430,6 +436,7 @@ async fn main() -> Result<()> {
             .context("The management port is already in use")?;
         cfg.save(&dir)?;
         let app = App::new(dir.clone(), cfg.clone())?;
+        app.companion()?;
         app.workers();
         eprintln!(
             "Dauerbot {} · {} · data directory {}",
@@ -569,7 +576,7 @@ async fn main() -> Result<()> {
             println!("[Unit]\nDescription=HERDR Feishu Bridge\nAfter=network-online.target\n\n[Service]\nExecStart=\"{}\" --data-dir \"{}\" serve\nRestart=on-failure\n\n[Install]\nWantedBy=default.target",exe.display(),dir.display());
             return Ok(())
         }
-        Commands::Serve{..}|Commands::Mcp{..}|Commands::Update{..}|Commands::Ui=>unreachable!(),
+        Commands::Serve{..}|Commands::Mcp{..}|Commands::Update{..}|Commands::Ui|Commands::CompanionIdentity=>unreachable!(),
     };
     print(&value);
     Ok(())

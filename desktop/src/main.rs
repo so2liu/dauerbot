@@ -870,6 +870,24 @@ impl Desktop {
                 body = body.child(self.card("Manual control is reserved", "Release the reservation to let queued messages continue, or take control in the terminal."))
                     .child(self.btn("release-reservation", "Release reservation", move |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Takeover { project:project.clone(),generation:generation.clone(),active:false }); }, cx));
             }
+            if project["lifecycle"] == "update_required" {
+                let recover = id.clone();
+                let has_native = project["native_session"].as_str().is_some_and(|s| !s.is_empty());
+                let notice = if has_native {
+                    herdr_feishu_bridge::UPDATE_RESUME_NOTICE
+                } else {
+                    herdr_feishu_bridge::UPDATE_FRESH_NOTICE
+                };
+                body = body.child(self.card("Agent update required", notice))
+                    .child(self.btn("recover-after-update", "Recover Agent after update", move |this, _, _| {
+                        let message = if has_native {
+                            "Agent recovery started with the saved native session. Saved messages continue when automatic activity is enabled."
+                        } else {
+                            "Agent recovery started with a fresh session because no native session ID was saved. Saved messages continue when automatic activity is enabled."
+                        };
+                        this.api("POST", format!("/projects/{recover}/recover-after-update"), None, message);
+                    }, cx));
+            }
             let pause = id.clone();
             let paused = project["paused"].as_bool().unwrap_or(false);
             body = body.child(
@@ -1082,7 +1100,7 @@ impl Desktop {
                 "Connecting to the live terminal…"
             } else if lifecycle == "paused" {
                 "Automatic activity is paused. Messages stay saved until you resume."
-            } else if matches!(lifecycle, "needs_attention" | "error") {
+            } else if matches!(lifecycle, "needs_attention" | "update_required" | "error") {
                 "Agent needs attention. Review the project notice."
             } else {
                 "Ready for messages. The Agent starts automatically when needed."

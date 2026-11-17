@@ -55,6 +55,10 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/projects/{id}/bot/check", post(check_bot))
         .route("/projects/{id}/resume", post(resume))
+        .route(
+            "/projects/{id}/recover-after-update",
+            post(recover_after_update),
+        )
         .route("/projects/{id}/agent", post(switch_agent))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
@@ -161,6 +165,9 @@ async fn auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Resp
             && !p.generation.is_empty()
             && equal(generation, &p.generation)
         {
+            if App::update_required(&p) {
+                return (StatusCode::CONFLICT, Json(json!({"error":"update_required: Open this project in Dauerbot and choose Recover Agent after update. Saved messages and uncertain results are preserved."}))).into_response();
+            }
             req.extensions_mut().insert(SessionAuthority {
                 project: p.id,
                 generation: p.generation,
@@ -190,6 +197,9 @@ async fn shutdown_service(State(app): State<Arc<App>>) -> ApiResult {
     app.shutdown.cancel();
     Ok(Json(json!({"stopping":true})))
 }
+async fn recover_after_update(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(json!(app.recover_after_update(&id).await?)))
+}
 async fn state(State(app): State<Arc<App>>) -> ApiResult {
     let projects = app.db.projects().await?;
     let runtime = serde_json::to_value(&*app.runtime.read().await).map_err(anyhow::Error::from)?;
@@ -205,7 +215,9 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
             .find(|b| b.project_id == p.id)
             .map(|b| json!({"app_id":b.app_id,"has_secret":!b.app_secret.is_empty()}))
             .unwrap_or(Value::Null);
-        if let Some(phase) = runtime["projects"].get(&p.id).and_then(Value::as_object) {
+        if App::update_required(&p) {
+            record["lifecycle"] = json!("update_required");
+        } else if let Some(phase) = runtime["projects"].get(&p.id).and_then(Value::as_object) {
             record.as_object_mut().unwrap().extend(phase.clone());
         } else {
             record["lifecycle"] = json!(if p.paused {
