@@ -98,7 +98,8 @@ pub fn fail(c: &Connection, id: &str, error: &str) -> Result<()> {
     Ok(())
 }
 
-/// This transaction is the retirement boundary. Later input stays queued for wakeup.
+/// This transaction is the daemon input retirement boundary; the caller must also
+/// hold the native managed-child dispatch gate. Later input stays queued for wakeup.
 /// Until stop succeeds, keep the old native session available for crash recovery.
 pub fn claim(c: &Connection, project: &str, generation: &str, id: &str) -> Result<bool> {
     let tx = c.unchecked_transaction()?;

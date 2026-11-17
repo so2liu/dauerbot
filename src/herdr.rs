@@ -3,7 +3,7 @@
 //! `hc` is intentionally absent from this module. Persisted legacy execution
 //! identities must be checked before sending input or closing a pane.
 use crate::{config::Config, db::Project};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -321,6 +321,23 @@ async fn compatible_launch_args(
     Ok(effective)
 }
 
+/// Identify the user's selected Pi without modifying its configuration.
+pub async fn pi_version(config: &Config, p: &Project) -> Result<String> {
+    let probe = login_shell_args(vec!["pi".into(), "--version".into()]);
+    let mut cmd = Command::new(&probe[0]);
+    cmd.args(&probe[1..]).current_dir(&p.path);
+    command_environment(config, &mut cmd);
+    let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
+        .await
+        .context("Pi version check timed out")??;
+    ensure!(
+        output.status.success(),
+        "Cannot identify the selected Pi runtime"
+    );
+    let version = String::from_utf8(output.stdout)?.trim().to_owned();
+    Ok(version)
+}
+
 /// Create the identity before launch so an early MCP registration can validate it.
 pub async fn prepare_execution(
     config: &Config,
@@ -577,7 +594,7 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         "native_session":native_agent.get("agent_session").cloned().unwrap_or(Value::Null),
         "interactive_ready":native_agent["interactive_ready"].as_bool().unwrap_or(!pending),
         "launch_pending":pending,"completion_seq":native_agent["completion_seq"],"state_change_seq":native_agent["state_change_seq"],
-        "processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"tokens":pane["tokens"],
+        "children":crate::native_children::observe(p, crate::db::now()),"processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"tokens":pane["tokens"],
         "cwd":pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("")}),
     )
 }
@@ -729,6 +746,11 @@ fn is_claude_sleep_inhibitor(process: &Value) -> bool {
 /// Retirement requires the CLI itself in the foreground, not a tool subprocess
 /// beneath a stale HERDR agent label. Unrecognized launch wrappers stay warm.
 pub fn quiescent(p: &Project, record: &Value) -> bool {
+    record["children"]["state"] == "quiescent" && foreground_quiescent(p, record)
+}
+
+/// Necessary foreground checks; these do not establish native child coverage.
+pub fn foreground_quiescent(p: &Project, record: &Value) -> bool {
     if check_identity(p, record).is_err()
         || !matches!(record["status"]["state"].as_str(), Some("idle" | "done"))
     {
@@ -1154,7 +1176,7 @@ pub async fn confirm_project_trust(config: &Config, p: &Project) -> Result<()> {
 
 pub fn capabilities(agent: &str) -> Value {
     json!({"backend":"legacy","interactive_terminal":true,"native_resume":(["codex","claude","pi","agy"].contains(&agent)),
-        "native_session_source":"herdr.agent_session","model_confirmation":"unverified","background_quiescence":"native_state_and_foreground_processes"})
+        "native_session_source":"herdr.agent_session","model_confirmation":"unverified","background_quiescence":"managed_child_evidence_required;unsupported_or_incomplete_coverage_retains_session"})
 }
 
 fn integration_target(agent: &str) -> Result<&'static str> {

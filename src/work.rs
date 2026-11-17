@@ -233,6 +233,14 @@ pub fn migrate(c: &Connection) -> Result<()> {
             [],
         )?;
     }
+    let has_child_revision: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_executions') WHERE name='child_revision')", [], |r| r.get(0))?;
+    if !has_child_revision {
+        c.execute(
+            "ALTER TABLE work_executions ADD COLUMN child_revision TEXT",
+            [],
+        )?;
+    }
     // Removed bookkeeping must never gate an upgraded session. Keep the journal,
     // messages, schedule IDs and occurrences; do not requeue submitted input.
     c.execute_batch("DROP TABLE IF EXISTS work_jobs; DROP TABLE IF EXISTS work_decisions;
@@ -1036,6 +1044,36 @@ fn activity(c: &Connection, project: &str, generation: &str, now: i64) -> Result
       params![now,now,project,generation])?;
     Ok(())
 }
+/// Coverage changes and child activity invalidate the whole warm interval and handoff.
+pub fn observe_children(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+    coverage: &Value,
+    now: i64,
+) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    let revision = coverage["revision"].as_str();
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT child_revision FROM work_executions WHERE project_id=? AND generation=?",
+            params![project, generation],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if coverage["state"] != "quiescent" || revision.is_none() || previous.as_deref() != revision {
+        activity(&tx, project, generation, now)?;
+        tx.execute("UPDATE idle_handoffs SET status='cancelled',error='Native child activity or coverage changed' WHERE project_id=? AND generation=? AND status='requested'", params![project,generation])?;
+    }
+    tx.execute(
+        "UPDATE work_executions SET child_revision=? WHERE project_id=? AND generation=?",
+        params![revision, project, generation],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn touch_execution(c: &Connection, project: &str, generation: &str, now: i64) -> Result<()> {
     activity(c, project, generation, now)
 }

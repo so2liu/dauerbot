@@ -462,7 +462,9 @@ def main():
         def native_idle():
             if not real_agent:
                 fixture_continuity()
-            return api(f"/projects/{key}/work")["execution"]["status"] == "idle"
+            state = api("/state")
+            terminal = next(p for p in state["projects"] if p["id"] == key)["terminal"]
+            return state["runtime"]["terminals"].get(terminal, {}).get("status", {}).get("state") in {"idle", "done"}
 
         def settled():
             if not real_agent:
@@ -591,54 +593,37 @@ def main():
         def age_idle_execution():
             now = int(time.time() * 1000) - 601_000
             with sqlite3.connect(run / "bridge.sqlite3") as conn:
-                conn.execute("UPDATE work_executions SET idle_since=?,last_activity=?,warm_until=? WHERE project_id=? AND status='idle'",
+                conn.execute("UPDATE work_executions SET idle_since=?,last_activity=?,warm_until=? WHERE project_id=? AND status IN ('idle','running')",
                              (now, now, now + 600_000, key))
 
         wait_for(lambda: any(e["status"] == "settled" for e in api(f"/projects/{key}/work")["runs"]), "no completed run")
         wait_for(native_idle, "execution did not become idle")
-        if not real_agent:
-            mode = workspace / ".fixture-handoff-mode"
-            mode.write_text("hold")
-            (workspace / "HANDOFF.md").write_text("Old handoff, not evidence for the pending request.\n<!-- dauerbot-handoff:old -->\n")
-            age_idle_execution()
-            def latest_handoff():
-                with sqlite3.connect(run / "bridge.sqlite3") as conn:
-                    return conn.execute("SELECT id,status FROM idle_handoffs WHERE project_id=? ORDER BY rowid DESC LIMIT 1", (key,)).fetchone()
-            wait_for(lambda: latest_handoff() and latest_handoff()[1] == "requested", "handoff was not requested")
-            wait_for(lambda: "MOCK_HANDOFF_HELD" in api(f"/projects/{key}/screen")["text"], "fixture did not hold handoff while working")
-            handoff_generation = project_state()["generation"]
-            FIXTURE.emit(message("om_handoff_steer", "Immediately steer while writing handoff"))
-            wait_for(lambda: any(e["source_id"] == "om_handoff_steer" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "input waited for handoff completion")
-            assert latest_handoff()[1] == "cancelled"
-            assert project_state()["generation"] == handoff_generation
-            assert project_state()["terminal"] is not None
-            mode.unlink()
-            wait_for(native_idle, "steered handoff did not return to idle")
+        age_idle_execution()
+        # A custom fixture (and an unsupported real CLI) has no native-child census.
+        # Advancing a database clock must never manufacture safe child coverage.
+        held_terminal = project_state()["terminal"]
+        held_generation = project_state()["generation"]
+        def unknown_retention_observed():
             with sqlite3.connect(run / "bridge.sqlite3") as conn:
-                conn.execute("UPDATE idle_handoffs SET requested_at=requested_at-601000 WHERE project_id=? AND status='cancelled'", (key,))
-            checks.append("Feishu input cancels an in-flight handoff and steers the same native execution despite a stale artifact")
-        age_idle_execution()
-        wait_for(lambda: project_state()["terminal"] is None, "idle execution was not retired")
-        assert project_state()["native_session"] == "", "successful handoff retained the old native pointer"
-        assert not legacy_rpc("workspace.list")["workspaces"], "idle retirement left an owned workspace"
-        checks.append("finished fixture execution retires after the persisted ten-minute warm deadline")
-        count = len(FIXTURE.messages)
-        FIXTURE.emit(message("om_wakeup", "wake sleeping project"))
-        wait_for(lambda: any(m["source_id"] == "om_wakeup" and m["status"] == "submitted" for m in api(f"/projects/{key}")["messages"]), "new message did not wake the fixture")
-        wait_for(settled, "wakeup run did not finish")
-        assert project_state()["terminal"] != old_terminal and len(FIXTURE.messages) > count
-        assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "wake leaked a workspace"
-        if not real_agent:
-            launches = [json.loads(line) for line in (workspace / ".fixture-launches").read_text().splitlines()]
-            assert launches[-1]["resume"] == "", "handoff wake resumed the old conversation"
-            assert launches[-1]["native"] != launches[-2]["native"]
-            assert "AGENTS.md and HANDOFF.md" in launches[-1]["instructions"]
-            assert (workspace / "HANDOFF.md").is_file()
-        checks.append("verified handoff retirement wakes a fresh native session instructed to read AGENTS.md/HANDOFF.md")
+                row = conn.execute("SELECT idle_since,warm_until FROM work_executions WHERE project_id=? AND generation=?", (key, held_generation)).fetchone()
+                return row is not None and row == (None, None)
+        # Observe an actual supervisor reconciliation before introducing new input,
+        # which would itself reset eligibility and mask a retirement regression.
+        wait_for(unknown_retention_observed, "unknown coverage did not clear the aged warm deadline")
+        with sqlite3.connect(run / "bridge.sqlite3") as conn:
+            assert conn.execute("SELECT COUNT(*) FROM idle_handoffs WHERE project_id=?", (key,)).fetchone()[0] == 0
+        FIXTURE.emit(message("om_unknown_steer", "steer retained native session"))
+        wait_for(lambda: any(e["source_id"] == "om_unknown_steer" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "unknown child coverage blocked steering")
+        wait_for(settled, "retained session steering did not settle")
+        assert project_state()["terminal"] == held_terminal
+        assert project_state()["generation"] == held_generation
+        with sqlite3.connect(run / "bridge.sqlite3") as conn:
+            assert conn.execute("SELECT COUNT(*) FROM idle_handoffs WHERE project_id=?", (key,)).fetchone()[0] == 0
+        checks.append("unknown native-child coverage retains the execution beyond the idle deadline while steering still works")
 
-        wait_for(native_idle, "woken execution did not idle")
-        age_idle_execution()
-        wait_for(lambda: project_state()["terminal"] is None, "fixture did not sleep before timer")
+        # Explicit stop still preserves native continuity and timer wakeup.
+        api(f"/projects/{key}/stop", {})
+        wait_for(lambda: project_state()["terminal"] is None, "explicit stop did not release owned execution")
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
         timer = api(f"/projects/{key}/timers", {"name": "Scheduled wakeup", "prompt": "scheduled-wakeup", "kind": "once",
                     "at": due.isoformat(), "timezone": "UTC", "to": "oc_fixture", "request_id": "fixture-timer"})
@@ -646,7 +631,7 @@ def main():
         wait_for(settled, "timer run did not finish")
         assert project_state()["terminal"] is not None
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "timer wake leaked a workspace"
-        checks.append("durable one-shot timer wakes a sleeping fixture through the persisted input journal")
+        checks.append("durable one-shot timer wakes an explicitly stopped fixture through the persisted input journal")
         FIXTURE.emit(message("om_schedule_tool", "fixture-create-schedule"))
         wait_for(lambda: "scheduled-via-mcp" in str(FIXTURE.messages), "schedule_run tool did not persist and fire its schedule")
         wait_for(settled, "MCP scheduled input did not settle through native idle")
@@ -724,18 +709,18 @@ def main():
         wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "unpause did not automatically resume delivery")
         checks.append("only an explicit pause holds new messages; resuming activity automatically wakes the Agent")
         wait_for(native_idle, "old uncertain work pinned the new execution")
-        before_final_handoff = project_state()["native_session"]
-        assert before_final_handoff
-        age_idle_execution()
-        wait_for(lambda: project_state()["terminal"] is None, "new execution could not retire with old uncertain history")
+        before_final_stop = project_state()["native_session"]
+        assert before_final_stop
+        api(f"/projects/{key}/stop", {}, "POST")
+        wait_for(lambda: project_state()["terminal"] is None, "new execution could not stop with old uncertain history")
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
         api(f"/projects/{key}/timers", {"name":"Independent scheduled work","prompt":"independent-after-stop","kind":"once","at":due.isoformat(),"timezone":"UTC","to":"oc_fixture"})
         wait_for(lambda: "independent-after-stop" in str(FIXTURE.messages), "old uncertain history blocked independent scheduled wakeup")
         if not real_agent:
             fixture_continuity()
-            assert project_state()["native_session"] != before_final_handoff
+            assert project_state()["native_session"] == before_final_stop
             launches = [json.loads(line) for line in (workspace / ".fixture-launches").read_text().splitlines()]
-            assert launches[-1]["resume"] == ""
+            assert launches[-1]["resume"] == before_final_stop
         assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
         checks.append("old uncertain history stays recorded without pinning a new execution or blocking independent timer wakeup")
         (results / "smoke.json").write_text(json.dumps({"passed": True, "checks": checks, "run_dir": str(run)}, ensure_ascii=False, indent=2))

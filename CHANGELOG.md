@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Advance the daemon contract to API protocol 7 so the desktop cannot silently reuse an API 6 service without managed runtime and child-aware retirement semantics. Existing incompatible native executions require the established explicit recovery action.
+
+### Fixed
+
+- Require fresh, generation- and native-session-matched child coverage before idle handoff retirement. Child activity, revision changes and unknown coverage reset eligibility and cancel pending handoff; a shared native dispatch gate fences the final stop. Unsupported CLI child observation retains sessions instead of inferring safety from parent idle (#57).
+
+### Added
+
+- Load the pinned official Pi subprocess subagent extension explicitly for managed Pi 1.5.1 sessions, preserving global plugins, authentication and selected models. Native same-CLI delegation is preferred, with Herdr for cross-CLI/model work. External plugins or incomplete discovery make retirement coverage unknown; the foreground child tool can delay the root model's response to steering (#57).
+
 ## 0.4.6 — 2026-11-17
 
 ### Fixed
