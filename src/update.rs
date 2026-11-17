@@ -513,7 +513,11 @@ struct InstallRecord {
 }
 /// The old updater saved this exact signed bundle before replacing the app.
 /// Do not search arbitrary backup directories or trust a version string alone.
-pub fn historical_companion(data: &Path, version: &str, protocol: u64) -> Result<PathBuf> {
+pub fn historical_companion(
+    data: &Path,
+    version: &str,
+    protocol: u64,
+) -> Result<crate::companion::Retained> {
     let updates = data.join("updates");
     config::private_dir(&updates)?;
     let lock = fs::OpenOptions::new()
@@ -531,9 +535,9 @@ pub fn historical_companion(data: &Path, version: &str, protocol: u64) -> Result
         for entry in fs::read_dir(&cache)? {
             let executable = entry?.path().join("hfb");
             if executable.is_file() {
-                crate::companion::validate(&executable)?;
-                verify_historical_executable(&executable, version)?;
-                return Ok(executable);
+                let retained = crate::companion::retain(data, &executable)?;
+                verify_historical_executable(retained.path(), version)?;
+                return Ok(retained);
             }
         }
     }
@@ -556,8 +560,33 @@ pub fn historical_companion(data: &Path, version: &str, protocol: u64) -> Result
     let source = record.backup.join("Contents/MacOS/hfb");
     verify_historical_executable(&source, version)?;
     let retained = crate::companion::pin(data, &source, version, protocol)?;
-    verify_historical_executable(&retained, version)?;
+    verify_historical_executable(retained.path(), version)?;
     Ok(retained)
+}
+
+/// Only the exact signed rollback executable is a root, including when several
+/// different builds use the same version. A broken record aborts collection.
+pub fn rollback_companion_digest(data: &Path) -> Result<Option<String>> {
+    let path = data.join("updates/installed.json");
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let record: InstallRecord = serde_json::from_slice(&bytes)?;
+    let stage = record.backup.parent().context("Invalid backup path")?;
+    ensure!(
+        record.app.is_absolute()
+            && record.backup.is_absolute()
+            && record.backup.file_name().is_some_and(|n| n == "old")
+            && stage.parent() == record.app.parent()
+            && stage
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".dauerbot-update-")),
+        "Invalid rollback backup"
+    );
+    verify_bundle(&record.backup, None)?;
+    Ok(Some(file_hash(&record.backup.join("Contents/MacOS/hfb"))?))
 }
 
 fn verify_historical_executable(path: &Path, version: &str) -> Result<()> {

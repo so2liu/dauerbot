@@ -135,6 +135,10 @@ def main():
         pinned_old = list((data / "runtime/hfb/0.4.4-api4").glob("*/hfb"))
         assert len(pinned_old) == 1
         assert hashlib.sha256(pinned_old[0].read_bytes()).digest() == hashlib.sha256((backup / "Contents/MacOS/hfb").read_bytes()).digest()
+        holders = subprocess.run(["/usr/sbin/lsof", "-nP", "-t", "--", str(pinned_old[0].with_name(".lease"))],
+                                 capture_output=True, text=True, timeout=5, check=True)
+        assert not holders.stderr and str(launches(second_dir)[0]["mcp_pid"]) in holders.stdout.splitlines(), holders
+        checks.append("Unmodified signed 0.4.4 MCP inherits the publication lease across historical exec")
         inject(second, "after-swap")
         wait_for(lambda: any("after-swap" in m["content"] for m in FIXTURE.messages), "historical fallback did not deliver")
         os.kill(old_launch["mcp_pid"], 0)
@@ -211,6 +215,32 @@ def main():
         assert len(launches(first_dir)) == 2
         assert hashlib.sha256(pinned_command.read_bytes()).hexdigest() == before_hash
         checks.append("Same-protocol daemon restart and source replacement reuse the same live Agent/MCP generation and immutable bytes")
+        # End all historical references, restore the real signed rollback bundle,
+        # and prove that archives and same-version alternative content do not
+        # prevent the automatic startup collector from reclaiming old copies.
+        api(f"/projects/{second}/recover-after-update", {})
+        wait_for(lambda: project(second)["ready"], "second historical Agent did not recover")
+        api(f"/projects/{missing['id']}/stop", {})
+        (stage / "retained-test-backup").rename(backup)
+        obsolete_bytes = b"obsolete companion fixture"
+        obsolete_digest = hashlib.sha256(obsolete_bytes).hexdigest()
+        obsolete = data / "runtime/hfb/0.4.4-api4" / obsolete_digest / "hfb"
+        obsolete.parent.mkdir(mode=0o700)
+        obsolete.write_bytes(obsolete_bytes)
+        obsolete.chmod(0o500)
+        archived = data / "sessions" / first / old_launch["generation"] / "mcp.json"
+        archived.write_text(json.dumps({"mcpServers": {"herdr_feishu": {"command": str(obsolete), "args": ["mcp"]}}}))
+        (data / "updates/service-identity.json").write_text(json.dumps(api("/state")))
+        api("/service/shutdown", {})
+        daemon.wait(timeout=20)
+        daemon = boot()
+        wait_for(lambda: api("/state")["api_protocol"] == 6, "collector daemon did not restart")
+        wait_for(lambda: not obsolete.exists(), "automatic collector did not reclaim retired same-version companion")
+        assert pinned_old[0].exists(), "The exact signed rollback companion was removed"
+        assert pinned_command.exists() and archived.exists()
+        inject(first, "after-collection")
+        wait_for(lambda: any("after-collection" in m["content"] for m in FIXTURE.messages), "collection broke active MCP")
+        checks.append("Automatic startup collection reclaims retired archived-generation content with the rollback version while preserving the exact signed rollback digest and active MCP")
         evidence = {"passed": True, "checks": checks, "run_dir": str(run), "old_version": "0.4.4", "old_protocol": 4, "new_protocol": 6, "queued_message": queued["id"]}
         (results / "upgrade-companion.json").write_text(json.dumps(evidence, indent=2) + "\n")
         print(json.dumps(evidence, indent=2))
