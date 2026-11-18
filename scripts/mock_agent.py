@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+import threading
 import tty
 import xml.etree.ElementTree as ET
 
@@ -20,9 +21,18 @@ sys.stdout.write("\x1b[?2004h")
 sys.stdout.flush()
 
 
+native_session_value = None
+
+
 def status(state):
     native_hook = len(sys.argv) > 6 and json.loads(sys.argv[6]).get("native_session_hook")
-    if native_hook:
+    if native_hook == "pi":
+        if native_session_value is None:
+            return
+        request = {"id":"fixture-pi-state","method":"pane.report_agent","params":{
+            "pane_id":os.environ["HERDR_PANE_ID"],"source":"herdr:pi","agent":"pi",
+            "state":state,"seq":time.time_ns(),"agent_session_path":native_session_value}}
+    elif native_hook:
         # HERDR 0.9.5 reserves herdr:codex state reports for identity only;
         # a different hook source cannot own an officially anchored session.
         # Exercise its actual Codex OSC-title detector instead. Wait for every
@@ -42,15 +52,16 @@ def status(state):
                 result = json.loads(conn.makefile().readline())
             if "error" not in result:
                 observed = result.get("result", {}).get("agent", {}).get("agent_status")
-                if observed == state:
+                if observed == state or state == "idle" and observed == "done":
                     return
             time.sleep(0.05)
         (Path.cwd() / ".fixture-native-state-error").write_text(json.dumps({"requested":state,"observed":observed,"reply":result}))
         raise RuntimeError(f"Native Codex OSC state did not become {state}: {observed}")
-    request = {"id": "fixture-status", "method": "pane.report_agent", "params": {
-        "pane_id": os.environ["HERDR_PANE_ID"], "source": "dauerbot-fixture",
-        "agent": sys.argv[5] if len(sys.argv)>5 else "fixture-agent", "state": state, "seq": time.time_ns(),
-    }}
+    else:
+        request = {"id": "fixture-status", "method": "pane.report_agent", "params": {
+            "pane_id": os.environ["HERDR_PANE_ID"], "source": "dauerbot-fixture",
+            "agent": sys.argv[5] if len(sys.argv)>5 else "fixture-agent", "state": state, "seq": time.time_ns(),
+        }}
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(3)
         conn.connect(os.environ["HERDR_SOCKET_PATH"])
@@ -75,15 +86,44 @@ else:
     marker.write_text(str(uuid.uuid4()))
 launch_metadata = json.loads(sys.argv[6]) if len(sys.argv) > 6 else {}
 if launch_metadata.get("native_session_hook"):
-    # The installed HERDR 0.9.5 Codex SessionStart integration reports this
-    # separate RPC; pane.report_agent alone never confirms native continuity.
-    assert sys.argv[5] == "codex"
-    os.environ["CODEX_THREAD_ID"] = marker.read_text()
-    request = {"id": "fixture-native-session", "method": "pane.report_agent_session", "params": {
-        "pane_id": os.environ["HERDR_PANE_ID"], "source": "herdr:codex", "agent": "codex",
-        "seq": time.time_ns(), "agent_session_id": marker.read_text(),
-        "session_start_source": "resume" if expected else "startup",
-    }}
+    agent = sys.argv[5]
+    assert agent in {"codex", "pi"}
+    if agent == "pi":
+        # A real Pi TUI renders before hooks/MCP initialize; output also wakes
+        # HERDR's native foreground acquisition rather than inventing an Agent.
+        sys.stdout.write("\r\nPi fixture 1.5.1\r\n")
+        sys.stdout.flush()
+    if agent == "pi" and not expected:
+        if launch_metadata.get("assigned_native_id"):
+            marker.write_text(launch_metadata["assigned_native_id"])
+        native_file = Path.cwd() / (".fixture-native-" + marker.read_text() + ".jsonl")
+        native_file.write_text(json.dumps({"type":"session","version":3,"id":marker.read_text(),"cwd":str(Path.cwd())}) + "\n")
+        marker.write_text(str(native_file))
+    native_session_value = marker.read_text()
+    fork = Path.cwd() / ".fixture-fork-on-resume"
+    if expected and fork.exists():
+        # Default remains the original one-shot fixture. The reboot recovery
+        # regression opts into a persistent fork that only its repair Agent clears.
+        if fork.read_text().strip() != "persistent":
+            fork.unlink()
+        import uuid
+        observed = str(uuid.uuid4())
+        if agent == "pi":
+            file = Path.cwd() / (".fixture-fork-" + observed + ".jsonl")
+            file.write_text(json.dumps({"type":"session","version":3,"id":observed}) + "\n")
+            observed = str(file)
+        native_session_value = observed
+        fork_record = {"expected":expected,"observed":observed,"generation":Path(sys.argv[2]).parent.name,
+                       "pane":os.environ["HERDR_PANE_ID"],"credentials":sys.argv[2]}
+        (Path.cwd() / ".fixture-native-fork").write_text(json.dumps(fork_record))
+        with (Path.cwd() / ".fixture-native-forks").open("a") as forks:
+            forks.write(json.dumps(fork_record) + "\n")
+    params = {"pane_id":os.environ["HERDR_PANE_ID"],"source":"herdr:" + agent,"agent":agent,
+              "seq":time.time_ns(),"session_start_source":"resume" if expected else ("new" if agent == "pi" else "startup")}
+    params["agent_session_path" if agent == "pi" else "agent_session_id"] = native_session_value
+    if agent == "codex":
+        os.environ["CODEX_THREAD_ID"] = native_session_value
+    request = {"id":"fixture-native-session","method":"pane.report_agent_session","params":params}
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(3)
         conn.connect(os.environ["HERDR_SOCKET_PATH"])
@@ -91,16 +131,31 @@ if launch_metadata.get("native_session_hook"):
         result = json.loads(conn.makefile().readline())
         if "error" in result:
             raise RuntimeError(result["error"])
-    # HERDR's managed Codex startup acquisition requires the real composer
-    # marker, including when its native session ID was already reported.
-    sys.stdout.write("\r\n› Ask Codex to do anything\r\n")
-    sys.stdout.flush()
+    if agent == "pi":
+        adapter = Path(launch_metadata["child_adapter"])
+        evidence = {"schema":1,"generation":Path(sys.argv[2]).parent.name,"session":native_session_value,
+                    "sessionFile":native_session_value,"epoch":"fixture","revision":1,"state":"quiescent","updated":int(time.time()*1000)}
+        def publish_children():
+            evidence["updated"] = int(time.time()*1000)
+            temp = adapter / "fixture-children.tmp"
+            temp.write_text(json.dumps(evidence))
+            temp.replace(adapter / "children.json")
+        publish_children()
+        def child_heartbeat():
+            while True:
+                time.sleep(1.5)
+                publish_children()
+        # The bundled managed.ts publishes the same 1500ms heartbeat.
+        threading.Thread(target=child_heartbeat, daemon=True).start()
+    else:
+        sys.stdout.write("\r\n› Ask Codex to do anything\r\n")
+        sys.stdout.flush()
     status("idle")
     if launch_metadata.get("native_state_probe"):
         status("working")
         status("idle")
 with (Path.cwd() / ".fixture-launches").open("a") as launches:
-    launch = {"resume": expected, "native": marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}
+    launch = {"resume": expected, "native": native_session_value or marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}
     if len(sys.argv) > 6:
         launch["launch"] = json.loads(sys.argv[6])
     launches.write(json.dumps(launch) + "\n")
@@ -125,7 +180,7 @@ def rpc(method, params=None):
     raise RuntimeError("MCP closed unexpectedly")
 
 
-rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-fixture", "version": "2"}, "capabilities": {}})
+initialization = rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-fixture", "version": "2"}, "capabilities": {}})
 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 proc.stdin.flush()
 tools = rpc("tools/list")
@@ -146,6 +201,7 @@ buffer = b""
 held = None
 switch_held = None
 repair_held = None
+repair_lane = None
 
 
 def switch_handoff(event):
@@ -165,6 +221,56 @@ def repair_handoff(event):
     handoff = event.find("dauerbot_cli_switch")
     assert handoff is not None, "Repair control did not contain the fresh handoff request"
     switch_handoff(handoff)
+
+
+def native_repair_control(event, wrapped):
+    global repair_lane
+    if event.tag == "dauerbot_cli_repair" and event.attrib.get("repair_only") == "true":
+        assert repair_lane is None, "Repair lane received duplicate initial prompt"
+        assert event.attrib["original_native"] == marker.read_text()
+        assert event.attrib["observed_native"] == native_session_value != marker.read_text()
+        instructions = initialization.get("instructions", "")
+        assert "repair-only" in instructions.lower() and marker.read_text() in instructions, initialization
+        repair_lane = event
+        generation = Path(sys.argv[2]).parent.name
+        diagnostic = tool("send_md", {"to":"oc_fixture", "text":"Fixture repair-only Agent is investigating preserved native continuity.",
+            "request_id":"repair-lane-diagnostic-" + generation, "reply_to_message_id":"om_reboot_warm_0"})
+        due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+        denied = rpc("tools/call", {"name":"schedule_run", "arguments":{"request_id":"repair-lane-denied-" + generation,
+            "name":"Must be denied", "prompt":"repair lane must not schedule ordinary work", "kind":"once", "at":due.isoformat(),
+            "timezone":"UTC", "to":"oc_fixture", "purpose":"internal"}})
+        assert denied.get("isError") and "repair" in json.dumps(denied).lower(), denied
+        (Path.cwd() / ".fixture-repair-lane-ready").write_text(json.dumps({"generation":generation,
+            "original":marker.read_text(),"observed":native_session_value,"request":event.attrib["request_id"],
+            "nonce":event.find("dauerbot_cli_switch").attrib["handoff_nonce"],
+            "diagnostic":diagnostic,"schedule_denied":denied}))
+    if repair_lane is None:
+        return False
+    instructions = []
+    for element in wrapped.findall("repair_user_instructions"):
+        assert element.attrib.get("trust") == "user_input"
+        instructions.extend(json.loads(element.text or "[]"))
+    controls = [item for item in instructions if item.get("content") == "fixture-repair-persistent-native-resume"]
+    if not controls:
+        status("idle")
+        return True
+    assert len(controls) == 1, controls
+    control = controls[0]
+    assert control["message_id"] == "om_reboot_repair_0", control
+    assert control["source"]["chat_id"] == "oc_fixture" and control["source"]["sender"]["open_id"] == "ou_fixture", control
+    tool("send_md", {"to":"oc_fixture", "text":"Fixture repair-only Agent received trusted repair instructions; restoring the saved conversation.",
+        "request_id":"repair-lane-control-" + Path(sys.argv[2]).parent.name, "reply_to_message_id":control["message_id"]})
+    # This changes only the fixture's private simulated CLI failure. Saved A and
+    # the daemon journal remain untouched by the diagnostic Agent.
+    (Path.cwd() / ".fixture-fork-on-resume").unlink()
+    handoff = event.find("dauerbot_cli_switch")
+    if handoff is None:
+        handoff = repair_lane.find("dauerbot_cli_switch")
+    assert handoff is not None
+    (Path.cwd() / ".fixture-native-repaired").write_text(json.dumps({"generation":Path(sys.argv[2]).parent.name,
+        "original":marker.read_text(),"observed":native_session_value,"control":control,"nonce":handoff.attrib["handoff_nonce"]}))
+    switch_handoff(handoff)
+    return True
 
 
 try:
@@ -194,6 +300,8 @@ try:
                 event = ET.fromstring(text)
             if event.tag in {"dauerbot_cli_repair", "dauerbot_cli_repair_control"}:
                 status("working")
+                if native_repair_control(event, wrapped):
+                    continue
                 with (Path.cwd() / ".fixture-repairs").open("a") as repairs:
                     repairs.write(json.dumps({"generation": Path(sys.argv[2]).parent.name, "native": marker.read_text(), "payload": text}) + "\n")
                 mode = Path.cwd() / ".fixture-repair-mode"

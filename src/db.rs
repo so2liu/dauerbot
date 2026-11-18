@@ -400,6 +400,22 @@ impl Db {
             Ok(())
         }).await
     }
+    pub(crate) async fn observe_native(
+        &self,
+        key: &str,
+        generation: &str,
+        native: &str,
+    ) -> Result<bool> {
+        let key = key.to_owned();
+        let generation = generation.to_owned();
+        let native = native.to_owned();
+        self.call(move|c|{
+            let tx=c.unchecked_transaction()?;
+            let changed=tx.execute("UPDATE projects SET native_session=?,execution=json_set(execution,'$.native_confirmed',json('true')) WHERE id=? AND generation=? AND terminal IS NOT NULL AND json_type(execution,'$.repair_lane') IS NULL",params![native,key,generation])?;
+            if changed==1 {crate::work::set_native_session(&tx,&key,&generation,&native,now())?;}
+            tx.commit()?;Ok(changed==1)
+        }).await
+    }
     pub async fn native_session(&self, key: &str, native: &str) -> Result<()> {
         let key = key.to_owned();
         let native = native.to_owned();
@@ -408,7 +424,7 @@ impl Db {
                 "UPDATE projects SET native_session=?,
                  execution=CASE WHEN terminal IS NOT NULL AND execution!='null'
                    THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END
-                 WHERE id=? AND ?<>''",
+                 WHERE id=? AND ?<>'' AND json_type(execution,'$.repair_lane') IS NULL",
                 params![native, key, native],
             )?;
             Ok(())
@@ -449,7 +465,7 @@ impl Db {
         self.call(move|c|{
             let n=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,
                 execution=CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END
-                WHERE id=?2 AND generation=?3 AND terminal=?4",
+                WHERE id=?2 AND generation=?3 AND terminal=?4 AND json_type(execution,'$.repair_lane') IS NULL",
                 params![native,key,generation,terminal])?;
             if n!=1 {bail!("Session identity changed; reconnect MCP");} Ok(())
         }).await

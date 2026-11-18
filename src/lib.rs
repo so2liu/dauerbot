@@ -17,6 +17,7 @@ pub mod models;
 pub mod native_children;
 pub mod project_documents;
 pub mod project_instructions;
+mod repair_lane;
 pub mod service;
 pub mod update;
 pub mod work;
@@ -276,20 +277,24 @@ impl App {
         if let Some(dir) = child_adapter {
             execution["child_adapter"] = json!(dir);
         }
-        if let Some((request, intended_native)) = self.cli_switch_launch_context(&p, resume).await?
-        {
+        if let Some((request, _)) = self.cli_switch_launch_context(&p, resume).await? {
             execution["cli_switch_request"] = json!(request);
-            // Capture the exact resume identity passed to this launch, after
-            // source settlement; the original request snapshot may be older.
-            if let Some(native) = intended_native {
-                execution["intended_native_session"] = json!(native);
-            }
+        }
+        // Every supported native resume, including a repair owner, must be
+        // verified before its native pointer or ordinary delivery can advance.
+        // Custom placeholders have no HERDR native-identity observer.
+        if let Some(native) = herdr::intended_native_resume(&p, resume) {
+            execution["intended_native_session"] = json!(native);
         }
         if let Some(request) = self.cli_recovery_launch_id(&p).await? {
             execution["cli_recovery_request"] = json!(request);
         }
         // This records configured launch arguments, not the model actually
         // observed in a native turn. Effective-model metadata remains separate.
+        execution["launch_started_at"] = json!(db::now());
+        if let Some(boot) = herdr::host_boot() {
+            execution["host_boot_id"] = json!(boot.id);
+        }
         execution["model_selection"] = json!(model_selection);
         execution["api_protocol"] = json!(api::PROTOCOL);
         execution["mcp_contract"] = json!(mcp::CONTRACT);
@@ -470,7 +475,38 @@ impl App {
             }
         }
         let p = self.db.project(&m.project_id).await?;
-        self.db.state(&m.id, "sending", "").await?;
+        if m.attachment.get(repair_lane::OUTBOX_KEY).is_some() {
+            let current = p.clone();
+            let attachment = m.attachment.clone();
+            let checked: Result<()> = async {
+                self.db
+                    .call(move |c| repair_lane::validate_outbox(c, &current.id, &attachment))
+                    .await?;
+                let cfg = self.config.read().await.clone();
+                let observed = herdr::observe(&cfg, &p).await?;
+                repair_lane::check_identity(&p, &observed)?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = checked {
+                let id = m.id.clone();
+                let error = error.to_string();
+                self.db.call(move|c|{c.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error,db::now(),id])?;Ok(())}).await?;
+                return Ok(());
+            }
+        }
+        let message = m.clone();
+        let admitted=self.db.call(move|c|{
+            let tx=c.unchecked_transaction()?;
+            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment) {
+                tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;tx.commit()?;return Ok(false);
+            }
+            let changed=tx.execute("UPDATE messages SET status='sending',error='',updated_at=? WHERE id=? AND status='pending'",rusqlite::params![db::now(),message.id])?;
+            tx.commit()?;Ok(changed==1)
+        }).await?;
+        if !admitted {
+            return Ok(());
+        }
 
         match feishu::send(self, &p, &m).await {
             Ok(receipt) => {
@@ -512,7 +548,7 @@ impl App {
         if active {
             let cfg = self.config.read().await.clone();
             let record = herdr::observe(&cfg, &p).await?;
-            herdr::check_identity(&p, &record)?;
+            repair_lane::check_identity(&p, &record)?;
         }
         let id = p.id.clone();
         let generation_id = generation.to_owned();
@@ -665,8 +701,57 @@ impl App {
                 }
             }
         }
+        // Old releases did not record the boot identity. Only the matching
+        // durable generation journal may supply their launch timestamp.
+        if p.execution.get("launch_started_at").is_none() {
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            self.db.call(move |c| {
+                c.execute("UPDATE projects SET execution=json_set(execution,'$.launch_started_at',(SELECT created_at FROM work_executions WHERE project_id=? AND generation=?)) WHERE id=? AND generation=? AND terminal IS NOT NULL AND json_type(execution)='object' AND json_extract(execution,'$.launch_started_at') IS NULL AND EXISTS(SELECT 1 FROM work_executions WHERE project_id=? AND generation=? AND created_at>0)",rusqlite::params![id,generation,id,generation,id,generation])?;
+                Ok(())
+            }).await?;
+            p = self.db.project(&p.id).await?;
+        }
         let cfg = self.config.read().await.clone();
-        let record = match herdr::observe(&cfg, &p).await {
+        let mut observation = herdr::observe(&cfg, &p).await;
+        if observation.as_ref().is_err_and(herdr::runtime_missing)
+            || herdr::startup_pending(&cfg).await?
+        {
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            let takeover = self
+                .db
+                .call(move |c| work::has_takeover(c, &id, &generation))
+                .await?;
+            if p.paused || takeover {
+                self.set_phase(
+                    &p,
+                    if p.paused { "paused" } else { "taken_over" },
+                    Value::Null,
+                )
+                .await;
+                return Ok(());
+            }
+            self.set_phase(
+                &p,
+                "recovering_cli",
+                json!({"runtime":"starting_missing_herdr"}),
+            )
+            .await;
+            observation = match herdr::ensure_server(&cfg).await {
+                Ok(()) => herdr::observe(&cfg, &p).await,
+                Err(error) => {
+                    self.set_phase(
+                        &p,
+                        "recovering_cli",
+                        json!({"runtime":"waiting_for_herdr","error":error.to_string()}),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+        }
+        let record = match observation {
             Ok(record) => record,
             Err(error) => {
                 let id = p.id.clone();
@@ -682,6 +767,11 @@ impl App {
             let mut rt = self.runtime.write().await;
             rt.core = "connected".into();
             rt.core_error.clear();
+        }
+        if repair_lane::descriptor(&p).is_some() {
+            self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?;
+            return Ok(());
         }
         if record["state"] != "live"
             && self.cli_switch_holds_input(&p).await?
@@ -753,15 +843,14 @@ impl App {
             .as_str()
             .filter(|s| !s.is_empty())
         {
-            self.db.native_session(&p.id, native).await?;
+            if !self.db.observe_native(&p.id, &p.generation, native).await? {
+                // Registration may have admitted a repair role after the native
+                // observation. Never publish old normal readiness into that role.
+                self.notify.notify_one();
+                return Ok(());
+            }
             p.native_session = native.into();
             p.execution["native_confirmed"] = json!(true);
-            let id = p.id.clone();
-            let generation_id = p.generation.clone();
-            let native = native.to_owned();
-            self.db
-                .call(move |c| work::set_native_session(c, &id, &generation_id, &native, db::now()))
-                .await?;
         }
         let id = p.id.clone();
         let generation = p.generation.clone();
@@ -1315,6 +1404,149 @@ fn xml(text: &str) -> String {
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+    #[tokio::test]
+    async fn resumed_fork_cannot_overwrite_project_or_execution_journal_before_repair() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            herdr_session: dir.path().to_string_lossy().into(),
+            ..Config::default()
+        };
+        let app = App::new(dir.path().join("store"), cfg.clone()).unwrap();
+        let p = app
+            .db
+            .create(db::ProjectInput {
+                name: "Saved native".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "codex".into(),
+                chat_id: String::new(),
+                native_session: "original-native".into(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        let execution = json!({"api_protocol":7,"mcp_contract":1,"backend":"legacy","workspace_id":"w1","pane_id":"w1:p2","terminal_id":"owned-terminal","managed_name":"owned-managed","generation":"saved-generation","shell_pid":null,"launch_permit":dir.path().join("permit"),"intended_native_session":"original-native","mcp_registered":true});
+        app.db.sync(|c|{c.execute("UPDATE projects SET generation='saved-generation',terminal='owned-terminal',ready=1,execution=? WHERE id=?",rusqlite::params![execution.to_string(),p.id])?;work::begin_execution(c,&p.id,"saved-generation",db::now())?;Ok(())}).unwrap();
+        let pane = json!({"pane_id":"w1:p2","terminal_id":"owned-terminal","workspace_id":"w1","agent":"codex","agent_status":"working","agent_session":{"value":"forked-native"},"tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"saved-generation","hfb_execution":"owned-managed"}});
+        let listener = tokio::net::UnixListener::bind(herdr::socket_path(&cfg).unwrap()).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (input, mut output) = stream.into_split();
+                let request: Value = serde_json::from_str(
+                    &BufReader::new(input)
+                        .lines()
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                let value = match request["method"].as_str().unwrap() {
+                    "pane.get" => json!({"pane":pane}),
+                    "agent.get" => json!({"agent":pane}),
+                    "pane.process_info" => {
+                        json!({"process_info":{"shell_pid":null,"foreground_processes":[{"pid":100,"name":"codex","argv":["codex"]}]}})
+                    }
+                    method => panic!("Unexpected native fork effect: {method}"),
+                };
+                output
+                    .write_all(
+                        format!("{}\n", json!({"id":request["id"],"result":value})).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        app.reconcile(&p.id).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let current = app.db.project(&p.id).await.unwrap();
+        assert_eq!(current.native_session, "original-native");
+        app.db.sync(|c|{
+            let native:String=c.query_row("SELECT native_session FROM work_executions WHERE project_id=? AND generation='saved-generation'",[&p.id],|r|r.get(0))?;
+            assert_eq!(native,"original-native");
+            let r=cli_switch::latest(c,&p.id)?.unwrap();assert!(r.holds_input);
+            let source:String=c.query_row("SELECT source FROM cli_switch_requests WHERE id=?",[&r.id],|row|row.get(0))?;
+            assert_eq!(serde_json::from_str::<Value>(&source)?["native_session"],"original-native");Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn missing_saved_runtime_respects_pause_takeover_and_shared_failure_backoff() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("herdr");
+        let attempted = dir.path().join("attempted");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\necho attempt >> '{}'\necho 'herdr 0.0.0'\n",
+                attempted.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let app = App::new(
+            dir.path().join("store"),
+            Config {
+                herdr: executable.to_string_lossy().into(),
+                herdr_session: dir.path().to_string_lossy().into(),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let p = app
+            .db
+            .create(db::ProjectInput {
+                name: "Saved Pi".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "pi".into(),
+                chat_id: String::new(),
+                native_session: "preserved-native-file".into(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        let execution = json!({"api_protocol":7,"mcp_contract":1,"backend":"legacy","workspace_id":"w1","pane_id":"w1:p2","terminal_id":"old-terminal","managed_name":"old-managed","generation":"old-generation","shell_pid":12345,"launch_permit":dir.path().join("permit"),"child_adapter":dir.path().join("missing-child-evidence")});
+        app.db.sync(|c|{
+            c.execute("UPDATE projects SET generation='old-generation',terminal='old-terminal',terminal_pid=12345,execution=?,ready=1,paused=1 WHERE id=?",rusqlite::params![execution.to_string(),p.id])?;
+            work::begin_execution(c,&p.id,"old-generation",1)?;
+            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('held',?,'in','held','pending','queued',1,1)",[&p.id])?;work::sync_inbound(c)?;
+            Ok(())
+        }).unwrap();
+        app.reconcile(&p.id).await.unwrap();
+        assert!(!attempted.exists());
+        let saved = app.db.project(&p.id).await.unwrap();
+        assert_eq!(saved.execution["launch_started_at"], 1);
+        app.db.pause(&p.id, false).await.unwrap();
+        app.db
+            .sync(|c| work::set_takeover(c, &p.id, "old-generation", true, 2))
+            .unwrap();
+        app.reconcile(&p.id).await.unwrap();
+        assert!(!attempted.exists());
+        app.db
+            .sync(|c| work::set_takeover(c, &p.id, "old-generation", false, 3))
+            .unwrap();
+        assert!(app.reconcile(&p.id).await.is_err());
+        assert!(app.reconcile(&p.id).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(attempted).unwrap().lines().count(),
+            1
+        );
+        let saved = app.db.project(&p.id).await.unwrap();
+        assert_eq!(saved.native_session, p.native_session);
+        assert_eq!(saved.terminal.as_deref(), Some("old-terminal"));
+        app.db
+            .sync(|c| {
+                assert_eq!(work::event(c, &p.id, "held")?.status, "queued");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            app.runtime.read().await.projects[&p.id]["lifecycle"],
+            "recovering_cli"
+        );
+    }
     #[tokio::test]
     async fn attention_and_outbox_are_atomic_deduplicated_and_use_the_affected_task_recipient() {
         let dir = tempfile::tempdir().unwrap();
