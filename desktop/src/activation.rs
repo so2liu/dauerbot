@@ -295,7 +295,7 @@ async fn activate_with_launcher(
                         .context("Ownership confirmation is unavailable; keeping the prepared app for recovery")?,
                 };
                 if receipt["owner_committed"] == true { transaction.committed()?; }
-                ensure!(transaction.journal.owner_committed && receipt["phase"] == "serving", "The new service did not confirm healthy ownership");
+                confirm_ownership(&receipt)?;
             } else {
                 let receipt = api(&http,&cfg,"GET",&status_path,None).await?;
                 ensure!(receipt["owner_committed"] == true && receipt["phase"] == "serving", "Waiting for the updated service to finish starting");
@@ -364,6 +364,18 @@ async fn activate_with_launcher(
     }
 }
 
+fn confirm_ownership(receipt: &Value) -> Result<()> {
+    ensure!(
+        receipt["owner_committed"] == true && receipt["phase"] == "serving",
+        "{}",
+        receipt["error"]
+            .as_str()
+            .filter(|error| !error.trim().is_empty())
+            .unwrap_or("The new service did not confirm healthy ownership")
+    );
+    Ok(())
+}
+
 async fn api(
     http: &reqwest::Client,
     cfg: &Config,
@@ -393,6 +405,27 @@ async fn api(
 
 #[cfg(test)]
 static LOSE_PUBLICATION_ACK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn failed_ownership_preserves_service_diagnostic_without_accepting_commit() {
+        let error = "Project or bot configuration changed; prepare the upgrade again";
+        let receipt = json!({"phase":"failed","owner_committed":false,"error":error});
+        assert_eq!(confirm_ownership(&receipt).unwrap_err().to_string(), error);
+        assert!(confirm_ownership(&json!({"phase":"serving","owner_committed":false})).is_err());
+        assert!(confirm_ownership(&json!({"phase":"committing","owner_committed":true})).is_err());
+        assert!(confirm_ownership(&json!({"phase":"serving","owner_committed":true})).is_ok());
+        assert_eq!(
+            confirm_ownership(&json!({"phase":"failed","error":""}))
+                .unwrap_err()
+                .to_string(),
+            "The new service did not confirm healthy ownership"
+        );
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod native_tests {
