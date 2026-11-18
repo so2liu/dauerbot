@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 mod access;
 mod activation;
+mod agent_tree;
 mod backend;
 mod locale;
 #[cfg(target_os = "macos")]
@@ -136,6 +137,7 @@ struct Desktop {
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
+    folded_agents: std::collections::HashMap<String, std::collections::HashSet<String>>,
     activation_frozen: bool,
     restored: bool,
 }
@@ -230,6 +232,7 @@ impl Desktop {
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
+            folded_agents: std::collections::HashMap::new(),
             activation_frozen: false,
             restored: false,
         }
@@ -1842,84 +1845,290 @@ impl Render for Desktop {
             let keyboard_id = id.clone();
             let selected = id == self.selected && page == 6;
             let status = project_status(project);
-            let symbol = if matches!(status, "error" | "needs_attention" | "offline") {
-                "×"
-            } else if matches!(status, "busy" | "running") {
-                "•"
-            } else {
-                "·"
-            };
-            project_list = project_list.child(
-                div()
-                    .id(SharedString::from(format!("project-{id}")))
-                    .focusable()
-                    .tab_index(0)
-                    .border_1()
-                    .border_color(rgb(CANVAS))
-                    .focus(|style| style.border_color(rgb(ACCENT)))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            this.select_project(keyboard_id.clone(), cx);
-                            this.go(6);
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(rgb(if selected { 0xe6e6eb } else { CANVAS }))
-                    .hover(|style| style.bg(rgb(0xececf0)))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .font_weight(if selected {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .child(
-                                        project["name"].as_str().unwrap_or("Project").to_owned(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(if matches!(status, "busy" | "running") {
-                                        ACCENT
-                                    } else {
-                                        MUTED
-                                    }))
-                                    .child(symbol),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED))
-                            .child(format!(
-                                "{} · {}",
-                                agent_name(project["agent"].as_str().unwrap_or("")),
-                                self.tr(status)
-                            )),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_project(id.clone(), cx);
-                        this.go(6);
-                        cx.notify();
-                    })),
+            let tree = agent_tree::Tree::from_project(project);
+            let fold_scope = format!(
+                "{}:{}:{}",
+                id,
+                project["generation"].as_str().unwrap_or(""),
+                agent_tree::observed_native(project)
             );
+            let folded = self
+                .folded_agents
+                .get(&fold_scope)
+                .cloned()
+                .unwrap_or_default();
+            let tree_rows = tree.rows(&folded);
+            let has_children = !tree.nodes.is_empty();
+            let root_folded = folded.contains("");
+            let click_project = id.clone();
+            let root_row = div()
+                .id(SharedString::from(format!("project-{id}")))
+                .focusable()
+                .tab_index(0)
+                .border_1()
+                .border_color(rgb(CANVAS))
+                .focus(|style| style.border_color(rgb(ACCENT)))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.select_project(keyboard_id.clone(), cx);
+                        this.go(6);
+                        cx.stop_propagation();
+                    }
+                }))
+                .px_2()
+                .h(px(32.))
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(if selected { 0xe6e6eb } else { CANVAS }))
+                .hover(|style| style.bg(rgb(0xececf0)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h_full()
+                        .child(agent_tree::cli_icon(
+                            project["agent"].as_str().unwrap_or("custom"),
+                            format!("project-cli-{id}"),
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.))
+                                .font_weight(if selected {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .child(project["name"].as_str().unwrap_or("Project").to_owned()),
+                        )
+                        .child(agent_tree::status_dot(
+                            status,
+                            self.tr(status),
+                            format!("project-status-{id}"),
+                        )),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_project(click_project.clone(), cx);
+                    this.go(6);
+                    cx.notify();
+                }));
+            let mut root = div().flex().items_center().w_full().min_w_0();
+            if has_children {
+                let scope = fold_scope.clone();
+                root = root.child(
+                    Button::new(SharedString::from(format!("fold-project-{id}")))
+                        .child(div().text_size(px(12.)).child(if root_folded {
+                            "›"
+                        } else {
+                            "⌄"
+                        }))
+                        .xsmall()
+                        .tooltip(self.tr(if root_folded {
+                            "Show subagents"
+                        } else {
+                            "Hide subagents"
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let folded = this.folded_agents.entry(scope.clone()).or_default();
+                            if !folded.remove("") {
+                                folded.insert(String::new());
+                            }
+                            cx.notify();
+                        })),
+                );
+            } else {
+                root = root.child(div().w(px(20.)).flex_shrink_0());
+            }
+            let mut group = div()
+                .id(SharedString::from(format!("project-tree-{id}")))
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(root.child(div().flex_1().min_w_0().child(root_row)));
+            if !root_folded {
+                for row in tree_rows {
+                    let node = row.node;
+                    let node_id = node.id.clone();
+                    let scope = fold_scope.clone();
+                    let target = if tree.status == "observed" {
+                        agent_tree::project_target(node, &self.state["projects"])
+                    } else {
+                        None
+                    };
+                    let detail = format!(
+                        "{} · {} · {}{}",
+                        node.name,
+                        agent_tree::cli_label(&node.cli),
+                        self.tr(&node.state),
+                        if node.observation.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n{}", node.observation)
+                        }
+                    );
+                    let mut child = div()
+                        .id(SharedString::from(format!("agent-{id}-{}", node.id)))
+                        .h(px(26.))
+                        .min_w_0()
+                        .pl(px(28.))
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_md()
+                        .hover(|style| style.bg(rgb(0xececf0)))
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
+                        })
+                        .child(agent_tree::branches(&row));
+                    if row.has_children {
+                        let fold_id = node_id.clone();
+                        child = child.child(
+                            Button::new(SharedString::from(format!("fold-agent-{id}-{node_id}")))
+                                .child(div().text_size(px(11.)).child(
+                                    if folded.contains(&node_id) {
+                                        "›"
+                                    } else {
+                                        "⌄"
+                                    },
+                                ))
+                                .xsmall()
+                                .tooltip(self.tr(if folded.contains(&node_id) {
+                                    "Show subagents"
+                                } else {
+                                    "Hide subagents"
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let folded =
+                                        this.folded_agents.entry(scope.clone()).or_default();
+                                    if !folded.remove(&fold_id) {
+                                        folded.insert(fold_id.clone());
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    child = child.child(agent_tree::cli_icon(
+                        &node.cli,
+                        format!("agent-cli-{id}-{node_id}"),
+                    ));
+                    if target.is_none() {
+                        let name = node.name.clone();
+                        let summary = format!(
+                            "{} · {}",
+                            agent_tree::cli_label(&node.cli),
+                            self.tr(&node.state)
+                        );
+                        let observation = node.observation.clone();
+                        let read_only = self.tr("Observed subagent · read only");
+                        child = child.child(
+                            div().flex_1().min_w_0().child(
+                                gpui_component::popover::Popover::new(SharedString::from(format!(
+                                    "agent-details-{id}-{node_id}"
+                                )))
+                                .trigger(
+                                    Button::new(SharedString::from(format!(
+                                        "inspect-agent-{id}-{node_id}"
+                                    )))
+                                    .ghost()
+                                    .xsmall()
+                                    .w_full()
+                                    .h(px(24.))
+                                    .tooltip(self.tr("View Agent details"))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(0x65656f))
+                                            .child(node.name.clone()),
+                                    ),
+                                )
+                                .content(move |_, _, _| {
+                                    div()
+                                        .w(px(260.))
+                                        .p_3()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .text_size(px(12.))
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(name.clone()),
+                                        )
+                                        .child(summary.clone())
+                                        .child(
+                                            div().text_color(rgb(MUTED)).child(observation.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(rgb(MUTED))
+                                                .child(read_only.clone()),
+                                        )
+                                }),
+                            ),
+                        );
+                    } else {
+                        child = child.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(rgb(0x65656f))
+                                .child(node.name.clone()),
+                        );
+                    }
+                    child = child.child(agent_tree::status_dot(
+                        &node.state,
+                        self.tr(&node.state),
+                        format!("agent-state-{id}-{node_id}"),
+                    ));
+                    if let Some(target) = target {
+                        let key_target = target.clone();
+                        child = child
+                            .focusable()
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    this.select_project(key_target.clone(), cx);
+                                    this.go(6);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_project(target.clone(), cx);
+                                this.go(6);
+                                cx.notify();
+                            }));
+                    }
+                    group = group.child(child);
+                }
+                if project["execution"]["agent_tree"].is_object() && tree.status != "observed" {
+                    group = group.child(
+                        div()
+                            .pl(px(40.))
+                            .pr_2()
+                            .py_1()
+                            .text_size(px(10.))
+                            .text_color(rgb(MUTED))
+                            .child(self.tr(if tree.status == "stale" {
+                                "Agent details may be out of date"
+                            } else {
+                                "Some Agent details are unavailable"
+                            })),
+                    );
+                }
+            }
+            project_list = project_list.child(group);
         }
         let sidebar =
             div()
@@ -2273,7 +2482,7 @@ fn main() {
         Backend::start(dir)
     };
     let frontend_ready = backend.frontend_ready.clone();
-    let app = Application::new();
+    let app = Application::new().with_assets(agent_tree::Assets);
     let published = candidate
         .as_ref()
         .map(|candidate| candidate.serving.clone());

@@ -26,6 +26,7 @@ let ext;
 const ctx = {mode:'tui', cwd:tmp, model:{provider:'fixture',id:'chosen-model'},thinkingLevel:'low',isProjectTrusted:()=>true,
   sessionManager:{getSessionId:()=> 'fixture-parent',getSessionFile:()=>path.join(tmp,'parent.jsonl')}, ui:{confirm:async()=>true}};
 const state = () => JSON.parse(fs.readFileSync(path.join(managed,'children.json')));
+const tree = () => JSON.parse(fs.readFileSync(path.join(managed,'tree.json')));
 try {
  const result = await loadExtensions([path.join(managed,'managed.ts')], tmp);
  assert.deepEqual(result.errors,[]);
@@ -40,6 +41,7 @@ try {
  for (const fn of ext.handlers.get('session_start')) await fn({type:'session_start'},ctx);
  assert.equal(state().state,'quiescent','only the exact pinned HERDR observer can join known coverage');
  const tool = ext.tools.get('dauerbot_subagent').definition;
+ let invocation = 0;
  for (const params of [
    {agent:'worker',task:'hold single'},
    {tasks:Array.from({length:7},(_,i)=>({agent:'worker',task:`hold parallel ${i}`}))},
@@ -47,14 +49,20 @@ try {
  ]) {
    const before = state().revision;
    let settled = false;
-   const running = tool.execute('fixture-call',params,new AbortController().signal,undefined,ctx).then(x=>{settled=true;return x});
+   const running = tool.execute(`fixture-call-${invocation++}`,params,new AbortController().signal,undefined,ctx).then(x=>{settled=true;return x});
    await delay(15);
    assert.equal(state().state,'active'); assert.equal(settled,false,'foreground tool must await its children');
+   assert.equal(tree().generation,'fixture-generation'); assert.equal(tree().session,'fixture-parent');
+   assert.ok(tree().nodes.some(node=>node.name==='worker' && node.state==='running'));
+   assert.ok(tree().nodes.every(node=>node.parent_id==='root' && node.id.startsWith('pi:')));
+   assert.ok(!JSON.stringify(tree()).includes('hold '),'presentation must not expose child prompts');
    for(let i=0;i<5;i++){await delay(15); assert.equal(state().state,'active','pending/parallel/chain gaps must stay active');}
    const outcome = await running;
    assert.equal(outcome.details.isError,false,JSON.stringify(outcome));
    assert.equal(state().state,'quiescent'); assert.equal(state().revision,before+2);
    assert.ok(outcome.details.results.every(x=>x.model==='fixture/chosen-model'),'selected parent model must be inherited');
+   assert.ok(tree().nodes.every(node=>node.state==='completed'));
+   assert.ok(fs.statSync(path.join(managed,'children.json')).size<4096,'strict retirement aggregate remains separate and bounded');
  }
  const abort = new AbortController();
  const running = tool.execute('abort',{agent:'worker',task:'hold aborted'},abort.signal,undefined,ctx);

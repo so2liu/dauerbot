@@ -1,8 +1,10 @@
 pub mod adapter;
+mod agent_tree;
 pub mod api;
 pub mod bot;
 pub mod cli_control;
 pub mod cli_switch;
+mod codex_tree;
 pub mod companion;
 pub mod config;
 pub mod conversation;
