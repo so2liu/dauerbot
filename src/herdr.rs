@@ -525,6 +525,107 @@ pub async fn launch_execution(_config: &Config, p: &Project, _argv: &[String]) -
     Ok(())
 }
 
+// Pane addresses are reusable after a HERDR restart. Only a complete census
+// of immutable terminals, plus definite process death, can prove disappearance.
+async fn execution_registry(
+    config: &Config,
+    p: &Project,
+    execution: &ExecutionRef,
+) -> Result<Option<BTreeMap<String, Value>>> {
+    let list = rpc(config, "workspace.list", json!({})).await?;
+    let workspaces = list["workspaces"]
+        .as_array()
+        .context("Missing complete HERDR workspace registry")?;
+    let mut registry = BTreeMap::new();
+    for workspace in workspaces {
+        let id = workspace["workspace_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("Invalid workspace registry identity")?;
+        let count = workspace["pane_count"]
+            .as_u64()
+            .context("Missing workspace pane count")?;
+        let listed = rpc(config, "pane.list", json!({"workspace_id":id})).await?;
+        let panes = listed["panes"]
+            .as_array()
+            .context("Missing complete workspace pane registry")?;
+        ensure!(
+            panes.len() as u64 == count,
+            "HERDR registry changed during disappearance verification"
+        );
+        ensure!(
+            registry
+                .insert(format!("workspace:{id}"), json!(count))
+                .is_none(),
+            "Duplicate workspace registry identity"
+        );
+        for pane in panes {
+            let pane_id = pane["pane_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .context("Invalid pane registry identity")?;
+            let terminal = pane["terminal_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .context("Invalid immutable terminal identity")?;
+            ensure!(
+                pane["workspace_id"] == id,
+                "Incomplete HERDR workspace registry"
+            );
+            if terminal == execution.terminal_id
+                || pane["tokens"]["hfb_generation"] == p.generation
+                || pane["tokens"]["hfb_execution"] == execution.managed_name
+            {
+                return Ok(None);
+            }
+            ensure!(
+                registry
+                    .insert(
+                        format!("terminal:{terminal}"),
+                        json!({"pane":pane_id,"workspace":id,"tokens":pane["tokens"]})
+                    )
+                    .is_none(),
+                "Duplicate immutable terminal identity"
+            );
+        }
+    }
+    Ok(Some(registry))
+}
+async fn vanished_execution(
+    config: &Config,
+    p: &Project,
+    execution: &ExecutionRef,
+) -> Result<bool> {
+    if !root_has_exited(execution.shell_pid) {
+        return Ok(false);
+    }
+    let children = crate::native_children::observe(p, crate::db::now());
+    if children["state"] == "active"
+        || (p.execution["child_adapter"].is_string() && children["state"] != "quiescent")
+    {
+        return Ok(false);
+    }
+    let Some(first) = execution_registry(config, p, execution).await? else {
+        return Ok(false);
+    };
+    let Some(second) = execution_registry(config, p, execution).await? else {
+        return Ok(false);
+    };
+    ensure!(
+        first == second,
+        "HERDR registry changed during disappearance verification"
+    );
+    // PID reuse, permission errors, and missing managed child evidence retain
+    // the old fence; no signal is sent to either the old or replacement pane.
+    let children = crate::native_children::observe(p, crate::db::now());
+    Ok(root_has_exited(execution.shell_pid)
+        && children["state"] != "active"
+        && (!p.execution["child_adapter"].is_string() || children["state"] == "quiescent"))
+}
+fn vanished_record(execution: &ExecutionRef) -> Value {
+    json!({"state":"finished","vanished_execution":true,"execution":execution})
+}
+
 pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
     let execution = ExecutionRef::from_project(p)?;
     let pane = match rpc(config, "pane.get", json!({"pane_id":execution.pane_id})).await {
@@ -534,10 +635,20 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
                 matches!(e.kind.as_str(), "pane_not_found" | "target_not_found")
             }) =>
         {
-            return Ok(json!({"state":"finished","execution":execution}));
+            ensure!(
+                vanished_execution(config, p, &execution).await?,
+                "The saved HERDR pane is missing, but execution disappearance is not verified"
+            );
+            return Ok(vanished_record(&execution));
         }
         Err(error) => return Err(error),
     };
+    if (pane["terminal_id"] != execution.terminal_id
+        || pane["workspace_id"] != execution.workspace_id)
+        && vanished_execution(config, p, &execution).await?
+    {
+        return Ok(vanished_record(&execution));
+    }
     let native_agent = match rpc(config, "agent.get", json!({"target":execution.pane_id})).await {
         Ok(v) => v["agent"].clone(),
         Err(error)
@@ -562,7 +673,11 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
                 matches!(e.kind.as_str(), "pane_not_found" | "target_not_found")
             }) =>
         {
-            return Ok(json!({"state":"finished","execution":execution}));
+            ensure!(
+                vanished_execution(config, p, &execution).await?,
+                "The saved HERDR pane is missing, but execution disappearance is not verified"
+            );
+            return Ok(vanished_record(&execution));
         }
         Err(error) => return Err(error),
     };
@@ -951,6 +1066,11 @@ pub async fn send(config: &Config, p: &Project, text: &str) -> Result<Value> {
 
 pub async fn stop(config: &Config, p: &Project) -> Result<()> {
     let record = observe(config, p).await?;
+    if record["vanished_execution"] == true {
+        // observe verified the immutable old terminal is gone. Its reusable
+        // address may belong to a user shell now; there is nothing to close.
+        return Ok(());
+    }
     if record["state"] == "finished" {
         let execution = ExecutionRef::from_project(p)?;
         // Exited direct-command panes remain in HERDR. Their immutable terminal
@@ -1260,6 +1380,142 @@ pub async fn install_integration(config: &Config, agent: &str) -> Result<Value> 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn reused_pane_recovery_requires_global_absence_and_never_mutates_foreign_pane() {
+        for scenario in [
+            "gone",
+            "moved",
+            "incomplete",
+            "alive",
+            "unknown_pid",
+            "unknown_children",
+            "active_children",
+            "registry_race",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = Config {
+                herdr_session: dir.path().to_string_lossy().into_owned(),
+                ..Config::default()
+            };
+            let db = crate::db::Db::open(&dir.path().join("db")).unwrap();
+            let mut p = db
+                .create(crate::db::ProjectInput {
+                    name: "Vanished native fixture".into(),
+                    path: dir.path().to_string_lossy().into(),
+                    agent: "codex".into(),
+                    chat_id: String::new(),
+                    native_session: "saved-native".into(),
+                    extra_args: vec![],
+                })
+                .await
+                .unwrap();
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            let dead_pid = i64::from(child.id());
+            child.wait().unwrap();
+            p.generation = "old-generation".into();
+            p.terminal = Some("old-terminal".into());
+            p.ready = true;
+            p.terminal_pid = match scenario {
+                "alive" => Some(i64::from(std::process::id())),
+                "unknown_pid" => None,
+                _ => Some(dead_pid),
+            };
+            p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"old-terminal","managed_name":"old-managed","generation":p.generation,"shell_pid":p.terminal_pid,"launch_permit":dir.path().join("permit")});
+            if matches!(scenario, "unknown_children" | "active_children") {
+                let adapter = dir.path().join("adapter");
+                std::fs::create_dir(&adapter).unwrap();
+                p.execution["child_adapter"] = json!(adapter);
+                if scenario == "active_children" {
+                    std::fs::write(adapter.join("children.json"),json!({"schema":1,"generation":p.generation,"session":p.native_session,"sessionFile":"","epoch":"epoch","revision":1,"state":"active","updated":crate::db::now()}).to_string()).unwrap();
+                }
+            }
+            let foreign = json!({"pane_id":"w1:p1","workspace_id":"w1","terminal_id":"replacement-terminal","agent_status":"unknown"});
+            let old = json!({"pane_id":"w2:p1","workspace_id":"w2","terminal_id":"old-terminal"});
+            let other =
+                json!({"pane_id":"w2:p1","workspace_id":"w2","terminal_id":"unrelated-terminal"});
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen = calls.clone();
+            let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
+            let worker = tokio::spawn(async move {
+                let mut registry_reads = 0;
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (input, mut output) = stream.into_split();
+                    let request: Value = serde_json::from_str(
+                        &BufReader::new(input)
+                            .lines()
+                            .next_line()
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    seen.lock().unwrap().push(method.into());
+                    let result = match method {
+                        "pane.get" => json!({"pane":foreign}),
+                        "workspace.list" => {
+                            registry_reads += 1;
+                            json!({"workspaces":[{"workspace_id":"w1","pane_count":1},{"workspace_id":"w2","pane_count":if scenario=="incomplete"{2}else{1}}]})
+                        }
+                        "pane.list" => {
+                            if request["params"]["workspace_id"] == "w1" {
+                                json!({"panes":[foreign]})
+                            } else if scenario == "moved" {
+                                json!({"panes":[old]})
+                            } else if scenario == "registry_race" && registry_reads % 2 == 0 {
+                                json!({"panes":[{"pane_id":"w2:p2","workspace_id":"w2","terminal_id":"another-terminal"}]})
+                            } else {
+                                json!({"panes":[other]})
+                            }
+                        }
+                        "agent.get" => json!({"agent":foreign}),
+                        "pane.process_info" => {
+                            json!({"process_info":{"shell_pid":std::process::id(),"foreground_processes":[{"pid":std::process::id(),"name":"zsh","argv":["zsh"]}]}})
+                        }
+                        _ => panic!("Unexpected effect on unrelated pane: {method}"),
+                    };
+                    output
+                        .write_all(
+                            format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+            let observed = observe(&cfg, &p).await;
+            if scenario == "gone" {
+                assert_eq!(observed.unwrap()["vanished_execution"], true);
+                assert!(stop(&cfg, &p).await.is_ok());
+            } else {
+                if let Ok(record) = observed {
+                    assert_ne!(record["state"], "finished", "{scenario}");
+                }
+                assert!(stop(&cfg, &p).await.is_err(), "{scenario}");
+            }
+            assert!(seen_read_only(&calls.lock().unwrap()));
+            assert!(
+                !calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m == "pane.close" || m == "agent.prompt" || m == "pane.send_input")
+            );
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+    fn seen_read_only(methods: &[String]) -> bool {
+        methods.iter().all(|m| {
+            matches!(
+                m.as_str(),
+                "pane.get" | "workspace.list" | "pane.list" | "agent.get" | "pane.process_info"
+            )
+        })
+    }
     #[tokio::test]
     async fn native_observation_and_prompt_use_public_pane_target() {
         for starting in [false, true] {
