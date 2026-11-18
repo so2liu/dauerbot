@@ -5,6 +5,7 @@
 ### Added
 
 - Select per-project models for Codex, Claude Code, Pi and Antigravity from the desktop or authenticated Feishu selection cards. Keep requested and observed models distinct, preserve native login/settings, and guide setup of Feishu shortcut buttons (#83).
+- Refresh the native project workspace using the reviewed Magpie layout, including responsive terminal geometry, accessible recovery controls and a searchable model picker (#84).
 
 ### Fixed
 
@@ -14,12 +15,12 @@
 
 ### Changed
 
+- Adapt Herdr App terminal rendering and input mechanisms for the native legacy transport, including ANSI colors, fixed-column shaping, bounded frame ingestion, takeover focus and AGY Alt+M. Physical keyboard, IME, scrolling and selection acceptance remains open under #85.
 - Advance both application crates to 0.5.0 and bundle build 15. Keep API protocol 7, the three Agent tools and bundled HERDR 0.9.5 unchanged.
 
 ### Pending final acceptance
 
-- The refreshed native project workspace will be included after PR #88 merges and passes native UI acceptance (#84).
-- Herdr App terminal rendering, colors, input and frame scheduling will be included after PR #87 merges and passes physical keyboard and native rendering acceptance (#85).
+- Terminal implementation is merged in PR #87. Remaining physical keyboard/IME, control release, scrolling and selection checks under #85 still gate publication; the locked macOS session currently prevents completing them.
 - Automatic recovery of saved Agent sessions after a computer reboot will be included after the fix for #94 merges and passes its recovery checks.
 
 ## 0.4.9 — 2026-11-17
