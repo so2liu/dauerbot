@@ -112,7 +112,7 @@ pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
         [project],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    let source = if let Some(previous) =
+    let mut source = if let Some(previous) =
         previous.filter(|r| r.phase == "ready" && r.target == agent)
     {
         if previous.source["agent"]
@@ -1012,10 +1012,7 @@ impl App {
             let record = record.expect("live recovery has an observation");
             // A target has not received held user work, but may have an initial
             // tool in flight. Preserve its execution until that work settles.
-            if record["state"] != "finished"
-                && (record["status"]["state"] == "working"
-                    || record["children"]["state"] == "active")
-            {
+            if record["state"] != "finished" && !herdr::recovery_foreground_quiescent(p, record) {
                 self.defer_cli_recovery(r,"Waiting for the selected CLI's in-flight startup work before restoring the repair Agent.").await?;
                 return Ok(true);
             }
@@ -1137,10 +1134,7 @@ impl App {
                 .await?;
                 return Ok(true);
             }
-            if herdr::check_pane_ownership(p, record).is_ok()
-                && record["children"]["state"] != "active"
-                && record["status"]["state"] != "working"
-            {
+            if herdr::recovery_foreground_quiescent(p, record) {
                 let id = r.id.clone();
                 self.db.call(move|c|phase(c,&id,"recovery_stopping","Replacing the owned execution whose native Agent identity no longer matches.")).await?;
             }
@@ -1160,7 +1154,7 @@ impl App {
                 .await?;
                 return Ok(true);
             }
-            if herdr::check_pane_ownership(p, record).is_ok() {
+            if herdr::recovery_foreground_quiescent(p, record) {
                 let rid = r.id.clone();
                 self.db.call(move|c|{
                     c.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.error_restart_done',json('true')) WHERE id=?",[&rid])?;
