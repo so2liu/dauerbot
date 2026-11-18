@@ -372,6 +372,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         let id = p.id.clone();
         let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
         let mut record = json!(p);
+        record["execution"]["agent_tree"] = crate::agent_tree::observe(p.clone()).await;
         let project_id = p.id.clone();
         record["cli_transition"] = json!(
             app.db

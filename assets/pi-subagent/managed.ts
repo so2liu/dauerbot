@@ -1,6 +1,7 @@
 /** Dauerbot's managed-only wrapper. No global Pi settings are changed. */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import official from "./index.ts";
@@ -19,6 +20,34 @@ export default function managed(pi: ExtensionAPI) {
 	let incomplete = config.incomplete || VERSION !== "1.5.1" || fs.existsSync(unknown) || fs.existsSync(state);
 	const epoch = `${process.pid}-${Date.now()}`;
 	let heartbeat: ReturnType<typeof setInterval> | undefined;
+	// Independent presentation sample: never consumed by retirement coverage.
+	const tree = new Map<string, { id: string; parent_id: string; name: string; state: string }>();
+	let treeTruncated = false;
+	function publishTree() {
+		try {
+			const file = path.join(dir, "tree.json"), tmp = `${file}.${process.pid}.tmp`;
+			const nodes = [...tree.values()].slice(-96);
+			const bytes = JSON.stringify({ schema: 1, generation: config.generation, session, sessionFile,
+				updated: Date.now(), nodes, truncated: treeTruncated || incomplete });
+			if (Buffer.byteLength(bytes) > 65536) return;
+			fs.writeFileSync(tmp, bytes, { mode: 0o600 }); fs.renameSync(tmp, file);
+		} catch { /* Presentation failure must not change dispatch/retirement behavior. */ }
+	}
+	function observeResults(call: string, result: any) {
+		try {
+		const results = result?.details?.results;
+		if (!Array.isArray(results)) return;
+		for (const [index, child] of results.slice(0, 96).entries()) {
+			if (typeof child?.agent !== "string" || !child.agent || child.agent.length > 256 || /[\x00-\x1f\x7f]/.test(child.agent)) continue;
+			if (!["pending", "running", "completed", "failed", "aborted"].includes(child.status)) continue;
+			const id = `pi:${createHash("sha256").update(`${call}:${index}`).digest("hex").slice(0, 24)}`;
+			tree.set(id, { id, parent_id: "root", name: child.agent, state: child.status });
+		}
+		while (tree.size > 96) { tree.delete(tree.keys().next().value!); treeTruncated = true; }
+		treeTruncated ||= results.length > 96;
+		publishTree();
+		} catch { /* Presentation failure never changes the native tool result. */ }
+	}
 	function publish() {
 		if (!session) return;
 		// Removing configuration does not unload a running plugin or its children.
@@ -29,6 +58,7 @@ export default function managed(pi: ExtensionAPI) {
 		fs.writeFileSync(tmp, JSON.stringify({ schema: 1, generation: config.generation,
 			session, sessionFile, epoch, revision, state: active ? "active" : (incomplete ? "unknown" : "quiescent"), updated: Date.now() }), { mode: 0o600 });
 		fs.renameSync(tmp, state);
+		publishTree();
 	}
 	function enter() {
 		// A held gate or persistent retirement marker fails closed. Never dispatch
@@ -40,7 +70,9 @@ export default function managed(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
 		cwd = ctx.cwd;
-		session = ctx.sessionManager.getSessionId();
+		const nextSession = ctx.sessionManager.getSessionId();
+		if (session !== nextSession) { tree.clear(); treeTruncated = false; }
+		session = nextSession;
 		sessionFile = ctx.sessionManager.getSessionFile() ?? "";
 		publish();
 		if (heartbeat) clearInterval(heartbeat);
@@ -61,7 +93,10 @@ export default function managed(pi: ExtensionAPI) {
 				if (!session) throw new Error("Managed subagents require a native parent session");
 				enter();
 				try { active++; revision++; publish(); } finally { fs.rmdirSync(gate); }
-				try { return await tool.execute(...args); }
+				const call = String(args[0]);
+				const onUpdate = args[3];
+				args[3] = (result: any) => { observeResults(call, result); onUpdate?.(result); };
+				try { const result = await tool.execute(...args); observeResults(call, result); return result; }
 				finally { active--; revision++; publish(); }
 			} });
 		},
