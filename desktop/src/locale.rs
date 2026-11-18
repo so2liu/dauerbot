@@ -22,6 +22,10 @@ impl Language {
                 "sleeping" => "Standby",
                 "preparing_handoff" => "Preparing handoff",
                 "switching_cli" => "Switching CLI",
+                "recovery_pending" | "recovery_stopping" | "recovery_starting" => {
+                    "Recovering Agent"
+                }
+                "repairing" => "Repair Agent available",
                 "starting" => "Starting",
                 "ready" => "Ready",
                 "busy" | "running" => "Working",
@@ -75,6 +79,17 @@ impl Language {
             "Switching CLI…" | "switching_cli" => "正在切换 CLI…",
             "Selected CLI is ready." => "所选 CLI 已就绪。",
             "CLI handoff requested." => "已请求 CLI 交接。",
+            "CLI recovery requested." => "已请求恢复 Agent。",
+            "Repair Agent" => "修复 Agent",
+            "Retry recovery" => "重试恢复",
+            "Recovering the previous Agent automatically…"
+            | "recovery_pending"
+            | "recovery_stopping" => "正在自动恢复原 Agent…",
+            "Starting the repair Agent with the saved conversation…" | "recovery_starting" => {
+                "正在使用已保存的会话启动修复 Agent…"
+            }
+            "Repair Agent is available. Messages remain saved for the selected CLI."
+            | "repairing" => "修复 Agent 已可用，消息仍保留并等待所选 CLI。",
             "Messages wait for the selected CLI. Stop pauses the project and cancels the switch." => {
                 "消息将等待所选 CLI 就绪。停止会暂停项目并取消切换。"
             }

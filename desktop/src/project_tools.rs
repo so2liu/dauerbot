@@ -18,10 +18,12 @@ struct Ticket {
 enum Work {
     Document(Ticket),
     Switch(Ticket, String),
+    Repair(Ticket),
 }
 struct Reply {
     ticket: Ticket,
     result: Result<Value, String>,
+    recovery: bool,
 }
 pub struct ProjectTools {
     project: Value,
@@ -50,6 +52,7 @@ impl ProjectTools {
                 .build();
             let Ok(http) = http else { return };
             while let Ok(work) = requests.recv() {
+                let recovery = matches!(&work, Work::Repair(_));
                 let (ticket, method, suffix, body) = match work {
                     Work::Document(ticket) => {
                         let suffix = format!("documents/{}", ticket.document.unwrap().key());
@@ -61,6 +64,9 @@ impl ProjectTools {
                         "agent/transition".into(),
                         Some(json!({"agent":agent})),
                     ),
+                    Work::Repair(ticket) => {
+                        (ticket, "POST", "agent/repair".into(), Some(json!({})))
+                    }
                 };
                 let result = runtime
                     .block_on(async {
@@ -97,7 +103,14 @@ impl ProjectTools {
                         Ok::<_, anyhow::Error>(value)
                     })
                     .map_err(|error| error.to_string());
-                if replies.send(Reply { ticket, result }).is_err() {
+                if replies
+                    .send(Reply {
+                        ticket,
+                        result,
+                        recovery,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -119,7 +132,12 @@ impl ProjectTools {
                                 }
                             }
                             Ok(_) => {
-                                this.message = "CLI handoff requested.".into();
+                                this.message = if reply.recovery {
+                                    "CLI recovery requested."
+                                } else {
+                                    "CLI handoff requested."
+                                }
+                                .into();
                             }
                             Err(error) => {
                                 this.pending_cli = None;
@@ -162,7 +180,16 @@ impl ProjectTools {
         }
         if matches!(
             project["cli_transition"]["phase"].as_str(),
-            Some("failed" | "startup_failed" | "uncertain" | "cancelled")
+            Some(
+                "failed"
+                    | "startup_failed"
+                    | "uncertain"
+                    | "cancelled"
+                    | "recovery_pending"
+                    | "recovery_stopping"
+                    | "recovery_starting"
+                    | "repairing"
+            )
         ) {
             self.pending_cli = None;
         }
@@ -175,7 +202,10 @@ impl ProjectTools {
         }
         self.project = project.clone();
         if project["cli_transition"]["phase"].is_string()
-            && self.message == "CLI handoff requested."
+            && matches!(
+                self.message.as_str(),
+                "CLI handoff requested." | "CLI recovery requested."
+            )
         {
             self.message.clear();
         }
@@ -201,10 +231,12 @@ impl ProjectTools {
         let sent = if let Some(agent) = agent {
             self.pending_cli = Some(agent.clone());
             self.tx.send(Work::Switch(ticket, agent))
-        } else {
+        } else if document.is_some() {
             self.document = document;
             self.content = None;
             self.tx.send(Work::Document(ticket))
+        } else {
+            self.tx.send(Work::Repair(ticket))
         };
         if sent.is_err() {
             self.ticket = None;
@@ -217,19 +249,48 @@ impl ProjectTools {
 fn accept_reply(project: &Value, current: Option<&Ticket>, incoming: &Ticket) -> bool {
     project["id"].as_str() == Some(incoming.project.as_str()) && current == Some(incoming)
 }
+fn recovery_control(project: &Value, busy: bool) -> Option<(&'static str, bool)> {
+    let label = match project["cli_transition"]["phase"].as_str()? {
+        "failed" | "startup_failed" | "uncertain" => "Repair Agent",
+        "recovery_pending" | "recovery_stopping" | "recovery_starting" => "Retry recovery",
+        "repairing" => "Repair Agent",
+        _ => return None,
+    };
+    Some((
+        label,
+        busy || project["paused"] == true || project["lifecycle"] == "taken_over",
+    ))
+}
 impl Render for ProjectTools {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let transition = &self.project["cli_transition"];
         let switching = self.pending_cli.is_some()
             || matches!(
                 transition["phase"].as_str(),
-                Some("preparing" | "requested" | "switching" | "starting" | "uncertain")
+                Some(
+                    "preparing"
+                        | "requested"
+                        | "switching"
+                        | "starting"
+                        | "uncertain"
+                        | "recovery_pending"
+                        | "recovery_stopping"
+                        | "recovery_starting"
+                        | "repairing"
+                )
             );
         let unavailable =
             self.project["paused"] == true || self.project["lifecycle"] == "taken_over";
         let status = match transition["phase"].as_str() {
             Some("preparing" | "requested") => "Preparing handoff…",
             Some("switching" | "starting") => "Switching CLI…",
+            Some("recovery_pending" | "recovery_stopping") => {
+                "Recovering the previous Agent automatically…"
+            }
+            Some("recovery_starting") => "Starting the repair Agent with the saved conversation…",
+            Some("repairing") => {
+                "Repair Agent is available. Messages remain saved for the selected CLI."
+            }
             Some("ready")
                 if self.project["ready"] == true
                     && transition["target"] == self.project["agent"] =>
@@ -292,19 +353,13 @@ impl Render for ProjectTools {
                     })),
             );
         }
-        if transition["phase"] == "startup_failed"
-            && self.project["terminal"].is_null()
-            && transition["target"] == self.project["agent"]
-        {
-            let target = self.project["agent"].as_str().unwrap_or("").to_owned();
+        if let Some((label, disabled)) = recovery_control(&self.project, busy) {
             choices = choices.child(
-                Button::new("retry-cli-start")
+                Button::new("repair-cli")
                     .small()
-                    .label(self.language.text("Retry startup"))
-                    .disabled(unavailable || busy)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.request(None, Some(target.clone()), cx)
-                    })),
+                    .label(self.language.text(label))
+                    .disabled(disabled)
+                    .on_click(cx.listener(|this, _, _, cx| this.request(None, None, cx))),
             );
         }
         let mut documents = div().flex().flex_wrap().items_center().gap_2().child(
@@ -380,10 +435,11 @@ impl Render for ProjectTools {
             view = view.child(div().text_sm().child(self.language.text(status)));
         }
         if unavailable {
-            view =
-                view.child(div().text_xs().text_color(rgb(0x85858d)).child(
+            view = view.child(div().text_xs().text_color(rgb(0x85858d)).child(
+                self.language.text(
                     "Resume this project and release terminal input before changing its CLI.",
-                ));
+                ),
+            ));
         }
         if !self.message.is_empty() {
             view = view.child(div().text_sm().child(self.language.text(&self.message)));
@@ -461,9 +517,39 @@ fn display_markdown(source: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ticket, accept_reply, display_markdown};
+    use super::{Ticket, accept_reply, display_markdown, recovery_control};
     use herdr_feishu_bridge::project_documents::Document;
     use serde_json::json;
+    #[test]
+    fn failed_or_uncertain_switch_keeps_repair_reachable_until_user_pauses_or_takes_over() {
+        for phase in [
+            "failed",
+            "startup_failed",
+            "uncertain",
+            "recovery_pending",
+            "recovery_stopping",
+            "recovery_starting",
+            "repairing",
+        ] {
+            for terminal in [json!(null), json!("live-target-pane")] {
+                let mut project = json!({"id":"one", "agent":"agy", "terminal":terminal, "cli_transition":{"phase":phase,"holds_input":true}});
+                assert_eq!(
+                    recovery_control(&project, false).map(|v| v.1),
+                    Some(false),
+                    "{phase}"
+                );
+                assert_eq!(recovery_control(&project, true).map(|v| v.1), Some(true));
+                project["paused"] = json!(true);
+                assert_eq!(recovery_control(&project, false).map(|v| v.1), Some(true));
+                project["paused"] = json!(false);
+                project["lifecycle"] = json!("taken_over");
+                assert_eq!(recovery_control(&project, false).map(|v| v.1), Some(true));
+            }
+        }
+        for phase in ["ready", "cancelled", "preparing", "requested", "starting"] {
+            assert!(recovery_control(&json!({"cli_transition":{"phase":phase}}), false).is_none());
+        }
+    }
     #[test]
     fn stale_project_document_and_reload_replies_are_ignored() {
         let ticket = Ticket {
