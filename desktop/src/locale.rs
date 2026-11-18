@@ -49,6 +49,13 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "Requested · switching model" => "已请求 · 正在切换模型",
+            "Invalid or stale model catalogue response" => "模型目录响应无效或已过期，请刷新",
+            "Model unavailable" => "模型信息暂不可用",
+            "Model unknown" => "模型信息未知",
+            "Native model catalogue could not be loaded" => "无法加载 CLI 模型目录",
+            "Refreshing model catalogue…" => "正在刷新模型目录…",
+            "Native model selection is unknown" => "尚未获知 CLI 的模型设置",
             "Show sidebar" => "显示侧栏",
             "Hide sidebar" => "隐藏侧栏",
             "Search projects · ⌘F" => "搜索项目 · ⌘F",
@@ -59,11 +66,12 @@ impl Language {
             "Your instructions, one message away." => "发条飞书消息，即可开始。",
             "Managed in Feishu" => "在飞书中管理",
             "Nothing scheduled yet" => "暂无定时安排",
-            "Native default" => "CLI 默认模型",
+            "Native CLI/session settings" => "CLI 与原生会话设置",
+            "Remove project model override" => "移除项目模型覆盖",
             "Choose model" => "选择模型",
             "Confirmed by CLI" => "CLI 已确认",
             "Requested · awaiting native confirmation" => "已选择 · 等待 CLI 确认",
-            "Uses the CLI's own settings" => "使用 CLI 自身设置",
+            "Uses native CLI/session settings" => "沿用 CLI 与原生会话设置",
             "This project only. Native login and global CLI settings stay in place." => {
                 "仅用于当前项目，保留 CLI 的登录和全局设置。"
             }

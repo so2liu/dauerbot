@@ -23,6 +23,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 
+fn control_label(text: impl Into<SharedString>) -> Div {
+    let text: SharedString = text.into();
+    div()
+        .min_w_0()
+        .text_size(px(13.))
+        .line_height(relative(1.))
+        .child(text)
+}
+
 const INK: u32 = 0x1c1c21;
 const MUTED: u32 = 0x85858d;
 const LINE: u32 = 0xe3e3e8;
@@ -30,6 +39,28 @@ const ACCENT: u32 = 0x4f46e5;
 const CANVAS: u32 = 0xf4f4f6;
 const SURFACE: u32 = 0xffffff;
 const PILL: u32 = 0xf1f1f4;
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceGeometry {
+    sidebar_hidden: bool,
+    available: Pixels,
+    center: Pixels,
+}
+fn workspace_geometry(
+    width: Pixels,
+    terminal_open: bool,
+    sidebar_preference: bool,
+) -> WorkspaceGeometry {
+    // Match the reference's compact breakpoint without changing the saved preference.
+    let sidebar_hidden = sidebar_preference || terminal_open && width < px(1024.);
+    let available = width - if sidebar_hidden { px(0.) } else { px(224.) };
+    let center = px((f32::from(available) * 0.45).clamp(320., 520.));
+    WorkspaceGeometry {
+        sidebar_hidden,
+        available,
+        center,
+    }
+}
+
 const STEPS: [&str; 9] = [
     "Welcome",
     "Create a Feishu bot",
@@ -505,6 +536,28 @@ impl Desktop {
             }
         }
     }
+    fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let geometry = workspace_geometry(
+            window.viewport_size().width,
+            self.setup.page == 6 && !self.setup.terminal_hidden,
+            self.setup.sidebar_hidden,
+        );
+        if geometry.sidebar_hidden {
+            self.setup.sidebar_hidden = false;
+            if self.setup.page == 6
+                && !self.setup.terminal_hidden
+                && window.viewport_size().width < px(1024.)
+            {
+                self.setup.terminal_hidden = true;
+                self.release_terminal();
+                self.terminal_key.clear();
+            }
+        } else {
+            self.setup.sidebar_hidden = true;
+        }
+        self.go(self.setup.page);
+        cx.notify();
+    }
     fn visible_project_ids(&self, cx: &App) -> Vec<String> {
         let query = self.project_search.read(cx).value().trim().to_lowercase();
         self.state["projects"]
@@ -533,8 +586,13 @@ impl Desktop {
         let index = if direction == 0 {
             0
         } else {
-            let current = ids.iter().position(|id| id == &self.selected).unwrap_or(0);
-            (current as isize + direction).rem_euclid(ids.len() as isize) as usize
+            match ids.iter().position(|id| id == &self.selected) {
+                Some(current) => {
+                    (current as isize + direction).rem_euclid(ids.len() as isize) as usize
+                }
+                None if direction < 0 => ids.len() - 1,
+                None => 0,
+            }
         };
         self.select_project(ids[index].clone(), cx);
         self.go(6);
@@ -683,7 +741,9 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) -> Button {
         Button::new(id)
-            .label(self.tr(label))
+            .small()
+            .text_size(px(13.))
+            .child(control_label(self.tr(label)))
             .disabled(self.busy)
             .on_click(cx.listener(move |this, _, window, cx| {
                 action(this, window, cx);
@@ -704,7 +764,7 @@ impl Desktop {
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.))
                     .text_color(rgb(MUTED))
                     .line_height(relative(1.5))
                     .child(self.tr(description)),
@@ -727,12 +787,12 @@ impl Desktop {
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_sm()
+                    .text_size(px(13.))
                     .child(self.tr(title)),
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.))
                     .text_color(rgb(MUTED))
                     .line_height(relative(1.6))
                     .child(text.to_owned()),
@@ -745,7 +805,7 @@ impl Desktop {
             .gap_2()
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.))
                     .font_weight(FontWeight::MEDIUM)
                     .child(self.tr(label)),
             )
@@ -789,7 +849,9 @@ impl Desktop {
             let id = project["id"].as_str().unwrap_or("").to_owned();
             choices = choices.child(
                 Button::new(SharedString::from(format!("bot-project-{id}")))
-                    .label(project["name"].as_str().unwrap_or("Project").to_owned())
+                    .child(control_label(
+                        project["name"].as_str().unwrap_or("Project").to_owned(),
+                    ))
                     .selected(self.selected == id)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.select_project(id.clone(), cx)),
@@ -803,7 +865,7 @@ impl Desktop {
             .child(choices)
             .child(self.field("App ID", &self.app_id))
             .child(self.field("App Secret", &self.secret))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(self.tr("The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac.")))
+            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(self.tr("The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac.")))
             .child(self.btn("save-credentials", "Save and connect", |this, _, cx| {
                 let id = this.app_id.read(cx).value().to_string();
                 if !id.starts_with("cli_") { this.notice = "Enter an App ID starting with cli_".into(); this.error = true; return; }
@@ -869,7 +931,7 @@ impl Desktop {
         for (index, name) in agents.into_iter().enumerate() {
             choices = choices.child(
                 Button::new(("agent", index))
-                    .label(name)
+                    .child(control_label(name))
                     .selected(self.agent == index)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.agent = index;
@@ -882,7 +944,7 @@ impl Desktop {
             .child(self.field("Project name", &self.name))
             .child(self.card("Private workspace", "By default, Dauerbot creates a folder in ~/.dauerbot/agents with project instructions. You can also choose an existing folder."))
             .child(self.field("Project folder (optional existing folder)", &self.path))
-            .when(!picked.is_empty(), |v| v.child(div().text_sm().text_color(rgb(ACCENT)).child(format!("{} {picked}", self.tr("Selected:")))))
+            .when(!picked.is_empty(), |v| v.child(div().text_size(px(13.)).text_color(rgb(ACCENT)).child(format!("{} {picked}", self.tr("Selected:")))))
             .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
             .child(self.card("Connect a dedicated bot", "After creating this project, connect its own Feishu bot or continue locally. You never need to enter chat IDs."))
@@ -916,7 +978,7 @@ impl Desktop {
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(project["path"].as_str().unwrap_or("").to_owned()),
                 );
@@ -929,7 +991,7 @@ impl Desktop {
                     .gap_2()
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(13.))
                             .text_color(rgb(if bound { ACCENT } else { MUTED }))
                             .child(self.tr(if bound {
                                 "Bot connected"
@@ -945,7 +1007,7 @@ impl Desktop {
                     )),
             );
             if !bound {
-                body = body.child(div().text_xs().text_color(rgb(MUTED))
+                body = body.child(div().text_size(px(11.)).text_color(rgb(MUTED))
                     .child(self.tr("This project is local only. Connect a dedicated Feishu bot to receive messages.")));
             }
             if let Some(error) = self.state["runtime"]["bots"][&id]["error"]
@@ -1046,7 +1108,7 @@ impl Desktop {
                     ))
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(13.))
                             .text_color(rgb(0x667782))
                             .child(self.tr(if paused {
                             "Automatic activity is paused. Messages stay saved until you resume."
@@ -1057,7 +1119,7 @@ impl Desktop {
             );
             body = body.child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(self.tr("Project CLI")),
             );
@@ -1066,7 +1128,7 @@ impl Desktop {
                 let project_id = id.clone();
                 agents = agents.child(
                     Button::new(("agent", index))
-                        .label(agent_name(agent))
+                        .child(control_label(agent_name(agent)))
                         .selected(project["agent"] == agent)
                         .disabled(
                             self.busy
@@ -1094,14 +1156,14 @@ impl Desktop {
             {
                 body = body.child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(format!("{}: {model}", self.tr("Model"))),
                 );
             } else {
                 body = body.child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(self.tr("Model follows the CLI's own settings")),
                 );
@@ -1145,7 +1207,9 @@ impl Desktop {
             .as_ref()
             .is_some_and(|bridge| bridge.controlling);
         let mut header = div()
-            .h(px(52.))
+            .min_h(px(52.))
+            .py_2()
+            .flex_wrap()
             .flex_shrink_0()
             .px_4()
             .flex()
@@ -1155,7 +1219,7 @@ impl Desktop {
             .bg(rgb(0x202a35))
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(13.))
                     .text_color(rgb(0xe8eeeb))
                     .child(self.tr(if control {
                         "You are in control"
@@ -1168,11 +1232,11 @@ impl Desktop {
             let generation = bridge.descriptor.generation.clone();
             header = header.child(
                 Button::new("terminal-control")
-                    .label(self.tr(if control {
+                    .child(control_label(self.tr(if control {
                         "Release control"
                     } else {
                         "Take control"
-                    }))
+                    })))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.takeover_requested = !control;
                         let _ = this.backend.tx.send(CommandRequest::Takeover {
@@ -1210,7 +1274,7 @@ impl Desktop {
                     div()
                         .px_4()
                         .py_2()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(0xffcf89))
                         .child(self.tr(&bridge.notice)),
                 );
@@ -1220,7 +1284,7 @@ impl Desktop {
                     div()
                         .px_4()
                         .py_2()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(0xa7b5c2))
                         .child(self.tr("Viewing only · Take control to scroll app history")),
                 );
@@ -1258,7 +1322,7 @@ impl Desktop {
                 div()
                     .px_4()
                     .py_2()
-                    .text_xs()
+                    .text_size(px(11.))
                     .text_color(rgb(0xffcf89))
                     .child(self.terminal_error.clone()),
             );
@@ -1266,7 +1330,7 @@ impl Desktop {
         panel
             .child(
                 Button::new("reconnect-terminal")
-                    .label(self.tr("Reconnect"))
+                    .child(control_label(self.tr("Reconnect")))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.release_terminal();
                         this.terminal_key.clear();
@@ -1299,7 +1363,7 @@ impl Desktop {
                 )
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(px(13.))
                         .text_color(rgb(MUTED))
                         .child(self.tr("Add a project, then send instructions in Feishu.")),
                 )
@@ -1344,7 +1408,7 @@ impl Desktop {
                             )
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_size(px(13.))
                                     .text_color(rgb(MUTED))
                                     .child(self.tr("Your instructions, one message away.")),
                             ),
@@ -1356,7 +1420,7 @@ impl Desktop {
                             .py_1()
                             .rounded_full()
                             .bg(rgb(PILL))
-                            .text_xs()
+                            .text_size(px(11.))
                             .text_color(rgb(0x63636b))
                             .child(self.tr(project_status(project))),
                     ),
@@ -1401,7 +1465,7 @@ impl Desktop {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_size(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(self.tr("Scheduled runs")),
                             )
@@ -1411,14 +1475,14 @@ impl Desktop {
                                     .py_1()
                                     .rounded_md()
                                     .bg(rgb(PILL))
-                                    .text_xs()
+                                    .text_size(px(11.))
                                     .text_color(rgb(MUTED))
                                     .child(timers.len().to_string()),
                             ),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(px(11.))
                             .text_color(rgb(MUTED))
                             .child(self.tr("Managed in Feishu")),
                     ),
@@ -1448,11 +1512,11 @@ impl Desktop {
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
                             .child(self.tr("Nothing scheduled yet")),
                     )
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(
+                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child(
                         self.tr("Ask the Agent in Feishu to schedule something when you need it."),
                     )),
             );
@@ -1472,21 +1536,21 @@ impl Desktop {
                 .gap_1()
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(px(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .truncate()
                         .child(timer["name"].as_str().unwrap_or("Scheduled run").to_owned()),
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(timer_description(&timer, self.setup.language)),
                 );
             if !next.is_empty() && enabled {
                 details = details.child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(format!("{} · {next}", self.tr("Next run"))),
                 );
@@ -1515,7 +1579,12 @@ impl Desktop {
                     .child(
                         Button::new(SharedString::from(format!("timer-{id}")))
                             .small()
-                            .label(self.tr(if enabled { "Pause" } else { "Enable" }))
+                            .text_size(px(13.))
+                            .child(control_label(self.tr(if enabled {
+                                "Pause"
+                            } else {
+                                "Enable"
+                            })))
                             .disabled(self.busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.api(
@@ -1531,11 +1600,16 @@ impl Desktop {
                     ),
             );
         }
-        content = content.child(schedules).child(div().text_xs().text_color(rgb(MUTED))
+        content = content.child(schedules).child(div().text_size(px(11.)).text_color(rgb(MUTED))
             .child(self.tr("Send instructions in Feishu. New messages immediately steer the Agent, even while it is working.")));
         content.into_any_element()
     }
-    fn workspace_layout(&mut self, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+    fn workspace_layout(
+        &mut self,
+        content: AnyElement,
+        geometry: WorkspaceGeometry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let center = div()
             .id("scheduled-work")
             .size_full()
@@ -1562,7 +1636,7 @@ impl Desktop {
                         .items_center()
                         .child(
                             Button::new("expand-terminal")
-                                .label("›_")
+                                .child(control_label("›_"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.setup.terminal_hidden = false;
                                     this.terminal_key.clear();
@@ -1573,7 +1647,7 @@ impl Desktop {
                         .child(
                             div()
                                 .mt_3()
-                                .text_xs()
+                                .text_size(px(11.))
                                 .text_color(rgb(MUTED))
                                 .child(self.tr("Terminal")),
                         ),
@@ -1582,8 +1656,17 @@ impl Desktop {
         }
         let terminal = self.execution_panel(cx);
         h_resizable("workspace-split")
-            .child(resizable_panel().size(px(420.)).child(center))
-            .child(resizable_panel().child(terminal))
+            .child(
+                resizable_panel()
+                    .size(geometry.center)
+                    .size_range(px(320.)..geometry.available - px(320.))
+                    .child(center),
+            )
+            .child(
+                resizable_panel()
+                    .size_range(px(320.)..geometry.available - px(320.))
+                    .child(terminal),
+            )
             .into_any_element()
     }
     fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1646,7 +1729,7 @@ impl Desktop {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .text_sm()
+                    .text_size(px(13.))
                     .child(self.tr(name))
                     .child(div().text_color(rgb(MUTED)).child(self.tr(status)))
             }))
@@ -1700,20 +1783,20 @@ impl Desktop {
             .child(self.card("Current version", &format!("Dauerbot {} · {}", env!("CARGO_PKG_VERSION"), self.tr(if channel == "preview" { "Preview channel" } else { "Stable channel" }))))
             .child(self.card("Update status", &message))
             .child(div().flex().gap_3().flex_wrap()
-                .child(Button::new("update-check").label(self.tr("Check for updates")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .child(Button::new("update-check").child(control_label(self.tr("Check for updates"))).disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.tx.send(CommandRequest::Update(updater::Action::Check)); cx.notify();
                 })))
-                .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").label(self.tr("Download and install")).disabled(running).on_click(cx.listener(|this, _, _, cx| {
+                .when(phase == "available" || phase == "error", |row| row.child(Button::new("update-install").child(control_label(self.tr("Download and install"))).disabled(running).on_click(cx.listener(|this, _, _, cx| {
                     let _ = this.backend.tx.send(CommandRequest::Update(updater::Action::Install)); cx.notify();
                 }))))
 
             )
             .child(div().flex().gap_3()
-                .child(Button::new("update-auto").label(self.tr(if automatic { "Disable automatic updates" } else { "Enable automatic updates" })).on_click(cx.listener(move |this, _, _, cx| {
+                .child(Button::new("update-auto").child(control_label(self.tr(if automatic { "Disable automatic updates" } else { "Enable automatic updates" }))).on_click(cx.listener(move |this, _, _, cx| {
                     let channel = this.update_status["preferences"]["channel"].as_str().unwrap_or("stable").to_owned();
                     let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic: !automatic, channel }); cx.notify();
                 })))
-                .child(Button::new("update-channel").label(self.tr(if channel == "stable" { "Switch to preview channel" } else { "Switch to stable channel" })).on_click(cx.listener(|this, _, _, cx| {
+                .child(Button::new("update-channel").child(control_label(self.tr(if channel == "stable" { "Switch to preview channel" } else { "Switch to stable channel" }))).on_click(cx.listener(|this, _, _, cx| {
                     let channel = if this.update_status["preferences"]["channel"] == "preview" { "stable" } else { "preview" }.into();
                     let automatic = this.update_status["preferences"]["automatic"].as_bool().unwrap_or(true);
                     let _ = this.backend.tx.send(CommandRequest::UpdatePreferences { automatic, channel }); cx.notify();
@@ -1724,7 +1807,7 @@ impl Desktop {
     }
 }
 impl Render for Desktop {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.activation_frozen {
             return div()
                 .size_full()
@@ -1736,6 +1819,11 @@ impl Render for Desktop {
                 .into_any_element();
         }
         let page = self.setup.page;
+        let geometry = workspace_geometry(
+            window.viewport_size().width,
+            page == 6 && !self.setup.terminal_hidden,
+            self.setup.sidebar_hidden,
+        );
         let visible = self.visible_project_ids(cx);
         let mut project_list = div()
             .id("sidebar-project-list")
@@ -1792,7 +1880,7 @@ impl Render for Desktop {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_sm()
+                                    .text_size(px(13.))
                                     .font_weight(if selected {
                                         FontWeight::SEMIBOLD
                                     } else {
@@ -1805,7 +1893,7 @@ impl Render for Desktop {
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_sm()
+                                    .text_size(px(13.))
                                     .text_color(rgb(if matches!(status, "busy" | "running") {
                                         ACCENT
                                     } else {
@@ -1818,7 +1906,7 @@ impl Render for Desktop {
                         div()
                             .mt_1()
                             .truncate()
-                            .text_xs()
+                            .text_size(px(11.))
                             .text_color(rgb(MUTED))
                             .child(format!(
                                 "{} · {}",
@@ -1858,14 +1946,14 @@ impl Render for Desktop {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_sm()
+                                .text_size(px(13.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(SURFACE))
                                 .child("D"),
                         )
                         .child(
                             div()
-                                .text_sm()
+                                .text_size(px(13.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child("Dauerbot"),
                         ),
@@ -1875,7 +1963,7 @@ impl Render for Desktop {
                         .px_5()
                         .pt_3()
                         .pb_2()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(self.tr("Projects")),
                 )
@@ -1883,7 +1971,7 @@ impl Render for Desktop {
                     div()
                         .px_3()
                         .pb_3()
-                        .child(Input::new(&self.project_search).small()),
+                        .child(Input::new(&self.project_search).small().text_size(px(13.))),
                 )
                 .child(project_list)
                 .when(visible.is_empty(), |view| {
@@ -1891,7 +1979,7 @@ impl Render for Desktop {
                         div()
                             .px_4()
                             .py_3()
-                            .text_xs()
+                            .text_size(px(11.))
                             .text_color(rgb(MUTED))
                             .child(self.tr("No matching projects")),
                     )
@@ -1915,7 +2003,7 @@ impl Render for Desktop {
                         .child(
                             div()
                                 .px_2()
-                                .text_xs()
+                                .text_size(px(11.))
                                 .text_color(rgb(MUTED))
                                 .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                         ),
@@ -1936,18 +2024,15 @@ impl Render for Desktop {
             .track_focus(&self.focus_handle)
             .key_context("Dauerbot")
             .on_action(cx.listener(|this, _: &FocusProjects, window, cx| {
-                this.setup.sidebar_hidden = false;
-                this.go(this.setup.page);
+                if workspace_geometry(window.viewport_size().width, this.setup.page == 6 && !this.setup.terminal_hidden, this.setup.sidebar_hidden).sidebar_hidden {
+                    this.toggle_sidebar(window, cx);
+                }
                 this.project_search.update(cx, |search, cx| search.focus(window, cx));
             }))
             .on_action(cx.listener(|this, _: &NextProject, _, cx| this.move_project(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousProject, _, cx| this.move_project(-1, cx)))
             .on_action(cx.listener(|this, _: &AddProject, _, cx| { this.go(5); cx.notify(); }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.setup.sidebar_hidden = !this.setup.sidebar_hidden;
-                this.go(this.setup.page);
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleTerminal, _, cx| {
                 this.go(6);
                 this.setup.terminal_hidden = !this.setup.terminal_hidden;
@@ -1962,7 +2047,7 @@ impl Render for Desktop {
             .text_size(px(13.))
             .text_color(rgb(INK))
             .bg(rgb(CANVAS))
-            .when(!self.setup.sidebar_hidden, |view| view.child(sidebar))
+            .when(!geometry.sidebar_hidden, |view| view.child(sidebar))
             .child(
                 div()
                     .flex_1()
@@ -1979,17 +2064,13 @@ impl Render for Desktop {
                             .justify_between()
                             .border_b_1()
                             .border_color(rgb(LINE))
-                            .text_xs()
+                            .text_size(px(11.))
                             .text_color(rgb(MUTED))
                             .child(div().flex().items_center().gap_3()
-                                .child(Button::new("toggle-sidebar").small().label(self.tr(if self.setup.sidebar_hidden { "Show sidebar" } else { "Hide sidebar" }))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.setup.sidebar_hidden = !this.setup.sidebar_hidden;
-                                        this.go(this.setup.page);
-                                        cx.notify();
-                                    })))
+                                .child(Button::new("toggle-sidebar").small().text_size(px(13.)).child(control_label(self.tr(if geometry.sidebar_hidden { "Show sidebar" } else { "Hide sidebar" })))
+                                    .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx))))
                                 .child(self.tr(if page == 6 { "Projects" } else { STEPS[page] })))
-                            .child(Button::new("language").label(if self.setup.language == Language::En { "简体中文" } else { "English" }).on_click(cx.listener(|this, _, window, cx| {
+                            .child(Button::new("language").child(control_label(if self.setup.language == Language::En { "简体中文" } else { "English" })).on_click(cx.listener(|this, _, window, cx| {
                                 this.setup.language = this.setup.language.other();
                                 this.go(this.setup.page);
                                 this.name.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("For example: personal website"), window, cx));
@@ -2001,7 +2082,7 @@ impl Render for Desktop {
                             }))),
                     )
                     .child(if page == 6 {
-                        self.workspace_layout(content, cx)
+                        self.workspace_layout(content, geometry, cx)
                     } else {
                         div()
                             .id(("content-scroll", page))
@@ -2019,9 +2100,9 @@ impl Render for Desktop {
                                                 .p_4()
                                                 .rounded_lg()
                                                 .bg(rgb(0xfff1ce))
-                                                .text_sm()
+                                                .text_size(px(13.))
                                                 .child(self.tr("Independent instance · This window uses separate data from your everyday workspace."))
-                                                .child(div().mt_2().text_xs().child(
+                                                .child(div().mt_2().text_size(px(11.)).child(
                                                     self.backend.dir.display().to_string(),
                                                 )),
                                         )
@@ -2029,7 +2110,7 @@ impl Render for Desktop {
                                     .when(matches!(page, 1..=3), |view| {
                                         let mut steps = div().flex().flex_wrap().gap_2().mb_6();
                                         for (index, label) in [(1, "Create bot"), (2, "Connect bot"), (3, "Permissions & events")] {
-                                            steps = steps.child(Button::new(("setup-stage", index)).label(format!("{}  {}", index, self.tr(label))).selected(page == index).on_click(cx.listener(move |this, _, _, cx| { this.go(index); cx.notify(); })));
+                                            steps = steps.child(Button::new(("setup-stage", index)).child(control_label(format!("{}  {}", index, self.tr(label)))).selected(page == index).on_click(cx.listener(move |this, _, _, cx| { this.go(index); cx.notify(); })));
                                         }
                                         view.child(steps)
                                     })
@@ -2043,7 +2124,7 @@ impl Render for Desktop {
                             .py_2()
                             .border_t_1()
                             .border_color(rgb(LINE))
-                            .text_xs()
+                            .text_size(px(11.))
                             .text_color(rgb(if self.error { 0xb44343 } else { MUTED }))
                             .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
                     ),
@@ -2210,7 +2291,7 @@ fn main() {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Light, None, cx);
         Theme::global_mut(cx).font_family = ".AppleSystemUIFont".into();
-        Theme::global_mut(cx).font_size = px(13.);
+        Theme::global_mut(cx).font_size = px(16.); // Keep REM geometry stable; UI text uses explicit pixels.
         Theme::global_mut(cx).colors.primary = rgb(ACCENT).into();
         Theme::global_mut(cx).colors.primary_hover = rgb(0x4338ca).into();
         cx.bind_keys([

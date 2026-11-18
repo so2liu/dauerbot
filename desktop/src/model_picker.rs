@@ -10,6 +10,15 @@ use herdr_feishu_bridge::config::Config;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::mpsc, time::Duration};
 
+fn control_label(text: impl Into<SharedString>) -> Div {
+    let text: SharedString = text.into();
+    div()
+        .min_w_0()
+        .text_size(px(13.))
+        .line_height(relative(1.))
+        .child(text)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Ticket {
     project: String,
@@ -32,6 +41,8 @@ pub struct ModelPicker {
     language: Language,
     input_language: Language,
     catalog: Value,
+    catalog_error: bool,
+    clear_inputs: bool,
     open: bool,
     ticket: Option<Ticket>,
     revision: u64,
@@ -123,15 +134,31 @@ impl ModelPicker {
                         this.ticket = None;
                         match reply.result {
                             Ok(value) if !reply.changing => {
-                                this.catalog = value;
-                                this.message.clear();
+                                let scoped = value["agent"] == reply.ticket.agent
+                                    && value["generation"] == reply.ticket.generation
+                                    && value["options"].is_array()
+                                    && value.get("configured").is_some();
+                                this.catalog_error = !scoped;
+                                if scoped {
+                                    this.catalog = value;
+                                    this.message.clear();
+                                } else {
+                                    this.catalog = Value::Null;
+                                    this.message =
+                                        "Invalid or stale model catalogue response".into();
+                                }
                             }
                             Ok(_) => {
                                 this.open = false;
                                 this.message = "Model change requested".into();
                                 this.request(None, cx);
                             }
-                            Err(error) => this.message = error,
+                            Err(error) => {
+                                if !reply.changing {
+                                    this.catalog_error = true;
+                                }
+                                this.message = error;
+                            }
                         }
                         cx.notify();
                     })
@@ -147,6 +174,8 @@ impl ModelPicker {
             language: Language::default(),
             input_language: Language::default(),
             catalog: Value::Null,
+            catalog_error: false,
+            clear_inputs: false,
             open: false,
             ticket: None,
             revision: 0,
@@ -165,6 +194,8 @@ impl ModelPicker {
         self.language = language;
         if changed {
             self.catalog = Value::Null;
+            self.catalog_error = false;
+            self.clear_inputs = true;
             self.open = false;
             self.message.clear();
             self.request(None, cx);
@@ -182,6 +213,9 @@ impl ModelPicker {
         if ticket.project.is_empty() {
             return;
         }
+        if selection.is_none() {
+            self.catalog_error = false;
+        }
         self.ticket = Some(ticket.clone());
         if self.tx.send(Work { ticket, selection }).is_err() {
             self.ticket = None;
@@ -193,6 +227,12 @@ impl ModelPicker {
 
 impl Render for ModelPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.clear_inputs) {
+            self.model
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.provider
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
         if self.input_language != self.language {
             self.input_language = self.language;
             self.model.update(cx, |input, cx| {
@@ -208,11 +248,42 @@ impl Render for ModelPicker {
         );
         let configured = &self.catalog["configured"];
         let effective = &self.catalog["effective"];
-        let label = effective["model"]
-            .as_str()
-            .or(configured["model"].as_str())
-            .unwrap_or("Native default");
+        let transition = &self.project["cli_transition"];
+        let pending = transition["holds_input"] == true && transition["intent"] == "model";
+        let requested = &transition["requested_model"];
         let busy = self.ticket.is_some();
+        let known = self.catalog.is_object();
+        let label = if pending {
+            requested["model"].as_str().unwrap_or("Native CLI/session settings")
+        } else if self.catalog_error {
+            "Model unavailable"
+        } else if !known {
+            if busy {
+                "Loading models…"
+            } else {
+                "Model unknown"
+            }
+        } else {
+            effective["model"]
+                .as_str()
+                .or(configured["model"].as_str())
+                .unwrap_or("Native CLI/session settings")
+        };
+        let caption = if pending {
+            "Requested · switching model"
+        } else if self.catalog_error {
+            "Native model catalogue could not be loaded"
+        } else if busy {
+            "Refreshing model catalogue…"
+        } else if !known {
+            "Native model selection is unknown"
+        } else if effective["model"].is_string() {
+            "Confirmed by CLI"
+        } else if configured["model"].is_string() {
+            "Requested · awaiting native confirmation"
+        } else {
+            "Uses native CLI/session settings"
+        };
         let unavailable =
             self.project["paused"] == true || self.project["lifecycle"] == "taken_over";
         let mut view = div().flex().flex_col().gap_2().min_w_0().child(
@@ -224,11 +295,17 @@ impl Render for ModelPicker {
                 .child(
                     Button::new("choose-project-model")
                         .small()
-                        .label(format!(
-                            "{}  ·  {}  ⌄",
-                            self.language.text("Model"),
-                            self.language.text(label)
-                        ))
+                        .text_size(px(13.))
+                        .max_w_full()
+                        .child(
+                            control_label(format!(
+                                "{}  ·  {}  ⌄",
+                                self.language.text("Model"),
+                                self.language.text(label)
+                            ))
+                            .w(px(200.))
+                            .truncate(),
+                        )
                         .disabled(!supported)
                         .selected(self.open)
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -241,15 +318,9 @@ impl Render for ModelPicker {
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(0x85858d))
-                        .child(self.language.text(if effective["model"].is_string() {
-                            "Confirmed by CLI"
-                        } else if configured["model"].is_string() {
-                            "Requested · awaiting native confirmation"
-                        } else {
-                            "Uses the CLI's own settings"
-                        })),
+                        .child(self.language.text(caption)),
                 ),
         );
         if self.open {
@@ -269,26 +340,24 @@ impl Render for ModelPicker {
                         .items_center()
                         .child(
                             div()
-                                .text_sm()
+                                .text_size(px(13.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(self.language.text("Choose model")),
                         )
                         .child(
                             Button::new("reload-model-catalog")
                                 .small()
-                                .label(self.language.text("Refresh"))
+                                .text_size(px(13.))
+                                .child(control_label(self.language.text("Refresh")))
                                 .disabled(busy)
                                 .on_click(cx.listener(|this, _, _, cx| this.request(None, cx))),
                         ),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x85858d))
-                        .child(self.language.text(
+                .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(
+                    self.language.text(
                         "This project only. Native login and global CLI settings stay in place.",
-                    )),
-                );
+                    ),
+                ));
             let mut options = div()
                 .id("native-model-options")
                 .max_h(px(220.))
@@ -299,7 +368,10 @@ impl Render for ModelPicker {
             options = options.child(
                 Button::new("model-native-default")
                     .small()
-                    .label(self.language.text("Native default"))
+                    .text_size(px(13.))
+                    .child(control_label(
+                        self.language.text("Remove project model override"),
+                    ))
                     .selected(!configured["model"].is_string())
                     .disabled(busy || unavailable)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -325,9 +397,10 @@ impl Render for ModelPicker {
                 options = options.child(
                     Button::new(("native-model", index))
                         .small()
+                        .text_size(px(13.))
                         .max_w_full()
                         .overflow_hidden()
-                        .label(name)
+                        .child(control_label(name).max_w(px(180.)).truncate())
                         .selected(selected)
                         .disabled(busy || unavailable)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -337,16 +410,21 @@ impl Render for ModelPicker {
             }
             panel = panel.child(options);
             if busy {
-                panel = panel.child(div().text_xs().child(self.language.text("Loading models…")));
+                panel = panel.child(
+                    div()
+                        .text_size(px(11.))
+                        .child(self.language.text("Loading models…")),
+                );
             }
-            panel = panel.child(Input::new(&self.model).small());
+            panel = panel.child(Input::new(&self.model).small().text_size(px(13.)));
             if matches!(self.project["agent"].as_str(), Some("pi" | "codex")) {
-                panel = panel.child(Input::new(&self.provider).small());
+                panel = panel.child(Input::new(&self.provider).small().text_size(px(13.)));
             }
             panel = panel.child(
                 Button::new("apply-custom-model")
                     .small()
-                    .label(self.language.text("Use model ID"))
+                    .text_size(px(13.))
+                    .child(control_label(self.language.text("Use model ID")))
                     .disabled(busy || unavailable)
                     .on_click(cx.listener(|this, _, _, cx| {
                         let model = this.model.read(cx).value().to_string();
@@ -373,7 +451,7 @@ impl Render for ModelPicker {
             {
                 panel = panel.child(
                     div()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(0x85858d))
                         .child(self.language.text(warning)),
                 );
@@ -383,7 +461,7 @@ impl Render for ModelPicker {
         if !self.message.is_empty() {
             view = view.child(
                 div()
-                    .text_xs()
+                    .text_size(px(11.))
                     .text_color(rgb(0x63636b))
                     .child(self.language.text(&self.message)),
             );
