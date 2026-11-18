@@ -1,4 +1,5 @@
 //! Compact project controls and read-only native continuity documents.
+use crate::control_label;
 use crate::locale::Language;
 use gpui::{prelude::*, *};
 use gpui_component::{Disableable, Selectable, Sizable, button::*, text::TextView};
@@ -34,6 +35,7 @@ pub struct ProjectTools {
     revision: u64,
     content: Option<Content>,
     pending_cli: Option<String>,
+    cli_open: bool,
     message: String,
 }
 impl ProjectTools {
@@ -162,6 +164,7 @@ impl ProjectTools {
             revision: 0,
             content: None,
             pending_cli: None,
+            cli_open: false,
             message: String::new(),
         }
     }
@@ -172,6 +175,7 @@ impl ProjectTools {
             self.content = None;
             self.ticket = None;
             self.pending_cli = None;
+            self.cli_open = false;
             self.message.clear();
             self.revision += 1;
         }
@@ -247,10 +251,20 @@ fn accept_reply(project: &Value, current: Option<&Ticket>, incoming: &Ticket) ->
     project["id"].as_str() == Some(incoming.project.as_str()) && current == Some(incoming)
 }
 fn recovery_control(project: &Value, busy: bool) -> Option<(&'static str, bool)> {
-    let label = match project["cli_transition"]["phase"].as_str()? {
-        "failed" | "startup_failed" | "uncertain" => "Repair Agent",
+    let phase = project["cli_transition"]["phase"].as_str().unwrap_or("");
+    let owner = project["generation"]
+        .as_str()
+        .filter(|g| !g.is_empty())
+        .is_some_and(|generation| project["cli_transition"]["recovery_generation"] == generation);
+    let unavailable = matches!(
+        project["lifecycle"].as_str(),
+        Some("offline" | "error" | "needs_attention" | "update_required" | "exited")
+    );
+    let label = match phase {
+        "failed" | "startup_failed" | "uncertain" | "repairing" => "Repair Agent",
         "recovery_pending" | "recovery_stopping" | "recovery_starting" => "Retry recovery",
-        "repairing" => "Repair Agent",
+        "requested" | "preparing" if owner => "Repair Agent",
+        _ if unavailable => "Repair Agent",
         _ => return None,
     };
     Some((
@@ -258,6 +272,7 @@ fn recovery_control(project: &Value, busy: bool) -> Option<(&'static str, bool)>
         busy || project["paused"] == true || project["lifecycle"] == "taken_over",
     ))
 }
+
 impl Render for ProjectTools {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let transition = &self.project["cli_transition"];
@@ -307,9 +322,27 @@ impl Render for ProjectTools {
             .unwrap_or("");
         let mut choices = div().flex().flex_wrap().gap_2().items_center().child(
             div()
-                .text_xs()
-                .text_color(rgb(0x74808c))
+                .text_size(px(11.))
+                .text_color(rgb(0x85858d))
                 .child(self.language.text("CLI")),
+        );
+        let current_name = match agent {
+            "codex" => "Codex",
+            "claude" => "Claude Code",
+            "pi" => "Pi",
+            "agy" => "Antigravity",
+            _ => agent,
+        };
+        choices = choices.child(
+            Button::new("project-cli-menu")
+                .small()
+                .text_size(px(13.))
+                .child(control_label(format!("{current_name}  ⌄")))
+                .selected(self.cli_open)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cli_open = !this.cli_open;
+                    cx.notify();
+                })),
         );
         for (index, (key, label)) in [
             ("codex", "Codex"),
@@ -319,31 +352,35 @@ impl Render for ProjectTools {
         ]
         .into_iter()
         .enumerate()
+        .take(if self.cli_open { 4 } else { 0 })
         {
             choices = choices.child(
                 Button::new(("standby-cli", index))
                     .small()
-                    .label(label)
+                    .text_size(px(13.))
+                    .child(control_label(label))
                     .selected(agent == key)
                     .disabled(unavailable || switching || busy || agent == key)
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.request(None, Some(key.into()), cx)),
-                    ),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cli_open = false;
+                        this.request(None, Some(key.into()), cx);
+                    })),
             );
         }
         if let Some((label, disabled)) = recovery_control(&self.project, busy) {
             choices = choices.child(
                 Button::new("repair-cli")
                     .small()
-                    .label(self.language.text(label))
+                    .text_size(px(13.))
+                    .child(control_label(self.language.text(label)))
                     .disabled(disabled)
                     .on_click(cx.listener(|this, _, _, cx| this.request(None, None, cx))),
             );
         }
         let mut documents = div().flex().flex_wrap().items_center().gap_2().child(
             div()
-                .text_xs()
-                .text_color(rgb(0x74808c))
+                .text_size(px(11.))
+                .text_color(rgb(0x85858d))
                 .child(self.language.text("Project files")),
         );
         for (index, document) in [Document::Handoff, Document::Agents]
@@ -353,7 +390,8 @@ impl Render for ProjectTools {
             documents = documents.child(
                 Button::new(("project-document", index))
                     .small()
-                    .label(document.filename())
+                    .text_size(px(13.))
+                    .child(control_label(document.filename()))
                     .selected(self.document == Some(document))
                     .disabled(busy)
                     .on_click(
@@ -361,11 +399,37 @@ impl Render for ProjectTools {
                     ),
             );
         }
+        let folder = self.project["path"].as_str().unwrap_or("").to_owned();
+        let copy_folder = folder.clone();
+        documents = documents
+            .child(
+                Button::new("reveal-project-folder")
+                    .small()
+                    .text_size(px(13.))
+                    .child(control_label(self.language.text("Reveal folder")))
+                    .disabled(folder.is_empty())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.reveal_path(std::path::Path::new(&folder))
+                    })),
+            )
+            .child(
+                Button::new("copy-project-folder")
+                    .small()
+                    .text_size(px(13.))
+                    .child(control_label(self.language.text("Copy path")))
+                    .disabled(copy_folder.is_empty())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_folder.clone()));
+                        this.message = "Path copied".into();
+                        cx.notify();
+                    })),
+            );
         if self.document.is_some() {
             documents = documents.child(
                 Button::new("close-project-document")
                     .small()
-                    .label(self.language.text("Close"))
+                    .text_size(px(13.))
+                    .child(control_label(self.language.text("Close")))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.document = None;
                         this.content = None;
@@ -382,28 +446,32 @@ impl Render for ProjectTools {
             .child(choices)
             .child(documents);
         if transition["holds_input"] == true {
-            view = view.child(div().text_xs().text_color(rgb(0x74808c)).child(
+            view = view.child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(
                 self.language.text("Messages wait for the selected CLI. Stop pauses the project and cancels the switch."),
             ));
         }
         if !status.is_empty() {
-            view = view.child(div().text_sm().child(self.language.text(status)));
+            view = view.child(div().text_size(px(13.)).child(self.language.text(status)));
         }
         if unavailable {
-            view = view.child(div().text_xs().text_color(rgb(0x74808c)).child(
+            view = view.child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(
                 self.language.text(
                     "Resume this project and release terminal input before changing its CLI.",
                 ),
             ));
         }
         if !self.message.is_empty() {
-            view = view.child(div().text_sm().child(self.language.text(&self.message)));
+            view = view.child(
+                div()
+                    .text_size(px(13.))
+                    .child(self.language.text(&self.message)),
+            );
         }
         if let Some(document) = self.document {
             let mut pane = div()
                 .id("project-document-pane")
                 .border_1()
-                .border_color(rgb(0xe6e9ec))
+                .border_color(rgb(0xe3e3e8))
                 .rounded_md()
                 .p_4();
             if let Some(content) = &self.content {
@@ -501,6 +569,23 @@ mod tests {
                 assert_eq!(recovery_control(&project, false).map(|v| v.1), Some(true));
             }
         }
+        for phase in ["preparing", "requested"] {
+            let mut project = json!({"generation":"repair-owner","cli_transition":{"phase":phase,"recovery_generation":"repair-owner","holds_input":true}});
+            assert_eq!(
+                recovery_control(&project, false),
+                Some(("Repair Agent", false))
+            );
+            project["paused"] = json!(true);
+            assert_eq!(recovery_control(&project, false).map(|v| v.1), Some(true));
+        }
+        let mut offline = json!({"lifecycle":"offline","generation":"saved-owner"});
+        assert_eq!(
+            recovery_control(&offline, false),
+            Some(("Repair Agent", false))
+        );
+        assert_eq!(recovery_control(&offline, true).map(|v| v.1), Some(true));
+        offline["paused"] = json!(true);
+        assert_eq!(recovery_control(&offline, false).map(|v| v.1), Some(true));
         for phase in ["ready", "cancelled", "preparing", "requested", "starting"] {
             assert!(recovery_control(&json!({"cli_transition":{"phase":phase}}), false).is_none());
         }
