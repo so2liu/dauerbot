@@ -69,7 +69,11 @@ async fn setup() -> (
         .route("/open-apis/im/v1/messages/{anchor}/reply", post(reply))
         .route(
             "/open-apis/im/v1/files",
-            post(|| async { Json(json!({"code":0,"data":{"file_key":"file_fixture"}})) }),
+            // Drain the multipart body before replying; an early HTTP/1
+            // response can race reqwest's streaming upload on loopback.
+            post(|_: axum::body::Bytes| async {
+                Json(json!({"code":0,"data":{"file_key":"file_fixture"}}))
+            }),
         )
         .with_state(fixture.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

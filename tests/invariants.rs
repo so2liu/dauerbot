@@ -162,6 +162,18 @@ async fn stale_native_detection_allows_owned_pane_repair_but_never_input_or_fore
     record["agent"]["workspace_id"] = json!("stale-workspace");
     assert!(herdr::check_identity(&p, &record).is_err());
     assert!(herdr::check_pane_ownership(&p, &record).is_ok());
+    record["status"]["state"] = json!("error");
+    record["processes"] = json!([{"pid":100,"name":p.agent,"argv":[p.agent]}]);
+    assert!(herdr::recovery_foreground_quiescent(&p, &record));
+    let mut with_tool = record.clone();
+    with_tool["processes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"pid":101,"name":"git","argv":["git","push"]}));
+    assert!(!herdr::recovery_foreground_quiescent(&p, &with_tool));
+    with_tool = record.clone();
+    with_tool["children"]["state"] = json!("active");
+    assert!(!herdr::recovery_foreground_quiescent(&p, &with_tool));
     for (pointer, value) in [
         ("/pane_id", json!("w2:p1")),
         ("/workspace_id", json!("w2")),

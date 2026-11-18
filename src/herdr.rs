@@ -778,6 +778,19 @@ pub fn foreground_quiescent(p: &Project, record: &Value) -> bool {
     {
         return false;
     }
+    foreground_processes_match(p, record)
+}
+
+/// Recovery can close an owned CLI whose detector is blocked or stale, but a
+/// foreground tool still prevents closure. This never authorizes native input.
+pub fn recovery_foreground_quiescent(p: &Project, record: &Value) -> bool {
+    check_pane_ownership(p, record).is_ok()
+        && record["status"]["state"] != "working"
+        && record["children"]["state"] != "active"
+        && foreground_processes_match(p, record)
+}
+
+fn foreground_processes_match(p: &Project, record: &Value) -> bool {
     let Some(processes) = record["processes"].as_array().filter(|v| !v.is_empty()) else {
         return false;
     };

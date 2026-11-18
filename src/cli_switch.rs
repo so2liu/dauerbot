@@ -112,7 +112,7 @@ pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
         [project],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    let source = if let Some(previous) =
+    let mut source = if let Some(previous) =
         previous.filter(|r| r.phase == "ready" && r.target == agent)
     {
         if previous.source["agent"]
@@ -483,7 +483,12 @@ impl App {
                     return Ok(true);
                 }
                 let accepted = artifact(p).await?;
-                if !stop_retry_safe(p, &r, observed, accepted.as_deref()) {
+                let rid = r.id.clone();
+                let controls=self.db.call(move|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM cli_repair_instructions WHERE request_id=? AND prompt_id='')",[rid],|row|row.get::<_,bool>(0))?)).await?;
+                if controls || !stop_retry_safe(p, &r, observed, accepted.as_deref()) {
+                    if self.recover_uncertain_source(p,&mut r,observed,"The uncertain stop was not retried: source activity, its accepted handoff, or new repair controls require a fresh diagnostic handoff.").await? {
+                        return Ok(true);
+                    }
                     self.defer_cli_recovery(&r,"Waiting for renewed source quiescence, settled children and the unchanged accepted nonce handoff before retrying native stop.").await?;
                     return Ok(true);
                 }
@@ -495,6 +500,9 @@ impl App {
                         || handoff::fingerprint(final_text.as_deref())
                             != handoff::fingerprint(accepted.as_deref()))
                 {
+                    if self.recover_uncertain_source(p,&mut r,&fresh,"Source activity or its accepted handoff changed during stop retry verification; requesting a fresh diagnostic handoff on the same verified execution.").await? {
+                        return Ok(true);
+                    }
                     self.defer_cli_recovery(&r,"Source activity or the accepted handoff changed during stop retry verification; continuing recovery observations.").await?;
                     return Ok(true);
                 }
@@ -807,6 +815,47 @@ impl App {
         self.notify.notify_one();
         Ok(true)
     }
+    /// A verified live source can repair the transition even when an earlier
+    /// close has an uncertain result. This sends no replacement process: a late
+    /// close is handled by the ordinary verified-exit/native-resume recovery.
+    async fn recover_uncertain_source(
+        &self,
+        p: &Project,
+        r: &mut Request,
+        record: &Value,
+        reason: &str,
+    ) -> Result<bool> {
+        if herdr::check_pane_ownership(p, record).is_err()
+            || herdr::check_identity(p, record).is_err()
+            || record["state_change_seq"].as_i64().is_none()
+        {
+            return Ok(false);
+        }
+        self.ensure_cli_source(p, r).await?;
+        let mut effects = r.source["uncertain_stops"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !effects
+            .iter()
+            .any(|effect| effect["generation"] == r.generation && effect["nonce"] == r.nonce)
+        {
+            effects.push(json!({"generation":r.generation,"nonce":r.nonce,"accepted_handoff":r.baseline,"sequence":r.sequence,"result":"uncertain","recorded_at":db::now()}));
+        }
+        r.source["uncertain_stops"] = json!(effects);
+        let rid = r.id.clone();
+        let source = r.source.to_string();
+        let reason = reason.to_owned();
+        self.db.call(move|c|{
+            let tx=c.unchecked_transaction()?;
+            tx.execute("UPDATE cli_switch_requests SET source=? WHERE id=? AND phase='uncertain' AND holds_input=1",params![source,rid])?;
+            record_failure(&tx,&rid,&reason)?;
+            tx.commit()?;Ok(())
+        }).await?;
+        self.notify.notify_one();
+        Ok(true)
+    }
+
     /// Fault supervision is independent of ordinary message delivery and remains
     /// available even when no user task happens to be queued.
     pub(crate) async fn journal_cli_fault(&self, project: &str, diagnostic: &str) -> Result<()> {
@@ -963,10 +1012,7 @@ impl App {
             let record = record.expect("live recovery has an observation");
             // A target has not received held user work, but may have an initial
             // tool in flight. Preserve its execution until that work settles.
-            if record["state"] != "finished"
-                && (record["status"]["state"] == "working"
-                    || record["children"]["state"] == "active")
-            {
+            if record["state"] != "finished" && !herdr::recovery_foreground_quiescent(p, record) {
                 self.defer_cli_recovery(r,"Waiting for the selected CLI's in-flight startup work before restoring the repair Agent.").await?;
                 return Ok(true);
             }
@@ -1088,10 +1134,7 @@ impl App {
                 .await?;
                 return Ok(true);
             }
-            if herdr::check_pane_ownership(p, record).is_ok()
-                && record["children"]["state"] != "active"
-                && record["status"]["state"] != "working"
-            {
+            if herdr::recovery_foreground_quiescent(p, record) {
                 let id = r.id.clone();
                 self.db.call(move|c|phase(c,&id,"recovery_stopping","Replacing the owned execution whose native Agent identity no longer matches.")).await?;
             }
@@ -1111,7 +1154,7 @@ impl App {
                 .await?;
                 return Ok(true);
             }
-            if herdr::check_pane_ownership(p, record).is_ok() {
+            if herdr::recovery_foreground_quiescent(p, record) {
                 let rid = r.id.clone();
                 self.db.call(move|c|{
                     c.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.error_restart_done',json('true')) WHERE id=?",[&rid])?;
@@ -1759,7 +1802,7 @@ mod tests {
         }).unwrap();
         let p = app.db.project(&p.id).await.unwrap();
         app.journal_cli_fault(&p.id, "native error").await.unwrap();
-        let mut record = json!({"state":"live","status":{"state":"error"},"foreground":{"name":"codex"},"interactive_ready":true,"state_change_seq":22,
+        let mut record = json!({"state":"live","status":{"state":"error"},"foreground":{"name":"codex"},"processes":[{"pid":100,"name":"codex","argv":["codex"]}],"interactive_ready":true,"state_change_seq":22,
             "execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace",
             "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
             "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"active"}});
@@ -1826,6 +1869,9 @@ mod tests {
         let mut tool = good.clone();
         tool["processes"] = json!([{"name":"python3","argv":["python3","ongoing.py"]}]);
         for observed in [&bad_foreground, &child, &tool] {
+            app.db
+                .sync(|c| phase(c, &r.id, "uncertain", "Uncertain original close"))
+                .unwrap();
             app.request_cli_repair(&p.id).await.unwrap();
             assert!(
                 app.advance_cli_switch(&p, None, Some(observed))
@@ -1834,8 +1880,9 @@ mod tests {
             );
             assert_eq!(app.db.project(&p.id).await.unwrap().terminal, p.terminal);
             let held = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
-            assert_eq!(held.phase, "uncertain");
-            assert!(held.error.contains("renewed source quiescence"));
+            assert_eq!(held.phase, "recovery_pending");
+            assert!(held.error.contains("fresh diagnostic handoff"));
+            assert_eq!(held.source["uncertain_stops"][0]["result"], "uncertain");
             assert!(held.holds_input);
         }
         for changed in [
@@ -1843,11 +1890,15 @@ mod tests {
             format!("{text}\nUnexpected handoff update"),
         ] {
             std::fs::write(dir.path().join("HANDOFF.md"), &changed).unwrap();
+            app.db
+                .sync(|c| phase(c, &r.id, "uncertain", "Uncertain original close"))
+                .unwrap();
             app.request_cli_repair(&p.id).await.unwrap();
             assert!(app.advance_cli_switch(&p, None, Some(&good)).await.unwrap());
             let held = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
-            assert_eq!(held.phase, "uncertain");
-            assert!(held.error.contains("renewed source quiescence"));
+            assert_eq!(held.phase, "recovery_pending");
+            assert!(held.error.contains("fresh diagnostic handoff"));
+            assert_eq!(held.source["uncertain_stops"][0]["result"], "uncertain");
             assert_eq!(app.db.project(&p.id).await.unwrap().terminal, p.terminal);
         }
     }
