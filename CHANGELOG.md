@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.1 — 2026-11-18
+
+### Added
+
+- Show observed child Agents in a compact, collapsible project sidebar tree with nested branch lines, CLI icons and read-only details. Codex 0.169.1 uses its official ancestor-scoped metadata API; managed Pi exposes named invocations. Recorded relationships do not prove live activity or complete child coverage, and unsupported sources remain unknown (#99).
+
+### Fixed
+
+- Separate automatic terminal viewport sizing from keyboard takeover. Bind viewport ownership to the immutable terminal, preserve the single terminal stream across input control changes, and keep displaced views from reacquiring another view's viewport (#98).
+
+### Changed
+
+- Advance both application crates to 0.5.1 and bundle build 16. Keep API protocol 7, the three Agent tools and bundled HERDR 0.9.5 unchanged.
+
 ## 0.5.0 — 2026-11-18
 
 ### Added
