@@ -64,6 +64,14 @@ impl Gate {
         .await
         .context("Existing operations have not drained")
     }
+    #[cfg(test)]
+    pub(crate) async fn close_for_test(&self) -> Result<()> {
+        self.close().await
+    }
+    #[cfg(test)]
+    pub(crate) fn reopen_for_test(&self) {
+        self.reopen();
+    }
     fn reopen(&self) {
         self.closed.store(false, Ordering::SeqCst);
     }

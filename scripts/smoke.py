@@ -188,6 +188,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply({"code": 404, "msg": "unimplemented fixture endpoint"})
 
     def do_GET(self):
+        if self.path == "/open-apis/bot/v3/info":
+            assert self.headers.get("Authorization") in FIXTURE.issued_tokens
+            self.reply({"code":0,"bot":{"open_id":"ou_fixture_bot"}}); return
         if self.path.startswith("/open-apis/im/v1/chats/oc_fixture/members"):
             app_id = self.headers["Authorization"].removeprefix("Bearer fixture-token-")
             self.reply({"code":0,"data":{"items":[{"member_id":"ou_fixture","name":"测试用户-" + app_id}],"has_more":False}}); return
@@ -265,10 +268,11 @@ def wait_for(predicate, message, timeout=35):
     raise AssertionError(message)
 
 
-def message(source, text, kind="text", content=None, chat_type="group", chat_id="oc_fixture"):
+def message(source, text, kind="text", content=None, chat_type="group", chat_id="oc_fixture", addressed=True):
     return {"schema": "2.0", "header": {"event_type": "im.message.receive_v1", "event_id": str(uuid.uuid4())},
             "event": {"sender": {"sender_type": "user", "sender_id": {"open_id": "ou_fixture"}},
                       "message": {"chat_id": chat_id, "chat_type": chat_type, "message_id": source, "message_type": kind,
+                                  "mentions": [{"id":{"open_id":"ou_fixture_bot"},"key":"@_user_1","mentioned_type":"bot","name":"Fixture bot"}] if addressed and chat_type=="group" else [],
                                   "content": json.dumps(content if content is not None else {"text": text})}}}
 
 
@@ -556,6 +560,11 @@ def main():
         api(f"/projects/{second_id}", method="DELETE")
         wait_for(lambda: "cli_second" not in FIXTURE.connection_bots.values(), "removed project's bot listener remained active")
         assert first_connection in FIXTURE.connections
+        before_noise_ack = FIXTURE.acks
+        noise = message("om_unrelated_group", "unrelated group chatter", addressed=False)
+        FIXTURE.emit(noise)
+        wait_for(lambda: FIXTURE.acks > before_noise_ack, "unrelated event was not acknowledged")
+        assert not any(m["source_id"]=="om_unrelated_group" for m in api(f"/projects/{key}")["messages"])
         checks.append("two project bots isolate messages, tokens, same-group context and reconnects; new projects never inherit a bot")
         terminal = project_state()["terminal"]
         descriptor = api(f"/projects/{key}/show", {}, "POST")
@@ -593,7 +602,9 @@ def main():
                 return original and original["status"] == "submitted" and native["agent_status"] == "working"
             wait_for(held_run, "fixture did not hold the original run while working")
             for suffix, text in (("one", "Change course now"), ("two", "fixture-steer-release")):
-                FIXTURE.emit(message("om_steer_" + hold + suffix, text))
+                steer = message("om_steer_" + hold + suffix, text, addressed=False)
+                steer["event"]["message"].update(thread_id="omt_om_first",root_id="om_first",parent_id="om_first")
+                FIXTURE.emit(steer)
             wait_for(lambda: all(any(e["source_id"] == "om_steer_" + hold + suffix and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]) for suffix in ("one", "two")), "steering waited for the unfinished original run")
             wait_for(settled, "original run did not settle after steering")
             work = api(f"/projects/{key}/work")
@@ -603,7 +614,7 @@ def main():
                 steer = next(e for e in work["events"] if e["source_id"] == "om_steer_" + hold + suffix)
                 assert steer["created_at"] <= held["finished_at"], "message did not steer the original run"
             assert project_state()["generation"] == original_generation
-        checks.append("busy Agent receives a message burst before native turn completion without receipt/completion tools")
+        checks.append("unmentioned replies in a verified topic steer the busy Agent before native turn completion without receipt/completion tools")
         FIXTURE.emit(message("om_second", "second message"))
         FIXTURE.emit(message("om_third", "", kind="file", content={"file_key": "fixture-inbound", "file_name": "incoming.txt"}))
         wait_for(lambda: all(any(m["source_id"] == key and m["status"] == "submitted" for m in api(f"/projects/{project['id']}")["messages"]) for key in ["om_second", "om_third"]), "queued messages failed")

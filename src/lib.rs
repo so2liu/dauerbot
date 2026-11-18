@@ -11,6 +11,7 @@ pub mod conversation;
 pub mod db;
 pub mod envelope;
 pub mod feishu;
+mod group_ingress;
 pub mod handoff;
 pub mod herdr;
 pub mod mcp;
@@ -127,7 +128,7 @@ impl App {
             Self::update_required(&p),
             "This Agent does not need update recovery"
         );
-        self.stop_inner(&p).await?;
+        self.stop_inner_mode(&p, false).await?;
         let recovered = self
             .start_inner(&p.id, !p.native_session.is_empty())
             .await?;
@@ -343,6 +344,9 @@ impl App {
         self.stop_inner(&p).await
     }
     pub(crate) async fn stop_inner(&self, p: &Project) -> Result<()> {
+        self.stop_inner_mode(p, true).await
+    }
+    async fn stop_inner_mode(&self, p: &Project, cancel_intake: bool) -> Result<()> {
         if p.terminal.is_some() {
             let cfg = self.config.read().await.clone();
             herdr::stop(&cfg, p).await?;
@@ -350,7 +354,7 @@ impl App {
         let id = p.id.clone();
         let generation_id = p.generation.clone();
         self.db
-            .call(move |c| cli_switch::stopped(c, &id, &generation_id))
+            .call(move |c| cli_switch::stopped_mode(c, &id, &generation_id, cancel_intake))
             .await?;
         Ok(())
     }
@@ -1286,6 +1290,7 @@ impl App {
     pub fn workers_with_ingress(self: &Arc<Self>, warm: Option<feishu::WarmIngress>) {
         tokio::spawn(model_control::run(self.clone()));
         tokio::spawn(feishu::resource_worker(self.clone()));
+        tokio::spawn(group_ingress::run(self.clone()));
         let app = self.clone();
         tokio::spawn(async move {
             loop {

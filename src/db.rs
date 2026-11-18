@@ -199,6 +199,104 @@ fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 }
 const MESSAGE: &str = "id,project_id,direction,source_id,content,status,error,attempts,attachment,created_at,updated_at";
 
+#[allow(clippy::too_many_arguments)]
+fn ingest_message(
+    c: &Connection,
+    project: &str,
+    app_id: &str,
+    chat: &str,
+    source: &str,
+    content: &str,
+    attachment: &serde_json::Value,
+    routed: bool,
+) -> Result<Option<String>> {
+    let tx = c.unchecked_transaction()?;
+    let bound: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM project_bots WHERE project_id=? AND app_id=?)",
+        params![project, app_id],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        bound,
+        "The receiving bot is no longer bound to this project"
+    );
+    if routed && tx.query_row("SELECT EXISTS(SELECT 1 FROM feishu_group_intake WHERE project_id=? AND app_id=? AND source_id=? AND status='cancelled')",params![project,app_id,source],|r|r.get::<_,bool>(0))? {tx.commit()?;return Ok(None);}
+    if routed && tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=? AND direction='in' AND source_id=?)",params![project,source],|r|r.get::<_,bool>(0))? {tx.commit()?;return Ok(None);}
+    // Preserve the first undecided native payload across event retries.
+    let original: Option<(String, String, String)> = if routed {
+        tx.query_row("SELECT chat_id,content,attachment FROM feishu_group_intake WHERE project_id=? AND app_id=? AND source_id=?",params![project,app_id,source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?
+    } else {
+        None
+    };
+    let original_attachment = original
+        .as_ref()
+        .map(|(_, _, raw)| serde_json::from_str::<serde_json::Value>(raw))
+        .transpose()?;
+    let chat = original.as_ref().map(|row| row.0.as_str()).unwrap_or(chat);
+    let content = original
+        .as_ref()
+        .map(|row| row.1.as_str())
+        .unwrap_or(content);
+    let attachment = original_attachment.as_ref().unwrap_or(attachment);
+    let decision = if routed {
+        crate::group_ingress::classify(&tx, project, app_id, chat, attachment)?
+    } else {
+        crate::group_ingress::Decision::Accept
+    };
+    if decision == crate::group_ingress::Decision::Ignore {
+        tx.execute(
+            "DELETE FROM feishu_group_intake WHERE project_id=? AND app_id=? AND source_id=?",
+            params![project, app_id, source],
+        )?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    if decision == crate::group_ingress::Decision::AwaitIdentity {
+        let reason = "identity";
+        tx.execute("INSERT OR IGNORE INTO feishu_group_intake(project_id,app_id,chat_id,source_id,content,attachment,created_at,reason) VALUES(?,?,?,?,?,?,?,?)",params![project,app_id,chat,source,content,attachment.to_string(),now(),reason])?;
+        tx.execute("UPDATE feishu_group_intake SET reason=? WHERE project_id=? AND app_id=? AND source_id=? AND status='pending'",params![reason,project,app_id,source])?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    let mut attachment = attachment.clone();
+    attachment["bot_app_id"] = serde_json::json!(app_id);
+    {
+        let kind = attachment["source"]["chat_type"]
+            .as_str()
+            .unwrap_or("unknown");
+        tx.execute("INSERT INTO conversations(project_id,chat_id,kind,seen_at,preview) VALUES(?,?,?,?,?) ON CONFLICT(project_id,chat_id) DO UPDATE SET seen_at=excluded.seen_at,preview=excluded.preview,kind=CASE WHEN excluded.kind='unknown' THEN conversations.kind ELSE excluded.kind END",params![project,chat,kind,now(),content.chars().take(96).collect::<String>()])?;
+        if routed {
+            attachment["source"]["group_admission"] = serde_json::json!(match decision {
+                crate::group_ingress::Decision::OwnMention => "own_mention",
+                crate::group_ingress::Decision::MentionAll => "mention_all",
+                _ => "topic",
+            });
+        }
+    }
+    let key = id();
+    let inserted=tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",params![key,project,source,content,attachment.to_string(),now(),now()])?;
+    if inserted == 1 && attachment["daemon_control"] == "model" {
+        crate::model_control::journal_source(
+            &tx,
+            project,
+            app_id,
+            chat,
+            source,
+            content,
+            &attachment,
+        )?;
+    }
+    if routed {
+        tx.execute(
+            "DELETE FROM feishu_group_intake WHERE project_id=? AND app_id=? AND source_id=?",
+            params![project, app_id, source],
+        )?;
+    }
+    let result = (inserted == 1).then_some(key);
+    tx.commit()?;
+    Ok(result)
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_mode(path, true)
@@ -258,6 +356,7 @@ impl Db {
         }
         crate::conversation::migrate(&migration)?;
         crate::bot::migrate(&migration)?;
+        crate::group_ingress::migrate(&migration)?;
         if recover {
             migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         }
@@ -480,35 +579,20 @@ impl Db {
         content: &str,
         attachment: &serde_json::Value,
     ) -> Result<Option<String>> {
-        self.sync(|c| {
-            let tx = c.unchecked_transaction()?;
-            let bound: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM project_bots WHERE project_id=? AND app_id=?)",
-                params![project, app_id], |r| r.get(0),
-            )?;
-            anyhow::ensure!(bound, "The receiving bot is no longer bound to this project");
-            let kind = attachment["source"]["chat_type"].as_str().unwrap_or("unknown");
-            tx.execute(
-                "INSERT INTO conversations(project_id,chat_id,kind,seen_at,preview) VALUES(?,?,?,?,?)
-                 ON CONFLICT(project_id,chat_id) DO UPDATE SET seen_at=excluded.seen_at,preview=excluded.preview,
-                 kind=CASE WHEN excluded.kind='unknown' THEN conversations.kind ELSE excluded.kind END",
-                params![project, chat, kind, now(), content.chars().take(96).collect::<String>()],
-            )?;
-            let mut attachment = attachment.clone();
-            attachment["bot_app_id"] = serde_json::json!(app_id);
-            let key = id();
-            let inserted = tx.execute(
-                "INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
-                 VALUES(?,?,'in',?,?,'queued',?,?,?)",
-                params![key,project,source,content,attachment.to_string(),now(),now()],
-            )?;
-            if inserted == 1 && attachment["daemon_control"] == "model" {
-                crate::model_control::journal_source(&tx, project, app_id, chat, source, content, &attachment)?;
-            }
-            tx.commit()?;
-            Ok((inserted == 1).then_some(key))
-        })
+        self.sync(|c| ingest_message(c, project, app_id, chat, source, content, attachment, false))
     }
+    pub(crate) fn ingest_routed_bot(
+        &self,
+        project: &str,
+        app_id: &str,
+        chat: &str,
+        source: &str,
+        content: &str,
+        attachment: &serde_json::Value,
+    ) -> Result<Option<String>> {
+        self.sync(|c| ingest_message(c, project, app_id, chat, source, content, attachment, true))
+    }
+
     pub async fn enqueue_out(
         &self,
         key: &str,

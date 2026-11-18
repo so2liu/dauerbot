@@ -196,8 +196,8 @@ impl Language {
                 "每个项目连接自己的机器人。请先创建项目，再填写机器人的凭据。"
             }
             "Connect this project's bot" => "连接这个项目的机器人",
-            "Every project has its own bot. Direct and group messages received by this bot go to this project." => {
-                "每个项目都有自己的机器人。这个机器人收到的私聊和群聊消息，都会进入此项目。"
+            "Every project has its own bot. Direct messages, bot mentions and verified topic replies reach its project." => {
+                "每个项目都有自己的机器人。私聊、明确 @ 机器人及已确认归属的话题回复会进入对应项目。"
             }
             "The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac." => {
                 "密钥始终隐藏。留空会保留这个机器人已保存的密钥；更换 App ID 时需要填写对应的新密钥。凭据仅保存在这台 Mac 上。"
@@ -455,9 +455,9 @@ impl Language {
             "Under Events and Callbacks, choose long connections. Save valid credentials in Dauerbot and keep it running before saving the subscription. Add im.message.receive_v1 to receive messages." => {
                 "在“事件与回调”中选择长连接。先在 Dauerbot 保存有效凭据并保持运行，再添加 im.message.receive_v1 消息事件并保存订阅。"
             }
-            "Need every group reply?" => "需要接收所有群回复？",
-            "The full JSON includes im:message.group_msg for all user messages in groups; your administrator may need to approve it. The basic set only receives bot mentions. All messages this bot receives reach its fixed project." => {
-                "完整权限包含 im:message.group_msg，可接收群内所有用户消息，可能需要管理员审批。基础权限仅接收 @ 机器人消息。机器人收到的所有消息都会进入绑定项目。"
+            "Reply in a topic without @mentions" => "在话题中回复，无需每次 @",
+            "Use the Feishu Agent permission preset or the full JSON with im:message.group_msg to receive topic replies without mentioning the bot. Obtain approval and publish if the scope is not already effective. The basic set only receives mentions. Dauerbot admits known project discussions and ignores unrelated group traffic; an ambiguous shared topic needs an explicit bot mention." => {
+                "可使用飞书现成的智能体权限组，或包含 im:message.group_msg 的完整 JSON，接收话题中不带 @ 的回复。若权限已生效无需重复导入，否则需审批并发布。基础权限只接收 @ 消息。Dauerbot 仅接收已确认属于该项目的讨论，忽略无关群消息；多人共享且无法确定目标的话题需明确 @ 机器人。"
             }
             "3. Publish the app and add the bot" => "3. 发布应用并添加机器人",
             "Create a version in Version Management and Release, choose its availability, and publish it. Wait for administrator approval if required. Add the bot to a group or use direct messages. Publish a new version after changing permissions or subscriptions." => {
