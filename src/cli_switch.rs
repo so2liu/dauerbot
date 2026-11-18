@@ -122,7 +122,7 @@ fn model_repair_can_be_corrected(r: &Request) -> bool {
                 | "repairing"
         ) || r.phase == "requested" && !r.recovery_generation.is_empty())
 }
-fn retiring_candidate(r: &Request, execution: &Value, generation: &str) -> bool {
+pub(crate) fn retiring_candidate(r: &Request, execution: &Value, generation: &str) -> bool {
     (execution["cli_switch_request"] == r.id && execution["cli_recovery_request"] != r.id)
         || r.source["retiring_candidates"]
             .as_array()

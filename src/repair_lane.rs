@@ -191,13 +191,15 @@ pub(crate) fn admit(c: &Connection, p: &Project, record: &Value) -> Result<Optio
     )?;
     let source: Value = serde_json::from_str(&source)?;
     if !request.holds_input
+        || cli_switch::retiring_candidate(&request, &p.execution, &p.generation)
         || source["agent"] != p.agent
         || !source["native_session"]
             .as_str()
             .is_some_and(|v| herdr::same_native_session(&p.agent, v, &p.native_session))
     {
-        // A previous cross-CLI source remains the trusted repair owner. Let
-        // existing recovery restore it instead of adopting a target fork.
+        // Restore the trusted source launch settings before electing its repair
+        // Agent. A selected or superseded target may carry the broken model or
+        // provider even when its CLI and saved native identity match the source.
         return Ok(None);
     }
     candidate.request_id = request.id.clone();
@@ -272,6 +274,59 @@ pub(crate) mod tests {
         let current = app.db.project(&p.id).await.unwrap();
         (dir, app, current, record)
     }
+    #[tokio::test]
+    async fn failed_model_targets_restore_source_settings_before_fork_repair_admission() {
+        for role in ["selected-target", "superseded-target", "restored-source"] {
+            let (_dir, app, initial, mut record) = fixture("codex").await;
+            let lane = descriptor(&initial).unwrap();
+            app.db.sync(|c| {
+                let mut execution = initial.execution.clone();
+                execution.as_object_mut().unwrap().remove("repair_lane");
+                let tag = if role == "superseded-target" { "superseded-model-request" } else { &lane.request_id };
+                execution["cli_switch_request"] = json!(tag);
+                if role != "restored-source" {
+                    execution.as_object_mut().unwrap().remove("cli_recovery_request");
+                }
+                let retired = if role == "superseded-target" {
+                    json!([{"generation":initial.generation,"request_id":tag}])
+                } else { json!([]) };
+                c.execute("UPDATE projects SET execution=? WHERE id=?",params![execution.to_string(),initial.id])?;
+                c.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.intent','model','$.selection',json(?),'$.target_model',json(?),'$.retiring_candidates',json(?)) WHERE id=?",params![json!({"model":"working-source-model","provider":"working-provider"}).to_string(),json!({"model":"broken-target-model","provider":"broken-provider"}).to_string(),retired.to_string(),lane.request_id])?;
+                Ok(())
+            }).unwrap();
+            let p = app.db.project(&initial.id).await.unwrap();
+            record["execution"] = p.execution.clone();
+            app.db
+                .sync(|c| {
+                    let source_before: String = c.query_row(
+                        "SELECT source FROM cli_switch_requests WHERE id=?",
+                        [&lane.request_id],
+                        |r| r.get(0),
+                    )?;
+                    let admitted = admit(c, &p, &record)?;
+                    assert_eq!(admitted.is_some(), role == "restored-source", "{role}");
+                    let source_after: String = c.query_row(
+                        "SELECT source FROM cli_switch_requests WHERE id=?",
+                        [&lane.request_id],
+                        |r| r.get(0),
+                    )?;
+                    if role != "restored-source" {
+                        assert_eq!(
+                            source_before, source_after,
+                            "rejected target must not rewrite the source snapshot"
+                        );
+                        assert!(current(c, &p.id, false)?.is_none());
+                    }
+                    let source: Value = serde_json::from_str(&source_after)?;
+                    assert_eq!(source["selection"]["model"], "working-source-model");
+                    assert_eq!(source["target_model"]["model"], "broken-target-model");
+                    assert_eq!(source["native_session"], p.native_session);
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn repair_native_and_effect_authority_never_become_original_readiness() {
         let (_dir, app, p, record) = fixture("codex").await;
