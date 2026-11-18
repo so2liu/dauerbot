@@ -408,6 +408,7 @@ pub struct TerminalView {
     typed_at: LocalCell<Option<Instant>>,
     redraw_pending: bool,
     redraw_task: Option<Task<()>>,
+    output_window: Option<AnyWindowHandle>,
     scroll_callback: Option<Arc<dyn Fn(TerminalScroll) + Send + Sync>>,
     scroll_accumulator: ScrollAccumulator,
     /// The terminal state managing the grid and VTE parser
@@ -484,10 +485,17 @@ impl TerminalView {
             self.redraw_pending = true;
             self.redraw_task = Some(cx.spawn(async |this, cx| {
                 cx.background_executor().timer(REDRAW_INTERVAL).await;
-                let _ = this.update(cx, |view, cx| {
+                let window = this.update(cx, |view, cx| {
                     view.redraw_pending = false;
                     cx.notify();
+                    view.output_window
                 });
+                if let Ok(Some(window)) = window {
+                    // A retained child notification can leave the previously
+                    // presented canvas after native window resize. Refresh the
+                    // owning window once for this coalesced output batch.
+                    let _ = window.update(cx, |_, window, _| window.refresh());
+                }
             }));
         }
     }
@@ -623,6 +631,7 @@ impl TerminalView {
             typed_at: LocalCell::new(None),
             redraw_pending: false,
             redraw_task: None,
+            output_window: None,
             scroll_callback: None,
             scroll_accumulator: ScrollAccumulator::default(),
             state,
@@ -1212,6 +1221,7 @@ impl Render for TerminalView {
         if self.input_ownership.take_focus() {
             self.focus_handle.focus(window);
         }
+        self.output_window = Some(window.window_handle());
         // Process any pending events
         self.process_events(window, cx);
 
