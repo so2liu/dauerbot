@@ -45,7 +45,9 @@ class Model:
         with self.lock:
             self.requests.append(body)
             matched = self.trigger is None or self.trigger in json.dumps(body)
-            step = self.steps.pop(0) if self.steps and matched else {"text": ""}
+            step = self.steps[0] if self.steps and matched else {"text": ""}
+            if self.steps and matched and not step.get("repeat"):
+                self.steps.pop(0)
         if matched:
             self.started.set()
         if step.get("wait"):
@@ -158,6 +160,10 @@ def main():
         results.mkdir(exist_ok=True, mode=0o700)
         (results / "manager-smoke.json").write_text(json.dumps(result, indent=2))
         print(json.dumps(result, indent=2))
+    except Exception:
+        (harness.run / "failure-evidence.json").write_text(json.dumps({"passed": False, "checks": harness.checks, "run_dir": str(harness.run)}, indent=2))
+        (harness.run / "model-requests.json").write_text(json.dumps(MODEL.requests, indent=2))
+        raise
     finally:
         harness.close()
 
@@ -192,6 +198,7 @@ def run_checks(h):
     fixture.wait_for(lambda: any(m.get("msg_type") == "file" and m.get("fixture_reply_to") == "om_manager_write" for m in fixture.FIXTURE.messages), "manager did not send its project file into the same topic")
     assert fixture.FIXTURE.uploads and b"restricted manager fixture" in fixture.FIXTURE.uploads[-1]
     assert not h.api(route + "/work")["runs"], "raw manager input was also dispatched to native CLI"
+    assert "om_manager_write" in json.dumps(MODEL.requests[0]), "manager context omitted the trusted source message ID required for a topic reply"
     advertised = {t["function"]["name"] for t in MODEL.requests[0]["tools"]}
     assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file"}, advertised
     h.checks.append("scripted model → bounded file write/read → real SDK topic outbox; no raw native delivery or Bash tool")
@@ -208,10 +215,10 @@ def run_checks(h):
 
     # Pause an in-flight request, then send fresh input before its stale tool call
     # returns. The delayed response must never admit a workspace write.
-    MODEL.script({"wait": True, "tool": "write_file", "arguments": {"path": "stale-write.txt", "content": "must not be written"}}, trigger="om_manager_stale")
+    MODEL.script({"wait": True, "tool": "write_file", "arguments": {"path": "stale-write.txt", "content": "must not be written"}}, trigger="Start the controlled delayed model request.")
     fixture.FIXTURE.emit(fixture.message("om_manager_stale", "Start the controlled delayed model request."))
     assert MODEL.started.wait(10), "delayed provider request did not start"
-    MODEL.script({"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_fresh", "text": "fresh-steer-ok"}}, {"text": ""}, trigger="om_manager_fresh")
+    MODEL.script({"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_fresh", "text": "fresh-steer-ok"}}, {"text": ""}, trigger="Supersede the delayed request immediately.")
     fixture.FIXTURE.emit(fixture.message("om_manager_fresh", "Supersede the delayed request immediately."))
     fixture.wait_for(lambda: any("fresh-steer-ok" in m["content"] for m in fixture.FIXTURE.messages), "fresh manager steer waited for the stale provider")
     MODEL.release.set()
@@ -227,7 +234,7 @@ def run_checks(h):
     assert h.api(route)["project"]["ready"]
     h.checks.append("manager delegation wakes isolated native coding worker with real HERDR and exactly three MCP tools")
 
-    MODEL.script({"error": True}, trigger="om_manager_unavailable")
+    MODEL.script({"error": True, "repeat": True}, trigger="Exercise a manager provider outage.")
     fixture.FIXTURE.emit(fixture.message("om_manager_unavailable", "Exercise a manager provider outage."))
     fixture.wait_for(lambda: h.api(route + "/manager")["status"] in {"failed", "error", "attention", "unavailable"}, "provider outage not surfaced")
     assert h.api(route + "/models"), "deterministic model control unavailable during manager outage"
