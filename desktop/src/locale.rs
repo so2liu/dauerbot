@@ -49,6 +49,12 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "Show subagents" => "展开子智能体",
+            "View Agent details" => "查看智能体信息",
+            "Observed subagent · read only" => "已观测的子智能体 · 只读",
+            "Hide subagents" => "收起子智能体",
+            "Agent details may be out of date" => "智能体信息可能已过期",
+            "Some Agent details are unavailable" => "部分智能体信息不可用",
             "Requested · switching model" => "已请求 · 正在切换模型",
             "Invalid or stale model catalogue response" => "模型目录响应无效或已过期，请刷新",
             "Model unavailable" => "模型信息暂不可用",
