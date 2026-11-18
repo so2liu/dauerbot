@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0 — 2026-11-18
+
+### Added
+
+- Select per-project models for Codex, Claude Code, Pi and Antigravity from the desktop or authenticated Feishu selection cards. Keep requested and observed models distinct, preserve native login/settings, and guide setup of Feishu shortcut buttons (#83).
+
+### Fixed
+
+- Keep a supervised repair Agent reachable after CLI switching or runtime failure. Hold ordinary pending input until the selected execution is ready, preserve uncertain effects and native continuity, and respect pause, explicit Stop and terminal takeover (#82).
+- Recover verified vanished native executions after HERDR restarts without closing or sending input to a foreign terminal that reused the old pane address (#90).
+- Retain one canonical rich-post caption and embedded image/media references. Prepare bounded cached resources outside the delivery lock so slow downloads do not block later steering; surface unavailable resources in the Agent envelope (#92).
+
+### Changed
+
+- Advance both application crates to 0.5.0 and bundle build 15. Keep API protocol 7, the three Agent tools and bundled HERDR 0.9.5 unchanged.
+
+### Pending final acceptance
+
+- The refreshed native project workspace will be included after PR #88 merges and passes native UI acceptance (#84).
+- Herdr App terminal rendering, colors, input and frame scheduling will be included after PR #87 merges and passes physical keyboard and native rendering acceptance (#85).
+- Automatic recovery of saved Agent sessions after a computer reboot will be included after the fix for #94 merges and passes its recovery checks.
+
 ## 0.4.9 — 2026-11-17
 
 ### Fixed
