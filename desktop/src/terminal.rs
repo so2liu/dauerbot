@@ -11,7 +11,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -27,8 +27,6 @@ pub struct Descriptor {
     #[serde(default)]
     pub terminal_id: String,
     #[serde(default)]
-    pub pane_id: String,
-    #[serde(default)]
     pub herdr: String,
     #[serde(default)]
     pub program: String,
@@ -43,7 +41,6 @@ fn default_session() -> String {
 
 enum Control {
     Input(Vec<u8>),
-    Resize(usize, usize),
     Scroll(TerminalScroll),
 }
 
@@ -66,17 +63,28 @@ impl Bridge {
         }
         let (tx, commands) = mpsc::sync_channel(128);
         let (output, reader) = flume::bounded(8);
+        // Layout is latest-value state, not an input event: a full keyboard
+        // queue must never discard the final viewport measurement.
+        let viewport = Arc::new(AtomicU64::new(0));
         let (notices_tx, notices) = mpsc::channel();
         let closed = Arc::new(AtomicBool::new(false));
         let mode = Arc::new(AtomicBool::new(false));
         let stop = closed.clone();
         let desired_mode = mode.clone();
         let target = descriptor.clone();
+        let desired_viewport = viewport.clone();
         let errors = notices_tx.clone();
         let input_notices = notices_tx.clone();
         thread::spawn(move || {
-            if let Err(error) = supervise(target, commands, output, notices_tx, stop, desired_mode)
-            {
+            if let Err(error) = supervise(
+                target,
+                commands,
+                output,
+                notices_tx,
+                stop,
+                desired_mode,
+                desired_viewport,
+            ) {
                 let _ = errors.send(error.to_string());
             }
         });
@@ -84,7 +92,7 @@ impl Bridge {
             tx: tx.clone(),
             notices: input_notices,
         };
-        let resize = tx.clone();
+        let resize = viewport;
         let scroll = tx.clone();
         let view = cx.new(|cx| {
             TerminalView::from_frames(
@@ -99,7 +107,7 @@ impl Bridge {
                 cx,
             )
             .with_resize_callback(move |cols, rows| {
-                let _ = resize.try_send(Control::Resize(cols, rows));
+                resize.store(ViewportSize::new(cols, rows).pack(), Ordering::Release);
             })
             .with_scroll_callback(move |event| {
                 let _ = scroll.try_send(Control::Scroll(event));
@@ -188,12 +196,16 @@ impl Drop for Connection {
 }
 fn open(
     target: &Descriptor,
-    control: bool,
     cols: usize,
     rows: usize,
     output: flume::Sender<TerminalFrame>,
     notices: mpsc::Sender<String>,
 ) -> io::Result<Connection> {
+    if target.terminal.is_empty() {
+        return Err(io::Error::other(
+            "Terminal viewport requires an immutable terminal ID",
+        ));
+    }
     let mut command = Command::new(&target.herdr);
     for key in [
         "HC_SESSION",
@@ -213,29 +225,22 @@ fn open(
         &target.session,
         "terminal",
         "session",
-        if control { "control" } else { "observe" },
-        if target.pane_id.is_empty() {
-            &target.terminal
-        } else {
-            &target.pane_id
-        },
+        "control",
+        &target.terminal,
         "--cols",
         &cols.to_string(),
         "--rows",
         &rows.to_string(),
     ]);
-    if control {
-        command.arg("--takeover");
-    }
+    // Legacy HERDR couples PTY geometry to its direct-terminal lease. Keep
+    // exactly one geometry stream; keyboard rights remain independently gated
+    // by the explicit Dauerbot takeover and `mode` checks below.
+    command.arg("--takeover");
     if !target.config_path.is_empty() {
         command.env("HERDR_CONFIG_PATH", &target.config_path);
     }
     command
-        .stdin(if control {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
@@ -301,6 +306,63 @@ fn open(
         reader: Some(reader),
     })
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportSize {
+    cols: usize,
+    rows: usize,
+}
+impl ViewportSize {
+    fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            cols: cols.clamp(2, 1000),
+            rows: rows.clamp(1, 500),
+        }
+    }
+    fn pack(self) -> u64 {
+        (self.cols as u64) << 32 | self.rows as u64
+    }
+    fn unpack(value: u64) -> Option<Self> {
+        (value != 0).then(|| Self::new((value >> 32) as usize, value as u32 as usize))
+    }
+}
+
+struct ViewportResize {
+    desired: ViewportSize,
+    applied: ViewportSize,
+    changed_at: std::time::Instant,
+}
+impl ViewportResize {
+    fn new(size: ViewportSize) -> Self {
+        Self {
+            desired: size,
+            applied: size,
+            changed_at: std::time::Instant::now(),
+        }
+    }
+    fn observe(&mut self, size: ViewportSize, now: std::time::Instant) {
+        if self.desired != size {
+            self.desired = size;
+            self.changed_at = now;
+        }
+    }
+    fn pending(&self) -> bool {
+        self.desired != self.applied
+    }
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.pending() && now.duration_since(self.changed_at) >= Duration::from_millis(150)
+    }
+    fn apply(&mut self, input: &mut impl Write) -> io::Result<()> {
+        writeln!(
+            input,
+            "{}",
+            json!({"type":"terminal.resize","cols":self.desired.cols,"rows":self.desired.rows})
+        )?;
+        input.flush()?;
+        self.applied = self.desired;
+        Ok(())
+    }
+}
+
 fn supervise(
     target: Descriptor,
     commands: mpsc::Receiver<Control>,
@@ -308,55 +370,41 @@ fn supervise(
     notices: mpsc::Sender<String>,
     closed: Arc<AtomicBool>,
     mode: Arc<AtomicBool>,
+    viewport: Arc<AtomicU64>,
 ) -> io::Result<()> {
-    let (mut cols, mut rows) = (80, 24);
-    let mut controlling = false;
-    let mut pending_resize = None;
-    let mut connection = open(&target, false, cols, rows, output.clone(), notices.clone())?;
-    while !closed.load(Ordering::Acquire) {
-        let requested_mode = mode.load(Ordering::Acquire);
-        if requested_mode != controlling {
-            drop(connection);
-            controlling = requested_mode;
-            connection = open(
-                &target,
-                controlling,
-                cols,
-                rows,
-                output.clone(),
-                notices.clone(),
-            )?;
-            let _ = notices.send(String::new());
+    // Do not impose a temporary 80x24 PTY on open. The first native paint
+    // supplies the actual panel cells; close cancels an unpainted view.
+    let initial = loop {
+        if closed.load(Ordering::Acquire) {
+            return Ok(());
         }
+        if let Some(size) = ViewportSize::unpack(viewport.load(Ordering::Acquire)) {
+            break size;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut resize = ViewportResize::new(initial);
+    let mut connection = open(&target, initial.cols, initial.rows, output, notices.clone())?;
+    while !closed.load(Ordering::Acquire) {
+        // A newer window can displace this stream. Never auto-reacquire its
+        // lease on resize or input mode changes: an old view must not fight it.
         if let Some(status) = connection.child.try_wait()? {
             let _ = notices.send(format!(
                 "Terminal connection ended ({status}). Use Reconnect to reopen it."
             ));
             break;
         }
-        if pending_resize
-            .is_some_and(|at: std::time::Instant| at.elapsed() >= Duration::from_millis(150))
-        {
-            pending_resize = None;
-            if let Some(input) = &mut connection.input {
-                writeln!(
-                    input,
-                    "{}",
-                    json!({"type":"terminal.resize","cols":cols,"rows":rows})
-                )?;
-                input.flush()?;
-            } else {
-                drop(connection);
-                connection = open(&target, false, cols, rows, output.clone(), notices.clone())?;
-            }
+        if let Some(size) = ViewportSize::unpack(viewport.load(Ordering::Acquire)) {
+            resize.observe(size, std::time::Instant::now());
         }
-        match commands.recv_timeout(Duration::from_millis(100)) {
-            Ok(Control::Resize(c, r)) => {
-                cols = c.clamp(2, 1000);
-                rows = r.clamp(1, 500);
-                pending_resize = Some(std::time::Instant::now());
-            }
-            Ok(Control::Input(bytes)) if controlling && mode.load(Ordering::Acquire) => {
+        if resize.ready(std::time::Instant::now()) {
+            let input = connection.input.as_mut().ok_or_else(|| {
+                io::Error::other("Terminal viewport connection has no input channel")
+            })?;
+            resize.apply(input)?;
+        }
+        match commands.recv_timeout(Duration::from_millis(25)) {
+            Ok(Control::Input(bytes)) if mode.load(Ordering::Acquire) => {
                 if let Some(input) = &mut connection.input {
                     writeln!(
                         input,
@@ -366,11 +414,14 @@ fn supervise(
                     input.flush()?;
                 }
             }
-            Ok(Control::Scroll(event))
-                if controlling && mode.load(Ordering::Acquire) && pending_resize.is_none() =>
-            {
+            Ok(Control::Scroll(event)) if mode.load(Ordering::Acquire) && !resize.pending() => {
                 if let Some(input) = &mut connection.input {
-                    write_scroll(input, event, (cols, rows), &mode)?;
+                    write_scroll(
+                        input,
+                        event,
+                        (resize.applied.cols, resize.applied.rows),
+                        &mode,
+                    )?;
                 }
             }
             Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -448,6 +499,140 @@ fn decode_frame(frame: &Value) -> Result<Option<TerminalFrame>, String> {
 mod tests {
     use super::*;
     use gpui_terminal::{GpuiEventProxy, TerminalState};
+
+    #[test]
+    fn viewport_coalesces_latest_layout_and_retries_failed_writes() {
+        let start = std::time::Instant::now();
+        let mut resize = ViewportResize::new(ViewportSize::new(57, 13));
+        resize.observe(ViewportSize::new(70, 15), start);
+        resize.observe(ViewportSize::new(38, 9), start + Duration::from_millis(100));
+        assert!(!resize.ready(start + Duration::from_millis(200)));
+        assert!(resize.ready(start + Duration::from_millis(250)));
+        struct Failed;
+        impl Write for Failed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("closed stream"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(resize.apply(&mut Failed).is_err());
+        assert!(
+            resize.pending(),
+            "A failed resize must not become acknowledged"
+        );
+        let mut bytes = Vec::new();
+        resize.apply(&mut bytes).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"type":"terminal.resize","cols":38,"rows":9})
+        );
+        assert!(!resize.ready(start + Duration::from_secs(1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observer_viewport_owns_one_stream_without_implicit_keyboard_or_reacquisition() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        let program = dir.path().join("herdr");
+        std::fs::write(
+            &program,
+            format!(
+                r#"#!/usr/bin/python3
+import json,sys
+log=open({},'a',buffering=1)
+log.write(json.dumps({{'argv':sys.argv[1:]}})+'\n')
+for line in sys.stdin:
+ v=json.loads(line);log.write(json.dumps(v)+'\n')
+ if v['type']=='terminal.input':break
+"#,
+                serde_json::to_string(&log.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target: Descriptor = serde_json::from_value(json!({
+            "project_id":"fixture", "generation":"g", "terminal":"immutable-terminal",
+            "pane_id":"reusable-pane", "herdr":program, "session":"private-fixture"
+        }))
+        .unwrap();
+        let (tx, rx) = mpsc::sync_channel(128);
+        let (output, _frames) = flume::bounded(8);
+        let (notices, _) = mpsc::channel();
+        let closed = Arc::new(AtomicBool::new(false));
+        let mode = Arc::new(AtomicBool::new(false));
+        let viewport = Arc::new(AtomicU64::new(0));
+        let worker = {
+            let closed = closed.clone();
+            let mode = mode.clone();
+            let viewport = viewport.clone();
+            thread::spawn(move || supervise(target, rx, output, notices, closed, mode, viewport))
+        };
+        let read = || -> Vec<Value> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let wait = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stream log: {:?}",
+                    read()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        thread::sleep(Duration::from_millis(40));
+        assert!(read().is_empty(), "Unmeasured views must not impose 80x24");
+        viewport.store(ViewportSize::new(57, 13).pack(), Ordering::Release);
+        wait(&|| !read().is_empty());
+        let args = read()[0]["argv"].as_array().unwrap().clone();
+        assert!(args.contains(&json!("immutable-terminal")));
+        assert!(!args.contains(&json!("reusable-pane")));
+        assert_eq!(
+            &args[args.len() - 5..],
+            &[
+                json!("--cols"),
+                json!("57"),
+                json!("--rows"),
+                json!("13"),
+                json!("--takeover")
+            ]
+        );
+        tx.send(Control::Input(b"blocked".to_vec())).unwrap();
+        tx.send(Control::Scroll(TerminalScroll {
+            lines: 1,
+            column: 0,
+            row: 0,
+            size: (57, 13),
+            modifiers: 0,
+        }))
+        .unwrap();
+        viewport.store(ViewportSize::new(76, 18).pack(), Ordering::Release);
+        wait(&|| read().iter().any(|v| v["type"] == "terminal.resize"));
+        assert_eq!(
+            read().len(),
+            2,
+            "Observer mode must resize without forwarding input"
+        );
+        mode.store(true, Ordering::Release);
+        tx.send(Control::Input(b"end".to_vec())).unwrap();
+        wait(&|| read().len() == 3);
+        worker.join().unwrap().unwrap();
+        // A displaced/closed stream never reclaims the new window's viewport.
+        mode.store(false, Ordering::Release);
+        viewport.store(ViewportSize::new(20, 5).pack(), Ordering::Release);
+        assert_eq!(read().iter().filter(|v| v.get("argv").is_some()).count(), 1);
+        assert_eq!(read()[2]["type"], "terminal.input");
+        closed.store(true, Ordering::Release);
+    }
 
     #[test]
     fn native_wheel_units_preserve_geometry_and_never_forward_without_control() {
