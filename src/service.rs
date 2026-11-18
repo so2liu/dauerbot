@@ -235,6 +235,9 @@ fn valid_id(id: &str) -> Result<()> {
 /// Exclude inbox/outbox/timer activity. Include every setting and execution
 /// identity that changes which transports or native contracts must be prepared.
 fn fingerprint(path: &Path, cfg: &Config) -> Result<String> {
+    fingerprint_with_order(path, cfg, false)
+}
+fn fingerprint_with_order(path: &Path, cfg: &Config, insertion_order: bool) -> Result<String> {
     let c =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let schema: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -259,10 +262,33 @@ fn fingerprint(path: &Path, cfg: &Config) -> Result<String> {
             values.push(json!(fields));
         }
     }
+    // This is a cross-version wire fence. Dependencies can enable serde_json's
+    // preserve_order feature, but predecessors used lexicographically sorted
+    // object keys. Keep that encoding regardless of Cargo feature unification.
+    let mut values = json!(values);
+    if !insertion_order {
+        values.sort_all_objects();
+    }
     Ok(format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&values)?)
     ))
+}
+fn predecessor_insertion_order(owner: Option<&Owner>, parent_pid: u32) -> Result<bool> {
+    // 0.6.0 shipped an incidental preserve_order wire encoding. Its private
+    // owner journal is written/validated by claim_restart before it serves.
+    // Bind this narrow compatibility exception to our actual direct parent,
+    // never a stale receipt or a caller-supplied version string.
+    if let Some(owner) = owner
+        && owner.version == "0.6.0"
+    {
+        ensure!(
+            owner.pid == parent_pid,
+            "Preparation owner identity changed"
+        );
+        return Ok(true);
+    }
+    Ok(false)
 }
 fn candidate_identity(path: &Path) -> Result<(PathBuf, String, String)> {
     let canonical = fs::canonicalize(path)?;
@@ -847,7 +873,13 @@ pub async fn standby(
             "This schema requires a different upgrade boundary"
         );
         drop(original);
-        let fingerprint = fingerprint(&snapshot, &cfg)?;
+        let receipt: Receipt =
+            serde_json::from_slice(&fs::read(dir.join("service-activation.json"))?)?;
+        let insertion_order = predecessor_insertion_order(
+            receipt.serving_owner.as_ref(),
+            unsafe { libc::getppid() } as u32,
+        )?;
+        let fingerprint = fingerprint_with_order(&snapshot, &cfg, insertion_order)?;
         let db = Db::open(&snapshot)?;
         let projects = db
             .projects()
@@ -1064,6 +1096,55 @@ pub async fn termination() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn activation_fingerprint_matches_pre_preserve_order_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite3");
+        let db = Db::open(&path).unwrap();
+        db.sync(|c| {
+            c.execute("INSERT INTO projects(id,name,path,agent,generation,created_at,mcp_token) VALUES('p','p','','codex','generation',0,'token')", [])?;
+            c.execute("INSERT INTO project_bots(project_id,app_id,app_secret,updated_at) VALUES('p','app','secret',0)", [])?;
+            Ok(())
+        }).unwrap();
+        let cfg = Config {
+            token: "fixture-token".into(),
+            herdr_session: "fixture".into(),
+            ..Config::default()
+        };
+        // Captured wire encoding from serde_json without preserve_order (0.5.2).
+        let legacy = "c3741a670657dc6ae5e185b1e212a5faed2b155bc9b419c4304f0d834cf5c9e3";
+        assert_eq!(fingerprint(&path, &cfg).unwrap(), legacy);
+        assert_eq!(
+            fingerprint_with_order(&path, &cfg, true).unwrap(),
+            "0be61639e906b673be4be247fd0e1d98a9998f38b5da5d098de8e253bc181a9e"
+        );
+        let mut changed_cfg = cfg.clone();
+        changed_cfg.herdr_session = "other-session".into();
+        assert_ne!(fingerprint(&path, &changed_cfg).unwrap(), legacy);
+        db.sync(|c| {
+            c.execute("UPDATE projects SET generation='new-generation'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_ne!(fingerprint(&path, &cfg).unwrap(), legacy);
+    }
+    #[test]
+    fn insertion_order_compatibility_requires_the_actual_060_parent() {
+        let mut owner = Owner {
+            activation_id: "previous-activation".into(),
+            epoch: "epoch".into(),
+            pid: 123,
+            version: "0.6.0".into(),
+            digest: "validated-by-parent-restart".into(),
+        };
+        assert!(predecessor_insertion_order(Some(&owner), 123).unwrap());
+        assert!(predecessor_insertion_order(Some(&owner), 456).is_err());
+        for version in ["0.5.2", "0.6.1", "0.7.0"] {
+            owner.version = version.into();
+            assert!(!predecessor_insertion_order(Some(&owner), 123).unwrap());
+        }
+        assert!(!predecessor_insertion_order(None, 123).unwrap());
+    }
     #[tokio::test]
     async fn closing_admission_drains_existing_effect_and_reopens_after_abort() {
         let gate = Arc::new(Gate::default());

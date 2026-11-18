@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1 — 2026-11-19
+
+### Fixed
+
+- Restore automatic upgrade handover from 0.5.x by canonicalizing the cross-version configuration fingerprint independently of dependency-enabled JSON map ordering. Preserve compatibility with the 0.6.0 predecessor encoding while keeping configuration and execution identity checks intact (#113).
+- Show the service’s specific activation failure instead of replacing it with a generic healthy-ownership message (#113).
+
+### Changed
+
+- Advance both application crates to 0.6.1 and bundle build 19; keep API protocol 7.
+
 ## 0.6.0 — 2026-11-18
 
 ### Added
