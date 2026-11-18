@@ -5,6 +5,7 @@ mod backend;
 mod locale;
 #[cfg(target_os = "macos")]
 mod menubar;
+mod model_picker;
 mod project_tools;
 mod terminal;
 mod updater;
@@ -81,6 +82,7 @@ struct Desktop {
     terminal_error: String,
     timers: Value,
     project_tools: Entity<project_tools::ProjectTools>,
+    model_picker: Entity<model_picker::ModelPicker>,
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
@@ -131,6 +133,8 @@ impl Desktop {
         })
         .detach();
         let project_tools = cx.new(|cx| project_tools::ProjectTools::new(backend.dir.clone(), cx));
+        let model_picker =
+            cx.new(|cx| model_picker::ModelPicker::new(backend.dir.clone(), window, cx));
         Self {
             backend,
             independent_data,
@@ -159,6 +163,7 @@ impl Desktop {
             terminal_error: String::new(),
             timers: Value::Null,
             project_tools,
+            model_picker,
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
@@ -1237,6 +1242,9 @@ impl Desktop {
         self.project_tools.update(cx, |tools, cx| {
             tools.select(project, self.setup.language, cx)
         });
+        self.model_picker.update(cx, |picker, cx| {
+            picker.select(project, self.setup.language, cx)
+        });
         let timers = visible_timers(&self.timers);
         let mut content = div()
             .flex()
@@ -1255,6 +1263,7 @@ impl Desktop {
                     .child(self.tr(project_status(project))),
             )
             .child(self.project_tools.clone())
+            .child(self.model_picker.clone())
             .child(
                 div()
                     .mt_4()

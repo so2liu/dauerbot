@@ -12,6 +12,8 @@ pub mod feishu;
 pub mod handoff;
 pub mod herdr;
 pub mod mcp;
+pub mod model_control;
+pub mod models;
 pub mod native_children;
 pub mod project_documents;
 pub mod project_instructions;
@@ -234,7 +236,20 @@ impl App {
             "{instructions} Read the Dauerbot delegation block in AGENTS.md and its project-local Herdr skill before substantial work."
         );
         let instructions = instructions + &self.cli_switch_bootstrap(&p.id).await?;
-        let mut argv = herdr::launch_args(&p, &mcp_file, &entry, &instructions, resume)?;
+        let model_project = p.id.clone();
+        let model_agent = p.agent.clone();
+        let model_selection = self
+            .db
+            .call(move |c| models::load(c, &model_project, &model_agent))
+            .await?;
+        let mut argv = adapter::launch_args_with_selection(
+            &p,
+            &mcp_file,
+            &entry,
+            &instructions,
+            resume,
+            model_selection.as_ref(),
+        )?;
         let assigned =
             (!resume && ["claude", "pi"].contains(&p.agent.as_str())).then(|| generation.clone());
         if let Some(native) = &assigned {
@@ -261,12 +276,21 @@ impl App {
         if let Some(dir) = child_adapter {
             execution["child_adapter"] = json!(dir);
         }
-        if let Some(request) = self.cli_switch_launch_id(&p).await? {
+        if let Some((request, intended_native)) = self.cli_switch_launch_context(&p, resume).await?
+        {
             execution["cli_switch_request"] = json!(request);
+            // Capture the exact resume identity passed to this launch, after
+            // source settlement; the original request snapshot may be older.
+            if let Some(native) = intended_native {
+                execution["intended_native_session"] = json!(native);
+            }
         }
         if let Some(request) = self.cli_recovery_launch_id(&p).await? {
             execution["cli_recovery_request"] = json!(request);
         }
+        // This records configured launch arguments, not the model actually
+        // observed in a native turn. Effective-model metadata remains separate.
+        execution["model_selection"] = json!(model_selection);
         execution["api_protocol"] = json!(api::PROTOCOL);
         execution["mcp_contract"] = json!(mcp::CONTRACT);
         execution["companion"] = json!(self.companion()?);
@@ -1162,6 +1186,7 @@ impl App {
         self.workers_with_ingress(None);
     }
     pub fn workers_with_ingress(self: &Arc<Self>, warm: Option<feishu::WarmIngress>) {
+        tokio::spawn(model_control::run(self.clone()));
         let app = self.clone();
         tokio::spawn(async move {
             loop {
