@@ -12,16 +12,16 @@
 - Keep a supervised repair Agent reachable after CLI switching or runtime failure. Hold ordinary pending input until the selected execution is ready, preserve uncertain effects and native continuity, and respect pause, explicit Stop and terminal takeover (#82).
 - Recover verified vanished native executions after HERDR restarts without closing or sending input to a foreign terminal that reused the old pane address (#90).
 - Retain one canonical rich-post caption and embedded image/media references. Prepare bounded cached resources outside the delivery lock so slow downloads do not block later steering; surface unavailable resources in the Agent envelope (#92).
+- Recover saved Agent conversations after a computer reboot using verified prior-boot execution evidence and one supervised runtime restart. Preserve queued input, fired schedules and uncertain effects. If a native CLI repeatedly forks the saved conversation, keep a scoped repair-only Agent reachable through authenticated MCP and trusted Feishu repair instructions without adopting the fork as the original session or releasing ordinary work (#94, #96).
 
 ### Changed
 
-- Adapt Herdr App terminal rendering and input mechanisms for the native legacy transport, including ANSI colors, fixed-column shaping, bounded frame ingestion, takeover focus and AGY Alt+M. Physical keyboard, IME, scrolling and selection acceptance remains open under #85.
+- Adapt Herdr App terminal rendering and input mechanisms for the native legacy transport, including ANSI colors, fixed-column shaping, bounded frame ingestion, takeover focus and AGY Alt+M. Native checks verified control release, history scrolling, selection and clipboard copy; input-method candidate composition and commit acceptance remains open under #85.
 - Advance both application crates to 0.5.0 and bundle build 15. Keep API protocol 7, the three Agent tools and bundled HERDR 0.9.5 unchanged.
 
 ### Pending final acceptance
 
-- Terminal implementation is merged in PR #87. Remaining physical keyboard/IME, control release, scrolling and selection checks under #85 still gate publication; the locked macOS session currently prevents completing them.
-- Automatic recovery of saved Agent sessions after a computer reboot will be included after the fix for #94 merges and passes its recovery checks.
+- Input-method candidate composition and commit remains the only unverified terminal acceptance check under #85. The automation surface could not activate an input source even in TextEdit; publication remains gated on this check.
 
 ## 0.4.9 — 2026-11-17
 
