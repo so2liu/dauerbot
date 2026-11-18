@@ -1,4 +1,6 @@
 //! Terminal rendering module.
+//! Dauerbot modifications adapt Herdr App's Apache-2.0 retained row drawing
+//! and cell rendering mechanisms; see DAUERBOT-PATCHES.md for attribution.
 //!
 //! This module provides [`TerminalRenderer`], which handles efficient rendering of
 //! terminal content using GPUI's text and drawing systems.
@@ -66,11 +68,12 @@ use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::vte::ansi::Color;
+use alacritty_terminal::vte::ansi::{Color, CursorShape};
 use gpui::{
-    App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
-    SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
+    App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point, ShapedLine,
+    Size, StrikethroughStyle, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
+use std::{cell::RefCell, rc::Rc};
 
 /// A batched run of text with consistent styling.
 ///
@@ -183,6 +186,92 @@ pub struct TerminalRenderer {
 
     /// Color palette for resolving terminal colors
     pub palette: ColorPalette,
+    baseline: Pixels,
+    cache: Rc<RefCell<RowCache>>,
+}
+
+#[derive(Debug, PartialEq)]
+struct DrawingFacts {
+    font: String,
+    font_size: Pixels,
+    cell: (Pixels, Pixels),
+    baseline: Pixels,
+    palette: ColorPalette,
+    overrides: Vec<Option<alacritty_terminal::vte::ansi::Rgb>>,
+}
+
+#[derive(Debug, Default)]
+struct RowCache {
+    facts: Option<DrawingFacts>,
+    rows: Vec<Option<CachedRow>>,
+}
+
+impl RowCache {
+    fn prepare(&mut self, facts: DrawingFacts, count: usize) {
+        if self.facts.as_ref() != Some(&facts) {
+            self.rows.clear();
+            self.facts = Some(facts);
+        }
+        self.rows.resize_with(count, || None);
+    }
+}
+
+#[derive(Debug)]
+struct CachedRow {
+    cells: Vec<Cell>,
+    backgrounds: Vec<BackgroundRect>,
+    text: Vec<(usize, ShapedLine)>,
+}
+
+struct TextSegment {
+    column: usize,
+    text: String,
+    style: Cell,
+    ascii: bool,
+}
+
+/// GPUI 0.2 cannot place glyphs at explicit per-cell positions as gpui-pre
+/// does. Batch fixed-width ASCII runs; keep wide/combining clusters separate.
+fn text_segments(cells: &[Cell]) -> Vec<TextSegment> {
+    let mut segments = Vec::<TextSegment>::new();
+    let style_flags = Flags::BOLD
+        | Flags::ITALIC
+        | Flags::ALL_UNDERLINES
+        | Flags::STRIKEOUT
+        | Flags::INVERSE
+        | Flags::DIM;
+    for (column, cell) in cells.iter().enumerate() {
+        let text = cell_text(cell);
+        if text.is_empty() {
+            continue;
+        }
+        let ascii = text.len() == 1 && text.is_ascii() && !cell.flags.contains(Flags::WIDE_CHAR);
+        if let Some(previous) = segments.last_mut()
+            && ascii
+            && previous.ascii
+            && previous.column + previous.text.len() == column
+            && previous.style.fg == cell.fg
+            && previous.style.bg == cell.bg
+            && previous.style.flags & style_flags == cell.flags & style_flags
+            && previous.style.underline_color() == cell.underline_color()
+        {
+            previous.text.push_str(&text);
+        } else {
+            segments.push(TextSegment {
+                column,
+                text,
+                style: cell.clone(),
+                ascii,
+            });
+        }
+    }
+    segments.retain(|s| {
+        !s.text.trim().is_empty()
+            || s.style
+                .flags
+                .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+    });
+    segments
 }
 
 impl TerminalRenderer {
@@ -226,6 +315,8 @@ impl TerminalRenderer {
             cell_height,
             line_height_multiplier,
             palette,
+            baseline: font_size,
+            cache: Rc::new(RefCell::new(RowCache::default())),
         }
     }
 
@@ -239,13 +330,7 @@ impl TerminalRenderer {
     /// * `window` - The GPUI window for text system access
     pub fn measure_cell(&mut self, window: &mut Window) {
         // Measure using a reference character (M is typically the widest)
-        let font = Font {
-            family: self.font_family.clone().into(),
-            features: FontFeatures::default(),
-            fallbacks: None,
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-        };
+        let font = self.cell_font(false, false);
 
         let text_run = TextRun {
             len: 1,
@@ -263,14 +348,26 @@ impl TerminalRenderer {
 
         // Get the width from the shaped line (accessed via Deref to LineLayout)
         if shaped.width > px(0.0) {
-            self.cell_width = shaped.width;
+            self.cell_width =
+                px((f32::from(shaped.width) * window.scale_factor()).round()
+                    / window.scale_factor());
         }
 
         // Calculate height from ascent + descent with multiplier for tall glyphs (nerd fonts, etc.)
         let line_height = shaped.ascent + shaped.descent;
         if line_height > px(0.0) {
-            self.cell_height = line_height * self.line_height_multiplier;
+            self.cell_height = px((f32::from(line_height)
+                * self.line_height_multiplier
+                * window.scale_factor())
+            .round()
+                / window.scale_factor());
         }
+        self.baseline = px(
+            (f32::from(shaped.ascent + (self.cell_height - line_height) / 2.)
+                * window.scale_factor())
+            .round()
+                / window.scale_factor(),
+        );
     }
 
     /// Layout cells into batched text runs and background rects for a single row.
@@ -304,35 +401,39 @@ impl TerminalRenderer {
 
         for (col, cell) in cells {
             // Skip wide character spacers
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
                 continue;
             }
 
             // Extract cell styling
-            let fg_color = self.palette.resolve(cell.fg, colors);
-            let bg_color = self.palette.resolve(cell.bg, colors);
+            let (fg_color, bg_color) = self.cell_colors(&cell, colors);
+            let end_col = col
+                + if cell.flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                };
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
             let underline = cell.flags.contains(Flags::UNDERLINE);
 
             // Get the character (or space if empty)
-            let ch = if cell.c == ' ' || cell.c == '\0' {
-                ' '
-            } else {
-                cell.c
-            };
+            let text = cell_text(&cell);
 
             // Handle background rectangles
             if let Some(ref mut bg_rect) = current_bg {
                 if bg_rect.color == bg_color && bg_rect.end_col == col {
                     // Extend current background
-                    bg_rect.end_col = col + 1;
+                    bg_rect.end_col = end_col;
                 } else {
                     // Save current background and start new one
                     backgrounds.push(bg_rect.clone());
                     current_bg = Some(BackgroundRect {
                         start_col: col,
-                        end_col: col + 1,
+                        end_col,
                         row,
                         color: bg_color,
                     });
@@ -341,7 +442,7 @@ impl TerminalRenderer {
                 // Start new background
                 current_bg = Some(BackgroundRect {
                     start_col: col,
-                    end_col: col + 1,
+                    end_col,
                     row,
                     color: bg_color,
                 });
@@ -356,12 +457,12 @@ impl TerminalRenderer {
                     && run.underline == underline
                 {
                     // Extend current run
-                    run.text.push(ch);
+                    run.text.push_str(&text);
                 } else {
                     // Save current run and start new one
                     text_runs.push(run.clone());
                     current_run = Some(BatchedTextRun {
-                        text: ch.to_string(),
+                        text,
                         start_col: col,
                         row,
                         fg_color,
@@ -374,7 +475,7 @@ impl TerminalRenderer {
             } else {
                 // Start new run
                 current_run = Some(BatchedTextRun {
-                    text: ch.to_string(),
+                    text,
                     start_col: col,
                     row,
                     fg_color,
@@ -398,6 +499,112 @@ impl TerminalRenderer {
         let merged_backgrounds = self.merge_backgrounds(backgrounds);
 
         (merged_backgrounds, text_runs)
+    }
+
+    /// Resolve real VT cell attributes before shaping or merging backgrounds.
+    /// This follows Herdr App's cell-based renderer rather than treating ANSI
+    /// output as plain text (Apache-2.0, origin/master 321c9a84; adapted here).
+    fn cell_colors(&self, cell: &Cell, colors: &Colors) -> (Hsla, Hsla) {
+        let mut foreground = self.palette.resolve(cell.fg, colors);
+        let mut background = self.palette.resolve(cell.bg, colors);
+        if cell.flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut foreground, &mut background);
+        }
+        if cell.flags.contains(Flags::DIM) {
+            foreground.l *= 0.66;
+        }
+        if cell.flags.contains(Flags::HIDDEN) {
+            foreground = background;
+        }
+        (foreground, background)
+    }
+
+    // Herdr App 321c9a84 terminal.rs cell_font/ligature_features disable all
+    // three features before measuring or shaping fixed terminal columns.
+    fn cell_font(&self, bold: bool, italic: bool) -> Font {
+        static FEATURES: std::sync::LazyLock<FontFeatures> = std::sync::LazyLock::new(|| {
+            FontFeatures(std::sync::Arc::new(vec![
+                ("calt".into(), 0),
+                ("liga".into(), 0),
+                ("dlig".into(), 0),
+            ]))
+        });
+        Font {
+            family: self.font_family.clone().into(),
+            features: FEATURES.clone(),
+            fallbacks: None,
+            weight: if bold {
+                FontWeight::BOLD
+            } else {
+                FontWeight::NORMAL
+            },
+            style: if italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+        }
+    }
+
+    fn drawing_facts(&self, colors: &Colors) -> DrawingFacts {
+        DrawingFacts {
+            font: self.font_family.clone(),
+            font_size: self.font_size,
+            cell: (self.cell_width, self.cell_height),
+            baseline: self.baseline,
+            palette: self.palette.clone(),
+            overrides: (0..alacritty_terminal::term::color::COUNT)
+                .map(|index| colors[index])
+                .collect(),
+        }
+    }
+
+    fn build_row(&self, cells: Vec<Cell>, colors: &Colors, window: &mut Window) -> CachedRow {
+        let (backgrounds, _) = self.layout_row(0, cells.iter().cloned().enumerate(), colors);
+        let text = text_segments(&cells)
+            .into_iter()
+            .map(|segment| {
+                let flags = segment.style.flags;
+                let (color, _) = self.cell_colors(&segment.style, colors);
+                let underline_color = segment
+                    .style
+                    .underline_color()
+                    .map(|color| self.palette.resolve(color, colors))
+                    .unwrap_or(color);
+                let run = TextRun {
+                    len: segment.text.len(),
+                    font: self
+                        .cell_font(flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC)),
+                    color,
+                    background_color: None,
+                    underline: flags
+                        .intersects(Flags::ALL_UNDERLINES)
+                        .then(|| UnderlineStyle {
+                            thickness: px(1.),
+                            color: Some(underline_color),
+                            wavy: flags.contains(Flags::UNDERCURL),
+                        }),
+                    strikethrough: flags
+                        .contains(Flags::STRIKEOUT)
+                        .then(|| StrikethroughStyle {
+                            thickness: px(1.),
+                            color: Some(color),
+                        }),
+                };
+                let shaped = window.text_system().shape_line(
+                    segment.text.into(),
+                    self.font_size,
+                    &[run],
+                    segment.ascii.then_some(self.cell_width),
+                );
+                (segment.column, shaped)
+            })
+            .collect();
+        CachedRow {
+            cells,
+            backgrounds,
+            text,
+        }
     }
 
     /// Merge adjacent background rects with same color.
@@ -482,134 +689,103 @@ impl TerminalRenderer {
             y: bounds.origin.y + padding.top,
         };
 
-        // Iterate over visible lines
-        for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32 - grid.display_offset() as i32);
-
-            // Collect cells for this line
-            let cells: Vec<(usize, Cell)> = (0..num_cols)
-                .map(|col_idx| {
-                    let col = Column(col_idx);
-                    let point = AlacPoint::new(line, col);
-                    let mut cell = grid[point].clone();
-                    if let Some((a, b)) = selection {
-                        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-                        if (line.0, col_idx) >= start && (line.0, col_idx) <= end {
-                            cell.bg = Color::Spec(alacritty_terminal::vte::ansi::Rgb {
-                                r: 56,
-                                g: 83,
-                                b: 111,
-                            });
-                        }
-                    }
-                    (col_idx, cell)
-                })
+        // Keep GPUI shaping alive across window frames. A spinner changes one
+        // row; selection, palette, font, source size and viewport changes are
+        // part of the row/cache facts, so retained drawing cannot become stale.
+        let mut cache = self.cache.borrow_mut();
+        cache.prepare(self.drawing_facts(colors), num_lines);
+        for row in 0..num_lines {
+            let line = Line(row as i32 - grid.display_offset() as i32);
+            let cells: Vec<Cell> = (0..num_cols)
+                .map(|column| grid[AlacPoint::new(line, Column(column))].clone())
                 .collect();
-
-            // Layout the row for backgrounds
-            let (backgrounds, _) = self.layout_row(line_idx, cells.iter().cloned(), colors);
-
-            // Paint backgrounds
-            for bg_rect in backgrounds {
-                // Skip if it's the default background color
-                if bg_rect.color == default_bg {
+            if cache.rows[row]
+                .as_ref()
+                .is_none_or(|old| old.cells != cells)
+            {
+                cache.rows[row] = Some(self.build_row(cells, colors, window));
+            }
+        }
+        // Draw backgrounds first, selection as an overlay, then shaped text.
+        // Selection never mutates program cells or invalidates shaped rows.
+        for (row, drawing) in cache.rows.iter().enumerate() {
+            let Some(drawing) = drawing else { continue };
+            for background in &drawing.backgrounds {
+                if background.color == default_bg {
                     continue;
                 }
-
-                let x = origin.x + self.cell_width * (bg_rect.start_col as f32);
-                let y = origin.y + self.cell_height * (bg_rect.row as f32);
-                let width = self.cell_width * ((bg_rect.end_col - bg_rect.start_col) as f32);
-                let height = self.cell_height;
-
-                let rect_bounds = Bounds {
-                    origin: Point { x, y },
-                    size: Size { width, height },
-                };
-
                 window.paint_quad(quad(
-                    rect_bounds,
-                    px(0.0),
-                    bg_rect.color,
-                    Edges::<Pixels>::default(),
+                    Bounds::new(
+                        Point {
+                            x: origin.x + self.cell_width * background.start_col as f32,
+                            y: origin.y + self.cell_height * row as f32,
+                        },
+                        Size {
+                            width: self.cell_width
+                                * (background.end_col - background.start_col) as f32,
+                            height: self.cell_height,
+                        },
+                    ),
+                    px(0.),
+                    background.color,
+                    Edges::default(),
                     transparent_black(),
                     Default::default(),
                 ));
             }
-
-            // Calculate vertical offset to center text in cell
-            // The multiplier adds extra height; we want to distribute it evenly top/bottom
-            let base_height = self.cell_height / self.line_height_multiplier;
-            let vertical_offset = (self.cell_height - base_height) / 2.0;
-
-            // Paint each character individually at exact cell positions
-            // This ensures perfect alignment for terminal emulation
-            for (col_idx, cell) in cells {
-                let ch = cell.c;
-
-                // Skip empty cells (space or null)
-                if ch == ' ' || ch == '\0' {
+        }
+        if let Some((a, b)) = selection {
+            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+            for row in 0..num_lines {
+                let line = row as i32 - grid.display_offset() as i32;
+                if line < start.0 || line > end.0 {
                     continue;
                 }
-
-                let x = origin.x + self.cell_width * (col_idx as f32);
-                let y = origin.y + self.cell_height * (line_idx as f32) + vertical_offset;
-
-                // Get cell colors
-                let fg_color = self.palette.resolve(cell.fg, colors);
-
-                // Get cell flags for styling
-                let flags = cell.flags;
-                let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
-                let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
-                let underline = flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE);
-
-                // Create font with styling
-                let font = Font {
-                    family: self.font_family.clone().into(),
-                    features: FontFeatures::default(),
-                    fallbacks: None,
-                    weight: if bold {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    },
-                    style: if italic {
-                        FontStyle::Italic
-                    } else {
-                        FontStyle::Normal
-                    },
-                };
-
-                // Create text run for this single character
-                let char_str = ch.to_string();
-                let text_run = TextRun {
-                    len: char_str.len(),
-                    font,
-                    color: fg_color,
-                    background_color: None,
-                    underline: if underline {
-                        Some(UnderlineStyle {
-                            thickness: px(1.0),
-                            color: Some(fg_color),
-                            wavy: false,
-                        })
-                    } else {
-                        None
-                    },
-                    strikethrough: None,
-                };
-
-                // Shape and paint the character
-                let text: SharedString = char_str.into();
-                let shaped_line =
-                    window
-                        .text_system()
-                        .shape_line(text, self.font_size, &[text_run], None);
-
-                // Paint at exact cell position (ignore errors)
-                let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
+                let from = if line == start.0 { start.1 } else { 0 }.min(num_cols);
+                let to = if line == end.0 {
+                    end.1.saturating_add(1)
+                } else {
+                    num_cols
+                }
+                .min(num_cols);
+                if from >= to {
+                    continue;
+                }
+                let mut color: Hsla = gpui::rgb(0x38536f).into();
+                color.a = 0.65;
+                window.paint_quad(quad(
+                    Bounds::new(
+                        Point {
+                            x: origin.x + self.cell_width * from as f32,
+                            y: origin.y + self.cell_height * row as f32,
+                        },
+                        Size {
+                            width: self.cell_width * (to - from) as f32,
+                            height: self.cell_height,
+                        },
+                    ),
+                    px(0.),
+                    color,
+                    Edges::default(),
+                    transparent_black(),
+                    Default::default(),
+                ));
             }
         }
+        for (row, drawing) in cache.rows.iter().enumerate() {
+            let Some(drawing) = drawing else { continue };
+            for (column, line) in &drawing.text {
+                // All fallback glyphs share the primary font's snapped baseline.
+                let native_baseline =
+                    (self.cell_height - line.ascent - line.descent) / 2. + line.ascent;
+                let position = Point {
+                    x: origin.x + self.cell_width * *column as f32,
+                    y: origin.y + self.cell_height * row as f32 + self.baseline - native_baseline,
+                };
+                let _ = line.paint(position, self.cell_height, window, _cx);
+            }
+        }
+        drop(cache);
 
         if grid.display_offset() != 0
             || !term
@@ -623,12 +799,15 @@ impl TerminalRenderer {
         let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
         let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
 
-        let cursor_color = self.palette.resolve(
+        let mut cursor_color = self.palette.resolve(
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
             colors,
         );
+        // Keep the glyph under a block cursor readable instead of painting an
+        // opaque rectangle over the already-shaped text.
+        cursor_color.a = 0.45;
 
-        let cursor_bounds = Bounds {
+        let mut cursor_bounds = Bounds {
             origin: Point {
                 x: cursor_x,
                 y: cursor_y,
@@ -638,21 +817,227 @@ impl TerminalRenderer {
                 height: self.cell_height,
             },
         };
+        match term.cursor_style().shape {
+            CursorShape::Hidden => return,
+            CursorShape::Beam => cursor_bounds.size.width = px(2.0),
+            CursorShape::Underline => {
+                cursor_bounds.origin.y += cursor_bounds.size.height - px(2.0);
+                cursor_bounds.size.height = px(2.0);
+            }
+            CursorShape::Block | CursorShape::HollowBlock => {}
+        }
+        let hollow = term.cursor_style().shape == CursorShape::HollowBlock;
 
         window.paint_quad(quad(
             cursor_bounds,
             px(0.0),
+            if hollow {
+                transparent_black()
+            } else {
+                cursor_color
+            },
+            if hollow {
+                Edges::all(px(1.0))
+            } else {
+                Edges::default()
+            },
             cursor_color,
-            Edges::<Pixels>::default(),
-            transparent_black(),
             Default::default(),
         ));
     }
 }
 
+fn cell_text(cell: &Cell) -> String {
+    if cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN)
+    {
+        return String::new();
+    }
+    let mut text = if cell.c == '\0' {
+        " ".into()
+    } else {
+        cell.c.to_string()
+    };
+    if let Some(combining) = cell.zerowidth() {
+        text.extend(combining.iter());
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ligature_prone_ascii_runs_keep_terminal_columns_across_font_styles() {
+        let renderer =
+            TerminalRenderer::new("Fira Code".into(), px(13.), 1.2, ColorPalette::default());
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let font = renderer.cell_font(bold, italic);
+            for feature in ["calt", "liga", "dlig"] {
+                assert!(
+                    font.features
+                        .tag_value_list()
+                        .iter()
+                        .any(|(tag, value)| tag == feature && *value == 0),
+                    "{feature} was lost when selecting a styled terminal face"
+                );
+            }
+            let flags = if bold { Flags::BOLD } else { Flags::empty() }
+                | if italic {
+                    Flags::ITALIC
+                } else {
+                    Flags::empty()
+                };
+            let mut cells: Vec<_> = "fi->ffi"
+                .chars()
+                .map(|c| Cell {
+                    c,
+                    flags,
+                    ..Cell::default()
+                })
+                .collect();
+            cells.extend([
+                Cell {
+                    c: '界',
+                    flags: flags | Flags::WIDE_CHAR,
+                    ..Cell::default()
+                },
+                Cell {
+                    flags: Flags::WIDE_CHAR_SPACER,
+                    ..Cell::default()
+                },
+                Cell {
+                    c: 'Z',
+                    flags,
+                    ..Cell::default()
+                },
+            ]);
+            let segments = text_segments(&cells);
+            assert_eq!(
+                segments
+                    .iter()
+                    .map(|segment| (segment.column, segment.text.as_str(), segment.ascii))
+                    .collect::<Vec<_>>(),
+                vec![(0, "fi->ffi", true), (7, "界", false), (9, "Z", true)]
+            );
+        }
+    }
+
+    #[test]
+    fn retained_rows_invalidate_on_palette_metrics_and_style_changes_but_not_selection() {
+        let mut renderer =
+            TerminalRenderer::new("Menlo".into(), px(13.), 1.2, ColorPalette::default());
+        let mut colors = Colors::default();
+        let mut cache = RowCache::default();
+        cache.prepare(renderer.drawing_facts(&colors), 2);
+        cache.rows[0] = Some(CachedRow {
+            cells: vec![Cell {
+                c: 'A',
+                ..Cell::default()
+            }],
+            backgrounds: Vec::new(),
+            text: Vec::new(),
+        });
+        cache.prepare(renderer.drawing_facts(&colors), 2);
+        assert!(
+            cache.rows[0].is_some(),
+            "unchanged rows reuse their shaped drawing across selection and cursor paints"
+        );
+        colors[1] = Some(alacritty_terminal::vte::ansi::Rgb {
+            r: 12,
+            g: 34,
+            b: 56,
+        });
+        cache.prepare(renderer.drawing_facts(&colors), 2);
+        assert!(
+            cache.rows[0].is_none(),
+            "OSC palette updates invalidate text with unchanged raw cells"
+        );
+        cache.rows[0] = Some(CachedRow {
+            cells: vec![Cell::default()],
+            backgrounds: Vec::new(),
+            text: Vec::new(),
+        });
+        renderer.cell_width += px(1.);
+        cache.prepare(renderer.drawing_facts(&colors), 2);
+        assert!(
+            cache.rows[0].is_none(),
+            "scale/font metric changes must invalidate retained drawing"
+        );
+
+        let cells = [
+            Cell {
+                c: 'A',
+                ..Cell::default()
+            },
+            Cell {
+                c: 'B',
+                ..Cell::default()
+            },
+            Cell {
+                c: '界',
+                flags: Flags::WIDE_CHAR,
+                ..Cell::default()
+            },
+            Cell {
+                flags: Flags::WIDE_CHAR_SPACER,
+                ..Cell::default()
+            },
+            Cell {
+                c: 'C',
+                flags: Flags::BOLD,
+                ..Cell::default()
+            },
+        ];
+        let segments = text_segments(&cells);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| (s.column, s.text.as_str(), s.ascii))
+                .collect::<Vec<_>>(),
+            vec![(0, "AB", true), (2, "界", false), (4, "C", true)]
+        );
+    }
+
+    #[test]
+    fn ansi_cells_keep_rgb_reverse_wide_combining_and_hidden_attributes() {
+        let (events, _) = std::sync::mpsc::channel();
+        let mut terminal = crate::TerminalState::new(16, 2, GpuiEventProxy::new(events));
+        terminal.process_frame(
+            "\x1b[38;2;18;52;86;48;2;101;67;33mA\x1b[7mB\x1b[0m界e\u{301} \x1b[8mH".as_bytes(),
+            Some((16, 2)),
+        );
+        let renderer = TerminalRenderer::new("Menlo".into(), px(13.), 1.2, ColorPalette::default());
+        terminal.with_term(|term| {
+            let row = &term.grid()[Line(0)];
+            let foreground: Hsla = gpui::rgb(0x123456).into();
+            let background: Hsla = gpui::rgb(0x654321).into();
+            assert_eq!(
+                renderer.cell_colors(&row[Column(0)], term.colors()),
+                (foreground, background)
+            );
+            assert_eq!(
+                renderer.cell_colors(&row[Column(1)], term.colors()),
+                (background, foreground)
+            );
+            assert_eq!(cell_text(&row[Column(2)]), "界");
+            assert!(cell_text(&row[Column(3)]).is_empty());
+            assert_eq!(cell_text(&row[Column(4)]), "e\u{301}");
+            assert!(cell_text(&row[Column(6)]).is_empty());
+            let (backgrounds, _) = renderer.layout_row(
+                0,
+                (2..4).map(|col| (col, row[Column(col)].clone())),
+                term.colors(),
+            );
+            assert_eq!(backgrounds[0].start_col, 2);
+            assert_eq!(
+                backgrounds[0].end_col, 4,
+                "wide-cell background spans both columns"
+            );
+        });
+    }
 
     #[test]
     fn test_renderer_creation() {
