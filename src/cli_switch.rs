@@ -285,6 +285,50 @@ pub fn stopped(c: &Connection, project: &str, generation: &str) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+fn retire_vanished(c: &Connection, p: &Project, r: &Request) -> Result<bool> {
+    let tx = c.unchecked_transaction()?;
+    let saved: (String, Option<String>, Option<i64>, String, bool) = tx.query_row(
+        "SELECT generation,terminal,terminal_pid,execution,paused FROM projects WHERE id=?",
+        [&p.id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if saved.0 != p.generation
+        || saved.1 != p.terminal
+        || saved.2 != p.terminal_pid
+        || serde_json::from_str::<Value>(&saved.3)? != p.execution
+        || saved.4
+        || work::has_takeover(&tx, &p.id, &p.generation)?
+        || !latest(&tx, &p.id)?.is_some_and(|current| current.id == r.id && current.holds_input)
+    {
+        return Ok(false);
+    }
+    work::finish_execution(
+        &tx,
+        &p.id,
+        &p.generation,
+        "exited",
+        "The immutable HERDR terminal and its root process disappeared; submitted effects remain uncertain",
+        db::now(),
+    )?;
+    ensure!(tx.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=? AND paused=0",params![p.id,p.generation])? == 1,"Execution changed during disappearance recovery");
+    phase(
+        &tx,
+        &r.id,
+        "recovery_pending",
+        "The old native execution is verified gone; restoring its saved repair conversation without touching the reused pane",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 fn phase(c: &Connection, id: &str, value: &str, error: &str) -> Result<()> {
     c.execute(
         "UPDATE cli_switch_requests SET phase_started_at=CASE WHEN phase!=? THEN ? ELSE phase_started_at END,phase=?,error=?,next_attempt_at=0 WHERE id=?",
@@ -1355,6 +1399,23 @@ impl App {
                 })
                 .await?;
         }
+        if record.is_some_and(|value| value["vanished_execution"] == true) {
+            let expected = serde_json::to_value(herdr::ExecutionRef::from_project(p)?)?;
+            ensure!(
+                record.expect("verified disappearance")["execution"] == expected,
+                "Disappearance evidence refers to a different execution"
+            );
+            let current = p.clone();
+            let request = r.clone();
+            if self
+                .db
+                .call(move |c| retire_vanished(c, &current, &request))
+                .await?
+            {
+                self.notify.notify_one();
+            }
+            return Ok(true);
+        }
         if p.terminal.is_some()
             && (candidate || p.agent != source_agent || r.phase == "recovery_stopping")
         {
@@ -1772,6 +1833,73 @@ mod tests {
         c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES(?,?,'in',?,'pending direction','queued',?,?)",params![id,p.id,id,now,now])?;
         work::sync_inbound(c)?;
         Ok(())
+    }
+    #[tokio::test]
+    async fn vanished_execution_retirement_preserves_native_pending_and_uncertain_effects() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| {
+                queue(c, &p, "already-submitted", 1)?;
+                let run = work::claim_steering(c, &p.id, &p.generation, 2)?.unwrap();
+                work::delivery(c, &run.id, "submitted", "", 2)?;
+                queue(c, &p, "still-pending", 3)?;
+                Ok(())
+            })
+            .unwrap();
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db
+            .sync(|c| {
+                let r = latest(c, &p.id)?.unwrap();
+                assert!(retire_vanished(c, &p, &r)?);
+                assert_eq!(
+                    work::event(c, &p.id, "already-submitted")?.status,
+                    "uncertain"
+                );
+                assert_eq!(work::event(c, &p.id, "still-pending")?.status, "queued");
+                assert!(holds_input(c, &p.id)?);
+                assert!(work::claim_steering(c, &p.id, "repair-generation", 4)?.is_none());
+                let retired = latest(c, &p.id)?.unwrap();
+                assert_eq!(retired.phase, "recovery_pending");
+                assert_eq!(retired.source, r.source);
+                assert!(
+                    !retire_vanished(c, &p, &r)?,
+                    "The same stale observation cannot clear a later execution"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let current = app.db.project(&p.id).await.unwrap();
+        assert!(current.terminal.is_none());
+        assert!(current.terminal_pid.is_none());
+        assert!(!current.ready);
+        assert!(current.execution.is_null());
+        assert_eq!(current.native_session, p.native_session);
+        assert_eq!(current.extra_args, p.extra_args);
+        assert_eq!(current.agent, p.agent);
+    }
+    #[tokio::test]
+    async fn vanished_retirement_cas_respects_pause_takeover_and_replaced_execution() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db
+            .sync(|c| {
+                let r = latest(c, &p.id)?.unwrap();
+                c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
+                assert!(!retire_vanished(c, &p, &r)?);
+                c.execute("UPDATE projects SET paused=0 WHERE id=?", [&p.id])?;
+                work::set_takeover(c, &p.id, &p.generation, true, 1)?;
+                assert!(!retire_vanished(c, &p, &r)?);
+                work::set_takeover(c, &p.id, &p.generation, false, 2)?;
+                c.execute(
+                    "UPDATE projects SET terminal='new-terminal' WHERE id=?",
+                    [&p.id],
+                )?;
+                assert!(!retire_vanished(c, &p, &r)?);
+                assert!(holds_input(c, &p.id)?);
+                assert_eq!(latest(c, &p.id)?.unwrap().phase, r.phase);
+                Ok(())
+            })
+            .unwrap();
     }
     #[tokio::test]
     async fn accepted_switch_holds_all_unclaimed_input_without_invalidating_handoff() {
