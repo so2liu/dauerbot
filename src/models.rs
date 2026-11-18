@@ -169,6 +169,20 @@ pub fn extra_args(
         return Ok(args.to_vec());
     };
     let selection = validate(agent, selection)?;
+    remove_model_args(agent, args, selection.provider.is_some())
+}
+
+/// An explicit native-default selection removes project launch overrides only.
+/// The switch source snapshot retains the full original arguments for rollback.
+pub fn clear_model_args(agent: &str, args: &[String]) -> Result<Vec<String>> {
+    ensure!(
+        ["codex", "claude", "pi", "agy"].contains(&agent),
+        "Model selection is unavailable for this CLI"
+    );
+    remove_model_args(agent, args, true)
+}
+
+fn remove_model_args(agent: &str, args: &[String], remove_provider: bool) -> Result<Vec<String>> {
     let mut result = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -176,7 +190,7 @@ pub fn extra_args(
         if arg == "--model"
             || agent == "agy" && arg == "-model"
             || agent == "codex" && arg == "-m"
-            || agent == "pi" && arg == "--provider" && selection.provider.is_some()
+            || agent == "pi" && arg == "--provider" && remove_provider
         {
             ensure!(
                 i + 1 < args.len(),
@@ -187,7 +201,7 @@ pub fn extra_args(
         }
         if arg.starts_with("--model=")
             || agent == "agy" && arg.starts_with("-model=")
-            || agent == "pi" && selection.provider.is_some() && arg.starts_with("--provider=")
+            || agent == "pi" && remove_provider && arg.starts_with("--provider=")
         {
             i += 1;
             continue;
@@ -199,8 +213,7 @@ pub fn extra_args(
             if assignment
                 .and_then(|s| s.split_once('='))
                 .is_some_and(|(key, _)| {
-                    key.trim() == "model"
-                        || selection.provider.is_some() && key.trim() == "model_provider"
+                    key.trim() == "model" || remove_provider && key.trim() == "model_provider"
                 })
             {
                 i += 1;
@@ -215,8 +228,7 @@ pub fn extra_args(
             && matches!(arg.as_str(), "-c" | "--config")
             && let Some(value) = args.get(i + 1)
             && let Some((key, _)) = value.split_once('=')
-            && (key.trim() == "model"
-                || selection.provider.is_some() && key.trim() == "model_provider")
+            && (key.trim() == "model" || remove_provider && key.trim() == "model_provider")
         {
             i += 2;
             continue;
@@ -225,6 +237,93 @@ pub fn extra_args(
         i += 1;
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn explicit_native_default_clears_only_model_and_provider_overrides() {
+        let codex = args(&[
+            "--model",
+            "old",
+            "-mcompact",
+            "-c",
+            "model=\"older\"",
+            "--config=model_provider=\"local\"",
+            "--config",
+            "model_reasoning_effort=\"high\"",
+            "--profile",
+            "work",
+            "--add-dir",
+            "/project/other",
+        ]);
+        assert_eq!(
+            clear_model_args("codex", &codex).unwrap(),
+            args(&[
+                "--config",
+                "model_reasoning_effort=\"high\"",
+                "--profile",
+                "work",
+                "--add-dir",
+                "/project/other"
+            ])
+        );
+        assert_eq!(
+            clear_model_args(
+                "pi",
+                &args(&["--provider=local", "--model", "old", "--thinking", "high"])
+            )
+            .unwrap(),
+            args(&["--thinking", "high"])
+        );
+        assert_eq!(
+            clear_model_args("agy", &args(&["-model=old", "--settings", "native.json"])).unwrap(),
+            args(&["--settings", "native.json"])
+        );
+        assert_eq!(
+            clear_model_args(
+                "claude",
+                &args(&["--model=old", "--append-system-prompt", "keep me"])
+            )
+            .unwrap(),
+            args(&["--append-system-prompt", "keep me"])
+        );
+        assert!(clear_model_args("codex", &args(&["--model"])).is_err());
+    }
+
+    #[test]
+    fn new_model_keeps_existing_provider_unless_the_user_selects_another() {
+        let original = args(&[
+            "-c",
+            "model_provider=\"existing\"",
+            "-mold",
+            "--add-dir",
+            "/other",
+        ]);
+        let selection = Selection {
+            model: "new-model".into(),
+            provider: None,
+        };
+        assert_eq!(
+            extra_args("codex", &original, Some(&selection)).unwrap(),
+            args(&["-c", "model_provider=\"existing\"", "--add-dir", "/other"])
+        );
+        let selected = Selection {
+            provider: Some("selected".into()),
+            ..selection
+        };
+        assert_eq!(
+            extra_args("codex", &original, Some(&selected)).unwrap(),
+            args(&["--add-dir", "/other"])
+        );
+        assert_eq!(extra_args("codex", &original, None).unwrap(), original);
+    }
 }
 
 fn json_file(path: &Path) -> Option<Value> {

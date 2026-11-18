@@ -382,7 +382,8 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
                 "The Feishu event belongs to a different bot"
             ));
         }
-        let model_command = crate::model_control::is_command(&text);
+        let model_command = attachment["source"]["message_type"] == "text"
+            && crate::model_control::is_command(&text);
         if model_command {
             attachment["daemon_control"] = json!("model");
         }

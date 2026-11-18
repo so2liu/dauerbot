@@ -14,7 +14,7 @@ use std::{sync::Arc, time::Duration};
 const EXPIRES_MS: i64 = 30 * 60 * 1000;
 const MAX_OPTIONS: usize = 60;
 
-pub fn migrate(c: &Connection) -> Result<()> {
+pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS model_control_commands (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       source_id TEXT NOT NULL, app_id TEXT NOT NULL, chat_id TEXT NOT NULL, operator_id TEXT NOT NULL,
@@ -25,8 +25,13 @@ pub fn migrate(c: &Connection) -> Result<()> {
       UNIQUE(project_id,source_id));
       CREATE TABLE IF NOT EXISTS model_control_actions (
       event_id TEXT PRIMARY KEY, command_id TEXT NOT NULL REFERENCES model_control_commands(id) ON DELETE CASCADE,
-      selection TEXT NOT NULL, created_at INTEGER NOT NULL);
-      UPDATE model_control_commands SET phase='pending' WHERE phase='building';")?;
+      selection TEXT NOT NULL, created_at INTEGER NOT NULL);")?;
+    if recover {
+        c.execute(
+            "UPDATE model_control_commands SET phase='pending' WHERE phase='building'",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -338,7 +343,20 @@ pub async fn reconcile(app: &Arc<App>) -> Result<()> {
     match app.request_model_switch_with_id(&command.project, selection, &command.id,
         Some(models::Scope { agent: command.agent.clone(), generation: command.generation.clone() })).await {
         Ok(_) => finish(app, &command, "done", "Model change requested. The CLI's effective model is confirmed separately.").await,
-        Err(error) => finish(app, &command, "failed", &format!("The model change could not be accepted: {error}. Your instructions remain available; send /models to choose again.")).await,
+        Err(error) => {
+            let (id, project) = (command.id.clone(), command.project.clone());
+            // A response can fail after the transition transaction committed.
+            // Inspect the same request before describing it as rejected.
+            let saved = app.db.call(move |c| Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cli_switch_requests WHERE id=? AND project_id=?)",
+                params![id,project], |r| r.get::<_,bool>(0),
+            )?)).await?;
+            if saved {
+                finish(app, &command, "done", "The model-change request is saved. Supervised transition or repair will continue; no duplicate request was created.").await
+            } else {
+                finish(app, &command, "failed", &format!("The model change could not be accepted: {error}. Your instructions remain available; send /models to choose again.")).await
+            }
+        },
     }
 }
 
@@ -482,7 +500,7 @@ mod tests {
           INSERT INTO projects VALUES('project','codex','generation');
           INSERT INTO project_bots VALUES('project','cli_test');
           INSERT INTO messages VALUES('outbox','project','sent','{\"bot_app_id\":\"cli_test\",\"sent_message_id\":\"om_card\",\"sent_chat_id\":\"oc_chat\"}');").unwrap();
-        migrate(&c).unwrap();
+        migrate(&c, false).unwrap();
         c.execute("INSERT INTO model_control_commands(id,project_id,source_id,app_id,chat_id,operator_id,agent,generation,token,phase,options,outbox_id,created_at,updated_at)
           VALUES('command','project','om_request','cli_test','oc_chat','ou_owner','codex','generation','token','card_ready','[]','outbox',?,?)",params![db::now(),db::now()]).unwrap();
         let binding = Binding {

@@ -265,7 +265,7 @@ impl Db {
         crate::handoff::migrate(&migration)?;
         crate::cli_switch::migrate(&migration, recover)?;
         crate::models::migrate(&migration)?;
-        crate::model_control::migrate(&migration)?;
+        crate::model_control::migrate(&migration, recover)?;
         migration.pragma_update(None, "user_version", 7)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))

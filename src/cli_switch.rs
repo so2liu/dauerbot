@@ -112,7 +112,7 @@ pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
         [project],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    let source = if let Some(previous) =
+    let mut source = if let Some(previous) =
         previous.filter(|r| r.phase == "ready" && r.target == agent)
     {
         if previous.source["agent"]
@@ -136,7 +136,12 @@ pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
     };
     // Runtime repair preserves both sides of a previous cross-CLI switch:
     // the original repair owner and the current target's native conversation.
-    source["runtime_target"] = json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([]))});
+    if source.get("selection").is_none() {
+        let original = source["agent"].as_str().unwrap_or(&agent);
+        source["selection"] = json!(crate::models::load(c, project, original)?);
+    }
+    source["intent"] = json!("runtime");
+    source["runtime_target"] = json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([])),"selection":crate::models::load(c,project,&agent)?});
     c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at,error) VALUES(?,?,?,'recovery_pending',?,?,1,?,?,?)",params![db::id(),project,agent,generation,db::now(),source.to_string(),db::now(),"Repairing this project's CLI runtime while preserving pending input and native continuity."])?;
     latest(c, project)?.ok_or_else(|| anyhow::anyhow!("Repair request was not journaled"))
 }
@@ -260,10 +265,85 @@ pub fn claim(c: &Connection, project: &str, r: &Request, accepted_hash: &str) ->
     tx.commit()?;
     Ok(changed == 1)
 }
+fn target_selection(r: &Request) -> Result<Option<Option<crate::models::Selection>>> {
+    let value = if r.source["intent"] == "model" {
+        Some(&r.source["target_model"])
+    } else if r.source["runtime_target"]["agent"] == r.target {
+        r.source["runtime_target"].get("selection")
+    } else {
+        None
+    };
+    value
+        .map(|value| serde_json::from_value(value.clone()).map_err(Into::into))
+        .transpose()
+}
+fn target_selection_matches(r: &Request, execution: &Value) -> bool {
+    match target_selection(r) {
+        Ok(Some(expected)) => execution.get("model_selection") == Some(&json!(expected)),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+fn target_launch_state(c: &Connection, project: &str, r: &Request) -> Result<(String, String)> {
+    let runtime = &r.source["runtime_target"];
+    let resume = runtime["agent"] == r.target;
+    let mut native = if resume {
+        runtime["native_session"].as_str().unwrap_or("").to_owned()
+    } else {
+        String::new()
+    };
+    let mut args: Vec<String> = if resume {
+        serde_json::from_value(runtime["extra_args"].clone())?
+    } else {
+        vec![]
+    };
+    if r.source["intent"] == "model" {
+        let current_native: String = c.query_row(
+            "SELECT native_session FROM projects WHERE id=?",
+            [project],
+            |row| row.get(0),
+        )?;
+        if !current_native.is_empty() {
+            native = current_native;
+        }
+        if r.source["target_model"].is_null() {
+            args = crate::models::clear_model_args(&r.target, &args)?;
+        }
+    }
+    if let Some(selection) = target_selection(r)? {
+        crate::models::save(c, project, &r.target, selection.as_ref())?;
+    }
+    Ok((native, serde_json::to_string(&args)?))
+}
+
+fn restore_source_state(c: &Connection, project: &str, source: &Value) -> Result<()> {
+    if let Some(selection) = source.get("selection") {
+        let selection: Option<crate::models::Selection> =
+            serde_json::from_value(selection.clone())?;
+        crate::models::save(
+            c,
+            project,
+            source["agent"].as_str().unwrap_or(""),
+            selection.as_ref(),
+        )?;
+    }
+    ensure!(c.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![source["agent"].as_str().unwrap_or(""),source["native_session"].as_str().unwrap_or(""),source["extra_args"].to_string(),project])?==1,"Project woke during recovery");
+    Ok(())
+}
+
 fn ready(c: &Connection, project: &str, generation: &str, r: &Request) -> Result<bool> {
     let tx = c.unchecked_transaction()?;
     let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id=? AND generation=? AND agent=? AND terminal IS NOT NULL AND ready=1 AND paused=0 AND json_extract(execution,'$.cli_switch_request')=? AND json_extract(execution,'$.mcp_registered')=1)",params![project,generation,r.target,r.id],|v|v.get(0))?;
-    if !valid || work::has_takeover(&tx, project, generation)? {
+    let execution: String = tx.query_row(
+        "SELECT execution FROM projects WHERE id=?",
+        [project],
+        |row| row.get(0),
+    )?;
+    let execution: Value = serde_json::from_str(&execution)?;
+    if !valid
+        || !target_selection_matches(r, &execution)
+        || work::has_takeover(&tx, project, generation)?
+    {
         return Ok(false);
     }
     let changed=tx.execute("UPDATE cli_switch_requests SET phase='ready',error='',holds_input=0 WHERE id=? AND phase IN ('starting','startup_failed','failed','recovery_pending') AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![r.id,project])?;
@@ -282,26 +362,26 @@ fn complete(c: &Connection, project: &str, r: &Request) -> Result<()> {
         "CLI handoff completed",
         db::now(),
     )?;
-    let runtime = &r.source["runtime_target"];
-    let resume = runtime["agent"] == r.target;
-    let native = if resume {
-        runtime["native_session"].as_str().unwrap_or("")
-    } else {
-        ""
-    };
-    let args = if resume {
-        runtime["extra_args"].to_string()
-    } else {
-        "[]".into()
-    };
+    let (native, args) = target_launch_state(&tx, project, r)?;
     ensure!(tx.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=?",params![r.target,native,args,project,r.generation])?==1,"Execution changed during CLI handoff");
     tx.commit()?;
     Ok(())
 }
 fn prompt(r: &Request) -> String {
+    let target = if r.source["intent"] == "model" {
+        format!(
+            "a model change within {} (pending selection: {}; preserve this same native conversation and unrelated launch arguments)",
+            r.target, r.source["target_model"]
+        )
+    } else {
+        r.target.clone()
+    };
     format!(
         "<dauerbot_cli_switch request_id=\"{}\" handoff_nonce=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle already-delivered work and JOIN/SETTLE every native subagent and external worker before acknowledging. New messages and scheduled input are held for the selected successor; they will not be delivered to you and do not invalidate this handoff. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, write this exact line INSIDE the project-root HANDOFF.md file, not merely in terminal output or your final response: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
-        r.id, r.nonce, r.target, r.nonce
+        r.id,
+        r.nonce,
+        crate::xml(&target),
+        r.nonce
     )
 }
 async fn artifact(p: &Project) -> Result<Option<String>> {
@@ -325,6 +405,11 @@ impl App {
                 .is_some_and(|r| r.holds_input && matches!(r.phase.as_str(), "recovery_starting"))
             {
                 " This is a daemon-managed CLI-switch recovery execution. Preserve the native conversation and completed effects. Do not resume historical tasks or process ordinary queued input. Read AGENTS.md and HANDOFF.md, connect MCP, then await the daemon's narrowly scoped repair instruction.".into()
+            } else if r.as_ref().is_some_and(|r| {
+                r.source["intent"] == "model"
+                    && matches!(r.phase.as_str(), "starting" | "startup_failed")
+            }) {
+                " The user changed this project's native model selection. Continue the same native conversation using the selected launch settings; preserve completed effects, user content and request IDs. Read AGENTS.md and HANDOFF.md. Do not replay historical work or held input; the daemon delivers pending instructions after native and MCP readiness. Launch selection is not proof of an effective model observation.".into()
             } else if r.is_some_and(|r| matches!(r.phase.as_str(), "starting" | "startup_failed")) {
                 " The user explicitly switched this project's CLI now. Read this project's AGENTS.md and HANDOFF.md before continuing the current goal. If HANDOFF.md is absent, this is a fresh workspace: use the project instructions and await user input. Preserve completed effects and request IDs; do not replay already delivered messages or work merely because this is a fresh native conversation.".into()
             } else {
@@ -346,6 +431,72 @@ impl App {
         })
         .map(|r| r.id))
     }
+    /// Accept a project-scoped native model transition. Selection remains
+    /// pending until verified source retirement, and idempotency precedes stale
+    /// catalogue checks so a retried accepted action never becomes a new effect.
+    pub async fn request_model_switch_with_id(
+        self: &Arc<Self>,
+        key: &str,
+        selection: Option<crate::models::Selection>,
+        request_id: &str,
+        expected: Option<crate::models::Scope>,
+    ) -> Result<Project> {
+        ensure!(
+            !request_id.is_empty() && request_id.len() <= 200,
+            "request_id must contain 1 to 200 characters"
+        );
+        let p = self.db.project(key).await?;
+        let lock = self.project_lock(&p.id).await;
+        let _guard = lock.lock().await;
+        let current = self.db.project(&p.id).await?;
+        let id = current.id.clone();
+        let request_id = request_id.to_owned();
+        self.db.call(move|c|{
+            let tx=c.unchecked_transaction()?;
+            let prior:Option<(String,String,String)>=tx.query_row(
+                "SELECT project_id,target,source FROM cli_switch_requests WHERE id=?",[&request_id],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).optional()?;
+            if let Some((project,agent,source))=prior {
+                let normalized=selection.as_ref().map(|s|crate::models::validate(&agent,s)).transpose()?;
+                let payload=json!({"selection":normalized,"expected":expected});
+                let source:Value=serde_json::from_str(&source)?;
+                ensure!(project==id && source["intent"]=="model" && source["model_payload"]==payload,
+                    "This request_id already refers to a different action, model, scope or project");
+                return Ok(());
+            }
+            // Compare the scope at acceptance, not before acquiring the project
+            // lock or while fetching a catalogue asynchronously.
+            let (agent,generation,paused,native,args,terminal,execution):(String,String,bool,String,String,Option<String>,String)=tx.query_row(
+                "SELECT agent,generation,paused,native_session,extra_args,terminal,execution FROM projects WHERE id=?",[&id],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+            )?;
+            let args:Vec<String>=serde_json::from_str(&args)?;
+            let execution:Value=serde_json::from_str(&execution)?;
+            ensure!(["codex","claude","pi","agy"].contains(&agent.as_str()),"Model selection is unavailable for this CLI");
+            if let Some(scope)=expected.as_ref() {
+                ensure!(scope.agent==agent && scope.generation==generation,
+                    "This model catalogue is stale: the project CLI or native execution changed. Open the model selector again");
+            }
+            ensure!(!paused,"Resume this project before changing its model");
+            ensure!(terminal.is_none() || crate::mcp::generation_contract(&execution).is_some(),"Recover this project's native runtime before changing its model");
+            ensure!(!work::has_takeover(&tx,&id,&generation)?,"Release terminal input before changing the model");
+            ensure!(!holds_input(&tx,&id)?,"A CLI or model transition is already in progress; repair or finish it before choosing another model");
+            let selection=selection.as_ref().map(|s|crate::models::validate(&agent,s)).transpose()?;
+            let source_selection=crate::models::load(&tx,&id,&agent)?;
+            let source=json!({"intent":"model","agent":agent,"native_session":native,"extra_args":args,
+                "generation":generation,"selection":source_selection,"target_model":selection,
+                "model_payload":{"selection":selection,"expected":expected},
+                "runtime_target":{"agent":agent,"native_session":native,"extra_args":args,"selection":selection}});
+            tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,'preparing',?,?,1,?,?)",
+                params![request_id,id,agent,generation,db::now(),source.to_string(),db::now()])?;
+            tx.commit()?;
+            Ok(())
+        }).await?;
+        self.notify.notify_one();
+        self.db.project(&p.id).await
+    }
+
     pub async fn request_cli_switch(self: &Arc<Self>, key: &str, target: &str) -> Result<Project> {
         ensure!(
             ["codex", "claude", "pi", "agy"].contains(&target),
@@ -403,8 +554,8 @@ impl App {
         let id = p.id.clone();
         let target = target.to_owned();
         let generation = p.generation.clone();
-        let source = json!({"agent":p.agent,"native_session":p.native_session,"extra_args":p.extra_args,"generation":p.generation});
-        self.db.call(move|c|{let tx=c.unchecked_transaction()?;tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,?,?,?,1,?,?)",params![db::id(),id,target,initial_phase,generation,db::now(),source.to_string(),db::now()])?;tx.commit()?;Ok(())}).await?;
+        let mut source = json!({"agent":p.agent,"native_session":p.native_session,"extra_args":p.extra_args,"generation":p.generation});
+        self.db.call(move|c|{let tx=c.unchecked_transaction()?;source["selection"]=json!(crate::models::load(&tx,&id,source["agent"].as_str().unwrap_or(""))?);tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,?,?,?,1,?,?)",params![db::id(),id,target,initial_phase,generation,db::now(),source.to_string(),db::now()])?;tx.commit()?;Ok(())}).await?;
         self.notify.notify_one();
         Ok(p)
     }
@@ -545,6 +696,7 @@ impl App {
             if let Some(record) = record {
                 if p.agent == r.target
                     && herdr::check_identity(p, record).is_ok()
+                    && target_selection_matches(&r, &p.execution)
                     && p.ready
                     && p.execution["mcp_registered"] == true
                     && matches!(
@@ -644,7 +796,9 @@ impl App {
                 let request = r.id.clone();
                 self.db.call(move |c| {
                     let tx = c.unchecked_transaction()?;
-                    ensure!(tx.execute("UPDATE projects SET agent=?,extra_args='[]',native_session='',generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![target,id])?==1,"Project woke during CLI selection");
+                    let rr=latest(&tx,&id)?.ok_or_else(||anyhow::anyhow!("Missing launch transition"))?;
+                    let (native,args)=target_launch_state(&tx,&id,&rr)?;
+                    ensure!(tx.execute("UPDATE projects SET agent=?,extra_args=?,native_session=?,generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![target,args,native,id])?==1,"Project woke during CLI selection");
                     phase(&tx,&request,"starting","")?;
                     tx.commit()?;
                     Ok(())
@@ -766,6 +920,10 @@ impl App {
                 final_check["state_change_seq"].as_i64(),
             )
         {
+            return Ok(true);
+        }
+        if r.source["intent"] == "model" && p.native_session.is_empty() {
+            self.fail_cli_switch(&r,"The model change needs this CLI's verified native session identity before retirement; repair the native continuity hook first.").await?;
             return Ok(true);
         }
         let id = p.id.clone();
@@ -938,9 +1096,10 @@ impl App {
             let mut source = match historical {
                 Some((agent,native)) if current.generation != generation =>
                     json!({"agent":agent,"native_session":native,"extra_args":[],"generation":generation,"historical_arguments_unavailable":true}),
-                _ => json!({"agent":current.agent,"native_session":current.native_session,"extra_args":current.extra_args,"generation":generation}),
+                _ => json!({"agent":current.agent,"native_session":native,"extra_args":args,"generation":generation}),
             };
             if !last_failure.is_null() { source["last_failure"] = last_failure; }
+            source["selection"]=json!(crate::models::load(c,&id,source["agent"].as_str().unwrap_or(""))?);
             c.execute("UPDATE cli_switch_requests SET source=? WHERE id=?",params![source.to_string(),rid])?;
             Ok(source)
         }).await?;
@@ -959,6 +1118,7 @@ impl App {
         // Readiness wins over an elapsed deadline, including after a service
         // restart or when the previous observation reported a startup failure.
         if p.agent == r.target
+            && target_selection_matches(r, &p.execution)
             && p.execution["cli_switch_request"] == r.id
             && p.ready
             && p.execution["mcp_registered"] == true
@@ -1059,13 +1219,21 @@ impl App {
             let id = p.id.clone();
             let rid = r.id.clone();
             let source = r.source.clone();
-            self.db.call(move |c| {
-                let tx = c.unchecked_transaction()?;
-                ensure!(tx.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![source["agent"].as_str().unwrap_or(""),source["native_session"].as_str().unwrap_or(""),source["extra_args"].to_string(),id])?==1,"Project woke during recovery");
-                // Retain the phase clock across failed launch retries.
-                phase(&tx,&rid,"recovery_starting","Starting the original CLI as the repair Agent.")?;
-                tx.commit()?; Ok(())
-            }).await?;
+            self.db
+                .call(move |c| {
+                    let tx = c.unchecked_transaction()?;
+                    restore_source_state(&tx, &id, &source)?;
+                    // Retain the phase clock across failed launch retries.
+                    phase(
+                        &tx,
+                        &rid,
+                        "recovery_starting",
+                        "Starting the original CLI as the repair Agent.",
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
             let resume = r.source["native_session"]
                 .as_str()
                 .is_some_and(|s| !s.is_empty());
@@ -1932,6 +2100,232 @@ mod tests {
                     json!(["--model", "preserve"])
                 );
                 assert!(holds_input(c, &p.id)?);
+                Ok(())
+            })
+            .unwrap();
+    }
+    fn model(name: &str) -> crate::models::Selection {
+        crate::models::Selection {
+            model: name.into(),
+            provider: None,
+        }
+    }
+    #[tokio::test]
+    async fn model_acceptance_keeps_source_preference_pending_and_scopes_new_effects_only() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| crate::models::save(c, &p.id, "codex", Some(&model("source-model"))))
+            .unwrap();
+        let scope = crate::models::Scope {
+            agent: "codex".into(),
+            generation: p.generation.clone(),
+        };
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "model-action",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        let accepted = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(accepted.id, "model-action");
+        assert_eq!(accepted.source["selection"], json!(model("source-model")));
+        assert_eq!(
+            accepted.source["target_model"],
+            json!(model("target-model"))
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| crate::models::load(c, &p.id, "codex"))
+                .unwrap(),
+            Some(model("source-model"))
+        );
+        assert_eq!(
+            app.db.project(&p.id).await.unwrap().native_session,
+            p.native_session
+        );
+        app.db
+            .sync(|c| {
+                c.execute(
+                    "UPDATE projects SET generation='different',agent='agy' WHERE id=?",
+                    [&p.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "model-action",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.request_model_switch_with_id(
+                &p.id,
+                Some(model("different-model")),
+                "model-action",
+                Some(scope.clone())
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            app.request_model_switch_with_id(
+                &p.id,
+                Some(model("target-model")),
+                "new-stale-action",
+                Some(scope)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(c.query_row(
+                    "SELECT count(*) FROM cli_switch_requests",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?))
+                .unwrap(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn model_cutover_preserves_native_and_args_and_rejects_wrong_launch_selection() {
+        let (_dir, app, p) = fixture().await;
+        app.request_model_switch_with_id(&p.id, Some(model("target-model")), "model-cutover", None)
+            .await
+            .unwrap();
+        app.db.sync(|c|{
+            let r=requested(c,&p)?;
+            assert!(claim(c,&p.id,&r,"accepted")?);
+            complete(c,&p.id,&r)?;
+            let saved:(String,String)=c.query_row("SELECT native_session,extra_args FROM projects WHERE id=?",[&p.id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(saved.0,"old-native");
+            assert_eq!(serde_json::from_str::<Value>(&saved.1)?,json!(["--model","preserve"]));
+            assert_eq!(crate::models::load(c,&p.id,"codex")?,Some(model("target-model")));
+            c.execute("UPDATE projects SET generation='target-gen',terminal='target-pane',ready=1,execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?,'mcp_registered',json('true'),'model_selection',json(?)) WHERE id=?",params![r.id,serde_json::to_string(&model("wrong-model"))?,p.id])?;
+            assert!(!ready(c,&p.id,"target-gen",&r)?);
+            assert!(holds_input(c,&p.id)?);
+            c.execute("UPDATE projects SET execution=json_set(execution,'$.model_selection',json(?)) WHERE id=?",params![serde_json::to_string(&model("target-model"))?,p.id])?;
+            assert!(ready(c,&p.id,"target-gen",&r)?);
+            assert!(!holds_input(c,&p.id)?);
+            Ok(())
+        }).unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "new-model-request-after-generation",
+            None,
+        )
+        .await
+        .unwrap();
+        let next = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(next.id, "new-model-request-after-generation");
+        assert_eq!(next.phase, "preparing");
+        assert!(next.holds_input);
+    }
+    #[tokio::test]
+    async fn failed_model_target_restores_source_preference_and_can_retry_pending_selection() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| crate::models::save(c, &p.id, "codex", Some(&model("source-model"))))
+            .unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "model-rollback",
+            None,
+        )
+        .await
+        .unwrap();
+        app.db
+            .sync(|c| {
+                let r = requested(c, &p)?;
+                assert!(claim(c, &p.id, &r, "accepted")?);
+                complete(c, &p.id, &r)?;
+                let tx = c.unchecked_transaction()?;
+                restore_source_state(&tx, &p.id, &r.source)?;
+                tx.commit()?;
+                assert_eq!(
+                    crate::models::load(c, &p.id, "codex")?,
+                    Some(model("source-model"))
+                );
+                let saved: (String, String) = c.query_row(
+                    "SELECT native_session,extra_args FROM projects WHERE id=?",
+                    [&p.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(saved.0, "old-native");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&saved.1)?,
+                    json!(p.extra_args)
+                );
+                assert!(holds_input(c, &p.id)?);
+                let tx = c.unchecked_transaction()?;
+                let (native, _) = target_launch_state(&tx, &p.id, &r)?;
+                assert_eq!(native, "old-native");
+                tx.commit()?;
+                assert_eq!(
+                    crate::models::load(c, &p.id, "codex")?,
+                    Some(model("target-model"))
+                );
+                assert_eq!(
+                    latest(c, &p.id)?.unwrap().source["target_model"],
+                    json!(model("target-model"))
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_model_reset_removes_project_model_flags_without_erasing_source_rollback_args()
+    {
+        let (_dir, app, p) = fixture().await;
+        let args = vec![
+            "--model",
+            "old-flag",
+            "--config",
+            "model_provider=\"old-provider\"",
+            "--config",
+            "unrelated=true",
+            "--other",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        app.db
+            .sync(|c| {
+                c.execute(
+                    "UPDATE projects SET extra_args=? WHERE id=?",
+                    params![serde_json::to_string(&args)?, p.id],
+                )?;
+                crate::models::save(c, &p.id, "codex", Some(&model("source-model")))
+            })
+            .unwrap();
+        app.request_model_switch_with_id(&p.id, None, "model-default", None)
+            .await
+            .unwrap();
+        app.db
+            .sync(|c| {
+                let r = requested(c, &p)?;
+                assert_eq!(r.source["extra_args"], json!(args));
+                assert!(claim(c, &p.id, &r, "accepted")?);
+                complete(c, &p.id, &r)?;
+                assert!(crate::models::load(c, &p.id, "codex")?.is_none());
+                let saved: String = c.query_row(
+                    "SELECT extra_args FROM projects WHERE id=?",
+                    [&p.id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    serde_json::from_str::<Value>(&saved)?,
+                    json!(["--config", "unrelated=true", "--other"])
+                );
+                assert_eq!(latest(c, &p.id)?.unwrap().source["extra_args"], json!(args));
                 Ok(())
             })
             .unwrap();
