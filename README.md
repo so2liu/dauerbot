@@ -2,7 +2,7 @@
 
 A native macOS workspace that connects Feishu messages and scheduled runs to native CLI agents running on demand in HERDR. Built with Rust and GPUI, with an independent daemon shared by the desktop app, CLI, and MCP server.
 
-One bot belongs to one project with one active agent. Direct messages and group messages reach the same main session; the agent chooses where to send its replies. Dauerbot supports Codex, Claude Code, Pi, and Antigravity through their installed CLIs and existing account and model settings. Watch and take over the real terminal directly in Dauerbot. The lightweight daemon stays online; sessions with verified native-child coverage can sleep after ten idle minutes and wake for new work. Sessions with unknown child coverage stay available. Dauerbot does not proxy model APIs.
+One bot belongs to one project with one active agent. Direct messages and group messages reach the same main session; the agent chooses where to send its replies. Dauerbot supports Codex, Claude Code, Pi, and Antigravity through their installed CLIs and existing account and model settings. Watch and take over the real terminal directly in Dauerbot. The lightweight daemon stays online; sessions with verified native-child coverage can sleep after ten idle minutes and wake for new work. Sessions with unknown child coverage stay available. Native mode uses the selected CLI directly. An optional built-in management Agent uses a separately configured model API for coordination while the native CLI continues to perform coding work.
 
 ## Install
 
@@ -92,6 +92,14 @@ python3 scripts/upgrade-smoke.py --old-app /path/to/extracted-0.4.4/Dauerbot.app
 It covers historical companion dispatch, missing-backup failure, a live old MCP across an incompatible daemon handoff, explicit native recovery, queued input delivered once, uncertain work retained, unrelated panes preserved, and compatible live-session reuse. Its private fixture Agent establishes native identity through HERDR and uses each published MCP contract normally; the harness does not acknowledge messages, patch the database, or replay effects.
 
 Live sending is opt-in: `tests/live_feishu.rs` reads `.local/live.json` with `app_id`, `app_secret`, and `chat_id`. Run `cargo test --test live_feishu -- --ignored` only for an explicitly selected bot and recipient, then remove the temporary credentials. It sends a test Markdown message and a small file without opening a competing event listener.
+
+## Built-in project manager
+
+Projects use their native CLI directly by default. In project settings, configure an OpenAI-compatible API endpoint, model and API key, then explicitly select **Built-in manager** to let a restricted Rust Agent manage the conversation. Its API credentials are separate from Codex, Claude Code, Pi and Antigravity login; Dauerbot does not copy native CLI credentials or change their global settings. Saving provider settings alone does not change a project's mode. API keys are stored in the private local database and omitted from configuration responses.
+
+The manager can read and update files within its project, delegate work to its native coding worker, observe or steer that worker, and send Feishu topic messages and files. It has no Bash, arbitrary process, generic HTTP or arbitrary MCP tool. Coding work runs through the existing native CLI, with its own model controls, terminal and three project MCP tools. In the sidebar, the manager is the root and its coding worker and observed child Agents appear underneath it.
+
+New input can interrupt an in-flight manager model request. The daemon owns input delivery and external-effect records, retaining uncertain submissions instead of repeating them after a restart. Pause, Stop, terminal takeover and CLI transitions remain daemon controls. Native model selection and repair controls remain available when the manager provider is unavailable. Switching back to native mode is an explicit mode action; a model error does not silently transfer the conversation to another Agent.
 
 ## CLI and HERDR sessions
 
