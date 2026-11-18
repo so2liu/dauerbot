@@ -408,7 +408,7 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
         }
         let mut query = c.prepare(
             "SELECT id,project_id,source_id,content,status,attachment,error,created_at,updated_at
-           FROM messages WHERE direction='in' AND NOT EXISTS(
+           FROM messages WHERE direction='in' AND json_extract(attachment,'$.daemon_control') IS NULL AND NOT EXISTS(
              SELECT 1 FROM work_events WHERE message_id=messages.id) ORDER BY rowid",
         )?;
         let rows = query

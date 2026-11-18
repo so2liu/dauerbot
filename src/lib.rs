@@ -11,6 +11,8 @@ pub mod feishu;
 pub mod handoff;
 pub mod herdr;
 pub mod mcp;
+pub mod models;
+pub mod model_control;
 pub mod native_children;
 pub mod project_documents;
 pub mod project_instructions;
@@ -1170,6 +1172,7 @@ impl App {
         self.workers_with_ingress(None);
     }
     pub fn workers_with_ingress(self: &Arc<Self>, warm: Option<feishu::WarmIngress>) {
+        tokio::spawn(model_control::run(self.clone()));
         let app = self.clone();
         tokio::spawn(async move {
             loop {

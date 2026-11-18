@@ -72,6 +72,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/projects/{id}/agent", post(switch_agent))
         .route("/projects/{id}/agent/standby", post(switch_standby_agent))
         .route("/projects/{id}/agent/transition", post(transition_agent))
+        .route("/projects/{id}/models", get(project_models))
+        .route("/projects/{id}/model", post(select_project_model))
         .route("/projects/{id}/documents/{document}", get(project_document))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
@@ -521,6 +523,64 @@ async fn transition_agent(
     value["cli_transition"] = json!(transition);
     Ok(Json(value))
 }
+async fn project_models(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    let project = app.db.project(&id).await?;
+    let key = project.id.clone();
+    let agent = project.agent.clone();
+    let configured = app
+        .db
+        .call(move |c| crate::models::load(c, &key, &agent))
+        .await?;
+    let catalog = crate::models::discover(&project, configured).await?;
+    let mut value = json!(catalog);
+    value["generation"] = json!(project.generation);
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct ProjectModelSelection {
+    model: String,
+    provider: Option<String>,
+    request_id: Option<String>,
+    agent: Option<String>,
+    generation: Option<String>,
+}
+
+async fn select_project_model(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<ProjectModelSelection>,
+) -> ApiResult {
+    let selection = if input.model.trim().is_empty() {
+        if input.provider.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+            return Err(anyhow::anyhow!("A native-default model cannot override its provider").into());
+        }
+        None
+    } else {
+        Some(crate::models::Selection {
+            model: input.model,
+            provider: input.provider,
+        })
+    };
+    let expected = match (input.agent, input.generation) {
+        (Some(agent), Some(generation)) => Some(crate::models::Scope { agent, generation }),
+        (None, None) => None,
+        _ => return Err(anyhow::anyhow!("Provide both the catalogue CLI and generation").into()),
+    };
+    let request_id = input.request_id.unwrap_or_else(crate::db::id);
+    let project = app
+        .request_model_switch_with_id(&id, selection, &request_id, expected)
+        .await?;
+    let key = project.id.clone();
+    let transition = app
+        .db
+        .call(move |c| crate::cli_switch::latest(c, &key))
+        .await?;
+    let mut value = json!(project);
+    value["cli_transition"] = json!(transition);
+    Ok(Json(value))
+}
+
 async fn project_document(
     State(app): State<Arc<App>>,
     Path((id, document)): Path<(String, crate::project_documents::Document)>,
