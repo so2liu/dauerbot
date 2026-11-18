@@ -39,7 +39,8 @@ resolved_herdr = shutil.which("herdr")
 assert resolved_herdr, "Native Agent tools cannot find HERDR in PATH"
 assert subprocess.check_output([resolved_herdr, "--version"], text=True, timeout=5).strip() == "herdr 0.9.5"
 (Path.cwd() / ".fixture-herdr").write_text(resolved_herdr)
-marker = Path.cwd() / ".fixture-session"
+# The target shim must not overwrite the source fixture's resumable identity.
+marker = Path.cwd() / (".fixture-session-codex" if len(sys.argv) > 5 and sys.argv[5] == "codex" else ".fixture-session")
 expected = sys.argv[3] if len(sys.argv) > 3 else ""
 if expected:
     assert expected == marker.read_text(), "Fixture resume did not retain native identity"
@@ -89,6 +90,7 @@ sys.stdout.flush()
 buffer = b""
 held = None
 switch_held = None
+repair_held = None
 
 
 def switch_handoff(event):
@@ -101,8 +103,22 @@ def switch_handoff(event):
     status("idle")
 
 
+def repair_handoff(event):
+    # Only fixture files are repaired. A real CLI/model is never invoked here.
+    (Path.cwd() / ".fixture-target-exit").unlink(missing_ok=True)
+    (Path.cwd() / ".fixture-switch-mode").unlink(missing_ok=True)
+    handoff = event.find("dauerbot_cli_switch")
+    assert handoff is not None, "Repair control did not contain the fresh handoff request"
+    switch_handoff(handoff)
+
+
 try:
     while True:
+        repair_release = Path.cwd() / ".fixture-repair-release"
+        if repair_held is not None and repair_release.exists():
+            repair_release.unlink()
+            repair_handoff(repair_held)
+            repair_held = None
         release = Path.cwd() / ".fixture-switch-release"
         if switch_held is not None and release.exists():
             release.unlink()
@@ -115,7 +131,25 @@ try:
         while end in buffer:
             text, buffer = buffer.split(end, 1)
             text = text.removeprefix(b"\x1b[200~").decode()
-            event = ET.fromstring(text)
+            # Repair controls append a separate user-instruction element.
+            if text.startswith("<dauerbot_cli_repair"):
+                wrapped = ET.fromstring("<fixture_controls>" + text + "</fixture_controls>")
+                event = wrapped[0]
+            else:
+                event = ET.fromstring(text)
+            if event.tag in {"dauerbot_cli_repair", "dauerbot_cli_repair_control"}:
+                status("working")
+                with (Path.cwd() / ".fixture-repairs").open("a") as repairs:
+                    repairs.write(json.dumps({"generation": Path(sys.argv[2]).parent.name, "native": marker.read_text(), "payload": text}) + "\n")
+                mode = Path.cwd() / ".fixture-repair-mode"
+                if mode.exists() and mode.read_text() == "hold":
+                    repair_held = event
+                    status("idle")
+                elif event.tag == "dauerbot_cli_repair":
+                    repair_handoff(event)
+                else:
+                    status("idle")
+                continue
             if event.tag == "dauerbot_cli_switch":
                 status("working")
                 mode = Path.cwd() / ".fixture-switch-mode"

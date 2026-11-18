@@ -143,10 +143,40 @@ fn legacy_record(p: &mut herdr_feishu_bridge::db::Project, pid: i64) -> Value {
     p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_owned",
         "managed_name":name,"generation":p.generation,"shell_pid":pid,"launch_permit":"/private/fixture/launch.permit"});
     json!({"state":"live","pid":pid,"execution":p.execution,"launch_pending":false,
+        "pane_id":"w1:p1","terminal_id":"term_owned","workspace_id":"w1",
         "foreground":{"pid":pid,"name":p.agent,"argv":[p.agent]},
         "agent":{"agent":p.agent,"workspace_id":"w1","pane_id":"w1:p1","terminal_id":"term_owned"},
         "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":p.generation,"hfb_execution":name},
         "cwd":p.path,"status":{"state":"idle","app":p.agent}})
+}
+
+#[tokio::test]
+async fn stale_native_detection_allows_owned_pane_repair_but_never_input_or_foreign_closure() {
+    let dir = TempDir::new().unwrap();
+    let db = Db::open(&dir.path().join("db")).unwrap();
+    let mut p = db
+        .create(input(&dir, "Stale native metadata", ""))
+        .await
+        .unwrap();
+    let mut record = legacy_record(&mut p, 100);
+    record["agent"]["workspace_id"] = json!("stale-workspace");
+    assert!(herdr::check_identity(&p, &record).is_err());
+    assert!(herdr::check_pane_ownership(&p, &record).is_ok());
+    for (pointer, value) in [
+        ("/pane_id", json!("w2:p1")),
+        ("/workspace_id", json!("w2")),
+        ("/terminal_id", json!("term_other")),
+        ("/pid", json!(101)),
+        ("/tokens/hfb_generation", json!("replaced")),
+        ("/tokens/hfb_project", json!("other")),
+    ] {
+        let mut foreign = record.clone();
+        *foreign.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            herdr::check_pane_ownership(&p, &foreign).is_err(),
+            "{pointer}"
+        );
+    }
 }
 
 #[tokio::test]

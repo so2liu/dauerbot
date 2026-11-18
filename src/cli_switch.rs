@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
 const BUDGET_MS: i64 = 180_000;
@@ -26,6 +26,12 @@ pub struct Request {
     pub created_at: i64,
     pub attempts: i64,
     pub holds_input: bool,
+    pub phase_started_at: i64,
+    pub next_attempt_at: i64,
+    pub recovery_attempts: i64,
+    pub recovery_generation: String,
+    #[serde(skip_serializing)]
+    pub source: Value,
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS cli_switch_requests (
@@ -46,20 +52,130 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
         c.execute_batch("ALTER TABLE cli_switch_requests ADD COLUMN holds_input INTEGER NOT NULL DEFAULT 0;
           UPDATE cli_switch_requests SET holds_input=1 WHERE phase IN ('preparing','requested','switching','starting','startup_failed','uncertain');")?;
     }
+    for (name, sql) in [
+        ("source", "TEXT NOT NULL DEFAULT '{}'"),
+        ("phase_started_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("recovery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("recovery_generation", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cli_switch_requests') WHERE name=?)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            c.execute_batch(&format!(
+                "ALTER TABLE cli_switch_requests ADD COLUMN {name} {sql}"
+            ))?;
+        }
+    }
+    c.execute(
+        "UPDATE cli_switch_requests SET phase_started_at=created_at WHERE phase_started_at=0",
+        [],
+    )?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS cli_repair_prompts (
+        id TEXT PRIMARY KEY,request_id TEXT NOT NULL REFERENCES cli_switch_requests(id) ON DELETE CASCADE,
+        generation TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,sequence INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,error TEXT NOT NULL DEFAULT '');
+      CREATE TABLE IF NOT EXISTS cli_repair_instructions (
+        request_id TEXT NOT NULL REFERENCES cli_switch_requests(id) ON DELETE CASCADE,
+        instruction_id TEXT NOT NULL,payload TEXT NOT NULL,prompt_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(request_id,instruction_id));")?;
     if recover {
-        c.execute("UPDATE cli_switch_requests SET phase=CASE WHEN phase='switching' THEN 'uncertain' ELSE 'failed' END,error='The service restarted during the CLI handoff; the saved native conversation and input are preserved.' WHERE phase IN ('preparing','requested','switching')", [])?;
+        // An interrupted send may already have reached the native Agent. Observe
+        // its nonce/sequence; never resubmit that prompt after a service restart.
+        c.execute(
+            "UPDATE cli_repair_prompts SET status='uncertain' WHERE status='submitting'",
+            [],
+        )?;
+        c.execute("UPDATE cli_switch_requests SET phase=CASE WHEN phase='switching' THEN 'uncertain' ELSE 'recovery_pending' END,phase_started_at=?,next_attempt_at=0,error='The service restarted during the CLI handoff; automatic recovery preserves the native conversation and queued input.' WHERE phase IN ('preparing','requested','switching')", [db::now()])?;
     }
     Ok(())
 }
 pub fn latest(c: &Connection, project: &str) -> Result<Option<Request>> {
-    Ok(c.query_row("SELECT id,target,phase,error,generation,nonce,baseline,sequence,revision,created_at,attempts,holds_input FROM cli_switch_requests WHERE project_id=? ORDER BY rowid DESC LIMIT 1",[project],|r|Ok(Request{id:r.get(0)?,target:r.get(1)?,phase:r.get(2)?,error:r.get(3)?,generation:r.get(4)?,nonce:r.get(5)?,baseline:r.get(6)?,sequence:r.get(7)?,revision:r.get(8)?,created_at:r.get(9)?,attempts:r.get(10)?,holds_input:r.get(11)?})).optional()?)
+    Ok(c.query_row("SELECT id,target,phase,error,generation,nonce,baseline,sequence,revision,created_at,attempts,holds_input,phase_started_at,next_attempt_at,recovery_attempts,recovery_generation,source FROM cli_switch_requests WHERE project_id=? ORDER BY rowid DESC LIMIT 1",[project],|r|Ok(Request{id:r.get(0)?,target:r.get(1)?,phase:r.get(2)?,error:r.get(3)?,generation:r.get(4)?,nonce:r.get(5)?,baseline:r.get(6)?,sequence:r.get(7)?,revision:r.get(8)?,created_at:r.get(9)?,attempts:r.get(10)?,holds_input:r.get(11)?,phase_started_at:r.get(12)?,next_attempt_at:r.get(13)?,recovery_attempts:r.get(14)?,recovery_generation:r.get(15)?,source:serde_json::from_str(&r.get::<_,String>(16)?).unwrap_or(Value::Null)})).optional()?)
 }
 pub fn active(r: &Request) -> bool {
-    matches!(
-        r.phase.as_str(),
-        "preparing" | "requested" | "switching" | "starting" | "uncertain"
-    )
+    r.holds_input && !matches!(r.phase.as_str(), "ready" | "cancelled")
 }
+
+/// A repair remains available after a completed switch or a runtime failure.
+/// Reuse its saved original CLI when possible; never invent a source session.
+pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
+    let previous = latest(c, project)?;
+    if let Some(r) = previous.as_ref().filter(|r| active(r)) {
+        return Ok(r.clone());
+    }
+    let (agent, native, args, generation): (String, String, String, String) = c.query_row(
+        "SELECT agent,native_session,extra_args,generation FROM projects WHERE id=?",
+        [project],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let source = if let Some(previous) =
+        previous.filter(|r| r.phase == "ready" && r.target == agent)
+    {
+        if previous.source["agent"]
+            .as_str()
+            .is_some_and(|a| !a.is_empty())
+        {
+            previous.source
+        } else {
+            let historical:Option<(String,String)> = c.query_row(
+                "SELECT agent,native_session FROM work_executions WHERE project_id=? AND generation=?",params![project,previous.generation],
+                |row|Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+            if let Some((source_agent, source_native)) = historical {
+                json!({"agent":source_agent,"native_session":source_native,"extra_args":[],"generation":previous.generation,"historical_arguments_unavailable":true})
+            } else {
+                json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([])),"generation":generation})
+            }
+        }
+    } else {
+        json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([])),"generation":generation})
+    };
+    // Runtime repair preserves both sides of a previous cross-CLI switch:
+    // the original repair owner and the current target's native conversation.
+    source["runtime_target"] = json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([]))});
+    c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at,error) VALUES(?,?,?,'recovery_pending',?,?,1,?,?,?)",params![db::id(),project,agent,generation,db::now(),source.to_string(),db::now(),"Repairing this project's CLI runtime while preserving pending input and native continuity."])?;
+    latest(c, project)?.ok_or_else(|| anyhow::anyhow!("Repair request was not journaled"))
+}
+
+/// Recovery control is journaled independently of ordinary held messages. Only
+/// the trusted ingress layer chooses whether a message is a repair instruction.
+pub fn journal_repair_instruction(
+    c: &Connection,
+    project: &str,
+    instruction_id: &str,
+    payload: &Value,
+) -> Result<()> {
+    let r = ensure_repair_request(c, project)?;
+    ensure!(
+        !instruction_id.is_empty(),
+        "Provide a repair instruction ID"
+    );
+    let encoded = serde_json::to_string(payload)?;
+    let previous: Option<String> = c
+        .query_row(
+            "SELECT payload FROM cli_repair_instructions WHERE request_id=? AND instruction_id=?",
+            params![r.id, instruction_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(previous) = previous {
+        ensure!(
+            previous == encoded,
+            "This repair instruction ID already has different content"
+        );
+    } else {
+        c.execute(
+            "INSERT INTO cli_repair_instructions(request_id,instruction_id,payload) VALUES(?,?,?)",
+            params![r.id, instruction_id, encoded],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn revision(c: &Connection, project: &str) -> Result<String> {
     Ok(c.query_row("SELECT COALESCE((SELECT MAX(rowid) FROM messages WHERE project_id=?1 AND direction='in'),0)||':'||COALESCE((SELECT MAX(rowid) FROM work_events WHERE project_id=?1),0)",[project],|r|r.get(0))?)
 }
@@ -95,11 +211,19 @@ pub fn stopped(c: &Connection, project: &str, generation: &str) -> Result<()> {
 }
 fn phase(c: &Connection, id: &str, value: &str, error: &str) -> Result<()> {
     c.execute(
-        "UPDATE cli_switch_requests SET phase=?,error=? WHERE id=?",
-        params![value, error, id],
+        "UPDATE cli_switch_requests SET phase_started_at=CASE WHEN phase!=? THEN ? ELSE phase_started_at END,phase=?,error=?,next_attempt_at=0 WHERE id=?",
+        params![value, db::now(), value, error, id],
     )?;
     Ok(())
 }
+fn record_failure(c: &Connection, id: &str, error: &str) -> Result<()> {
+    c.execute(
+        "UPDATE cli_switch_requests SET source=json_set(source,'$.last_failure',?) WHERE id=?",
+        params![error, id],
+    )?;
+    phase(c, id, "recovery_pending", error)
+}
+
 pub fn proof(r: &Request, text: Option<&str>, sequence: Option<i64>) -> bool {
     text.is_some_and(|t| {
         t.len() > 100
@@ -107,6 +231,18 @@ pub fn proof(r: &Request, text: Option<&str>, sequence: Option<i64>) -> bool {
             && handoff::fingerprint(Some(t)) != r.baseline
     }) && sequence.is_some_and(|s| s > r.sequence)
 }
+fn stop_retry_safe(p: &Project, r: &Request, record: &Value, text: Option<&str>) -> bool {
+    herdr::foreground_quiescent(p, record)
+        && record["children"]["state"] != "active"
+        && record["state_change_seq"]
+            .as_i64()
+            .is_some_and(|seq| seq > r.sequence)
+        && text.is_some_and(|text| {
+            text.contains(&format!("<!-- dauerbot-switch-ready:{} -->", r.nonce))
+        })
+        && handoff::fingerprint(text) == r.baseline
+}
+
 pub fn claim(c: &Connection, project: &str, r: &Request, accepted_hash: &str) -> Result<bool> {
     let tx = c.unchecked_transaction()?;
     if work::has_takeover(&tx, project, &r.generation)? {
@@ -120,7 +256,7 @@ pub fn claim(c: &Connection, project: &str, r: &Request, accepted_hash: &str) ->
     if !valid {
         return Ok(false);
     }
-    let changed=tx.execute("UPDATE cli_switch_requests SET phase='switching',baseline=? WHERE id=? AND phase='requested' AND nonce=? AND holds_input=1 AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![accepted_hash,r.id,r.nonce,project])?;
+    let changed=tx.execute("UPDATE cli_switch_requests SET phase='switching',phase_started_at=?,baseline=? WHERE id=? AND phase='requested' AND nonce=? AND holds_input=1 AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![db::now(),accepted_hash,r.id,r.nonce,project])?;
     tx.commit()?;
     Ok(changed == 1)
 }
@@ -130,13 +266,14 @@ fn ready(c: &Connection, project: &str, generation: &str, r: &Request) -> Result
     if !valid || work::has_takeover(&tx, project, generation)? {
         return Ok(false);
     }
-    let changed=tx.execute("UPDATE cli_switch_requests SET phase='ready',error='',holds_input=0 WHERE id=? AND phase IN ('starting','startup_failed') AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![r.id,project])?;
+    let changed=tx.execute("UPDATE cli_switch_requests SET phase='ready',error='',holds_input=0 WHERE id=? AND phase IN ('starting','startup_failed','failed','recovery_pending') AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![r.id,project])?;
     tx.commit()?;
     Ok(changed == 1)
 }
 fn complete(c: &Connection, project: &str, r: &Request) -> Result<()> {
     let tx = c.unchecked_transaction()?;
-    ensure!(tx.execute("UPDATE cli_switch_requests SET phase='starting' WHERE id=? AND phase IN ('switching','uncertain')",[&r.id])?==1,"CLI transition changed");
+    ensure!(tx.execute("UPDATE cli_switch_requests SET phase='starting',phase_started_at=?,next_attempt_at=0 WHERE id=? AND phase IN ('switching','uncertain')",params![db::now(),r.id])?==1,"CLI transition changed");
+    tx.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.native_session',(SELECT native_session FROM projects WHERE id=?)) WHERE id=?", params![project,r.id])?;
     work::finish_execution(
         &tx,
         project,
@@ -145,13 +282,25 @@ fn complete(c: &Connection, project: &str, r: &Request) -> Result<()> {
         "CLI handoff completed",
         db::now(),
     )?;
-    ensure!(tx.execute("UPDATE projects SET agent=?,native_session='',extra_args='[]',terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=?",params![r.target,project,r.generation])?==1,"Execution changed during CLI handoff");
+    let runtime = &r.source["runtime_target"];
+    let resume = runtime["agent"] == r.target;
+    let native = if resume {
+        runtime["native_session"].as_str().unwrap_or("")
+    } else {
+        ""
+    };
+    let args = if resume {
+        runtime["extra_args"].to_string()
+    } else {
+        "[]".into()
+    };
+    ensure!(tx.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=?",params![r.target,native,args,project,r.generation])?==1,"Execution changed during CLI handoff");
     tx.commit()?;
     Ok(())
 }
 fn prompt(r: &Request) -> String {
     format!(
-        "<dauerbot_cli_switch request_id=\"{}\" handoff_nonce=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle already-delivered work and JOIN/SETTLE every native subagent and external worker before acknowledging. New messages and scheduled input are held for the selected successor; they will not be delivered to you and do not invalidate this handoff. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, include this exact line: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
+        "<dauerbot_cli_switch request_id=\"{}\" handoff_nonce=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle already-delivered work and JOIN/SETTLE every native subagent and external worker before acknowledging. New messages and scheduled input are held for the selected successor; they will not be delivered to you and do not invalidate this handoff. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, write this exact line INSIDE the project-root HANDOFF.md file, not merely in terminal output or your final response: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
         r.id, r.nonce, r.target, r.nonce
     )
 }
@@ -172,7 +321,11 @@ impl App {
         let id = project.to_owned();
         let r = self.db.call(move |c| latest(c, &id)).await?;
         Ok(
-            if r.is_some_and(|r| matches!(r.phase.as_str(), "starting" | "startup_failed")) {
+            if r.as_ref()
+                .is_some_and(|r| r.holds_input && matches!(r.phase.as_str(), "recovery_starting"))
+            {
+                " This is a daemon-managed CLI-switch recovery execution. Preserve the native conversation and completed effects. Do not resume historical tasks or process ordinary queued input. Read AGENTS.md and HANDOFF.md, connect MCP, then await the daemon's narrowly scoped repair instruction.".into()
+            } else if r.is_some_and(|r| matches!(r.phase.as_str(), "starting" | "startup_failed")) {
                 " The user explicitly switched this project's CLI now. Read this project's AGENTS.md and HANDOFF.md before continuing the current goal. If HANDOFF.md is absent, this is a fresh workspace: use the project instructions and await user input. Preserve completed effects and request IDs; do not replay already delivered messages or work merely because this is a fresh native conversation.".into()
             } else {
                 String::new()
@@ -222,9 +375,20 @@ impl App {
         let previous = self.db.call(move |c| latest(c, &id)).await?;
         if let Some(r) = previous.as_ref().filter(|r| active(r)) {
             ensure!(
-                r.target == target && r.phase != "uncertain",
+                r.target == target,
                 "A CLI handoff is already in progress; review its result before starting another"
             );
+            let id = r.id.clone();
+            self.db
+                .call(move |c| {
+                    c.execute(
+                        "UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?",
+                        [id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            self.notify.notify_one();
             return Ok(p);
         }
         let retry = p.agent == target
@@ -239,7 +403,8 @@ impl App {
         let id = p.id.clone();
         let target = target.to_owned();
         let generation = p.generation.clone();
-        self.db.call(move|c|{let tx=c.unchecked_transaction()?;tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input) VALUES(?,?,?,?,?,?,1)",params![db::id(),id,target,initial_phase,generation,db::now()])?;tx.commit()?;Ok(())}).await?;
+        let source = json!({"agent":p.agent,"native_session":p.native_session,"extra_args":p.extra_args,"generation":p.generation});
+        self.db.call(move|c|{let tx=c.unchecked_transaction()?;tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,?,?,?,1,?,?)",params![db::id(),id,target,initial_phase,generation,db::now(),source.to_string(),db::now()])?;tx.commit()?;Ok(())}).await?;
         self.notify.notify_one();
         Ok(p)
     }
@@ -255,17 +420,21 @@ impl App {
         let Some(mut r) = self.db.call(move |c| latest(c, &id)).await? else {
             return Ok(false);
         };
-        if !(active(&r)
-            || (r.phase == "startup_failed"
-                && p.execution["cli_switch_request"] == r.id
-                && p.terminal.is_some()))
-        {
-            if r.holds_input && (p.terminal.is_none() || record.is_some()) {
-                self.set_phase(p, "needs_attention", Value::Null).await;
-                return Ok(true);
-            }
+        if !active(&r) {
             return Ok(false);
         }
+        // Live execution readiness and timeout decisions require an observation.
+        // The top reconciliation pass must not fail a newly ready candidate.
+        if p.terminal.is_some() && record.is_none() {
+            return Ok(false);
+        }
+        let cfg_owned;
+        let cfg = if let Some(cfg) = cfg {
+            cfg
+        } else {
+            cfg_owned = self.config.read().await.clone();
+            &cfg_owned
+        };
         let id = p.id.clone();
         let generation = p.generation.clone();
         let takeover = self
@@ -273,78 +442,169 @@ impl App {
             .call(move |c| work::has_takeover(c, &id, &generation))
             .await?;
         if p.paused || takeover {
-            if matches!(
-                r.phase.as_str(),
-                "uncertain" | "switching" | "starting" | "startup_failed"
-            ) {
-                self.set_phase(
-                    p,
-                    if p.paused { "paused" } else { "taken_over" },
-                    Value::Null,
-                )
-                .await;
-                return Ok(true);
-            }
-            self.fail_cli_switch(&r,"CLI handoff paused by project or terminal controls. Messages remain pending; select the target CLI again after releasing these controls.").await?;
+            self.set_phase(
+                p,
+                if p.paused { "paused" } else { "taken_over" },
+                record.cloned().unwrap_or(Value::Null),
+            )
+            .await;
             return Ok(true);
         }
-        if r.phase == "startup_failed" {
-            if p.execution["mcp_registered"] == true
-                && record.is_some_and(|v| {
-                    matches!(
-                        v["status"]["state"].as_str(),
-                        Some("idle" | "done" | "working")
-                    )
-                })
-            {
-                let project = p.id.clone();
-                let generation = p.generation.clone();
-                self.db
-                    .call(move |c| ready(c, &project, &generation, &r))
-                    .await?;
-            }
-            return Ok(false);
+        if matches!(
+            r.phase.as_str(),
+            "failed"
+                | "startup_failed"
+                | "recovery_pending"
+                | "recovery_stopping"
+                | "recovery_starting"
+                | "repairing"
+        ) {
+            return self.advance_cli_recovery(p, &mut r, cfg, record).await;
         }
         if r.phase == "uncertain" {
-            // A lost stop response or restart after the claim cannot be retried.
-            // Only a verified closed original execution permits target launch.
-            let cfg = self.config.read().await.clone();
-            if p.generation == r.generation
-                && p.terminal.is_some()
-                && let Ok(observed) = herdr::observe(&cfg, p).await
-                && observed["state"] == "finished"
-            {
-                let text = artifact(p).await?;
-                if handoff::fingerprint(text.as_deref()) != r.baseline {
-                    let id = r.id.clone();
-                    self.db.call(move|c|phase(c,&id,"uncertain","The accepted handoff changed after the stop boundary. The selected CLI has not been started; review HANDOFF.md and the saved execution.")).await?;
-                    return Ok(true);
-                }
-                let id = p.id.clone();
-                let rr = r.clone();
-                self.db.call(move |c| complete(c, &id, &rr)).await?;
-                self.start_cli_target(p, &r).await?;
-                self.notify.notify_one();
+            // A retry is permitted only after a fresh identity check of the same
+            // immutable pane. No successor can start before verified closure.
+            if p.generation != r.generation || p.terminal.is_none() {
+                self.fail_cli_switch(&r, "The stop boundary needs native continuity recovery.")
+                    .await?;
                 return Ok(true);
             }
-            self.set_phase(p, "needs_attention", Value::Null).await;
+            let observed = record.expect("live execution observed");
+            if observed["state"] != "finished" {
+                if let Err(error) = herdr::check_pane_ownership(p, observed) {
+                    self.defer_cli_recovery(
+                        &r,
+                        &format!("Rechecking the original execution before recovery: {error}"),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                if db::now() < r.next_attempt_at {
+                    return Ok(true);
+                }
+                let accepted = artifact(p).await?;
+                if !stop_retry_safe(p, &r, observed, accepted.as_deref()) {
+                    self.defer_cli_recovery(&r,"Waiting for renewed source quiescence, settled children and the unchanged accepted nonce handoff before retrying native stop.").await?;
+                    return Ok(true);
+                }
+                let fresh = herdr::observe(cfg, p).await?;
+                let final_text = artifact(p).await?;
+                if fresh["state"] != "finished"
+                    && (!stop_retry_safe(p, &r, &fresh, final_text.as_deref())
+                        || fresh["children"] != observed["children"]
+                        || handoff::fingerprint(final_text.as_deref())
+                            != handoff::fingerprint(accepted.as_deref()))
+                {
+                    self.defer_cli_recovery(&r,"Source activity or the accepted handoff changed during stop retry verification; continuing recovery observations.").await?;
+                    return Ok(true);
+                }
+                match herdr::stop(cfg, p).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.defer_cli_recovery(
+                            &r,
+                            &format!("Verifying the original stop before recovery: {error}"),
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                }
+            }
+            if !matches!(herdr::observe(cfg,p).await,Ok(closed) if closed["state"] == "finished") {
+                self.defer_cli_recovery(
+                    &r,
+                    "Verifying the original execution has closed; no second Agent is started.",
+                )
+                .await?;
+                return Ok(true);
+            }
+            let text = artifact(p).await?;
+            if handoff::fingerprint(text.as_deref()) != r.baseline {
+                self.fail_cli_switch(
+                    &r,
+                    "The accepted handoff changed; resume the original Agent to repair it.",
+                )
+                .await?;
+                return Ok(true);
+            }
+            let id = p.id.clone();
+            let rr = r.clone();
+            self.db.call(move |c| complete(c, &id, &rr)).await?;
+            self.start_cli_target(p, &r).await?;
             return Ok(true);
         }
-        if r.phase == "starting" && db::now() - r.created_at > BUDGET_MS {
-            self.fail_cli_start(&r,"The selected CLI started but is not ready. Check its login or permissions in Terminal.").await?;
-            return Ok(false);
+        if r.phase == "starting" {
+            if let Some(record) = record {
+                if p.agent == r.target
+                    && herdr::check_identity(p, record).is_ok()
+                    && p.ready
+                    && p.execution["mcp_registered"] == true
+                    && matches!(
+                        record["status"]["state"].as_str(),
+                        Some("idle" | "done" | "working")
+                    )
+                {
+                    let project = p.id.clone();
+                    let generation = p.generation.clone();
+                    let rr = r.clone();
+                    self.db
+                        .call(move |c| ready(c, &project, &generation, &rr))
+                        .await?;
+                    return Ok(false);
+                }
+                if record["status"]["state"] == "blocked" {
+                    if matches!(p.agent.as_str(), "agy" | "claude")
+                        && herdr::confirm_project_trust(cfg, p).await.is_ok()
+                    {
+                        self.set_phase(p, "switching_cli", record.clone()).await;
+                        return Ok(true);
+                    }
+                    self.fail_cli_start(&r,"The selected CLI needs an explicit native login or input decision; restoring its repair conversation without guessing that decision.").await?;
+                    return Ok(true);
+                }
+                if record["status"]["state"] == "error" {
+                    self.fail_cli_start(&r,"The selected CLI reported a native startup error; restoring its repair conversation.").await?;
+                    return Ok(true);
+                }
+                if record["state"] == "finished" || p.agent != r.target {
+                    self.fail_cli_start(&r, "The selected CLI exited before native and MCP readiness; restoring its repair conversation.").await?;
+                    return Ok(true);
+                }
+                if db::now() - r.phase_started_at > BUDGET_MS {
+                    self.fail_cli_start(&r, "The selected CLI did not become ready in time; restoring its repair conversation.").await?;
+                    return Ok(true);
+                }
+                self.set_phase(p, "switching_cli", record.clone()).await;
+                return Ok(true);
+            }
+            self.start_cli_target(p, &r).await?;
+            return Ok(true);
         }
-        if r.phase != "starting" && db::now() - r.created_at > BUDGET_MS {
-            self.fail_cli_switch(&r,"The Agent did not finish a safe handoff in time. The current CLI and native conversation were kept.").await?;
-            return Ok(false);
+        if let Some(record) = record {
+            if r.recovery_generation == p.generation {
+                let mut control = r.clone();
+                control.sequence = record["state_change_seq"].as_i64().unwrap_or(r.sequence);
+                control.baseline = handoff::fingerprint(artifact(p).await?.as_deref());
+                if self.send_cli_repair_prompt(p,&control,cfg,
+                "<dauerbot_cli_repair_control>New user instructions for this switch repair. Keep ordinary held work pending. After these instructions and all children settle, rewrite HANDOFF.md with the current nonce acknowledgement; an earlier acknowledgement cannot authorize retirement.</dauerbot_cli_repair_control>",false).await? {
+                return Ok(true);
+            }
+            }
+            if r.recovery_generation == p.generation
+                && (record["status"]["state"] == "working"
+                    || record["children"]["state"] == "active")
+            {
+                self.set_phase(p, "recovering_cli", record.clone()).await;
+                return Ok(true);
+            }
+        }
+        if db::now() - r.phase_started_at > BUDGET_MS {
+            self.fail_cli_switch(&r, "The safe handoff did not finish in time; the original Agent will repair the transition.").await?;
+            return Ok(true);
         }
         if p.terminal.is_none() {
-            if r.phase != "starting" && !r.generation.is_empty() {
-                self.fail_cli_switch(&r,"The current Agent exited before its handoff was verified. Its CLI and saved native continuity were kept.").await?;
-                return Ok(false);
-            }
-            if r.phase == "starting" {
-                self.start_cli_target(p, &r).await?;
+            if !r.generation.is_empty() {
+                self.fail_cli_switch(&r, "The original execution exited before its handoff; resuming native continuity for repair.").await?;
                 return Ok(true);
             }
             if !p.native_session.is_empty() {
@@ -362,65 +622,46 @@ impl App {
                             })
                             .await?;
                     }
-                    Err(e) => {
+                    Err(error) => {
                         self.fail_cli_switch(
                             &r,
-                            &format!("Cannot resume the current CLI to prepare its handoff: {e}"),
+                            &format!("Preparing native continuity for repair: {error}"),
                         )
                         .await?
                     }
                 }
             } else {
-                // No live or resumable native state exists. The selected CLI reads
-                // existing project files, or starts fresh when HANDOFF is absent.
                 let id = p.id.clone();
                 let target = r.target.clone();
                 let request = r.id.clone();
-                self.db.call(move|c|{let tx=c.unchecked_transaction()?;ensure!(tx.execute("UPDATE projects SET agent=?,extra_args='[]',native_session='',generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![target,id])?==1,"Project woke during CLI selection");phase(&tx,&request,"starting","")?;tx.commit()?;Ok(())}).await?;
-                r.phase = "starting".into();
+                self.db.call(move |c| {
+                    let tx = c.unchecked_transaction()?;
+                    ensure!(tx.execute("UPDATE projects SET agent=?,extra_args='[]',native_session='',generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![target,id])?==1,"Project woke during CLI selection");
+                    phase(&tx,&request,"starting","")?;
+                    tx.commit()?;
+                    Ok(())
+                }).await?;
                 self.start_cli_target(p, &r).await?;
             }
             self.notify.notify_one();
             return Ok(true);
         }
-        let Some(record) = record else {
-            return Ok(false);
-        };
-        let cfg = cfg.expect("live observation requires config");
-        if r.phase == "starting" {
-            if p.agent != r.target {
-                self.fail_cli_switch(&r, "The project CLI changed during startup.")
-                    .await?;
-                return Ok(false);
-            }
-            if p.ready
-                && p.execution["mcp_registered"] == true
-                && matches!(
-                    record["status"]["state"].as_str(),
-                    Some("idle" | "done" | "working")
-                )
-            {
-                let project = p.id.clone();
-                let generation = p.generation.clone();
-                self.db
-                    .call(move |c| ready(c, &project, &generation, &r))
-                    .await?;
-                return Ok(false);
-            }
-            if db::now() - r.created_at > BUDGET_MS {
-                self.fail_cli_start(&r,"The selected CLI started but is not ready. Check its login or permissions in Terminal.").await?;
-                return Ok(false);
-            }
-            self.set_phase(p, "switching_cli", record.clone()).await;
+        let record = record.expect("live execution observed");
+        if record["state"] == "finished" {
+            self.fail_cli_switch(
+                &r,
+                "The original Agent exited during handoff; recovering its native conversation.",
+            )
+            .await?;
             return Ok(true);
         }
         if p.generation != r.generation {
             self.fail_cli_switch(
                 &r,
-                "The native execution changed during CLI handoff. Its continuity was preserved.",
+                "The original execution changed; recovering the verified native conversation.",
             )
             .await?;
-            return Ok(false);
+            return Ok(true);
         }
         if r.phase == "preparing" {
             let text = match artifact(p).await {
@@ -445,7 +686,7 @@ impl App {
             let rid = r.id.clone();
             let baseline2 = baseline.clone();
             let nonce2 = nonce.clone();
-            let saved=self.db.call(move|c|{let revision=self::revision(c,&id)?;Ok(c.execute("UPDATE cli_switch_requests SET phase='requested',nonce=?,baseline=?,sequence=?,revision=?,attempts=attempts+1 WHERE id=? AND phase='preparing' AND holds_input=1",params![nonce2,baseline2,sequence,revision,rid])?==1)}).await?;
+            let saved=self.db.call(move|c|{let revision=self::revision(c,&id)?;Ok(c.execute("UPDATE cli_switch_requests SET phase='requested',phase_started_at=?,nonce=?,baseline=?,sequence=?,revision=?,attempts=attempts+1 WHERE id=? AND phase='preparing' AND holds_input=1",params![db::now(),nonce2,baseline2,sequence,revision,rid])?==1)}).await?;
             if !saved {
                 return Ok(true);
             }
@@ -545,6 +786,20 @@ impl App {
         if let Some(g) = gate {
             g.commit()
         };
+        if !matches!(herdr::observe(cfg,p).await,Ok(closed) if closed["state"] == "finished") {
+            let id = r.id.clone();
+            self.db
+                .call(move |c| {
+                    phase(
+                        c,
+                        &id,
+                        "uncertain",
+                        "Verifying the original execution closed before selected CLI startup.",
+                    )
+                })
+                .await?;
+            return Ok(true);
+        }
         let id = p.id.clone();
         let rr = r.clone();
         self.db.call(move |c| complete(c, &id, &rr)).await?;
@@ -552,17 +807,464 @@ impl App {
         self.notify.notify_one();
         Ok(true)
     }
+    /// Fault supervision is independent of ordinary message delivery and remains
+    /// available even when no user task happens to be queued.
+    pub(crate) async fn journal_cli_fault(&self, project: &str, diagnostic: &str) -> Result<()> {
+        let project = project.to_owned();
+        let diagnostic: String = diagnostic.chars().take(4000).collect();
+        self.db
+            .call(move |c| {
+                let r = ensure_repair_request(c, &project)?;
+                record_failure(c, &r.id, &diagnostic)
+            })
+            .await?;
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// Nudge the same durable transition. This neither abandons the selected
+    /// target nor releases ordinary input or repeats an uncertain prompt.
+    pub async fn request_cli_repair(&self, key: &str) -> Result<Project> {
+        let p = self.db.project(key).await?;
+        let lock = self.project_lock(&p.id).await;
+        let _guard = lock.lock().await;
+        let id = p.id.clone();
+        self.db
+            .call(move |c| {
+                let r = ensure_repair_request(c, &id)?;
+                c.execute(
+                    "UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?",
+                    [&r.id],
+                )?;
+                if matches!(
+                    r.phase.as_str(),
+                    "failed" | "startup_failed" | "preparing" | "starting"
+                ) || (r.phase == "requested" && r.recovery_generation.is_empty())
+                {
+                    phase(c, &r.id, "recovery_pending", &r.error)?;
+                }
+                Ok(())
+            })
+            .await?;
+        self.notify.notify_one();
+        self.db.project(&p.id).await
+    }
+
+    /// Used while constructing an execution, before its launch permit opens.
+    pub(crate) async fn cli_recovery_launch_id(&self, p: &Project) -> Result<Option<String>> {
+        let id = p.id.clone();
+        let r = self.db.call(move |c| latest(c, &id)).await?;
+        Ok(r.filter(|r| {
+            r.holds_input && r.phase == "recovery_starting" && r.source["agent"] == p.agent
+        })
+        .map(|r| r.id))
+    }
+
+    async fn defer_cli_recovery(&self, r: &Request, error: &str) -> Result<()> {
+        let id = r.id.clone();
+        let error: String = error.chars().take(4000).collect();
+        let delay = 1000 * (1_i64 << r.recovery_attempts.clamp(0, 5));
+        self.db.call(move |c| {
+            c.execute("UPDATE cli_switch_requests SET error=?,next_attempt_at=?,recovery_attempts=recovery_attempts+1 WHERE id=? AND holds_input=1", params![error,db::now()+delay,id])?;
+            Ok(())
+        }).await
+    }
+
+    /// Recover old stores without inventing an original native conversation.
+    /// New requests always snapshot arguments before the first cutover.
+    async fn ensure_cli_source(&self, p: &Project, r: &mut Request) -> Result<()> {
+        if r.source["agent"].as_str().is_some_and(|a| !a.is_empty()) {
+            return Ok(());
+        }
+        let id = p.id.clone();
+        let generation = r.generation.clone();
+        let current = p.clone();
+        let rid = r.id.clone();
+        let last_failure = r.source["last_failure"].clone();
+        r.source = self.db.call(move |c| {
+            let historical: Option<(String,String)> = c.query_row(
+                "SELECT agent,native_session FROM work_executions WHERE project_id=? AND generation=?",
+                params![id,generation], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+            let mut source = match historical {
+                Some((agent,native)) if current.generation != generation =>
+                    json!({"agent":agent,"native_session":native,"extra_args":[],"generation":generation,"historical_arguments_unavailable":true}),
+                _ => json!({"agent":current.agent,"native_session":current.native_session,"extra_args":current.extra_args,"generation":generation}),
+            };
+            if !last_failure.is_null() { source["last_failure"] = last_failure; }
+            c.execute("UPDATE cli_switch_requests SET source=? WHERE id=?",params![source.to_string(),rid])?;
+            Ok(source)
+        }).await?;
+        Ok(())
+    }
+
+    async fn advance_cli_recovery(
+        &self,
+        p: &Project,
+        r: &mut Request,
+        cfg: &Config,
+        record: Option<&Value>,
+    ) -> Result<bool> {
+        self.set_phase(p, "recovering_cli", record.cloned().unwrap_or(Value::Null))
+            .await;
+        // Readiness wins over an elapsed deadline, including after a service
+        // restart or when the previous observation reported a startup failure.
+        if p.agent == r.target
+            && p.execution["cli_switch_request"] == r.id
+            && p.ready
+            && p.execution["mcp_registered"] == true
+            && record.is_some_and(|v| {
+                herdr::check_identity(p, v).is_ok()
+                    && matches!(
+                        v["status"]["state"].as_str(),
+                        Some("idle" | "done" | "working")
+                    )
+            })
+            && r.phase != "recovery_stopping"
+        {
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            let rr = r.clone();
+            self.db
+                .call(move |c| ready(c, &id, &generation, &rr))
+                .await?;
+            return Ok(false);
+        }
+        if db::now() < r.next_attempt_at {
+            return Ok(true);
+        }
+        self.ensure_cli_source(p, r).await?;
+        let source_agent = r.source["agent"].as_str().unwrap_or("").to_owned();
+        let candidate = p.execution["cli_switch_request"] == r.id
+            && p.execution["cli_recovery_request"] != r.id;
+        // Hooks may discover native continuity after switch acceptance. Capture
+        // only the source's identity, never a failed target's different session.
+        if !candidate
+            && p.agent == source_agent
+            && !p.native_session.is_empty()
+            && r.source["native_session"] != p.native_session
+        {
+            r.source["native_session"] = json!(p.native_session);
+            let rid = r.id.clone();
+            let source = r.source.to_string();
+            self.db
+                .call(move |c| {
+                    c.execute(
+                        "UPDATE cli_switch_requests SET source=? WHERE id=?",
+                        params![source, rid],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        }
+        if p.terminal.is_some()
+            && (candidate || p.agent != source_agent || r.phase == "recovery_stopping")
+        {
+            let record = record.expect("live recovery has an observation");
+            // A target has not received held user work, but may have an initial
+            // tool in flight. Preserve its execution until that work settles.
+            if record["state"] != "finished"
+                && (record["status"]["state"] == "working"
+                    || record["children"]["state"] == "active")
+            {
+                self.defer_cli_recovery(r,"Waiting for the selected CLI's in-flight startup work before restoring the repair Agent.").await?;
+                return Ok(true);
+            }
+            if record["state"] != "finished"
+                && let Err(error) = herdr::check_pane_ownership(p, record)
+            {
+                self.defer_cli_recovery(
+                    r,
+                    &format!("Rechecking the selected execution identity before repair: {error}"),
+                )
+                .await?;
+                return Ok(true);
+            }
+            let id = r.id.clone();
+            self.db.call(move |c| phase(c,&id,"recovery_stopping","Verifying selected CLI closure before restoring the original conversation.")).await?;
+            if let Err(error) = herdr::stop(cfg, p).await {
+                self.defer_cli_recovery(r,&format!("Reobserving selected CLI closure before restoring the original conversation: {error}")).await?;
+                return Ok(true);
+            }
+            match herdr::observe(cfg, p).await {
+                Ok(closed) if closed["state"] == "finished" => {}
+                _ => {
+                    self.defer_cli_recovery(r,"Verifying the selected execution has actually closed before recovery startup.").await?;
+                    return Ok(true);
+                }
+            }
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            let rid = r.id.clone();
+            self.db.call(move |c| {
+                let tx = c.unchecked_transaction()?;
+                work::finish_execution(&tx,&id,&generation,"stopped","Selected CLI stopped for automatic switch repair",db::now())?;
+                ensure!(tx.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=?",params![id,generation])?==1,"Execution changed during recovery stop");
+                phase(&tx,&rid,"recovery_pending","The selected CLI is closed; restoring the original native conversation.")?;
+                tx.commit()?; Ok(())
+            }).await?;
+            self.notify.notify_one();
+            return Ok(true);
+        }
+        if p.terminal.is_none() {
+            let id = p.id.clone();
+            let rid = r.id.clone();
+            let source = r.source.clone();
+            self.db.call(move |c| {
+                let tx = c.unchecked_transaction()?;
+                ensure!(tx.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![source["agent"].as_str().unwrap_or(""),source["native_session"].as_str().unwrap_or(""),source["extra_args"].to_string(),id])?==1,"Project woke during recovery");
+                // Retain the phase clock across failed launch retries.
+                phase(&tx,&rid,"recovery_starting","Starting the original CLI as the repair Agent.")?;
+                tx.commit()?; Ok(())
+            }).await?;
+            let resume = r.source["native_session"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty());
+            match self.start_inner(&p.id, resume).await {
+                Ok(source) => {
+                    let rid = r.id.clone();
+                    let generation = source.generation;
+                    self.db
+                        .call(move |c| {
+                            c.execute(
+                                "UPDATE cli_switch_requests SET recovery_generation=? WHERE id=?",
+                                params![generation, rid],
+                            )?;
+                            Ok(())
+                        })
+                        .await?;
+                }
+                Err(error) => {
+                    self.defer_cli_recovery(
+                        r,
+                        &format!("Retrying original native conversation startup: {error}"),
+                    )
+                    .await?
+                }
+            }
+            return Ok(true);
+        }
+        let record = record.expect("source recovery observed");
+        if record["state"] == "finished" {
+            if let Err(error) = herdr::stop(cfg, p).await {
+                self.defer_cli_recovery(
+                    r,
+                    &format!("Removing the exited repair execution: {error}"),
+                )
+                .await?;
+                return Ok(true);
+            }
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            self.db
+                .call(move |c| {
+                    work::finish_execution(
+                        c,
+                        &id,
+                        &generation,
+                        "exited",
+                        "Repair Agent exited; native continuity retained for retry",
+                        db::now(),
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            self.db
+                .set_session(&p.id, None, None, String::new())
+                .await?;
+            self.defer_cli_recovery(
+                r,
+                "Restarting the repair Agent with its preserved native conversation.",
+            )
+            .await?;
+            return Ok(true);
+        }
+        if let Err(error) = herdr::check_identity(p, record) {
+            if error.is::<herdr::SessionStarting>() && db::now() - r.phase_started_at < BUDGET_MS {
+                self.defer_cli_recovery(
+                    r,
+                    "Waiting for the original native repair execution to finish starting.",
+                )
+                .await?;
+                return Ok(true);
+            }
+            if herdr::check_pane_ownership(p, record).is_ok()
+                && record["children"]["state"] != "active"
+                && record["status"]["state"] != "working"
+            {
+                let id = r.id.clone();
+                self.db.call(move|c|phase(c,&id,"recovery_stopping","Replacing the owned execution whose native Agent identity no longer matches.")).await?;
+            }
+            self.defer_cli_recovery(
+                r,
+                &format!("Reobserving the original native execution before repair: {error}"),
+            )
+            .await?;
+            return Ok(true);
+        }
+        if record["status"]["state"] == "error" && r.source["error_restart_done"] != true {
+            if record["children"]["state"] == "active" {
+                self.defer_cli_recovery(
+                    r,
+                    "Waiting for native children before restarting the errored repair Agent.",
+                )
+                .await?;
+                return Ok(true);
+            }
+            if herdr::check_pane_ownership(p, record).is_ok() {
+                let rid = r.id.clone();
+                self.db.call(move|c|{
+                    c.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.error_restart_done',json('true')) WHERE id=?",[&rid])?;
+                    phase(c,&rid,"recovery_stopping","Restarting the owned errored repair execution once before native diagnostic input.")
+                }).await?;
+                self.notify.notify_one();
+                return Ok(true);
+            }
+        }
+        if record["status"]["state"] == "blocked" {
+            let _ = herdr::confirm_project_trust(cfg, p).await;
+            self.defer_cli_recovery(r,"Rechecking native readiness while preserving the repair conversation and queued input.").await?;
+            return Ok(true);
+        }
+        let native_diagnostic_ready = matches!(
+            record["status"]["state"].as_str(),
+            Some("idle" | "done" | "working")
+        ) || (record["status"]["state"] == "error"
+            && record["interactive_ready"] == true
+            && r.source["error_restart_done"] == true);
+        if record["state_change_seq"].as_i64().is_none() || !native_diagnostic_ready {
+            self.defer_cli_recovery(
+                r,
+                "Waiting for a verified native repair channel; ordinary delivery stays held.",
+            )
+            .await?;
+            return Ok(true);
+        }
+        let rid = r.id.clone();
+        let generation = p.generation.clone();
+        let uncertain = self.db.call(move |c| {
+            c.query_row("SELECT EXISTS(SELECT 1 FROM cli_repair_prompts WHERE request_id=? AND generation=? AND status IN ('submitting','uncertain'))",params![rid,generation],|row|row.get::<_,bool>(0)).map_err(Into::into)
+        }).await?;
+        if uncertain && r.recovery_generation == p.generation && !r.nonce.is_empty() {
+            let rid = r.id.clone();
+            self.db.call(move|c|phase(c,&rid,"requested","Reobserving the previous repair submission; its uncertain prompt is not repeated.")).await?;
+            return Ok(true);
+        }
+        let text = artifact(p).await.unwrap_or(None);
+        let mut rr = r.clone();
+        rr.generation = p.generation.clone();
+        rr.recovery_generation = p.generation.clone();
+        rr.nonce = db::id();
+        rr.baseline = handoff::fingerprint(text.as_deref());
+        rr.sequence = record["state_change_seq"].as_i64().unwrap_or(0);
+        let id = rr.id.clone();
+        let generation = p.generation.clone();
+        let nonce = rr.nonce.clone();
+        let baseline = rr.baseline.clone();
+        let sequence = rr.sequence;
+        self.db.call(move|c|{
+            c.execute("UPDATE cli_switch_requests SET phase='requested',phase_started_at=?,next_attempt_at=0,generation=?,recovery_generation=?,nonce=?,baseline=?,sequence=?,attempts=attempts+1 WHERE id=? AND holds_input=1",params![db::now(),generation,generation,nonce,baseline,sequence,id])?;
+            c.execute("UPDATE projects SET execution=json_set(execution,'$.cli_recovery_request',?) WHERE id=(SELECT project_id FROM cli_switch_requests WHERE id=?) AND generation=?",params![id,id,generation])?;
+            Ok(())
+        }).await?;
+        let diagnostic = format!(
+            "<dauerbot_cli_repair request_id=\"{}\">The requested switch to {} failed. You are the original CLI's recovery owner, not the selected successor. Diagnose and fix the safe handoff or target startup cause using the existing local CLI, project and runtime. The daemon may submit this diagnostic through verified native input before MCP is registered; fix MCP connectivity when needed. Native input alone does not mean MCP readiness or successful user replies. Preserve native login/model settings, queued user input, files and already completed effects. Do not change the daemon database, unlock delivery, close your own terminal, start a second project Agent, or replay held tasks. Investigate actively and finish the repair; reporting a stuck state alone is not completion. Latest diagnostic: {}\nAfter repair, {}\n</dauerbot_cli_repair>",
+            rr.id,
+            rr.target,
+            crate::xml(&format!(
+                "{}\nRetained switch failure: {}",
+                rr.error,
+                rr.source["last_failure"]
+                    .as_str()
+                    .unwrap_or("No additional failure recorded.")
+            )),
+            prompt(&rr)
+        );
+        self.send_cli_repair_prompt(p, &rr, cfg, &diagnostic, true)
+            .await?;
+        Ok(true)
+    }
+
+    async fn send_cli_repair_prompt(
+        &self,
+        p: &Project,
+        r: &Request,
+        cfg: &Config,
+        body: &str,
+        initial: bool,
+    ) -> Result<bool> {
+        let rid = r.id.clone();
+        let generation = p.generation.clone();
+        let body = body.to_owned();
+        let sequence = r.sequence;
+        let baseline = r.baseline.clone();
+        let journal = self.db.call(move|c| {
+            let tx=c.unchecked_transaction()?;
+            let controls:Vec<(String,String)>=tx.prepare("SELECT instruction_id,payload FROM cli_repair_instructions WHERE request_id=? AND prompt_id='' ORDER BY rowid")?
+                .query_map([&rid],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            if !initial && controls.is_empty() { return Ok(None); }
+            if !initial {
+                tx.execute("UPDATE cli_switch_requests SET baseline=?,sequence=?,phase_started_at=? WHERE id=? AND holds_input=1",params![baseline,sequence,db::now(),rid])?;
+            }
+            let id=db::id();
+            let controls_payload:Vec<Value>=controls.iter().map(|(_,raw)|serde_json::from_str(raw).unwrap_or(Value::Null)).collect();
+            let payload=format!("{body}\n<repair_user_instructions trust=\"user_input\">{}\n</repair_user_instructions>",crate::xml(&serde_json::to_string(&controls_payload)?));
+            tx.execute("INSERT INTO cli_repair_prompts(id,request_id,generation,payload,status,sequence,created_at) VALUES(?,?,?,?,'submitting',?,?)",params![id,rid,generation,payload,sequence,db::now()])?;
+            for (instruction,_) in controls { tx.execute("UPDATE cli_repair_instructions SET prompt_id=? WHERE request_id=? AND instruction_id=? AND prompt_id=''",params![id,rid,instruction])?; }
+            tx.commit()?;
+            Ok(Some((id,payload)))
+        }).await?;
+        let Some((id, payload)) = journal else {
+            return Ok(false);
+        };
+        let result = herdr::send(cfg, p, &payload).await;
+        let (status, error) = match result {
+            Ok(_) => ("submitted", String::new()),
+            Err(error) if herdr::definitely_not_sent(&error) => ("not_sent", error.to_string()),
+            Err(error) => ("uncertain", error.to_string()),
+        };
+        let retry = status == "not_sent";
+        self.db
+            .call(move |c| {
+                c.execute(
+                    "UPDATE cli_repair_prompts SET status=?,error=? WHERE id=?",
+                    params![status, error, id],
+                )?;
+                // A proven preflight failure permits a new submission. Uncertain
+                // submissions retain their prompt association forever.
+                if status == "not_sent" {
+                    c.execute(
+                        "UPDATE cli_repair_instructions SET prompt_id='' WHERE prompt_id=?",
+                        [&id],
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+        if retry {
+            self.fail_cli_switch(
+                r,
+                "The repair prompt was definitely not submitted; retrying after native readiness.",
+            )
+            .await?;
+            self.defer_cli_recovery(
+                r,
+                "The repair prompt was definitely not submitted; retrying after native readiness.",
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
     async fn fail_cli_start(&self, r: &Request, error: &str) -> Result<()> {
         let id = r.id.clone();
         let error = error.to_owned();
-        self.db
-            .call(move |c| phase(c, &id, "startup_failed", &error))
-            .await
+        self.db.call(move |c| record_failure(c, &id, &error)).await
     }
     async fn fail_cli_switch(&self, r: &Request, error: &str) -> Result<()> {
         let id = r.id.clone();
         let error = error.to_owned();
-        self.db.call(move |c| phase(c, &id, "failed", &error)).await
+        self.db.call(move |c| record_failure(c, &id, &error)).await
     }
     async fn start_cli_target(&self, p: &Project, r: &Request) -> Result<()> {
         let current = self.db.project(&p.id).await?;
@@ -575,7 +1277,9 @@ impl App {
         if current.paused || takeover {
             return Ok(());
         }
-        if let Err(e) = self.start_inner(&p.id, false).await {
+        let resume = r.source["runtime_target"]["agent"] == current.agent
+            && !current.native_session.is_empty();
+        if let Err(e) = self.start_inner(&p.id, resume).await {
             self.fail_cli_start(r,&format!("The CLI selection was saved, but startup failed: {e}. Workspace files and saved input are preserved.")).await?;
             self.attention(p, "startup", &e.to_string()).await?;
         }
@@ -624,7 +1328,7 @@ mod tests {
                 c.execute_batch("ALTER TABLE cli_switch_requests DROP COLUMN holds_input")?;
                 phase(c, &r.id, "requested", "")?;
                 migrate(c, true)?;
-                assert_eq!(latest(c, &p.id)?.unwrap().phase, "failed");
+                assert_eq!(latest(c, &p.id)?.unwrap().phase, "recovery_pending");
                 assert!(
                     holds_input(c, &p.id)?,
                     "an interrupted outstanding request remains held after restart"
@@ -652,7 +1356,7 @@ mod tests {
         app.db.pause(&p.id, true).await.unwrap();
         assert!(app.request_cli_switch(&p.id, "pi").await.is_err());
         assert!(
-            app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
+            !app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
                 .await
                 .unwrap()
         );
@@ -661,7 +1365,7 @@ mod tests {
             app.db
                 .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
                 .unwrap(),
-            "failed"
+            "preparing"
         );
     }
     fn queue(c: &Connection, p: &Project, id: &str, now: i64) -> Result<()> {
@@ -766,13 +1470,13 @@ mod tests {
             .await
             .unwrap();
         let exited = app.db.project(&p.id).await.unwrap();
-        assert!(!app.advance_cli_switch(&exited, None, None).await.unwrap());
+        assert!(app.advance_cli_switch(&exited, None, None).await.unwrap());
         assert_eq!(app.db.project(&p.id).await.unwrap().agent, "codex");
         assert_eq!(
             app.db
                 .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
                 .unwrap(),
-            "failed"
+            "recovery_pending"
         );
     }
     #[tokio::test]
@@ -791,37 +1495,14 @@ mod tests {
             app.cli_switch_holds_input(&p).await.unwrap(),
             "old generation must not receive pending input"
         );
-        app.db.sync(|c|{c.execute("UPDATE projects SET agent='pi',generation='new-gen',execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?) WHERE id=?",params![id,p.id])?;c.execute("UPDATE cli_switch_requests SET phase='starting',created_at=0 WHERE id=?",[&id])?;Ok(())}).unwrap();
+        app.db.sync(|c|{c.execute("UPDATE projects SET agent='pi',generation='new-gen',execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?) WHERE id=?",params![id,p.id])?;c.execute("UPDATE cli_switch_requests SET phase='starting',phase_started_at=0 WHERE id=?",[&id])?;Ok(())}).unwrap();
         let waiting = app.db.project(&p.id).await.unwrap();
         assert!(app.cli_switch_holds_input(&waiting).await.unwrap());
-        assert!(!app.advance_cli_switch(&waiting, None, None).await.unwrap());
-        assert_eq!(
-            app.db
-                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
-                .unwrap(),
-            "startup_failed"
-        );
-        app.db.pause(&p.id, true).await.unwrap();
         assert!(
-            app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            app.db
-                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
-                .unwrap(),
-            "startup_failed"
-        );
-        app.db.pause(&p.id, false).await.unwrap();
-        app.db.sync(|c|{c.execute("UPDATE projects SET execution=json_set(execution,'$.mcp_registered',json('true')) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
-        let connected = app.db.project(&p.id).await.unwrap();
-        assert!(app.cli_switch_holds_input(&connected).await.unwrap());
-        assert!(
-            !app.advance_cli_switch(
-                &connected,
+            app.advance_cli_switch(
+                &waiting,
                 None,
-                Some(&serde_json::json!({"status":{"state":"idle"}}))
+                Some(&json!({"state":"live","status":{"state":"idle"}}))
             )
             .await
             .unwrap()
@@ -830,9 +1511,44 @@ mod tests {
             app.db
                 .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
                 .unwrap(),
+            "recovery_pending"
+        );
+        app.db.pause(&p.id, true).await.unwrap();
+        assert!(
+            !app.advance_cli_switch(&app.db.project(&p.id).await.unwrap(), None, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
+                .unwrap(),
+            "recovery_pending"
+        );
+        app.db.pause(&p.id, false).await.unwrap();
+        app.db.sync(|c|{c.execute("UPDATE projects SET execution=json_set(execution,'$.mcp_registered',json('true')) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
+        app.db.sync(|c|{
+            c.execute("UPDATE projects SET execution=json_set(execution,'$.backend','legacy','$.workspace_id','workspace','$.pane_id','old-pane','$.terminal_id','old-pane','$.managed_name','managed','$.generation','new-gen','$.shell_pid',NULL,'$.launch_permit','/private/fixture/launch') WHERE id=?",[&p.id])?;
+            Ok(())
+        }).unwrap();
+        let connected = app.db.project(&p.id).await.unwrap();
+        let observed = json!({"state":"live","status":{"state":"idle"},"foreground":{"name":"pi"},"execution":connected.execution,
+            "agent":{"agent":"pi","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
+            "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"new-gen","hfb_execution":"managed"}});
+        assert!(herdr::check_identity(&connected, &observed).is_ok());
+        assert!(app.cli_switch_holds_input(&connected).await.unwrap());
+        assert!(
+            !app.advance_cli_switch(&connected, None, Some(&observed))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
+                .unwrap(),
             "ready"
         );
-        app.db.sync(|c|{phase(c,&id,"startup_failed","old attempt")?;c.execute("UPDATE projects SET generation='unrelated',execution=json_object('api_protocol',7,'mcp_contract',1) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
+        app.db.sync(|c|{phase(c,&id,"recovery_pending","old attempt")?;c.execute("UPDATE projects SET generation='unrelated',execution=json_object('api_protocol',7,'mcp_contract',1) WHERE id=?",[&p.id])?;Ok(())}).unwrap();
         assert!(
             !app.cli_switch_holds_input(&app.db.project(&p.id).await.unwrap())
                 .await
@@ -854,7 +1570,7 @@ mod tests {
             .unwrap();
         app.db.pause(&p.id, true).await.unwrap();
         let paused = app.db.project(&p.id).await.unwrap();
-        assert!(app.advance_cli_switch(&paused, None, None).await.unwrap());
+        assert!(!app.advance_cli_switch(&paused, None, None).await.unwrap());
         assert_eq!(
             app.db
                 .sync(|c| Ok(latest(c, &p.id)?.unwrap().phase))
@@ -889,5 +1605,278 @@ mod tests {
         assert_eq!(preserved.agent, "codex");
         assert_eq!(preserved.native_session, "old-native");
         assert_eq!(preserved.terminal, p.terminal);
+    }
+    #[tokio::test]
+    async fn source_snapshot_survives_cutover_and_target_gets_its_own_startup_clock() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db
+            .sync(|c| {
+                let r = requested(c, &p)?;
+                assert_eq!(r.source["agent"], "codex");
+                assert_eq!(r.source["native_session"], "old-native");
+                assert_eq!(r.source["extra_args"], json!(["--model", "preserve"]));
+                c.execute(
+                    "UPDATE cli_switch_requests SET phase_started_at=1 WHERE id=?",
+                    [&r.id],
+                )?;
+                assert!(claim(c, &p.id, &r, "accepted")?);
+                complete(c, &p.id, &r)?;
+                let switched = latest(c, &p.id)?.unwrap();
+                assert!(switched.phase_started_at > 1);
+                assert_eq!(switched.source, r.source);
+                assert!(switched.holds_input);
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn historical_failed_switch_recovers_original_native_identity_from_execution_journal() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db.sync(|c|{
+            c.execute("UPDATE cli_switch_requests SET source='{}',phase='failed' WHERE project_id=?",[&p.id])?;
+            c.execute("UPDATE projects SET agent='agy',generation='candidate',native_session='' WHERE id=?",[&p.id])?;
+            Ok(())
+        }).unwrap();
+        let current = app.db.project(&p.id).await.unwrap();
+        let mut r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        app.ensure_cli_source(&current, &mut r).await.unwrap();
+        assert_eq!(r.source["agent"], "codex");
+        assert_eq!(r.source["native_session"], "old-native");
+        assert_eq!(r.source["historical_arguments_unavailable"], true);
+        assert_eq!(r.source["extra_args"], json!([]));
+    }
+    #[tokio::test]
+    async fn repair_controls_are_deduplicated_without_unlocking_ordinary_input() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db
+            .sync(|c| {
+                let payload = json!({"content":"repair startup","message_id":"om_control"});
+                journal_repair_instruction(c, &p.id, "om_control", &payload)?;
+                journal_repair_instruction(c, &p.id, "om_control", &payload)?;
+                assert!(
+                    journal_repair_instruction(
+                        c,
+                        &p.id,
+                        "om_control",
+                        &json!({"content":"different"})
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    c.query_row("SELECT count(*) FROM cli_repair_instructions", [], |r| r
+                        .get::<_, i64>(0))?,
+                    1
+                );
+                queue(c, &p, "ordinary", 1)?;
+                assert!(work::claim_steering(c, &p.id, &p.generation, 2)?.is_none());
+                assert!(holds_input(c, &p.id)?);
+                Ok(())
+            })
+            .unwrap();
+        app.request_cli_repair(&p.id).await.unwrap();
+        assert!(app.db.sync(|c| holds_input(c, &p.id)).unwrap());
+    }
+    #[tokio::test]
+    async fn restart_preserves_uncertain_repair_payload_and_its_control_association() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db.sync(|c|{
+            let r=latest(c,&p.id)?.unwrap();
+            journal_repair_instruction(c,&p.id,"control",&json!({"content":"fix"}))?;
+            c.execute("INSERT INTO cli_repair_prompts(id,request_id,generation,payload,status,sequence,created_at) VALUES('prompt',?,'old-gen','exact payload','submitting',12,1)",[&r.id])?;
+            c.execute("UPDATE cli_repair_instructions SET prompt_id='prompt' WHERE request_id=?",[&r.id])?;
+            migrate(c,true)?;
+            let saved:(String,String)=c.query_row("SELECT payload,status FROM cli_repair_prompts WHERE id='prompt'",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(saved,("exact payload".into(),"uncertain".into()));
+            assert_eq!(c.query_row("SELECT prompt_id FROM cli_repair_instructions WHERE request_id=?",[&r.id],|row|row.get::<_,String>(0))?,"prompt");
+            assert!(holds_input(c,&p.id)?);
+            Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn post_ready_repair_reuses_original_source_and_creates_a_new_delivery_fence() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db.sync(|c|{
+            let r=requested(c,&p)?;
+            assert!(claim(c,&p.id,&r,"accepted")?);
+            complete(c,&p.id,&r)?;
+            c.execute("UPDATE projects SET generation='agy-gen',terminal='agy-pane',ready=1,native_session='agy-live-native',extra_args=?,execution=json_object('cli_switch_request',?,'mcp_registered',json('true')) WHERE id=?",params![json!(["--model","agy-current-model"]).to_string(),r.id,p.id])?;
+            assert!(ready(c,&p.id,"agy-gen",&r)?);
+            assert!(!holds_input(c,&p.id)?);
+            journal_repair_instruction(c,&p.id,"om_after_ready",&json!({"content":"repair runtime"}))?;
+            let repair=latest(c,&p.id)?.unwrap();
+            assert_ne!(repair.id,r.id);
+            assert_eq!(repair.target,"agy");
+            assert_eq!(repair.source["agent"],"codex");
+            assert_eq!(repair.source["native_session"],"old-native");
+            assert_eq!(repair.source["extra_args"],json!(["--model","preserve"]));
+            assert!(repair.holds_input);
+            assert_eq!(repair.phase,"recovery_pending");
+            assert_eq!(repair.source["runtime_target"]["native_session"],"agy-live-native");
+            assert_eq!(repair.source["runtime_target"]["extra_args"],json!(["--model","agy-current-model"]));
+            Ok(())
+        }).unwrap();
+        let before = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap().id)).unwrap();
+        app.request_cli_repair(&p.id).await.unwrap();
+        assert_eq!(
+            before,
+            app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap().id)).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn runtime_fault_without_any_queued_message_journals_supervised_native_repair() {
+        let (_dir, app, p) = fixture().await;
+        app.journal_cli_fault(&p.id, "post-ready native error")
+            .await
+            .unwrap();
+        app.db
+            .sync(|c| {
+                let r = latest(c, &p.id)?.unwrap();
+                assert_eq!(r.phase, "recovery_pending");
+                assert_eq!(r.target, "codex");
+                assert_eq!(r.source["native_session"], "old-native");
+                assert_eq!(r.source["last_failure"], "post-ready native error");
+                assert!(r.holds_input);
+                assert_eq!(
+                    c.query_row("SELECT count(*) FROM messages", [], |row| row
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn errored_owned_source_schedules_one_supervised_restart_without_killing_children() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c|{
+            c.execute("UPDATE projects SET execution=json_object('api_protocol',7,'mcp_contract',1,'backend','legacy','workspace_id','workspace','pane_id','old-pane','terminal_id','old-pane','managed_name','managed','generation','old-gen','shell_pid',NULL,'launch_permit','/private/fixture/launch') WHERE id=?",[&p.id])?;
+            Ok(())
+        }).unwrap();
+        let p = app.db.project(&p.id).await.unwrap();
+        app.journal_cli_fault(&p.id, "native error").await.unwrap();
+        let mut record = json!({"state":"live","status":{"state":"error"},"foreground":{"name":"codex"},"interactive_ready":true,"state_change_seq":22,
+            "execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace",
+            "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
+            "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"active"}});
+        assert!(herdr::check_identity(&p, &record).is_ok());
+        assert!(
+            app.advance_cli_switch(&p, None, Some(&record))
+                .await
+                .unwrap()
+        );
+        let r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_ne!(r.source["error_restart_done"], true);
+        assert_eq!(app.db.project(&p.id).await.unwrap().terminal, p.terminal);
+        app.request_cli_repair(&p.id).await.unwrap();
+        record["children"]["state"] = json!("quiescent");
+        assert!(
+            app.advance_cli_switch(&p, None, Some(&record))
+                .await
+                .unwrap()
+        );
+        let r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(r.phase, "recovery_stopping");
+        assert_eq!(r.source["error_restart_done"], true);
+        assert_eq!(
+            app.db.project(&p.id).await.unwrap().terminal,
+            p.terminal,
+            "restart intent is durable before any native close"
+        );
+        assert!(r.holds_input);
+    }
+    #[tokio::test]
+    async fn uncertain_stop_rechecks_activity_children_and_accepted_handoff_before_any_native_effect()
+     {
+        let (dir, app, p) = fixture().await;
+        app.db.sync(|c|{
+            c.execute("UPDATE projects SET execution=json_object('api_protocol',7,'mcp_contract',1,'backend','legacy','workspace_id','workspace','pane_id','old-pane','terminal_id','old-pane','managed_name','managed','generation','old-gen','shell_pid',NULL,'launch_permit','/private/fixture/launch') WHERE id=?",[&p.id])?;
+            Ok(())
+        }).unwrap();
+        let p = app.db.project(&p.id).await.unwrap();
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        let text = format!(
+            "# Settled source handoff\n{}\n<!-- dauerbot-switch-ready:fresh -->",
+            "Current context; all native children and external effects settled. ".repeat(3)
+        );
+        std::fs::write(dir.path().join("HANDOFF.md"), &text).unwrap();
+        let r = app
+            .db
+            .sync(|c| {
+                let r = requested(c, &p)?;
+                assert!(claim(c, &p.id, &r, &handoff::fingerprint(Some(&text)))?);
+                phase(c, &r.id, "uncertain", "Lost native stop response")?;
+                Ok(latest(c, &p.id)?.unwrap())
+            })
+            .unwrap();
+        let good = json!({"state":"live","status":{"state":"idle"},"foreground":{"name":"codex"},"state_change_seq":22,
+            "execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace",
+            "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
+            "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},
+            "children":{"state":"quiescent","revision":"settled"},"processes":[{"name":"codex","argv":["codex"]}]});
+        assert!(stop_retry_safe(&p, &r, &good, Some(&text)));
+        let mut bad_foreground = good.clone();
+        bad_foreground["status"]["state"] = json!("working");
+        let mut child = good.clone();
+        child["children"]["state"] = json!("active");
+        let mut tool = good.clone();
+        tool["processes"] = json!([{"name":"python3","argv":["python3","ongoing.py"]}]);
+        for observed in [&bad_foreground, &child, &tool] {
+            app.request_cli_repair(&p.id).await.unwrap();
+            assert!(
+                app.advance_cli_switch(&p, None, Some(observed))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(app.db.project(&p.id).await.unwrap().terminal, p.terminal);
+            let held = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+            assert_eq!(held.phase, "uncertain");
+            assert!(held.error.contains("renewed source quiescence"));
+            assert!(held.holds_input);
+        }
+        for changed in [
+            text.replace("fresh", "missing"),
+            format!("{text}\nUnexpected handoff update"),
+        ] {
+            std::fs::write(dir.path().join("HANDOFF.md"), &changed).unwrap();
+            app.request_cli_repair(&p.id).await.unwrap();
+            assert!(app.advance_cli_switch(&p, None, Some(&good)).await.unwrap());
+            let held = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+            assert_eq!(held.phase, "uncertain");
+            assert!(held.error.contains("renewed source quiescence"));
+            assert_eq!(app.db.project(&p.id).await.unwrap().terminal, p.terminal);
+        }
+    }
+    #[tokio::test]
+    async fn runtime_repair_resumes_target_native_and_arguments_instead_of_erasing_its_conversation()
+     {
+        let (_dir, app, p) = fixture().await;
+        app.journal_cli_fault(&p.id, "Recover same CLI")
+            .await
+            .unwrap();
+        app.db
+            .sync(|c| {
+                let r = requested(c, &p)?;
+                assert_eq!(r.source["runtime_target"]["native_session"], "old-native");
+                assert!(claim(c, &p.id, &r, "accepted")?);
+                complete(c, &p.id, &r)?;
+                let saved: (String, String) = c.query_row(
+                    "SELECT native_session,extra_args FROM projects WHERE id=?",
+                    [&p.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(saved.0, "old-native");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&saved.1)?,
+                    json!(["--model", "preserve"])
+                );
+                assert!(holds_input(c, &p.id)?);
+                Ok(())
+            })
+            .unwrap();
     }
 }
