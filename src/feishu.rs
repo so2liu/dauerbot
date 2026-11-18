@@ -1,6 +1,9 @@
 use crate::{App, bot::Binding, config::Config, db};
 use anyhow::{Context, Result, bail};
-use open_lark::ws_client::{EventDispatcherHandler, EventHandler, LarkWsClient};
+use open_lark::ws_client::{
+    CardActionTrigger, CardActionTriggerHandler, CardActionTriggerResponse, CardToast,
+    EventDispatcherHandler, EventHandler, LarkWsClient,
+};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -107,6 +110,18 @@ impl SendReceipt {
     }
 }
 
+fn ensure_card(card: &Value) -> Result<()> {
+    anyhow::ensure!(
+        card["schema"] == "2.0" && card["body"]["elements"].is_array(),
+        "Invalid interactive card"
+    );
+    anyhow::ensure!(
+        serde_json::to_vec(card)?.len() <= 28_000,
+        "Interactive card exceeds the supported size"
+    );
+    Ok(())
+}
+
 pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendReceipt> {
     let cfg = app.config.read().await.clone();
     let binding = app.db.bot(&m.project_id).await?;
@@ -121,7 +136,10 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
     let token = token(app, &binding).await?;
     let to = m.attachment["to"].as_str().unwrap_or(&p.chat_id);
     let receive_id_type = recipient_type(to)?;
-    let (kind, content) = if let Some(path) = m.attachment["path"].as_str() {
+    let (kind, content) = if let Some(card) = m.attachment.get("interactive_card") {
+        ensure_card(card)?;
+        ("interactive", card.clone())
+    } else if let Some(path) = m.attachment["path"].as_str() {
         let path = allowed_file(p, Path::new(path), &app.dir)?;
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.len() == 0 || metadata.len() > MAX_FILE {
@@ -290,6 +308,42 @@ pub struct Inbound {
     pub app: Arc<App>,
     pub binding: Binding,
 }
+fn updating_card_response() -> CardActionTriggerResponse {
+    CardActionTriggerResponse {
+        toast: Some(CardToast {
+            r#type: "info".into(),
+            title: None,
+            content: Some(
+                "Dauerbot is finishing an update. This action was not accepted; try again shortly."
+                    .into(),
+            ),
+        }),
+        card: None,
+    }
+}
+impl CardActionTriggerHandler for Inbound {
+    fn handle(
+        &self,
+        event: CardActionTrigger,
+    ) -> Result<Option<CardActionTriggerResponse>, Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .app
+            .service
+            .relay
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(Some(updating_card_response()));
+        }
+        let Some(_permit) = self.app.service.gate.enter() else {
+            return Ok(Some(updating_card_response()));
+        };
+        Ok(Some(crate::model_control::ingest_callback(
+            &self.app,
+            &self.binding,
+            &event,
+        )?))
+    }
+}
 impl EventHandler for Inbound {
     fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self
@@ -319,7 +373,7 @@ impl EventHandler for Inbound {
 }
 pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
     let v: Value = serde_json::from_slice(payload)?;
-    if let Some((chat, source, text, attachment)) = normalize(&v)? {
+    if let Some((chat, source, text, mut attachment)) = normalize(&v)? {
         if v["header"]["app_id"]
             .as_str()
             .is_some_and(|id| id != binding.app_id)
@@ -327,6 +381,11 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
             return Err(anyhow::anyhow!(
                 "The Feishu event belongs to a different bot"
             ));
+        }
+        let model_command = attachment["source"]["message_type"] == "text"
+            && crate::model_control::is_command(&text);
+        if model_command {
+            attachment["daemon_control"] = json!("model");
         }
         app.db.ingest_bot(
             &binding.project_id,
@@ -451,15 +510,37 @@ struct WarmingInbound {
     binding: Binding,
     target: Arc<std::sync::RwLock<Option<Arc<App>>>>,
 }
+impl CardActionTriggerHandler for WarmingInbound {
+    fn handle(
+        &self,
+        event: CardActionTrigger,
+    ) -> Result<Option<CardActionTriggerResponse>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(app) = self.target.read().unwrap().clone() {
+            CardActionTriggerHandler::handle(
+                &Inbound {
+                    app,
+                    binding: self.binding.clone(),
+                },
+                event,
+            )
+        } else {
+            // Never ACK acceptance on a standby store. The click can be retried
+            // after ownership transfer; already accepted actions stay journaled.
+            Ok(Some(updating_card_response()))
+        }
+    }
+}
 impl EventHandler for WarmingInbound {
     fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let app = self.target.read().unwrap().clone();
         if let Some(app) = app {
-            Inbound {
-                app,
-                binding: self.binding.clone(),
-            }
-            .handle(payload)
+            EventHandler::handle(
+                &Inbound {
+                    app,
+                    binding: self.binding.clone(),
+                },
+                payload,
+            )
         } else {
             crate::service::relay(
                 &self.cfg,
@@ -491,6 +572,12 @@ pub async fn warm_ingress(cfg: Config, bindings: Vec<Binding>) -> Result<WarmIng
                     target: warm.target.clone(),
                 },
             )
+            .map_err(|e| anyhow::anyhow!(e))?
+            .register_card_action_trigger(WarmingInbound {
+                cfg: cfg.clone(),
+                binding: binding.clone(),
+                target: warm.target.clone(),
+            })
             .map_err(|e| anyhow::anyhow!(e))?
             .build();
         let config = open_lark::Config::builder()
@@ -616,6 +703,11 @@ async fn websocket_for(app: Arc<App>, binding: Binding) {
                 },
             )
             .expect("unique handler")
+            .register_card_action_trigger(Inbound {
+                app: app.clone(),
+                binding: binding.clone(),
+            })
+            .expect("unique card handler")
             .build();
         let config = open_lark::Config::builder()
             .app_id(&binding.app_id)

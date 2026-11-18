@@ -47,8 +47,10 @@ def blob(field, value):
     return varint((field << 3) | 2) + varint(len(value)) + value
 
 
-def event_frame(event):
-    headers = [("type", "event"), ("message_id", event["event"]["message"]["message_id"]), ("sum", "1"), ("seq", "0")]
+def event_frame(event, frame_id=None):
+    message = event.get("event", {}).get("message", {})
+    identity = frame_id or message.get("message_id") or event["header"]["event_id"]
+    headers = [("type", "event"), ("message_id", identity), ("sum", "1"), ("seq", "0")]
     return (scalar(1, 1) + scalar(2, 1) + scalar(3, 1) + scalar(4, 1)
             + b"".join(blob(5, blob(1, k) + blob(2, v)) for k, v in headers)
             + blob(6, "none") + blob(7, "application/json") + blob(8, json.dumps(event)))
@@ -102,19 +104,25 @@ class Fixture:
         self.connects = 0
         self.server = None
         self.issued_tokens = set()
+        self.callback_responses = []
 
-    def emit(self, event, app_id="cli_fixture"):
+    def emit(self, event, app_id="cli_fixture", frame_id=None):
         with self.lock:
-            message = event["event"]["message"]
-            self.message_destinations[(app_id, message["message_id"])] = message["chat_id"]
+            message = event.get("event", {}).get("message")
+            if message is not None:
+                self.message_destinations[(app_id, message["message_id"])] = message["chat_id"]
             for conn in self.connections[:]:
                 if self.connection_bots.get(conn) != app_id:
                     continue
                 try:
                     conn.sendall(ws_frame(b"heartbeat", 9))
-                    conn.sendall(ws_frame(event_frame(event)))
+                    conn.sendall(ws_frame(event_frame(event, frame_id)))
                 except OSError:
                     pass
+
+    def emit_callback(self, event, app_id="cli_fixture", frame_id=None):
+        assert event["header"]["event_type"] == "card.action.trigger"
+        self.emit(event, app_id, frame_id)
 
     def disconnect(self, app_id=None):
         with self.lock:
@@ -216,8 +224,17 @@ class Handler(BaseHTTPRequestHandler):
                     fields = proto_fields(data)
                     if 8 in fields:
                         try:
-                            if json.loads(fields[8][0]).get("code") == 200:
+                            ack = json.loads(fields[8][0])
+                            if ack.get("code") == 200:
                                 FIXTURE.acks += 1
+                            if ack.get("data"):
+                                headers = {}
+                                for raw in fields.get(5, []):
+                                    header = proto_fields(raw)
+                                    headers[header[1][0].decode()] = header[2][0].decode()
+                                response = json.loads(base64.b64decode(ack["data"]))
+                                with FIXTURE.lock:
+                                    FIXTURE.callback_responses.append({"frame_id": headers.get("message_id"), "code": ack["code"], "response": response})
                         except (ValueError, UnicodeDecodeError):
                             pass
         except (EOFError, OSError):

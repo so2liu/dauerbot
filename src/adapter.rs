@@ -11,6 +11,17 @@ pub fn launch_args(
     instructions: &str,
     resume: bool,
 ) -> Result<Vec<String>> {
+    launch_args_with_selection(p, mcp_file, mcp_entry, instructions, resume, None)
+}
+
+pub fn launch_args_with_selection(
+    p: &Project,
+    mcp_file: &Path,
+    mcp_entry: &Value,
+    instructions: &str,
+    resume: bool,
+    selection: Option<&crate::models::Selection>,
+) -> Result<Vec<String>> {
     let mut argv: Vec<String> = match p.agent.as_str() {
         "codex" => vec![
             "codex".into(),
@@ -59,7 +70,16 @@ pub fn launch_args(
         _ => bail!("Unsupported agent"),
     };
     if p.agent != "custom" {
-        argv.extend(p.extra_args.clone());
+        argv.extend(crate::models::extra_args(
+            &p.agent,
+            &p.extra_args,
+            selection,
+        )?);
+        if let Some(selection) = selection {
+            argv.extend(crate::models::selection_args(&p.agent, selection)?);
+        }
+    } else if selection.is_some() {
+        bail!("Model selection is unavailable for custom CLIs");
     }
     if resume {
         if p.native_session.is_empty() {

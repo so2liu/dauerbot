@@ -30,6 +30,8 @@ pub struct Request {
     pub next_attempt_at: i64,
     pub recovery_attempts: i64,
     pub recovery_generation: String,
+    pub intent: String,
+    pub requested_model: Option<crate::models::Selection>,
     #[serde(skip_serializing)]
     pub source: Value,
 }
@@ -94,10 +96,61 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     Ok(())
 }
 pub fn latest(c: &Connection, project: &str) -> Result<Option<Request>> {
-    Ok(c.query_row("SELECT id,target,phase,error,generation,nonce,baseline,sequence,revision,created_at,attempts,holds_input,phase_started_at,next_attempt_at,recovery_attempts,recovery_generation,source FROM cli_switch_requests WHERE project_id=? ORDER BY rowid DESC LIMIT 1",[project],|r|Ok(Request{id:r.get(0)?,target:r.get(1)?,phase:r.get(2)?,error:r.get(3)?,generation:r.get(4)?,nonce:r.get(5)?,baseline:r.get(6)?,sequence:r.get(7)?,revision:r.get(8)?,created_at:r.get(9)?,attempts:r.get(10)?,holds_input:r.get(11)?,phase_started_at:r.get(12)?,next_attempt_at:r.get(13)?,recovery_attempts:r.get(14)?,recovery_generation:r.get(15)?,source:serde_json::from_str(&r.get::<_,String>(16)?).unwrap_or(Value::Null)})).optional()?)
+    Ok(c.query_row("SELECT id,target,phase,error,generation,nonce,baseline,sequence,revision,created_at,attempts,holds_input,phase_started_at,next_attempt_at,recovery_attempts,recovery_generation,source FROM cli_switch_requests WHERE project_id=? ORDER BY rowid DESC LIMIT 1",[project],|r| {
+        let source:Value=serde_json::from_str(&r.get::<_,String>(16)?).unwrap_or(Value::Null);
+        let intent=source["intent"].as_str().unwrap_or("cli").to_owned();
+        let requested_model=if intent=="model" {serde_json::from_value(source["target_model"].clone()).ok().flatten()} else {None};
+        Ok(Request{id:r.get(0)?,target:r.get(1)?,phase:r.get(2)?,error:r.get(3)?,generation:r.get(4)?,nonce:r.get(5)?,baseline:r.get(6)?,sequence:r.get(7)?,revision:r.get(8)?,created_at:r.get(9)?,attempts:r.get(10)?,holds_input:r.get(11)?,phase_started_at:r.get(12)?,next_attempt_at:r.get(13)?,recovery_attempts:r.get(14)?,recovery_generation:r.get(15)?,intent,requested_model,source})
+    }).optional()?)
 }
+
 pub fn active(r: &Request) -> bool {
     r.holds_input && !matches!(r.phase.as_str(), "ready" | "cancelled")
+}
+
+fn model_repair_can_be_corrected(r: &Request) -> bool {
+    r.source["intent"] == "model"
+        && active(r)
+        && (matches!(
+            r.phase.as_str(),
+            "failed"
+                | "startup_failed"
+                | "uncertain"
+                | "recovery_pending"
+                | "recovery_stopping"
+                | "recovery_starting"
+                | "repairing"
+        ) || r.phase == "requested" && !r.recovery_generation.is_empty())
+}
+fn retiring_candidate(r: &Request, execution: &Value, generation: &str) -> bool {
+    (execution["cli_switch_request"] == r.id && execution["cli_recovery_request"] != r.id)
+        || r.source["retiring_candidates"]
+            .as_array()
+            .is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate["generation"] == generation
+                        && candidate["request_id"] == execution["cli_switch_request"]
+                        && execution["cli_switch_request"].is_string()
+                })
+            })
+}
+fn remember_retiring_candidate(source: &mut Value, execution: &Value, generation: &str) {
+    if generation.is_empty() {
+        return;
+    }
+    let Some(request) = execution["cli_switch_request"].as_str() else {
+        return;
+    };
+    let mut candidates = source["retiring_candidates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !candidates.iter().any(|candidate| {
+        candidate["generation"] == generation && candidate["request_id"] == request
+    }) {
+        candidates.push(json!({"generation":generation,"request_id":request}));
+    }
+    source["retiring_candidates"] = json!(candidates);
 }
 
 /// A repair remains available after a completed switch or a runtime failure.
@@ -107,11 +160,20 @@ pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
     if let Some(r) = previous.as_ref().filter(|r| active(r)) {
         return Ok(r.clone());
     }
-    let (agent, native, args, generation): (String, String, String, String) = c.query_row(
-        "SELECT agent,native_session,extra_args,generation FROM projects WHERE id=?",
-        [project],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
+    let (agent, native, args, generation, execution): (String, String, String, String, String) = c
+        .query_row(
+            "SELECT agent,native_session,extra_args,generation,execution FROM projects WHERE id=?",
+            [project],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
     let mut source = if let Some(previous) =
         previous.filter(|r| r.phase == "ready" && r.target == agent)
     {
@@ -136,7 +198,21 @@ pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
     };
     // Runtime repair preserves both sides of a previous cross-CLI switch:
     // the original repair owner and the current target's native conversation.
-    source["runtime_target"] = json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([]))});
+    if source.get("selection").is_none() {
+        let original = source["agent"].as_str().unwrap_or(&agent);
+        source["selection"] = json!(crate::models::load(c, project, original)?);
+    }
+    let target_model = crate::models::load(c, project, &agent)?;
+    if source["intent"] == "model" {
+        source["derived_runtime_repair"] = json!(true);
+        source["target_model"] = json!(target_model);
+        source["model_payload"] = json!({"selection":target_model,"expected":null});
+        let execution: Value = serde_json::from_str(&execution)?;
+        remember_retiring_candidate(&mut source, &execution, &generation);
+    } else {
+        source["intent"] = json!("runtime");
+    }
+    source["runtime_target"] = json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([])),"selection":target_model});
     c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at,error) VALUES(?,?,?,'recovery_pending',?,?,1,?,?,?)",params![db::id(),project,agent,generation,db::now(),source.to_string(),db::now(),"Repairing this project's CLI runtime while preserving pending input and native continuity."])?;
     latest(c, project)?.ok_or_else(|| anyhow::anyhow!("Repair request was not journaled"))
 }
@@ -260,10 +336,127 @@ pub fn claim(c: &Connection, project: &str, r: &Request, accepted_hash: &str) ->
     tx.commit()?;
     Ok(changed == 1)
 }
+fn target_selection(r: &Request) -> Result<Option<Option<crate::models::Selection>>> {
+    let value = if r.source["intent"] == "model" {
+        Some(&r.source["target_model"])
+    } else if r.source["runtime_target"]["agent"] == r.target {
+        r.source["runtime_target"].get("selection")
+    } else {
+        None
+    };
+    value
+        .map(|value| serde_json::from_value(value.clone()).map_err(Into::into))
+        .transpose()
+}
+fn target_selection_matches(r: &Request, execution: &Value) -> bool {
+    match target_selection(r) {
+        Ok(Some(expected)) => execution.get("model_selection") == Some(&json!(expected)),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+enum NativeResume {
+    Fresh,
+    Unconfirmed,
+    Matching,
+    Forked,
+}
+fn native_resume(agent: &str, execution: &Value, observed: &str) -> NativeResume {
+    let Some(expected) = execution["intended_native_session"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    else {
+        return NativeResume::Fresh;
+    };
+    // A saved project pointer alone is not evidence from this generation.
+    if execution["native_confirmed"] != true || observed.is_empty() {
+        return NativeResume::Unconfirmed;
+    }
+    let same = expected == observed
+        || (agent == "pi"
+            && std::path::Path::new(expected).is_absolute()
+            && std::path::Path::new(observed).is_absolute()
+            && std::fs::metadata(expected).is_ok_and(|m| m.is_file())
+            && std::fs::metadata(observed).is_ok_and(|m| m.is_file())
+            && std::fs::canonicalize(expected)
+                .ok()
+                .zip(std::fs::canonicalize(observed).ok())
+                .is_some_and(|(a, b)| a == b));
+    if same {
+        NativeResume::Matching
+    } else {
+        NativeResume::Forked
+    }
+}
+fn target_native_matches(r: &Request, execution: &Value, observed: &str) -> bool {
+    r.source["intent"] != "model"
+        || matches!(
+            native_resume(&r.target, execution, observed),
+            NativeResume::Fresh | NativeResume::Matching
+        )
+}
+fn target_launch_state(c: &Connection, project: &str, r: &Request) -> Result<(String, String)> {
+    let runtime = &r.source["runtime_target"];
+    let resume = runtime["agent"] == r.target;
+    let mut native = if resume {
+        runtime["native_session"].as_str().unwrap_or("").to_owned()
+    } else {
+        String::new()
+    };
+    let mut args: Vec<String> = if resume {
+        serde_json::from_value(runtime["extra_args"].clone())?
+    } else {
+        vec![]
+    };
+    if r.source["intent"] == "model" {
+        let current_native: String = c.query_row(
+            "SELECT native_session FROM projects WHERE id=?",
+            [project],
+            |row| row.get(0),
+        )?;
+        if !current_native.is_empty() {
+            native = current_native;
+        }
+        if r.source["target_model"].is_null() {
+            args = crate::models::clear_model_args(&r.target, &args)?;
+        }
+    }
+    if let Some(selection) = target_selection(r)? {
+        crate::models::save(c, project, &r.target, selection.as_ref())?;
+    }
+    Ok((native, serde_json::to_string(&args)?))
+}
+
+fn restore_source_state(c: &Connection, project: &str, source: &Value) -> Result<()> {
+    if let Some(selection) = source.get("selection") {
+        let selection: Option<crate::models::Selection> =
+            serde_json::from_value(selection.clone())?;
+        crate::models::save(
+            c,
+            project,
+            source["agent"].as_str().unwrap_or(""),
+            selection.as_ref(),
+        )?;
+    }
+    ensure!(c.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![source["agent"].as_str().unwrap_or(""),source["native_session"].as_str().unwrap_or(""),source["extra_args"].to_string(),project])?==1,"Project woke during recovery");
+    Ok(())
+}
+
 fn ready(c: &Connection, project: &str, generation: &str, r: &Request) -> Result<bool> {
     let tx = c.unchecked_transaction()?;
     let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id=? AND generation=? AND agent=? AND terminal IS NOT NULL AND ready=1 AND paused=0 AND json_extract(execution,'$.cli_switch_request')=? AND json_extract(execution,'$.mcp_registered')=1)",params![project,generation,r.target,r.id],|v|v.get(0))?;
-    if !valid || work::has_takeover(&tx, project, generation)? {
+    let (execution, native): (String, String) = tx.query_row(
+        "SELECT execution,native_session FROM projects WHERE id=?",
+        [project],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let execution: Value = serde_json::from_str(&execution)?;
+    if !valid
+        || !target_selection_matches(r, &execution)
+        || !target_native_matches(r, &execution, &native)
+        || work::has_takeover(&tx, project, generation)?
+    {
         return Ok(false);
     }
     let changed=tx.execute("UPDATE cli_switch_requests SET phase='ready',error='',holds_input=0 WHERE id=? AND phase IN ('starting','startup_failed','failed','recovery_pending') AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![r.id,project])?;
@@ -282,26 +475,26 @@ fn complete(c: &Connection, project: &str, r: &Request) -> Result<()> {
         "CLI handoff completed",
         db::now(),
     )?;
-    let runtime = &r.source["runtime_target"];
-    let resume = runtime["agent"] == r.target;
-    let native = if resume {
-        runtime["native_session"].as_str().unwrap_or("")
-    } else {
-        ""
-    };
-    let args = if resume {
-        runtime["extra_args"].to_string()
-    } else {
-        "[]".into()
-    };
+    let (native, args) = target_launch_state(&tx, project, r)?;
     ensure!(tx.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=?",params![r.target,native,args,project,r.generation])?==1,"Execution changed during CLI handoff");
     tx.commit()?;
     Ok(())
 }
 fn prompt(r: &Request) -> String {
+    let target = if r.source["intent"] == "model" {
+        format!(
+            "a model change within {} (pending selection: {}; preserve this same native conversation and unrelated launch arguments)",
+            r.target, r.source["target_model"]
+        )
+    } else {
+        r.target.clone()
+    };
     format!(
         "<dauerbot_cli_switch request_id=\"{}\" handoff_nonce=\"{}\">\nThe user requested switching this project to {} now. Finish or safely settle already-delivered work and JOIN/SETTLE every native subagent and external worker before acknowledging. New messages and scheduled input are held for the selected successor; they will not be delivered to you and do not invalidate this handoff. Update HANDOFF.md with the current goal, completed work, decisions, files, pending issues and next actions for the new CLI. Preserve user content and AGENTS.md. ONLY when no child or external worker or ongoing side effect remains, write this exact line INSIDE the project-root HANDOFF.md file, not merely in terminal output or your final response: <!-- dauerbot-switch-ready:{} -->. This line is your explicit ready-to-switch acknowledgement. If you cannot settle outstanding work, omit the marker and explain it in HANDOFF.md. Return to idle after writing. Do not close your own terminal or send an automatic completion message.\n</dauerbot_cli_switch>",
-        r.id, r.nonce, r.target, r.nonce
+        r.id,
+        r.nonce,
+        crate::xml(&target),
+        r.nonce
     )
 }
 async fn artifact(p: &Project) -> Result<Option<String>> {
@@ -325,6 +518,11 @@ impl App {
                 .is_some_and(|r| r.holds_input && matches!(r.phase.as_str(), "recovery_starting"))
             {
                 " This is a daemon-managed CLI-switch recovery execution. Preserve the native conversation and completed effects. Do not resume historical tasks or process ordinary queued input. Read AGENTS.md and HANDOFF.md, connect MCP, then await the daemon's narrowly scoped repair instruction.".into()
+            } else if r.as_ref().is_some_and(|r| {
+                r.source["intent"] == "model"
+                    && matches!(r.phase.as_str(), "starting" | "startup_failed")
+            }) {
+                " The user changed this project's native model selection. Continue the same native conversation using the selected launch settings; preserve completed effects, user content and request IDs. Read AGENTS.md and HANDOFF.md. Do not replay historical work or held input; the daemon delivers pending instructions after native and MCP readiness. Launch selection is not proof of an effective model observation.".into()
             } else if r.is_some_and(|r| matches!(r.phase.as_str(), "starting" | "startup_failed")) {
                 " The user explicitly switched this project's CLI now. Read this project's AGENTS.md and HANDOFF.md before continuing the current goal. If HANDOFF.md is absent, this is a fresh workspace: use the project instructions and await user input. Preserve completed effects and request IDs; do not replay already delivered messages or work merely because this is a fresh native conversation.".into()
             } else {
@@ -338,14 +536,147 @@ impl App {
         let id = p.id.clone();
         self.db.call(move |c| holds_input(c, &id)).await
     }
-    pub(crate) async fn cli_switch_launch_id(&self, p: &Project) -> Result<Option<String>> {
+    pub(crate) async fn cli_switch_launch_context(
+        &self,
+        p: &Project,
+        resume: bool,
+    ) -> Result<Option<(String, Option<String>)>> {
         let id = p.id.clone();
         let r = self.db.call(move |c| latest(c, &id)).await?;
         Ok(r.filter(|r| {
             matches!(r.phase.as_str(), "starting" | "startup_failed") && r.target == p.agent
         })
-        .map(|r| r.id))
+        .map(|r| {
+            let intended =
+                (r.source["intent"] == "model" && resume && !p.native_session.is_empty())
+                    .then(|| p.native_session.clone());
+            (r.id, intended)
+        }))
     }
+    /// Accept a project-scoped native model transition. Selection remains
+    /// pending until verified source retirement, and idempotency precedes stale
+    /// catalogue checks so a retried accepted action never becomes a new effect.
+    pub async fn request_model_switch_with_id(
+        self: &Arc<Self>,
+        key: &str,
+        selection: Option<crate::models::Selection>,
+        request_id: &str,
+        expected: Option<crate::models::Scope>,
+    ) -> Result<Project> {
+        ensure!(
+            !request_id.is_empty() && request_id.len() <= 200,
+            "request_id must contain 1 to 200 characters"
+        );
+        let p = self.db.project(key).await?;
+        let lock = self.project_lock(&p.id).await;
+        let _guard = lock.lock().await;
+        let current = self.db.project(&p.id).await?;
+        let id = current.id.clone();
+        let request_id = request_id.to_owned();
+        self.db.call(move|c|{
+            let tx=c.unchecked_transaction()?;
+            let prior:Option<(String,String,String)>=tx.query_row(
+                "SELECT project_id,target,source FROM cli_switch_requests WHERE id=?",[&request_id],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).optional()?;
+            if let Some((project,agent,source))=prior {
+                let normalized=selection.as_ref().map(|s|crate::models::validate(&agent,s)).transpose()?;
+                let payload=json!({"selection":normalized,"expected":expected});
+                let source:Value=serde_json::from_str(&source)?;
+                ensure!(project==id && source["intent"]=="model" && source["model_payload"]==payload,
+                    "This request_id already refers to a different action, model, scope or project");
+                return Ok(());
+            }
+            // Compare the scope at acceptance, not before acquiring the project
+            // lock or while fetching a catalogue asynchronously.
+            let (agent,generation,paused,native,args,terminal,execution):(String,String,bool,String,String,Option<String>,String)=tx.query_row(
+                "SELECT agent,generation,paused,native_session,extra_args,terminal,execution FROM projects WHERE id=?",[&id],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+            )?;
+            let args:Vec<String>=serde_json::from_str(&args)?;
+            let execution:Value=serde_json::from_str(&execution)?;
+            let direct_resume=terminal.is_none();
+            if direct_resume {
+                let unclosed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM work_executions WHERE project_id=? AND status NOT IN ('sleeping','stopped','exited','error'))",[&id],|row|row.get(0))?;
+                ensure!(!unclosed,"A saved native execution has not been verified closed; repair its ownership before starting a different model");
+            }
+            ensure!(["codex","claude","pi","agy"].contains(&agent.as_str()),"Model selection is unavailable for this CLI");
+            if let Some(scope)=expected.as_ref() {
+                ensure!(scope.agent==agent && scope.generation==generation,
+                    "This model catalogue is stale: the project CLI or native execution changed. Open the model selector again");
+            }
+            ensure!(!paused,"Resume this project before changing its model");
+            ensure!(terminal.is_none() || crate::mcp::generation_contract(&execution).is_some(),"Recover this project's native runtime before changing its model");
+            ensure!(!work::has_takeover(&tx,&id,&generation)?,"Release terminal input before changing the model");
+            let previous=latest(&tx,&id)?.filter(active);
+            if let Some(previous)=previous.as_ref() {
+                ensure!(previous.target==agent && model_repair_can_be_corrected(previous),
+                    "A CLI or model transition is already in progress; only its model-repair target can be corrected");
+            }
+            let selection=selection.as_ref().map(|s|crate::models::validate(&agent,s)).transpose()?;
+            let source_selection=crate::models::load(&tx,&id,&agent)?;
+            let (mut source,initial_phase,recovery_generation)=if let Some(previous)=previous.as_ref() {
+                let mut source=previous.source.clone();
+                // The original repair owner descriptor is immutable. A failed
+                // candidate's current preference/session must not replace it.
+                if retiring_candidate(previous,&execution,&generation) {
+                    remember_retiring_candidate(&mut source,&execution,&generation);
+                }
+                let mut history=source["superseded_requests"].as_array().cloned().unwrap_or_default();
+                history.push(json!({"id":previous.id,"phase":previous.phase,"generation":previous.generation,"nonce":previous.nonce,"accepted_handoff":previous.baseline,"sequence":previous.sequence,"error":previous.error}));
+                source["superseded_requests"]=json!(history);
+                source["target_model"]=json!(selection);
+                source["runtime_target"]["selection"]=json!(selection);
+                source["model_payload"]=json!({"selection":selection,"expected":expected});
+                source["supersedes"]=json!(previous.id);
+                let repair_owner=previous.recovery_generation==generation && execution["cli_recovery_request"]==previous.id
+                    && !retiring_candidate(previous,&execution,&generation);
+                (source,"recovery_pending",if repair_owner {generation.clone()} else {String::new()})
+            } else {
+                (json!({"intent":"model","agent":agent,"native_session":native,"extra_args":args,
+                    "generation":generation,"selection":source_selection,"target_model":selection,
+                    "model_payload":{"selection":selection,"expected":expected},
+                    "runtime_target":{"agent":agent,"native_session":native,"extra_args":args,"selection":selection}}),"preparing",String::new())
+            };
+            source["intent"]=json!("model");
+            let initial_phase=if direct_resume {
+                source["direct_model_resume"]=json!(true);
+                "starting"
+            } else {initial_phase};
+            // One transaction replaces the held owner: no observer can see an
+            // unlocked gap, and old ACKs no longer pass the latest-request guard.
+            if let Some(previous)=previous.as_ref() {
+                ensure!(tx.execute("UPDATE cli_switch_requests SET phase='superseded',holds_input=0,error='Superseded by a new explicitly selected repair model' WHERE id=? AND holds_input=1 AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![previous.id,id])?==1,"The pending model repair changed during correction");
+            }
+            tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at,recovery_generation) VALUES(?,?,?,?,?,?,1,?,?,?)",
+                params![request_id,id,agent,initial_phase,generation,db::now(),source.to_string(),db::now(),recovery_generation])?;
+            if let Some(previous)=previous.as_ref() {
+                tx.execute("UPDATE cli_repair_instructions SET request_id=? WHERE request_id=? AND prompt_id=''",params![request_id,previous.id])?;
+                if !recovery_generation.is_empty() {
+                    tx.execute("UPDATE projects SET execution=json_set(execution,'$.cli_recovery_request',?) WHERE id=? AND generation=?",params![request_id,id,generation])?;
+                }
+            }
+            if direct_resume {
+                // A stopped/sleeping same-CLI conversation needs no old-model
+                // bootstrap just to acknowledge a handoff. Apply the pending
+                // override and retain its native ID in this acceptance commit.
+                let accepted=latest(&tx,&id)?.ok_or_else(||anyhow::anyhow!("Missing accepted model transition"))?;
+                if previous.is_some() {
+                    // A closed failed candidate can leave its forked native
+                    // pointer behind. Restore the genuine settled source before
+                    // applying the corrected target; never adopt the candidate.
+                    restore_source_state(&tx,&id,&accepted.source)?;
+                }
+                let (native,args)=target_launch_state(&tx,&id,&accepted)?;
+                ensure!(tx.execute("UPDATE projects SET native_session=?,extra_args=?,generation='',ready=0,execution='null',terminal_pid=NULL WHERE id=? AND terminal IS NULL",params![native,args,id])?==1,"Native execution woke during model selection");
+            }
+            tx.commit()?;
+            Ok(())
+        }).await?;
+        self.notify.notify_one();
+        self.db.project(&p.id).await
+    }
+
     pub async fn request_cli_switch(self: &Arc<Self>, key: &str, target: &str) -> Result<Project> {
         ensure!(
             ["codex", "claude", "pi", "agy"].contains(&target),
@@ -403,8 +734,8 @@ impl App {
         let id = p.id.clone();
         let target = target.to_owned();
         let generation = p.generation.clone();
-        let source = json!({"agent":p.agent,"native_session":p.native_session,"extra_args":p.extra_args,"generation":p.generation});
-        self.db.call(move|c|{let tx=c.unchecked_transaction()?;tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,?,?,?,1,?,?)",params![db::id(),id,target,initial_phase,generation,db::now(),source.to_string(),db::now()])?;tx.commit()?;Ok(())}).await?;
+        let mut source = json!({"agent":p.agent,"native_session":p.native_session,"extra_args":p.extra_args,"generation":p.generation});
+        self.db.call(move|c|{let tx=c.unchecked_transaction()?;source["selection"]=json!(crate::models::load(&tx,&id,source["agent"].as_str().unwrap_or(""))?);tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,?,?,?,1,?,?)",params![db::id(),id,target,initial_phase,generation,db::now(),source.to_string(),db::now()])?;tx.commit()?;Ok(())}).await?;
         self.notify.notify_one();
         Ok(p)
     }
@@ -544,7 +875,17 @@ impl App {
         if r.phase == "starting" {
             if let Some(record) = record {
                 if p.agent == r.target
+                    && r.source["intent"] == "model"
+                    && native_resume(&p.agent, &p.execution, &p.native_session)
+                        == NativeResume::Forked
+                {
+                    self.fail_cli_start(&r, "The selected CLI resumed a different native conversation; keeping input held and restoring supervised repair.").await?;
+                    return Ok(true);
+                }
+                if p.agent == r.target
+                    && target_native_matches(&r, &p.execution, &p.native_session)
                     && herdr::check_identity(p, record).is_ok()
+                    && target_selection_matches(&r, &p.execution)
                     && p.ready
                     && p.execution["mcp_registered"] == true
                     && matches!(
@@ -644,7 +985,9 @@ impl App {
                 let request = r.id.clone();
                 self.db.call(move |c| {
                     let tx = c.unchecked_transaction()?;
-                    ensure!(tx.execute("UPDATE projects SET agent=?,extra_args='[]',native_session='',generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![target,id])?==1,"Project woke during CLI selection");
+                    let rr=latest(&tx,&id)?.ok_or_else(||anyhow::anyhow!("Missing launch transition"))?;
+                    let (native,args)=target_launch_state(&tx,&id,&rr)?;
+                    ensure!(tx.execute("UPDATE projects SET agent=?,extra_args=?,native_session=?,generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![target,args,native,id])?==1,"Project woke during CLI selection");
                     phase(&tx,&request,"starting","")?;
                     tx.commit()?;
                     Ok(())
@@ -766,6 +1109,10 @@ impl App {
                 final_check["state_change_seq"].as_i64(),
             )
         {
+            return Ok(true);
+        }
+        if r.source["intent"] == "model" && p.native_session.is_empty() {
+            self.fail_cli_switch(&r,"The model change needs this CLI's verified native session identity before retirement; repair the native continuity hook first.").await?;
             return Ok(true);
         }
         let id = p.id.clone();
@@ -941,6 +1288,7 @@ impl App {
                 _ => json!({"agent":current.agent,"native_session":current.native_session,"extra_args":current.extra_args,"generation":generation}),
             };
             if !last_failure.is_null() { source["last_failure"] = last_failure; }
+            source["selection"]=json!(crate::models::load(c,&id,source["agent"].as_str().unwrap_or(""))?);
             c.execute("UPDATE cli_switch_requests SET source=? WHERE id=?",params![source.to_string(),rid])?;
             Ok(source)
         }).await?;
@@ -959,6 +1307,8 @@ impl App {
         // Readiness wins over an elapsed deadline, including after a service
         // restart or when the previous observation reported a startup failure.
         if p.agent == r.target
+            && target_native_matches(r, &p.execution, &p.native_session)
+            && target_selection_matches(r, &p.execution)
             && p.execution["cli_switch_request"] == r.id
             && p.ready
             && p.execution["mcp_registered"] == true
@@ -984,8 +1334,7 @@ impl App {
         }
         self.ensure_cli_source(p, r).await?;
         let source_agent = r.source["agent"].as_str().unwrap_or("").to_owned();
-        let candidate = p.execution["cli_switch_request"] == r.id
-            && p.execution["cli_recovery_request"] != r.id;
+        let candidate = retiring_candidate(r, &p.execution, &p.generation);
         // Hooks may discover native continuity after switch acceptance. Capture
         // only the source's identity, never a failed target's different session.
         if !candidate
@@ -1056,13 +1405,21 @@ impl App {
             let id = p.id.clone();
             let rid = r.id.clone();
             let source = r.source.clone();
-            self.db.call(move |c| {
-                let tx = c.unchecked_transaction()?;
-                ensure!(tx.execute("UPDATE projects SET agent=?,native_session=?,extra_args=?,generation='',ready=0,execution='null' WHERE id=? AND terminal IS NULL",params![source["agent"].as_str().unwrap_or(""),source["native_session"].as_str().unwrap_or(""),source["extra_args"].to_string(),id])?==1,"Project woke during recovery");
-                // Retain the phase clock across failed launch retries.
-                phase(&tx,&rid,"recovery_starting","Starting the original CLI as the repair Agent.")?;
-                tx.commit()?; Ok(())
-            }).await?;
+            self.db
+                .call(move |c| {
+                    let tx = c.unchecked_transaction()?;
+                    restore_source_state(&tx, &id, &source)?;
+                    // Retain the phase clock across failed launch retries.
+                    phase(
+                        &tx,
+                        &rid,
+                        "recovery_starting",
+                        "Starting the original CLI as the repair Agent.",
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
             let resume = r.source["native_session"]
                 .as_str()
                 .is_some_and(|s| !s.is_empty());
@@ -1929,5 +2286,696 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+    fn model(name: &str) -> crate::models::Selection {
+        crate::models::Selection {
+            model: name.into(),
+            provider: None,
+        }
+    }
+    #[tokio::test]
+    async fn model_acceptance_keeps_source_preference_pending_and_scopes_new_effects_only() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| crate::models::save(c, &p.id, "codex", Some(&model("source-model"))))
+            .unwrap();
+        let scope = crate::models::Scope {
+            agent: "codex".into(),
+            generation: p.generation.clone(),
+        };
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "model-action",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        let accepted = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(accepted.id, "model-action");
+        assert_eq!(accepted.source["selection"], json!(model("source-model")));
+        assert_eq!(
+            accepted.source["target_model"],
+            json!(model("target-model"))
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| crate::models::load(c, &p.id, "codex"))
+                .unwrap(),
+            Some(model("source-model"))
+        );
+        assert_eq!(
+            app.db.project(&p.id).await.unwrap().native_session,
+            p.native_session
+        );
+        app.db
+            .sync(|c| {
+                c.execute(
+                    "UPDATE projects SET generation='different',agent='agy' WHERE id=?",
+                    [&p.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "model-action",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.request_model_switch_with_id(
+                &p.id,
+                Some(model("different-model")),
+                "model-action",
+                Some(scope.clone())
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            app.request_model_switch_with_id(
+                &p.id,
+                Some(model("target-model")),
+                "new-stale-action",
+                Some(scope)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(c.query_row(
+                    "SELECT count(*) FROM cli_switch_requests",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn model_native_resume_requires_current_confirmation_and_safe_pi_path_identity() {
+        let mut execution = json!({"intended_native_session":"native-id"});
+        assert_eq!(
+            native_resume("codex", &execution, "native-id"),
+            NativeResume::Unconfirmed
+        );
+        execution["native_confirmed"] = json!(true);
+        assert_eq!(
+            native_resume("codex", &execution, "native-id"),
+            NativeResume::Matching
+        );
+        assert_eq!(
+            native_resume("codex", &execution, "different-native-id"),
+            NativeResume::Forked
+        );
+        assert_eq!(
+            native_resume("codex", &execution, ""),
+            NativeResume::Unconfirmed
+        );
+        assert_eq!(
+            native_resume("codex", &json!({}), "new-native"),
+            NativeResume::Fresh
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.jsonl");
+        let other = dir.path().join("other.jsonl");
+        let alias = dir.path().join("alias.jsonl");
+        std::fs::write(&session, "native session").unwrap();
+        std::fs::write(&other, "different session").unwrap();
+        std::os::unix::fs::symlink(&session, &alias).unwrap();
+        execution["intended_native_session"] = json!(session);
+        assert_eq!(
+            native_resume("pi", &execution, alias.to_str().unwrap()),
+            NativeResume::Matching
+        );
+        assert_eq!(
+            native_resume("codex", &execution, alias.to_str().unwrap()),
+            NativeResume::Forked
+        );
+        assert_eq!(
+            native_resume("pi", &execution, other.to_str().unwrap()),
+            NativeResume::Forked
+        );
+        assert_eq!(
+            native_resume("pi", &execution, "session.jsonl"),
+            NativeResume::Forked
+        );
+        assert_eq!(
+            native_resume(
+                "pi",
+                &execution,
+                dir.path().join("missing.jsonl").to_str().unwrap()
+            ),
+            NativeResume::Forked
+        );
+    }
+    #[tokio::test]
+    async fn model_launch_captures_actual_settled_native_and_fork_routes_to_repair() {
+        let (_dir, app, p) = fixture().await;
+        app.request_model_switch_with_id(&p.id, Some(model("target-model")), "native-fork", None)
+            .await
+            .unwrap();
+        app.db.sync(|c| {
+            c.execute("UPDATE cli_switch_requests SET phase='starting' WHERE project_id=?", [&p.id])?;
+            c.execute("UPDATE projects SET native_session='latest-settled-native',generation='new-generation' WHERE id=?", [&p.id])?;
+            Ok(())
+        }).unwrap();
+        let mut current = app.db.project(&p.id).await.unwrap();
+        assert_eq!(
+            app.cli_switch_launch_context(&current, true).await.unwrap(),
+            Some(("native-fork".into(), Some("latest-settled-native".into())))
+        );
+        assert_eq!(
+            app.cli_switch_launch_context(&current, false)
+                .await
+                .unwrap(),
+            Some(("native-fork".into(), None))
+        );
+        current.native_session = "forked".into();
+        current.execution = json!({"cli_switch_request":"native-fork", "intended_native_session":"latest-settled-native", "native_confirmed":true});
+        assert!(
+            app.advance_cli_switch(
+                &current,
+                Some(&Config::default()),
+                Some(&json!({"state":"live"}))
+            )
+            .await
+            .unwrap()
+        );
+        let request = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(request.phase, "recovery_pending");
+        assert!(request.holds_input);
+        assert!(request.error.contains("different native conversation"));
+    }
+    #[tokio::test]
+    async fn model_cutover_preserves_native_and_args_and_rejects_wrong_launch_selection() {
+        let (_dir, app, p) = fixture().await;
+        app.request_model_switch_with_id(&p.id, Some(model("target-model")), "model-cutover", None)
+            .await
+            .unwrap();
+        app.db.sync(|c|{
+            let r=requested(c,&p)?;
+            assert!(claim(c,&p.id,&r,"accepted")?);
+            complete(c,&p.id,&r)?;
+            let saved:(String,String)=c.query_row("SELECT native_session,extra_args FROM projects WHERE id=?",[&p.id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(saved.0,"old-native");
+            assert_eq!(serde_json::from_str::<Value>(&saved.1)?,json!(["--model","preserve"]));
+            assert_eq!(crate::models::load(c,&p.id,"codex")?,Some(model("target-model")));
+            c.execute("UPDATE projects SET generation='target-gen',terminal='target-pane',ready=1,execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?,'mcp_registered',json('true'),'model_selection',json(?)) WHERE id=?",params![r.id,serde_json::to_string(&model("wrong-model"))?,p.id])?;
+            assert!(!ready(c,&p.id,"target-gen",&r)?);
+            assert!(holds_input(c,&p.id)?);
+            c.execute("UPDATE projects SET execution=json_set(execution,'$.model_selection',json(?),'$.intended_native_session','old-native') WHERE id=?",params![serde_json::to_string(&model("target-model"))?,p.id])?;
+            // The inherited native pointer is not a new-generation confirmation.
+            assert!(!ready(c,&p.id,"target-gen",&r)?);
+            c.execute("UPDATE projects SET native_session='forked-native',execution=json_set(execution,'$.native_confirmed',json('true')) WHERE id=?",[&p.id])?;
+            assert!(!ready(c,&p.id,"target-gen",&r)?);
+            assert!(holds_input(c,&p.id)?);
+            c.execute("UPDATE projects SET native_session='old-native' WHERE id=?",[&p.id])?;
+            assert!(ready(c,&p.id,"target-gen",&r)?);
+            assert!(!holds_input(c,&p.id)?);
+            Ok(())
+        }).unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "new-model-request-after-generation",
+            None,
+        )
+        .await
+        .unwrap();
+        let next = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(next.id, "new-model-request-after-generation");
+        assert_eq!(next.phase, "preparing");
+        assert!(next.holds_input);
+    }
+    #[tokio::test]
+    async fn failed_model_target_restores_source_preference_and_can_retry_pending_selection() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| crate::models::save(c, &p.id, "codex", Some(&model("source-model"))))
+            .unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("target-model")),
+            "model-rollback",
+            None,
+        )
+        .await
+        .unwrap();
+        app.db
+            .sync(|c| {
+                let r = requested(c, &p)?;
+                assert!(claim(c, &p.id, &r, "accepted")?);
+                complete(c, &p.id, &r)?;
+                let tx = c.unchecked_transaction()?;
+                restore_source_state(&tx, &p.id, &r.source)?;
+                tx.commit()?;
+                assert_eq!(
+                    crate::models::load(c, &p.id, "codex")?,
+                    Some(model("source-model"))
+                );
+                let saved: (String, String) = c.query_row(
+                    "SELECT native_session,extra_args FROM projects WHERE id=?",
+                    [&p.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(saved.0, "old-native");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&saved.1)?,
+                    json!(p.extra_args)
+                );
+                assert!(holds_input(c, &p.id)?);
+                let tx = c.unchecked_transaction()?;
+                let (native, _) = target_launch_state(&tx, &p.id, &r)?;
+                assert_eq!(native, "old-native");
+                tx.commit()?;
+                assert_eq!(
+                    crate::models::load(c, &p.id, "codex")?,
+                    Some(model("target-model"))
+                );
+                assert_eq!(
+                    latest(c, &p.id)?.unwrap().source["target_model"],
+                    json!(model("target-model"))
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_model_reset_removes_project_model_flags_without_erasing_source_rollback_args()
+    {
+        let (_dir, app, p) = fixture().await;
+        let args = vec![
+            "--model",
+            "old-flag",
+            "--config",
+            "model_provider=\"old-provider\"",
+            "--config",
+            "unrelated=true",
+            "--other",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        app.db
+            .sync(|c| {
+                c.execute(
+                    "UPDATE projects SET extra_args=? WHERE id=?",
+                    params![serde_json::to_string(&args)?, p.id],
+                )?;
+                crate::models::save(c, &p.id, "codex", Some(&model("source-model")))
+            })
+            .unwrap();
+        app.request_model_switch_with_id(&p.id, None, "model-default", None)
+            .await
+            .unwrap();
+        app.db
+            .sync(|c| {
+                let r = requested(c, &p)?;
+                assert_eq!(r.source["extra_args"], json!(args));
+                assert!(claim(c, &p.id, &r, "accepted")?);
+                complete(c, &p.id, &r)?;
+                assert!(crate::models::load(c, &p.id, "codex")?.is_none());
+                let saved: String = c.query_row(
+                    "SELECT extra_args FROM projects WHERE id=?",
+                    [&p.id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    serde_json::from_str::<Value>(&saved)?,
+                    json!(["--config", "unrelated=true", "--other"])
+                );
+                assert_eq!(latest(c, &p.id)?.unwrap().source["extra_args"], json!(args));
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn corrected_model_supersedes_held_repair_without_losing_source_or_queued_controls() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| crate::models::save(c, &p.id, "codex", Some(&model("known-good-source"))))
+            .unwrap();
+        let scope = crate::models::Scope {
+            agent: p.agent.clone(),
+            generation: p.generation.clone(),
+        };
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("unavailable")),
+            "bad-model",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        let old=app.db.sync(|c|{
+            phase(c,"bad-model","recovery_pending","Model not available")?;
+            c.execute("UPDATE cli_switch_requests SET recovery_generation=? WHERE id='bad-model'",[&p.generation])?;
+            c.execute("UPDATE projects SET execution=json_set(execution,'$.cli_recovery_request','bad-model') WHERE id=?",[&p.id])?;
+            queue(c,&p,"ordinary-held",1)?;
+            journal_repair_instruction(c,&p.id,"new-control",&json!({"content":"use the corrected model"}))?;
+            journal_repair_instruction(c,&p.id,"uncertain-control",&json!({"content":"already submitted"}))?;
+            c.execute("INSERT INTO cli_repair_prompts(id,request_id,generation,payload,status,sequence,created_at) VALUES('old-uncertain','bad-model',?,'original effect','uncertain',12,1)",[&p.generation])?;
+            c.execute("UPDATE cli_repair_instructions SET prompt_id='old-uncertain' WHERE request_id='bad-model' AND instruction_id='uncertain-control'",[])?;
+            Ok(latest(c,&p.id)?.unwrap())
+        }).unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("available")),
+            "corrected-model",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        let corrected=app.db.sync(|c|{
+            let corrected=latest(c,&p.id)?.unwrap();
+            assert_eq!(corrected.id,"corrected-model");
+            assert_eq!(corrected.intent,"model");
+            assert_eq!(corrected.requested_model,Some(model("available")));
+            assert_eq!(corrected.source["selection"],old.source["selection"]);
+            assert_eq!(corrected.source["native_session"],old.source["native_session"]);
+            assert_eq!(corrected.source["extra_args"],old.source["extra_args"]);
+            assert_eq!(corrected.source["runtime_target"]["native_session"],old.source["runtime_target"]["native_session"]);
+            assert_eq!(corrected.recovery_generation,p.generation);
+            assert!(holds_input(c,&p.id)?);
+            assert!(work::claim_steering(c,&p.id,&p.generation,3)?.is_none());
+            assert_eq!(c.query_row("SELECT request_id FROM cli_repair_instructions WHERE instruction_id='new-control'",[],|row|row.get::<_,String>(0))?,"corrected-model");
+            assert_eq!(c.query_row("SELECT request_id FROM cli_repair_instructions WHERE instruction_id='uncertain-control'",[],|row|row.get::<_,String>(0))?,"bad-model");
+            assert_eq!(c.query_row("SELECT phase FROM cli_switch_requests WHERE id='bad-model'",[],|row|row.get::<_,String>(0))?,"superseded");
+            let old_payload:String=c.query_row("SELECT source FROM cli_switch_requests WHERE id='bad-model'",[],|row|row.get(0))?;
+            assert_eq!(serde_json::from_str::<Value>(&old_payload)?["model_payload"],old.source["model_payload"]);
+            let public=serde_json::to_value(&corrected)?;
+            assert_eq!(public["intent"],"model");
+            assert_eq!(public["requested_model"],json!(model("available")));
+            assert!(public.get("source").is_none());
+            Ok(corrected)
+        }).unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("available")),
+            "corrected-model",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("unavailable")),
+            "bad-model",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            app.request_model_switch_with_id(
+                &p.id,
+                Some(model("another")),
+                "corrected-model",
+                Some(scope)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap().id)).unwrap(),
+            corrected.id
+        );
+        assert_eq!(
+            app.db
+                .sync(|c| Ok(c.query_row(
+                    "SELECT count(*) FROM cli_switch_requests",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?))
+                .unwrap(),
+            2
+        );
+    }
+    #[tokio::test]
+    async fn correcting_live_bad_candidate_preserves_retirement_identity_and_rejects_old_ack() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| crate::models::save(c, &p.id, "codex", Some(&model("source"))))
+            .unwrap();
+        app.request_model_switch_with_id(&p.id, Some(model("bad")), "bad-live-model", None)
+            .await
+            .unwrap();
+        let old=app.db.sync(|c|{
+            let r=requested(c,&p)?;
+            assert!(claim(c,&p.id,&r,"accepted")?);
+            complete(c,&p.id,&r)?;
+            c.execute("UPDATE projects SET generation='bad-candidate',terminal='bad-pane',ready=1,execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?,'mcp_registered',json('true'),'model_selection',json(?)) WHERE id=?",params![r.id,serde_json::to_string(&model("bad"))?,p.id])?;
+            phase(c,&r.id,"recovery_pending","Invalid target model")?;
+            Ok(latest(c,&p.id)?.unwrap())
+        }).unwrap();
+        let scope = crate::models::Scope {
+            agent: "codex".into(),
+            generation: "bad-candidate".into(),
+        };
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("fixed")),
+            "fixed-live-model",
+            Some(scope),
+        )
+        .await
+        .unwrap();
+        let current = app.db.project(&p.id).await.unwrap();
+        app.db.sync(|c|{
+            let corrected=latest(c,&p.id)?.unwrap();
+            assert!(retiring_candidate(&corrected,&current.execution,&current.generation));
+            assert_eq!(corrected.source["retiring_candidates"][0],json!({"generation":"bad-candidate","request_id":"bad-live-model"}));
+            assert_eq!(corrected.source["selection"],json!(model("source")));
+            assert_eq!(crate::models::load(c,&p.id,"codex")?,Some(model("bad")),"correction cannot rewrite a live candidate's model preference before its verified close");
+            assert!(!claim(c,&p.id,&old,"stale handoff")?);
+            assert!(!ready(c,&p.id,"bad-candidate",&old)?);
+            assert!(!ready(c,&p.id,"bad-candidate",&corrected)?);
+            assert!(holds_input(c,&p.id)?);
+            assert!(complete(c,&p.id,&old).is_err());
+            assert_eq!(latest(c,&p.id)?.unwrap().id,"fixed-live-model");
+            Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn post_ready_model_runtime_failure_is_correctable_but_other_cli_holds_are_not() {
+        let (_dir, app, p) = fixture().await;
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("bad-later")),
+            "model-ready-first",
+            None,
+        )
+        .await
+        .unwrap();
+        app.db.sync(|c|{
+            let r=requested(c,&p)?;
+            assert!(claim(c,&p.id,&r,"accepted")?);
+            complete(c,&p.id,&r)?;
+            c.execute("UPDATE projects SET generation='later-error',terminal='target-pane',ready=1,execution=json_object('api_protocol',7,'mcp_contract',1,'cli_switch_request',?,'mcp_registered',json('true'),'model_selection',json(?)) WHERE id=?",params![r.id,serde_json::to_string(&model("bad-later"))?,p.id])?;
+            assert!(ready(c,&p.id,"later-error",&r)?);
+            let recovery=ensure_repair_request(c,&p.id)?;
+            assert_eq!(recovery.intent,"model");
+            assert_eq!(recovery.requested_model,Some(model("bad-later")));
+            assert!(model_repair_can_be_corrected(&recovery));
+            Ok(())
+        }).unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("working")),
+            "model-correct-later",
+            None,
+        )
+        .await
+        .unwrap();
+        let current = app.db.project(&p.id).await.unwrap();
+        app.db
+            .sync(|c| {
+                let corrected = latest(c, &p.id)?.unwrap();
+                assert!(retiring_candidate(
+                    &corrected,
+                    &current.execution,
+                    "later-error"
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let (_dir2, other, other_p) = fixture().await;
+        other.request_cli_switch(&other_p.id, "agy").await.unwrap();
+        other
+            .db
+            .sync(|c| {
+                phase(
+                    c,
+                    &latest(c, &other_p.id)?.unwrap().id,
+                    "recovery_pending",
+                    "CLI startup failed",
+                )
+            })
+            .unwrap();
+        assert!(
+            other
+                .request_model_switch_with_id(
+                    &other_p.id,
+                    Some(model("working")),
+                    "forbidden-cli-model-correction",
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(other.db.sync(|c| holds_input(c, &other_p.id)).unwrap());
+    }
+    #[tokio::test]
+    async fn offline_saved_native_selection_applies_corrected_model_before_any_old_model_bootstrap()
+    {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c|{
+            crate::models::save(c,&p.id,"codex",Some(&model("invalid-old-model")))?;
+            work::finish_execution(c,&p.id,&p.generation,"stopped","Verified stopped fixture",1)?;
+            c.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=?",[&p.id])?;
+            Ok(())
+        }).unwrap();
+        let scope = crate::models::Scope {
+            agent: "codex".into(),
+            generation: String::new(),
+        };
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("working")),
+            "offline-correct-model",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        let current = app.db.project(&p.id).await.unwrap();
+        assert!(current.terminal.is_none());
+        assert_eq!(current.native_session, "old-native");
+        app.db
+            .sync(|c| {
+                let r = latest(c, &p.id)?.unwrap();
+                assert_eq!(r.phase, "starting");
+                assert!(r.holds_input && r.nonce.is_empty() && r.attempts == 0);
+                assert_eq!(r.source["selection"], json!(model("invalid-old-model")));
+                assert_eq!(r.source["extra_args"], json!(p.extra_args));
+                assert_eq!(r.source["direct_model_resume"], true);
+                assert_eq!(
+                    crate::models::load(c, &p.id, "codex")?,
+                    Some(model("working"))
+                );
+                queue(c, &p, "offline-held", 2)?;
+                assert!(work::claim_steering(c, &p.id, "old-gen", 3)?.is_none());
+                let args = crate::adapter::launch_args_with_selection(
+                    &current,
+                    &std::path::PathBuf::from("mcp.json"),
+                    &json!({"command":"hfb","args":["mcp"]}),
+                    "native continuation",
+                    true,
+                    crate::models::load(c, &p.id, "codex")?.as_ref(),
+                )?;
+                assert!(args.windows(2).any(|pair| pair == ["--model", "working"]));
+                assert!(args.windows(2).any(|pair| pair == ["resume", "old-native"]));
+                assert!(!args.iter().any(|arg| arg == "invalid-old-model"));
+                Ok(())
+            })
+            .unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("working")),
+            "offline-correct-model",
+            Some(scope),
+        )
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn offline_correction_after_candidate_close_never_adopts_its_forked_native() {
+        let (_dir, app, p) = fixture().await;
+        app.request_model_switch_with_id(&p.id, Some(model("bad")), "forked-model", None)
+            .await
+            .unwrap();
+        app.db.sync(|c| {
+            // The genuine source can report a newer native identity while
+            // settling; complete must preserve that, not the initial snapshot.
+            c.execute("UPDATE projects SET native_session='settled-source' WHERE id=?",[&p.id])?;
+            let r=requested(c,&p)?;
+            assert!(claim(c,&p.id,&r,"accepted")?);
+            complete(c,&p.id,&r)?;
+            work::begin_execution(c,&p.id,"forked-candidate",1)?;
+            work::finish_execution(c,&p.id,"forked-candidate","stopped","Verified candidate close",2)?;
+            c.execute("UPDATE projects SET native_session='wrong-candidate-fork',terminal=NULL,generation='',execution='null' WHERE id=?",[&p.id])?;
+            phase(c,&r.id,"recovery_pending","Candidate fork closed; source not yet restored")?;
+            Ok(())
+        }).unwrap();
+        let scope = crate::models::Scope {
+            agent: "codex".into(),
+            generation: String::new(),
+        };
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("fixed")),
+            "correct-after-fork-close",
+            Some(scope.clone()),
+        )
+        .await
+        .unwrap();
+        let corrected = app.db.project(&p.id).await.unwrap();
+        assert_eq!(corrected.native_session, "settled-source");
+        assert_eq!(corrected.extra_args, p.extra_args);
+        app.db
+            .sync(|c| {
+                let r = latest(c, &p.id)?.unwrap();
+                assert_eq!(r.phase, "starting");
+                assert!(r.holds_input);
+                assert_eq!(r.source["native_session"], "settled-source");
+                assert_eq!(
+                    crate::models::load(c, &p.id, "codex")?,
+                    Some(model("fixed"))
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT phase FROM cli_switch_requests WHERE id='forked-model'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )?,
+                    "superseded"
+                );
+                Ok(())
+            })
+            .unwrap();
+        app.request_model_switch_with_id(
+            &p.id,
+            Some(model("fixed")),
+            "correct-after-fork-close",
+            Some(scope),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.db.project(&p.id).await.unwrap().native_session,
+            "settled-source"
+        );
+    }
+    #[tokio::test]
+    async fn offline_model_selection_never_assumes_an_unclosed_execution_is_gone() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c|{
+            c.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=?",[&p.id])?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            app.request_model_switch_with_id(
+                &p.id,
+                Some(model("working")),
+                "unverified-offline-model",
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(app.db.sync(|c| Ok(latest(c, &p.id)?.is_none())).unwrap());
     }
 }

@@ -254,7 +254,9 @@ impl Render for ModelPicker {
         let busy = self.ticket.is_some();
         let known = self.catalog.is_object();
         let label = if pending {
-            requested["model"].as_str().unwrap_or("Native CLI/session settings")
+            requested["model"]
+                .as_str()
+                .unwrap_or("Native CLI/session settings")
         } else if self.catalog_error {
             "Model unavailable"
         } else if !known {

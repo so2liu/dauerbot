@@ -264,6 +264,8 @@ impl Db {
         crate::work::migrate(&migration)?;
         crate::handoff::migrate(&migration)?;
         crate::cli_switch::migrate(&migration, recover)?;
+        crate::models::migrate(&migration)?;
+        crate::model_control::migrate(&migration, recover)?;
         migration.pragma_update(None, "user_version", 7)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))
@@ -483,6 +485,9 @@ impl Db {
                  VALUES(?,?,'in',?,?,'queued',?,?,?)",
                 params![key,project,source,content,attachment.to_string(),now(),now()],
             )?;
+            if inserted == 1 && attachment["daemon_control"] == "model" {
+                crate::model_control::journal_source(&tx, project, app_id, chat, source, content, &attachment)?;
+            }
             tx.commit()?;
             Ok((inserted == 1).then_some(key))
         })
