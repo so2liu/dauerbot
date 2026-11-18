@@ -28,7 +28,11 @@ impl From<anyhow::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
-            StatusCode::BAD_REQUEST,
+            if self.0.to_string().starts_with("Manager settings changed") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
             Json(json!({"error":self.0.to_string()})),
         )
             .into_response()
@@ -73,6 +77,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/projects/{id}/agent/standby", post(switch_standby_agent))
         .route("/projects/{id}/agent/transition", post(transition_agent))
         .route("/projects/{id}/agent/repair", post(repair_agent))
+        .route(
+            "/projects/{id}/manager",
+            get(manager_config).put(manager_save),
+        )
+        .route("/projects/{id}/agent/mode", post(manager_mode))
         .route("/projects/{id}/models", get(project_models))
         .route("/projects/{id}/model", post(select_project_model))
         .route("/projects/{id}/documents/{document}", get(project_document))
@@ -372,6 +381,13 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         let id = p.id.clone();
         let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
         let mut record = json!(p);
+        let manager_project = p.id.clone();
+        let manager = app
+            .db
+            .call(move |c| crate::manager::public(c, &manager_project))
+            .await?;
+        record["agent_mode"] = manager["mode"].clone();
+        record["manager"] = manager;
         record["execution"]["agent_tree"] = crate::agent_tree::observe(p.clone()).await;
         let project_id = p.id.clone();
         record["cli_transition"] = json!(
@@ -684,6 +700,44 @@ async fn screen(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResul
 struct Text {
     content: String,
 }
+async fn manager_config(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    let p = app.db.project(&id).await?;
+    Ok(Json(
+        app.db
+            .call(move |c| crate::manager::public(c, &p.id))
+            .await?,
+    ))
+}
+async fn manager_save(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<crate::manager::ConfigInput>,
+) -> ApiResult {
+    let p = app.db.project(&id).await?;
+    let lock = app.project_lock(&p.id).await;
+    let _guard = lock.lock().await;
+    let value = app
+        .db
+        .call(move |c| crate::manager::save(c, &p.id, input))
+        .await?;
+    app.notify.notify_one();
+    Ok(Json(value))
+}
+async fn manager_mode(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<crate::manager::ModeInput>,
+) -> ApiResult {
+    let p = app.db.project(&id).await?;
+    let lock = app.project_lock(&p.id).await;
+    let _guard = lock.lock().await;
+    let value = app
+        .db
+        .call(move |c| crate::manager::set_mode(c, &p.id, input))
+        .await?;
+    app.notify.notify_one();
+    Ok(Json(value))
+}
 async fn inject(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
@@ -696,8 +750,8 @@ async fn inject(
     let key = db::id();
     let source = format!("local-{}", db::id());
     let out = key.clone();
-    app.db.call(move|c|{c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?)",
-        rusqlite::params![key,p.id,source,input.content,db::now(),db::now()])?;Ok(())}).await?;
+    app.db.call(move|c|{let tx=c.unchecked_transaction()?;let mut attachment=json!({});crate::manager::stamp(&tx,&p.id,&mut attachment)?;tx.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
+        rusqlite::params![key,p.id,source,input.content,attachment.to_string(),db::now(),db::now()])?;tx.commit()?;Ok(())}).await?;
     app.notify.notify_one();
 
     Ok(Json(
