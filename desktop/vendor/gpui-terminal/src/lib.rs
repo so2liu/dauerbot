@@ -341,6 +341,7 @@ pub mod colors;
 pub mod event;
 pub mod input;
 pub mod mouse;
+mod output;
 pub mod render;
 mod scroll;
 pub mod terminal;

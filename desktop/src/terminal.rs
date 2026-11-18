@@ -168,6 +168,7 @@ impl Write for StreamWriter {
 struct Connection {
     child: Child,
     input: Option<ChildStdin>,
+    reader: Option<thread::JoinHandle<()>>,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -178,6 +179,11 @@ impl Drop for Connection {
         // This child is an observe/control bridge, never the hosted Agent.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Each reconnect starts a fresh full frame. Finish publishing the old
+        // stream first, so a delayed delta cannot corrupt the new baseline.
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 fn open(
@@ -247,7 +253,7 @@ fn open(
             }
         });
     }
-    thread::spawn(move || {
+    let reader = thread::spawn(move || {
         let mut source = BufReader::new(stdout);
         loop {
             let mut line = String::new();
@@ -289,7 +295,11 @@ fn open(
         }
     });
     let input = child.stdin.take();
-    Ok(Connection { child, input })
+    Ok(Connection {
+        child,
+        input,
+        reader: Some(reader),
+    })
 }
 fn supervise(
     target: Descriptor,

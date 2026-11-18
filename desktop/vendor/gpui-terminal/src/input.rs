@@ -1,4 +1,6 @@
 //! Keyboard input handling for the terminal emulator.
+//! Dauerbot modifications adapt Herdr App's Apache-2.0 terminal key behavior;
+//! see DAUERBOT-PATCHES.md for the source revision and compatibility limits.
 //!
 //! This module provides [`keystroke_to_bytes`], which converts GPUI keyboard
 //! events into terminal escape sequences that can be written to the PTY.
@@ -89,12 +91,34 @@ use gpui::Keystroke;
 // macOS supplies key_char for Enter and Tab as well as printable text.
 pub(crate) fn uses_text_input(key: &Keystroke) -> bool {
     !key.modifiers.control
-        && !key.modifiers.alt
         && !key.modifiers.platform
-        && key
-            .key_char
-            .as_ref()
-            .is_some_and(|text| !text.chars().any(char::is_control))
+        && !key.modifiers.function
+        && !agy_meta_shortcut(key)
+        && (key.key_char.as_ref().is_some_and(|text| !text.chars().any(char::is_control)
+            && (!key.modifiers.alt || cfg!(target_os = "macos") || !text.is_ascii()))
+            // A dead Option key can have no committed text yet. Let AppKit's
+            // input context start composition instead of manufacturing ESC+key.
+            || (cfg!(target_os = "macos") && key.modifiers.alt && key.key.chars().count() == 1))
+}
+
+fn agy_meta_shortcut(key: &Keystroke) -> bool {
+    key.key == "m"
+        && key.modifiers.alt
+        && !key.modifiers.shift
+        && !key.modifiers.control
+        && !key.modifiers.platform
+        && !key.modifiers.function
+}
+
+pub(crate) fn key_input_bytes(key: &Keystroke, mode: TermMode, composing: bool) -> Option<Vec<u8>> {
+    // Pinned GPUI 0.2 has no prefer_character_input field. Its AppKit backend
+    // checks marked_text_range before dispatching KeyDown (mac/window.rs).
+    // Keep that native composition ownership here even for physical shortcuts.
+    if composing || uses_text_input(key) {
+        None
+    } else {
+        keystroke_to_bytes(key, mode)
+    }
 }
 
 /// Convert a GPUI keystroke to terminal escape sequence bytes.
@@ -124,149 +148,175 @@ pub(crate) fn uses_text_input(key: &Keystroke) -> bool {
 /// let bytes = keystroke_to_bytes(&keystroke, TermMode::empty());
 /// assert_eq!(bytes, Some(b"\r".to_vec()));
 /// ```
+// Key and modifier behavior follows Herdr App's Apache-2.0 terminal encoder
+// (origin/master 321c9a84). Adapted for Alacritty and legacy HERDR's ANSI stream;
+// Preserve native Option text; only AGY's requested Alt+M uses physical Meta.
 pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
-    // Handle special keys first
-    match keystroke.key.as_str() {
-        // Basic control characters
-        "space" => {
-            if keystroke.modifiers.control {
-                return Some(b"\x00".to_vec()); // Ctrl+Space = NUL
-            }
-            return Some(b" ".to_vec());
-        }
-        "enter" => return Some(b"\r".to_vec()),
-        "escape" => return Some(b"\x1b".to_vec()),
-        "backspace" => return Some(b"\x7f".to_vec()),
-        "tab" => {
-            // Shift+Tab sends a different sequence
-            if keystroke.modifiers.shift {
-                return Some(b"\x1b[Z".to_vec());
-            }
-            return Some(b"\t".to_vec());
-        }
-
-        // Arrow keys - check APP_CURSOR mode
-        "up" => {
-            if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOA".to_vec());
-            }
-            return Some(b"\x1b[A".to_vec());
-        }
-        "down" => {
-            if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOB".to_vec());
-            }
-            return Some(b"\x1b[B".to_vec());
-        }
-        "right" => {
-            if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOC".to_vec());
-            }
-            return Some(b"\x1b[C".to_vec());
-        }
-        "left" => {
-            if mode.contains(TermMode::APP_CURSOR) {
-                return Some(b"\x1bOD".to_vec());
-            }
-            return Some(b"\x1b[D".to_vec());
-        }
-
-        // Navigation keys
-        "home" => return Some(b"\x1b[H".to_vec()),
-        "end" => return Some(b"\x1b[F".to_vec()),
-        "pageup" => return Some(b"\x1b[5~".to_vec()),
-        "pagedown" => return Some(b"\x1b[6~".to_vec()),
-        "insert" => return Some(b"\x1b[2~".to_vec()),
-        "delete" => return Some(b"\x1b[3~".to_vec()),
-
-        // Function keys
-        "f1" => return Some(b"\x1bOP".to_vec()),
-        "f2" => return Some(b"\x1bOQ".to_vec()),
-        "f3" => return Some(b"\x1bOR".to_vec()),
-        "f4" => return Some(b"\x1bOS".to_vec()),
-        "f5" => return Some(b"\x1b[15~".to_vec()),
-        "f6" => return Some(b"\x1b[17~".to_vec()),
-        "f7" => return Some(b"\x1b[18~".to_vec()),
-        "f8" => return Some(b"\x1b[19~".to_vec()),
-        "f9" => return Some(b"\x1b[20~".to_vec()),
-        "f10" => return Some(b"\x1b[21~".to_vec()),
-        "f11" => return Some(b"\x1b[23~".to_vec()),
-        "f12" => return Some(b"\x1b[24~".to_vec()),
-
-        _ => {}
+    let modifiers = keystroke.modifiers;
+    if modifiers.platform {
+        return None;
     }
-
-    // Handle Ctrl+key combinations
-    if keystroke.modifiers.control {
-        let key = keystroke.key.as_str();
-
-        // Ctrl+A through Ctrl+Z map to 0x01 through 0x1a
-        if key.len() == 1 {
-            let ch = key.chars().next().unwrap();
-            if ch.is_ascii_alphabetic() {
-                // Convert to uppercase and then to control character
-                let upper = ch.to_ascii_uppercase();
-                let ctrl_char = (upper as u8) - b'@';
-                return Some(vec![ctrl_char]);
-            }
-
-            // Special Ctrl combinations
-            match ch {
-                '[' => return Some(b"\x1b".to_vec()),  // Ctrl+[
-                '\\' => return Some(b"\x1c".to_vec()), // Ctrl+\
-                ']' => return Some(b"\x1d".to_vec()),  // Ctrl+]
-                '^' => return Some(b"\x1e".to_vec()),  // Ctrl+^
-                '_' => return Some(b"\x1f".to_vec()),  // Ctrl+_
-                '?' => return Some(b"\x7f".to_vec()),  // Ctrl+?
-                _ => {}
-            }
-        }
-    }
-
-    // Handle Alt+key combinations
-    if keystroke.modifiers.alt {
-        let key = keystroke.key.as_str();
-        if key.len() == 1 {
-            // Alt+key sends ESC followed by the key
-            let ch = key.chars().next().unwrap();
-            if ch.is_ascii() {
-                let mut bytes = vec![b'\x1b'];
-                bytes.push(ch as u8);
-                return Some(bytes);
-            }
-        }
-    }
-
-    // Handle regular printable characters
-    // Use key_char if available (contains the actual typed character with modifiers like Shift)
-    if let Some(key_char) = &keystroke.key_char
-        && !keystroke.modifiers.control
-        && !keystroke.modifiers.alt
+    // Herdr App key_bytes consumes Option when it produced native text,
+    // including ASCII layout symbols. Do not turn composed text into Meta.
+    if modifiers.alt
+        && !modifiers.control
+        && !agy_meta_shortcut(keystroke)
+        && let Some(text) = keystroke.key_char.as_ref().filter(|text| !text.is_empty())
+        && (cfg!(target_os = "macos") || !text.is_ascii())
+        && !text.chars().any(char::is_control)
     {
-        return Some(key_char.as_bytes().to_vec());
+        return Some(text.as_bytes().to_vec());
     }
-
-    // Fallback to key for single characters
     let key = keystroke.key.as_str();
-    if key.len() == 1 {
-        let ch = key.chars().next().unwrap();
-        if ch.is_ascii() && !keystroke.modifiers.control {
-            // Handle shift modifier for uppercase
-            let ch = if keystroke.modifiers.shift {
+    let modifier = 1
+        + u8::from(modifiers.shift)
+        + 2 * u8::from(modifiers.alt)
+        + 4 * u8::from(modifiers.control);
+    let cursor = match key {
+        "up" => Some('A'),
+        "down" => Some('B'),
+        "right" => Some('C'),
+        "left" => Some('D'),
+        "home" => Some('H'),
+        "end" => Some('F'),
+        _ => None,
+    };
+    if let Some(code) = cursor {
+        return Some(if modifier != 1 {
+            format!("\x1b[1;{modifier}{code}").into_bytes()
+        } else if mode.contains(TermMode::APP_CURSOR) {
+            format!("\x1bO{code}").into_bytes()
+        } else {
+            format!("\x1b[{code}").into_bytes()
+        });
+    }
+    let function = match key {
+        "insert" => Some(2),
+        "delete" => Some(3),
+        "pageup" => Some(5),
+        "pagedown" => Some(6),
+        "f5" => Some(15),
+        "f6" => Some(17),
+        "f7" => Some(18),
+        "f8" => Some(19),
+        "f9" => Some(20),
+        "f10" => Some(21),
+        "f11" => Some(23),
+        "f12" => Some(24),
+        _ => None,
+    };
+    if let Some(code) = function {
+        return Some(
+            if modifier == 1 {
+                format!("\x1b[{code}~")
+            } else {
+                format!("\x1b[{code};{modifier}~")
+            }
+            .into_bytes(),
+        );
+    }
+    if let Some(code) = match key {
+        "f1" => Some('P'),
+        "f2" => Some('Q'),
+        "f3" => Some('R'),
+        "f4" => Some('S'),
+        _ => None,
+    } {
+        return Some(
+            if modifier == 1 {
+                format!("\x1bO{code}")
+            } else {
+                format!("\x1b[1;{modifier}{code}")
+            }
+            .into_bytes(),
+        );
+    }
+    // Ghostty distinguishes Shift+Enter even without the Kitty protocol.
+    if key == "enter" && modifiers.shift {
+        return Some(format!("\x1b[27;{modifier};13~").into_bytes());
+    }
+    let mut bytes = match key {
+        "enter" => b"\r".to_vec(),
+        "escape" => b"\x1b".to_vec(),
+        "backspace" => {
+            if modifiers.control {
+                vec![0x08]
+            } else {
+                vec![0x7f]
+            }
+        }
+        "tab" if modifiers.shift => b"\x1b[Z".to_vec(),
+        "tab" => b"\t".to_vec(),
+        "space" if modifiers.control => vec![0],
+        "space" => vec![b' '],
+        _ if modifiers.control => {
+            let mut chars = key.chars();
+            let (Some(ch), None) = (chars.next(), chars.next()) else {
+                return None;
+            };
+            let code = match ch {
+                'a'..='z' | 'A'..='Z' => ch.to_ascii_uppercase() as u8 - b'@',
+                '@' | '2' => 0,
+                '[' | '3' => 0x1b,
+                '\\' | '4' => 0x1c,
+                ']' | '5' => 0x1d,
+                '^' | '6' => 0x1e,
+                '_' | '-' | '/' | '7' => 0x1f,
+                '?' | '8' => 0x7f,
+                _ => return None,
+            };
+            vec![code]
+        }
+        _ if modifiers.alt => {
+            // Native text has already been preserved above. This is a physical
+            // Meta shortcut or a non-text Alt chord, not an Option composition.
+            let mut chars = key.chars();
+            let (Some(ch), None) = (chars.next(), chars.next()) else {
+                return None;
+            };
+            let ch = if modifiers.shift {
                 ch.to_ascii_uppercase()
             } else {
                 ch
             };
-            return Some(vec![ch as u8]);
+            ch.to_string().into_bytes()
         }
-        // For non-ASCII characters, encode as UTF-8
-        if !keystroke.modifiers.control && !keystroke.modifiers.alt {
-            return Some(key.as_bytes().to_vec());
+        _ => {
+            if let Some(text) = &keystroke.key_char {
+                text.as_bytes().to_vec()
+            } else {
+                let mut chars = key.chars();
+                let (Some(ch), None) = (chars.next(), chars.next()) else {
+                    return None;
+                };
+                let ch = if modifiers.shift {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                };
+                ch.to_string().into_bytes()
+            }
         }
+    };
+    if modifiers.alt {
+        bytes.insert(0, 0x1b);
     }
+    Some(bytes)
+}
 
-    // If we get here, the keystroke doesn't produce any output
-    None
+/// Text committed by an input method may include macOS's newline for Return.
+/// Terminal Return is CR; multiline paste is encoded separately as a paste.
+pub(crate) fn committed_text_bytes(text: &str) -> Vec<u8> {
+    text.replace("\r\n", "\n").replace('\n', "\r").into_bytes()
+}
+
+pub(crate) fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if bracketed {
+        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes()
+    } else {
+        text.replace('\n', "\r").into_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -465,5 +515,93 @@ mod routing_tests {
         assert!(uses_text_input(&key));
         key.key_char = Some("中".into());
         assert!(uses_text_input(&key));
+    }
+
+    #[test]
+    fn native_meta_and_control_chords_keep_the_physical_key_and_modifiers() {
+        let mut option_m = Keystroke::parse("alt-m").unwrap();
+        option_m.key_char = Some("µ".into());
+        assert!(!uses_text_input(&option_m));
+        assert_eq!(
+            keystroke_to_bytes(&option_m, TermMode::empty()).unwrap(),
+            b"\x1bm"
+        );
+        for (key, expected) in [
+            ("alt-shift-m", b"\x1bM".as_slice()),
+            ("ctrl-alt-m", b"\x1b\r".as_slice()),
+            ("alt-enter", b"\x1b\r".as_slice()),
+            ("ctrl-left", b"\x1b[1;5D".as_slice()),
+            ("alt-right", b"\x1b[1;3C".as_slice()),
+            ("shift-enter", b"\x1b[27;2;13~".as_slice()),
+            ("ctrl--", b"\x1f".as_slice()),
+        ] {
+            assert_eq!(
+                keystroke_to_bytes(&Keystroke::parse(key).unwrap(), TermMode::empty()).unwrap(),
+                expected,
+                "{key}"
+            );
+        }
+        assert!(
+            keystroke_to_bytes(&Keystroke::parse("cmd-m").unwrap(), TermMode::empty()).is_none()
+        );
+    }
+
+    #[test]
+    fn option_symbols_and_dead_key_composition_keep_native_text_ownership() {
+        for (chord, text) in [
+            ("alt-e", "´"),
+            ("alt-p", "π"),
+            ("alt-8", "{"),
+            ("alt-shift-2", "@"),
+            ("alt-shift-m", "Â"),
+        ] {
+            let mut key = Keystroke::parse(chord).unwrap();
+            key.key_char = Some(text.into());
+            let native_text = cfg!(target_os = "macos") || !text.is_ascii();
+            assert_eq!(uses_text_input(&key), native_text, "{chord}");
+            assert_eq!(
+                key_input_bytes(&key, TermMode::empty(), false).is_none(),
+                native_text,
+                "native text ownership for {chord}"
+            );
+            if native_text {
+                assert_eq!(
+                    keystroke_to_bytes(&key, TermMode::empty()).unwrap(),
+                    text.as_bytes()
+                );
+            }
+        }
+        if cfg!(target_os = "macos") {
+            let dead = Keystroke::parse("alt-e").unwrap();
+            assert!(
+                key_input_bytes(&dead, TermMode::empty(), false).is_none(),
+                "no committed dead-key text yet"
+            );
+        }
+        let mut shortcut = Keystroke::parse("alt-m").unwrap();
+        shortcut.key_char = Some("µ".into());
+        assert_eq!(
+            key_input_bytes(&shortcut, TermMode::empty(), false).unwrap(),
+            b"\x1bm"
+        );
+        assert!(
+            key_input_bytes(&shortcut, TermMode::empty(), true).is_none(),
+            "marked text owns even Alt+M"
+        );
+        assert!(
+            key_input_bytes(&Keystroke::parse("enter").unwrap(), TermMode::empty(), true).is_none(),
+            "Return confirms IME before it submits terminal input"
+        );
+        assert_eq!(committed_text_bytes("é"), "é".as_bytes());
+    }
+
+    #[test]
+    fn committed_return_and_multiline_paste_keep_terminal_line_discipline() {
+        assert_eq!(committed_text_bytes("中文\n"), "中文\r".as_bytes());
+        assert_eq!(paste_bytes("first\r\nsecond\n", false), b"first\rsecond\r");
+        assert_eq!(
+            paste_bytes("first\r\nsecond\x1b[201~", true),
+            b"\x1b[200~first\nsecond[201~\x1b[201~"
+        );
     }
 }

@@ -1,4 +1,6 @@
 //! Main terminal view component for GPUI.
+//! Dauerbot modifications adapt Herdr App's Apache-2.0 ingestion, refresh and
+//! focus mechanisms; see DAUERBOT-PATCHES.md for attribution and limitations.
 //!
 //! This module provides [`TerminalView`], the primary component for embedding terminals
 //! in GPUI applications. It manages:
@@ -49,7 +51,7 @@
 
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
-use crate::input::keystroke_to_bytes;
+use crate::output::{FrameIngest, INTERACTIVE_WINDOW, OUTPUT_TURN, REDRAW_INTERVAL};
 use crate::render::TerminalRenderer;
 use crate::scroll::{ScrollAccumulator, TerminalScroll, cell_at};
 use crate::terminal::TerminalState;
@@ -58,12 +60,13 @@ use alacritty_terminal::index::{Column, Line, Point as CellPoint};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use gpui::{Edges, *};
-use std::cell::RefCell;
+use std::cell::{Cell as LocalCell, RefCell};
 use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Configuration for terminal creation and runtime updates.
 ///
@@ -401,7 +404,10 @@ pub struct TerminalView {
     selection: Rc<RefCell<Option<SelectionRange>>>,
     selecting: bool,
     marked: Rc<RefCell<Option<String>>>,
-    writable: bool,
+    input_ownership: InputOwnership,
+    typed_at: LocalCell<Option<Instant>>,
+    redraw_pending: bool,
+    redraw_task: Option<Task<()>>,
     scroll_callback: Option<Arc<dyn Fn(TerminalScroll) + Send + Sync>>,
     scroll_accumulator: ScrollAccumulator,
     /// The terminal state managing the grid and VTE parser
@@ -445,7 +451,47 @@ pub struct TerminalView {
     exit_callback: Option<ExitCallback>,
 }
 
+/// Input takeover can receive repeated acknowledgements before GPUI paints.
+/// Retain a rising-edge focus request until paint consumes it or release cancels it.
+#[derive(Default)]
+struct InputOwnership {
+    writable: bool,
+    focus_pending: bool,
+}
+impl InputOwnership {
+    fn set_writable(&mut self, writable: bool) {
+        if !writable {
+            self.focus_pending = false;
+        } else if !self.writable {
+            self.focus_pending = true;
+        }
+        self.writable = writable;
+    }
+    fn take_focus(&mut self) -> bool {
+        std::mem::take(&mut self.focus_pending)
+    }
+}
+
 impl TerminalView {
+    fn redraw_soon(&mut self, cx: &mut Context<Self>) {
+        if self
+            .typed_at
+            .get()
+            .is_some_and(|at| at.elapsed() < INTERACTIVE_WINDOW)
+        {
+            cx.notify();
+        } else if !self.redraw_pending {
+            self.redraw_pending = true;
+            self.redraw_task = Some(cx.spawn(async |this, cx| {
+                cx.background_executor().timer(REDRAW_INTERVAL).await;
+                let _ = this.update(cx, |view, cx| {
+                    view.redraw_pending = false;
+                    cx.notify();
+                });
+            }));
+        }
+    }
+
     /// Create a new terminal with provided I/O streams.
     ///
     /// This method initializes a new terminal emulator with the given stdin writer
@@ -534,29 +580,35 @@ impl TerminalView {
         // Spawn async task that awaits on the channel and notifies the view
         // This is push-based: the task blocks until bytes arrive, then immediately notifies
         let reader_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut ingest = FrameIngest::default();
             loop {
-                // Wait for bytes from the background reader (blocks until data arrives)
-                match bytes_rx.recv_async().await {
-                    Ok(bytes) => {
-                        // Process bytes and notify the view
-                        let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
-                            view.state.process_frame(&bytes.bytes, bytes.size);
-                            cx.notify();
-                        });
-                        if result.is_err() {
-                            // View was dropped, exit
+                if ingest.is_empty() {
+                    match bytes_rx.recv_async().await {
+                        Ok(frame) => ingest.begin(frame),
+                        Err(_) => {
+                            let _ = exit_event_tx.send(TerminalEvent::Exit);
+                            let _ = this.update(cx, |_, cx| cx.notify());
                             break;
                         }
                     }
-                    Err(_) => {
-                        // Channel closed - PTY has finished, send Exit event
-                        let _ = exit_event_tx.send(TerminalEvent::Exit);
-                        // Notify view to process the Exit event
-                        let _ = this.update(cx, |_view, cx: &mut Context<Self>| {
-                            cx.notify();
+                }
+                if this
+                    .update(cx, |view, cx| {
+                        ingest.apply_turn(&bytes_rx, OUTPUT_TURN, |bytes, size| {
+                            view.state.process_frame(bytes, size)
                         });
-                        break;
-                    }
+                        view.redraw_soon(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if !ingest.is_empty() || !bytes_rx.is_empty() {
+                    // Yield after bounded parser units even inside a multi-MiB
+                    // legacy frame. No following delta can overtake its remainder.
+                    cx.background_executor()
+                        .timer(Duration::from_millis(1))
+                        .await;
                 }
             }
         });
@@ -567,7 +619,10 @@ impl TerminalView {
             selection: Rc::new(RefCell::new(None)),
             selecting: false,
             marked: Rc::new(RefCell::new(None)),
-            writable: false,
+            input_ownership: InputOwnership::default(),
+            typed_at: LocalCell::new(None),
+            redraw_pending: false,
+            redraw_task: None,
             scroll_callback: None,
             scroll_accumulator: ScrollAccumulator::default(),
             state,
@@ -767,7 +822,7 @@ impl TerminalView {
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
     pub fn set_writable(&mut self, writable: bool, cx: &mut Context<Self>) {
-        self.writable = writable;
+        self.input_ownership.set_writable(writable);
         self.scroll_accumulator.reset();
         if !writable {
             *self.marked.borrow_mut() = None;
@@ -784,7 +839,14 @@ impl TerminalView {
     }
 
     fn send(&self, bytes: &[u8]) {
-        if self.writable {
+        if self.input_ownership.writable && !bytes.is_empty() {
+            self.typed_at.set(Some(Instant::now()));
+            *self.selection.borrow_mut() = None;
+            if !self.remote_frames {
+                self.state.with_term_mut(|term| {
+                    term.scroll_display(alacritty_terminal::grid::Scroll::Bottom)
+                });
+            }
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(bytes);
             let _ = writer.flush();
@@ -857,26 +919,20 @@ impl TerminalView {
             return;
         }
         if key.modifiers.platform && key.key == "v" {
-            if self.writable
+            if self.input_ownership.writable
                 && let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
             {
-                if self.state.mode().contains(TermMode::BRACKETED_PASTE) {
-                    self.send(format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).as_bytes());
-                } else {
-                    self.send(text.as_bytes());
-                }
+                self.send(&crate::input::paste_bytes(
+                    &text,
+                    self.state.mode().contains(TermMode::BRACKETED_PASTE),
+                ));
             }
             cx.stop_propagation();
             return;
         }
-        // Printable text goes through macOS text input so IME does not duplicate keystrokes.
-        if crate::input::uses_text_input(key) {
-            return;
-        }
-        if self.marked.borrow().is_some() {
-            return;
-        }
-        if let Some(bytes) = keystroke_to_bytes(key, self.state.mode()) {
+        if let Some(bytes) =
+            crate::input::key_input_bytes(key, self.state.mode(), self.marked.borrow().is_some())
+        {
             self.send(&bytes);
             cx.stop_propagation();
         }
@@ -931,7 +987,7 @@ impl TerminalView {
         cx.stop_propagation();
         // Rendered frames contain repaint instructions, not source terminal modes/history.
         // Application scrolling must go through the explicitly enabled host controller.
-        if self.remote_frames && !self.writable {
+        if self.remote_frames && !self.input_ownership.writable {
             self.scroll_accumulator.reset();
             return;
         }
@@ -1111,8 +1167,51 @@ impl TerminalView {
     }
 }
 
+#[cfg(test)]
+mod ownership_tests {
+    use super::InputOwnership;
+
+    #[test]
+    fn repeated_takeover_acknowledgements_keep_focus_until_paint_and_release_cancels_it() {
+        let mut ownership = InputOwnership::default();
+        ownership.set_writable(true);
+        ownership.set_writable(true);
+        assert!(ownership.writable);
+        assert!(
+            ownership.take_focus(),
+            "both acknowledgements can arrive before the first render"
+        );
+        assert!(
+            !ownership.take_focus(),
+            "a later render must not steal focus again"
+        );
+        ownership.set_writable(true);
+        assert!(
+            !ownership.take_focus(),
+            "a redundant acknowledgement after paint is not another takeover"
+        );
+        ownership.set_writable(false);
+        ownership.set_writable(true);
+        ownership.set_writable(false);
+        assert!(!ownership.writable);
+        assert!(
+            !ownership.take_focus(),
+            "release before paint cancels the pending focus request"
+        );
+        ownership.set_writable(true);
+        ownership.set_writable(true);
+        assert!(
+            ownership.take_focus(),
+            "a new rising edge obtains focus after release"
+        );
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.input_ownership.take_focus() {
+            self.focus_handle.focus(window);
+        }
         // Process any pending events
         self.process_events(window, cx);
 
@@ -1314,11 +1413,13 @@ impl EntityInputHandler for TerminalView {
         &mut self,
         _: Option<std::ops::Range<usize>>,
         text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         *self.marked.borrow_mut() = None;
-        self.send(text.as_bytes());
+        if self.focus_handle.is_focused(window) {
+            self.send(&crate::input::committed_text_bytes(text));
+        }
         cx.notify();
     }
     fn replace_and_mark_text_in_range(
@@ -1326,10 +1427,10 @@ impl EntityInputHandler for TerminalView {
         _: Option<std::ops::Range<usize>>,
         text: &str,
         _: Option<std::ops::Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.writable {
+        if self.input_ownership.writable && self.focus_handle.is_focused(window) {
             *self.marked.borrow_mut() = (!text.is_empty()).then(|| text.to_owned());
         }
         cx.notify();
