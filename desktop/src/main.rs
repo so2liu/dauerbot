@@ -5,6 +5,7 @@ mod backend;
 mod locale;
 #[cfg(target_os = "macos")]
 mod menubar;
+mod model_picker;
 mod project_tools;
 mod terminal;
 mod updater;
@@ -13,7 +14,7 @@ use backend::{Backend, CommandRequest, Reply};
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::*,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     resizable::{h_resizable, resizable_panel},
     *,
 };
@@ -22,10 +23,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 
-const INK: u32 = 0x202a35;
-const MUTED: u32 = 0x74808c;
-const LINE: u32 = 0xe6e9ec;
-const ACCENT: u32 = 0x1c796c;
+const INK: u32 = 0x1c1c21;
+const MUTED: u32 = 0x85858d;
+const LINE: u32 = 0xe3e3e8;
+const ACCENT: u32 = 0x4f46e5;
+const CANVAS: u32 = 0xf4f4f6;
+const SURFACE: u32 = 0xffffff;
+const PILL: u32 = 0xf1f1f4;
 const STEPS: [&str; 9] = [
     "Welcome",
     "Create a Feishu bot",
@@ -37,7 +41,20 @@ const STEPS: [&str; 9] = [
     "App Updates",
     "Settings",
 ];
-actions!(bridge, [Quit, ShowUpdates, ShowSettings]);
+actions!(
+    bridge,
+    [
+        Quit,
+        ShowUpdates,
+        ShowSettings,
+        FocusProjects,
+        NextProject,
+        PreviousProject,
+        AddProject,
+        ToggleTerminal,
+        ToggleSidebar
+    ]
+);
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -46,6 +63,7 @@ struct Setup {
     bots: std::collections::HashMap<String, BotSetup>,
     language: Language,
     terminal_hidden: bool,
+    sidebar_hidden: bool,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -54,6 +72,7 @@ struct BotSetup {
     published: bool,
 }
 struct Desktop {
+    focus_handle: FocusHandle,
     backend: Backend,
     independent_data: bool,
     setup: Setup,
@@ -61,6 +80,7 @@ struct Desktop {
     selected: String,
     picked_path: String,
     name: Entity<InputState>,
+    project_search: Entity<InputState>,
     path: Entity<InputState>,
     app_id: Entity<InputState>,
     secret: Entity<InputState>,
@@ -81,6 +101,7 @@ struct Desktop {
     terminal_error: String,
     timers: Value,
     project_tools: Entity<project_tools::ProjectTools>,
+    model_picker: Entity<model_picker::ModelPicker>,
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
@@ -92,6 +113,8 @@ impl Desktop {
         self.setup.language.text(text)
     }
     fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
         let independent_data = independent_data_dir(&backend.dir);
         let mut setup: Setup = std::fs::read(backend.dir.join("desktop.json"))
             .ok()
@@ -104,6 +127,15 @@ impl Desktop {
             cx.new(|cx| InputState::new(window, cx).placeholder(setup.language.text(placeholder)))
         };
         let name = input("For example: personal website", cx);
+        let project_search = input("Search projects · ⌘F", cx);
+        cx.subscribe(&project_search, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.move_project(0, cx);
+                this.go(6);
+            }
+            cx.notify();
+        })
+        .detach();
         let path = input("Leave empty to create a private project folder", cx);
         let app_id = input("cli_…", cx);
         let secret = cx.new(|cx| {
@@ -131,7 +163,10 @@ impl Desktop {
         })
         .detach();
         let project_tools = cx.new(|cx| project_tools::ProjectTools::new(backend.dir.clone(), cx));
+        let model_picker =
+            cx.new(|cx| model_picker::ModelPicker::new(backend.dir.clone(), window, cx));
         Self {
+            focus_handle,
             backend,
             independent_data,
             setup,
@@ -139,6 +174,7 @@ impl Desktop {
             selected: String::new(),
             picked_path: String::new(),
             name,
+            project_search,
             path,
             app_id,
             secret,
@@ -159,6 +195,7 @@ impl Desktop {
             terminal_error: String::new(),
             timers: Value::Null,
             project_tools,
+            model_picker,
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
@@ -468,6 +505,40 @@ impl Desktop {
             }
         }
     }
+    fn visible_project_ids(&self, cx: &App) -> Vec<String> {
+        let query = self.project_search.read(cx).value().trim().to_lowercase();
+        self.state["projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|project| {
+                query.is_empty()
+                    || project["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&query)
+                    || agent_name(project["agent"].as_str().unwrap_or(""))
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .filter_map(|project| project["id"].as_str().map(str::to_owned))
+            .collect()
+    }
+    fn move_project(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let ids = self.visible_project_ids(cx);
+        if ids.is_empty() {
+            return;
+        }
+        let index = if direction == 0 {
+            0
+        } else {
+            let current = ids.iter().position(|id| id == &self.selected).unwrap_or(0);
+            (current as isize + direction).rem_euclid(ids.len() as isize) as usize
+        };
+        self.select_project(ids[index].clone(), cx);
+        self.go(6);
+    }
     fn select_project(&mut self, id: String, cx: &mut Context<Self>) {
         if self.selected != id {
             self.release_terminal();
@@ -619,30 +690,23 @@ impl Desktop {
                 cx.notify();
             }))
     }
-    fn title(&self, kicker: &str, title: &str, description: &str) -> Div {
+    fn title(&self, _kicker: &str, title: &str, description: &str) -> Div {
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .mb_6()
+            .gap_2()
+            .mb_4()
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(ACCENT))
+                    .text_xl()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr(kicker)),
-            )
-            .child(
-                div()
-                    .text_3xl()
-                    .font_weight(FontWeight::BOLD)
                     .child(self.tr(title)),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(rgb(MUTED))
-                    .line_height(relative(1.7))
+                    .line_height(relative(1.5))
                     .child(self.tr(description)),
             )
     }
@@ -1220,14 +1284,25 @@ impl Desktop {
         });
         let Some(project) = project else {
             return div()
+                .size_full()
                 .flex()
                 .flex_col()
+                .items_center()
+                .justify_center()
                 .gap_4()
-                .child(self.title(
-                    "PROJECTS",
-                    "No projects yet",
-                    "Add a project, then send instructions in Feishu.",
-                ))
+                .p_8()
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(self.tr("No projects yet")),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(self.tr("Add a project, then send instructions in Feishu.")),
+                )
                 .child(
                     self.btn("first-project", "Add project", |this, _, _| this.go(5), cx)
                         .primary(),
@@ -1237,48 +1312,150 @@ impl Desktop {
         self.project_tools.update(cx, |tools, cx| {
             tools.select(project, self.setup.language, cx)
         });
+        self.model_picker.update(cx, |picker, cx| {
+            picker.select(project, self.setup.language, cx)
+        });
         let timers = visible_timers(&self.timers);
         let mut content = div()
             .flex()
             .flex_col()
-            .gap_5()
+            .gap_6()
             .child(
                 div()
-                    .text_2xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(project["name"].as_str().unwrap_or("Project").to_owned()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(self.tr(project_status(project))),
-            )
-            .child(self.project_tools.clone())
-            .child(
-                div()
-                    .mt_4()
                     .flex()
-                    .gap_2()
                     .items_center()
+                    .justify_between()
+                    .gap_4()
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.tr("Scheduled runs")),
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(
+                                        project["name"].as_str().unwrap_or("Project").to_owned(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(MUTED))
+                                    .child(self.tr("Your instructions, one message away.")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .bg(rgb(PILL))
+                            .text_xs()
+                            .text_color(rgb(0x63636b))
+                            .child(self.tr(project_status(project))),
+                    ),
+            )
+            .child(
+                div()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(SURFACE))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(self.project_tools.clone())
+                    .child(
+                        div()
+                            .pt_3()
+                            .border_t_1()
+                            .border_color(rgb(0xececf0))
+                            .child(self.model_picker.clone()),
+                    ),
+            );
+        let mut schedules = div()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(SURFACE))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.tr("Scheduled runs")),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(PILL))
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(timers.len().to_string()),
+                            ),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(timers.len().to_string()),
+                            .child(self.tr("Managed in Feishu")),
                     ),
             );
         if timers.is_empty() {
-            content = content.child(self.card(
-                "No scheduled runs",
-                "Ask the Agent in Feishu to schedule something when you need it.",
-            ));
+            schedules = schedules.child(
+                div()
+                    .px_6()
+                    .py_8()
+                    .border_t_1()
+                    .border_color(rgb(0xececf0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(40.))
+                            .rounded_full()
+                            .bg(rgb(PILL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xl()
+                            .text_color(rgb(MUTED))
+                            .child("◷"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(self.tr("Nothing scheduled yet")),
+                    )
+                    .child(div().text_sm().text_color(rgb(MUTED)).child(
+                        self.tr("Ask the Agent in Feishu to schedule something when you need it."),
+                    )),
+            );
         }
         for timer in timers {
             let id = timer["id"].as_str().unwrap_or("").to_owned();
@@ -1288,10 +1465,18 @@ impl Desktop {
                 timer["timezone"].as_str().unwrap_or("UTC"),
             );
             let mut details = div()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .child(timer["name"].as_str().unwrap_or("Scheduled run").to_owned())
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .truncate()
+                        .child(timer["name"].as_str().unwrap_or("Scheduled run").to_owned()),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -1306,19 +1491,30 @@ impl Desktop {
                         .child(format!("{} · {next}", self.tr("Next run"))),
                 );
             }
-            content = content.child(
+            schedules = schedules.child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
+                    .px_4()
                     .py_4()
                     .border_t_1()
-                    .border_color(rgb(LINE))
-                    .text_sm()
+                    .border_color(rgb(0xececf0))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(30.))
+                            .rounded_lg()
+                            .bg(rgb(if enabled { 0xeeedfd } else { PILL }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(if enabled { ACCENT } else { MUTED }))
+                            .child("◷"),
+                    )
                     .child(details)
                     .child(
                         Button::new(SharedString::from(format!("timer-{id}")))
+                            .small()
                             .label(self.tr(if enabled { "Pause" } else { "Enable" }))
                             .disabled(self.busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1335,17 +1531,17 @@ impl Desktop {
                     ),
             );
         }
-        content.child(div().mt_5().pt_4().border_t_1().border_color(rgb(LINE))
-            .text_xs().text_color(rgb(MUTED))
-            .child(self.tr("Send instructions in Feishu. New messages immediately steer the Agent, even while it is working.")))
-            .into_any_element()
+        content = content.child(schedules).child(div().text_xs().text_color(rgb(MUTED))
+            .child(self.tr("Send instructions in Feishu. New messages immediately steer the Agent, even while it is working.")));
+        content.into_any_element()
     }
     fn workspace_layout(&mut self, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let center = div()
             .id("scheduled-work")
             .size_full()
             .overflow_y_scroll()
-            .p_8()
+            .p_6()
+            .bg(rgb(CANVAS))
             .child(content);
         if self.setup.terminal_hidden {
             return div()
@@ -1354,12 +1550,12 @@ impl Desktop {
                 .child(center.flex_1())
                 .child(
                     div()
-                        .w(px(64.))
+                        .w(px(54.))
                         .h_full()
                         .flex_shrink_0()
                         .border_l_1()
                         .border_color(rgb(LINE))
-                        .bg(rgb(0xf7f8f4))
+                        .bg(rgb(0xf9f9fb))
                         .pt_5()
                         .flex()
                         .flex_col()
@@ -1379,7 +1575,7 @@ impl Desktop {
                                 .mt_3()
                                 .text_xs()
                                 .text_color(rgb(MUTED))
-                                .child("Terminal"),
+                                .child(self.tr("Terminal")),
                         ),
                 )
                 .into_any_element();
@@ -1415,8 +1611,24 @@ impl Desktop {
                 "Connections and occasional project controls.",
             ))
             .child(links)
-            .child(project)
-            .child(self.environment_page(cx))
+            .child(
+                div()
+                    .p_5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(SURFACE))
+                    .child(project),
+            )
+            .child(
+                div()
+                    .p_5()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(SURFACE))
+                    .child(self.environment_page(cx)),
+            )
             .into_any_element()
     }
     fn environment_page(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1519,53 +1731,100 @@ impl Render for Desktop {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgb(0xfafbf9))
-                .child(self.tr("Finishing the update. Your projects keep running."));
+                .bg(rgb(CANVAS))
+                .child(self.tr("Finishing the update. Your projects keep running."))
+                .into_any_element();
         }
         let page = self.setup.page;
-        let mut sidebar = div()
-            .w(px(210.))
-            .flex_shrink_0()
-            .h_full()
+        let visible = self.visible_project_ids(cx);
+        let mut project_list = div()
+            .id("sidebar-project-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
             .flex()
             .flex_col()
-            .bg(rgb(0xf5f6f2))
-            .border_r_1()
-            .border_color(rgb(LINE))
-            .p_4()
-            .gap_2()
-            .child(
-                div()
-                    .px_2()
-                    .py_4()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(self.tr("Projects")),
-            );
+            .gap_1();
         for project in self.state["projects"].as_array().into_iter().flatten() {
             let id = project["id"].as_str().unwrap_or("").to_owned();
-            sidebar = sidebar.child(
+            if !visible.contains(&id) {
+                continue;
+            }
+            let keyboard_id = id.clone();
+            let selected = id == self.selected && page == 6;
+            let status = project_status(project);
+            let symbol = if matches!(status, "error" | "needs_attention" | "offline") {
+                "×"
+            } else if matches!(status, "busy" | "running") {
+                "•"
+            } else {
+                "·"
+            };
+            project_list = project_list.child(
                 div()
                     .id(SharedString::from(format!("project-{id}")))
-                    .px_3()
-                    .py_3()
-                    .rounded_lg()
-                    .cursor_pointer()
-                    .bg(rgb(if id == self.selected {
-                        0xe6ece1
-                    } else {
-                        0xf5f6f2
+                    .focusable()
+                    .tab_index(0)
+                    .border_1()
+                    .border_color(rgb(CANVAS))
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.select_project(keyboard_id.clone(), cx);
+                            this.go(6);
+                            cx.stop_propagation();
+                        }
                     }))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(if selected { 0xe6e6eb } else { CANVAS }))
+                    .hover(|style| style.bg(rgb(0xececf0)))
                     .child(
                         div()
-                            .text_sm()
-                            .child(project["name"].as_str().unwrap_or("Project").to_owned()),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_weight(if selected {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .child(
+                                        project["name"].as_str().unwrap_or("Project").to_owned(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .text_color(rgb(if matches!(status, "busy" | "running") {
+                                        ACCENT
+                                    } else {
+                                        MUTED
+                                    }))
+                                    .child(symbol),
+                            ),
                     )
                     .child(
                         div()
+                            .mt_1()
+                            .truncate()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(self.tr(project_status(project))),
+                            .child(format!(
+                                "{} · {}",
+                                agent_name(project["agent"].as_str().unwrap_or("")),
+                                self.tr(status)
+                            )),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_project(id.clone(), cx);
@@ -1574,17 +1833,93 @@ impl Render for Desktop {
                     })),
             );
         }
-        sidebar = sidebar
-            .child(self.btn("sidebar-add", "+ Add project", |this, _, _| this.go(5), cx))
-            .child(div().flex_1())
-            .child(self.btn("sidebar-settings", "Settings", |this, _, _| this.go(8), cx))
-            .child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
-            );
+        let sidebar =
+            div()
+                .w(px(224.))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(CANVAS))
+                .border_r_1()
+                .border_color(rgb(LINE))
+                .child(
+                    div()
+                        .h(px(54.))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .size(px(24.))
+                                .rounded_md()
+                                .bg(rgb(INK))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(SURFACE))
+                                .child("D"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Dauerbot"),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_5()
+                        .pt_3()
+                        .pb_2()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(self.tr("Projects")),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .pb_3()
+                        .child(Input::new(&self.project_search).small()),
+                )
+                .child(project_list)
+                .when(visible.is_empty(), |view| {
+                    view.child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(self.tr("No matching projects")),
+                    )
+                })
+                .child(
+                    div()
+                        .px_3()
+                        .py_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(self.btn(
+                            "sidebar-add",
+                            "+ Add project",
+                            |this, _, _| this.go(5),
+                            cx,
+                        ))
+                        .child(div().pt_3().border_t_1().border_color(rgb(0xececf0)).child(
+                            self.btn("sidebar-settings", "Settings", |this, _, _| this.go(8), cx),
+                        ))
+                        .child(
+                            div()
+                                .px_2()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                        ),
+                );
         let content = match page {
             0 => self.welcome(cx),
             1 => self.bot(cx),
@@ -1597,12 +1932,37 @@ impl Render for Desktop {
             _ => self.settings_page(cx),
         };
         div()
+            .id("dauerbot-desktop")
+            .track_focus(&self.focus_handle)
+            .key_context("Dauerbot")
+            .on_action(cx.listener(|this, _: &FocusProjects, window, cx| {
+                this.setup.sidebar_hidden = false;
+                this.go(this.setup.page);
+                this.project_search.update(cx, |search, cx| search.focus(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NextProject, _, cx| this.move_project(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousProject, _, cx| this.move_project(-1, cx)))
+            .on_action(cx.listener(|this, _: &AddProject, _, cx| { this.go(5); cx.notify(); }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.setup.sidebar_hidden = !this.setup.sidebar_hidden;
+                this.go(this.setup.page);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, _, cx| {
+                this.go(6);
+                this.setup.terminal_hidden = !this.setup.terminal_hidden;
+                this.release_terminal();
+                this.terminal_key.clear();
+                this.sync_terminal(cx);
+                cx.notify();
+            }))
             .size_full()
             .flex()
             .font_family(".AppleSystemUIFont")
+            .text_size(px(13.))
             .text_color(rgb(INK))
-            .bg(rgb(0xfafbf9))
-            .child(sidebar)
+            .bg(rgb(CANVAS))
+            .when(!self.setup.sidebar_hidden, |view| view.child(sidebar))
             .child(
                 div()
                     .flex_1()
@@ -1612,8 +1972,8 @@ impl Render for Desktop {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(56.))
-                            .px_10()
+                            .h(px(54.))
+                            .px_6()
                             .flex()
                             .items_center()
                             .justify_between()
@@ -1621,11 +1981,19 @@ impl Render for Desktop {
                             .border_color(rgb(LINE))
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(self.tr(STEPS[page]))
+                            .child(div().flex().items_center().gap_3()
+                                .child(Button::new("toggle-sidebar").small().label(self.tr(if self.setup.sidebar_hidden { "Show sidebar" } else { "Hide sidebar" }))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.setup.sidebar_hidden = !this.setup.sidebar_hidden;
+                                        this.go(this.setup.page);
+                                        cx.notify();
+                                    })))
+                                .child(self.tr(if page == 6 { "Projects" } else { STEPS[page] })))
                             .child(Button::new("language").label(if self.setup.language == Language::En { "简体中文" } else { "English" }).on_click(cx.listener(|this, _, window, cx| {
                                 this.setup.language = this.setup.language.other();
                                 this.go(this.setup.page);
                                 this.name.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("For example: personal website"), window, cx));
+                                this.project_search.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Search projects · ⌘F"), window, cx));
                                 this.path.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Leave empty to create a private project folder"), window, cx));
                                 this.secret.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Stored only on this Mac"), window, cx));
                                 set_menus(this.setup.language, cx);
@@ -1640,7 +2008,7 @@ impl Render for Desktop {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .p_10()
+                            .p_6()
                             .child(
                                 div()
                                     .max_w(px(850.))
@@ -1671,15 +2039,15 @@ impl Render for Desktop {
                     })
                     .child(
                         div()
-                            .px_8()
-                            .py_3()
+                            .px_6()
+                            .py_2()
                             .border_t_1()
                             .border_color(rgb(LINE))
                             .text_xs()
                             .text_color(rgb(if self.error { 0xb44343 } else { MUTED }))
                             .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
                     ),
-            )
+            ).into_any_element()
     }
 }
 fn project_status(project: &Value) -> &str {
@@ -1841,11 +2209,19 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Light, None, cx);
+        Theme::global_mut(cx).font_family = ".AppleSystemUIFont".into();
+        Theme::global_mut(cx).font_size = px(13.);
         Theme::global_mut(cx).colors.primary = rgb(ACCENT).into();
-        Theme::global_mut(cx).colors.primary_hover = rgb(0x23685e).into();
+        Theme::global_mut(cx).colors.primary_hover = rgb(0x4338ca).into();
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", ShowSettings, None),
+            KeyBinding::new("cmd-f", FocusProjects, Some("Dauerbot")),
+            KeyBinding::new("cmd-b", ToggleSidebar, Some("Dauerbot")),
+            KeyBinding::new("cmd-alt-down", NextProject, Some("Dauerbot")),
+            KeyBinding::new("cmd-alt-up", PreviousProject, Some("Dauerbot")),
+            KeyBinding::new("cmd-n", AddProject, Some("Dauerbot")),
+            KeyBinding::new("cmd-alt-t", ToggleTerminal, Some("Dauerbot")),
         ]);
         let language = std::fs::read(backend.dir.join("desktop.json"))
             .ok()

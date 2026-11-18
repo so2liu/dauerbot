@@ -32,6 +32,7 @@ pub struct ProjectTools {
     revision: u64,
     content: Option<Content>,
     pending_cli: Option<String>,
+    cli_open: bool,
     message: String,
 }
 impl ProjectTools {
@@ -144,6 +145,7 @@ impl ProjectTools {
             revision: 0,
             content: None,
             pending_cli: None,
+            cli_open: false,
             message: String::new(),
         }
     }
@@ -154,6 +156,7 @@ impl ProjectTools {
             self.content = None;
             self.ticket = None;
             self.pending_cli = None;
+            self.cli_open = false;
             self.message.clear();
             self.revision += 1;
         }
@@ -247,8 +250,25 @@ impl Render for ProjectTools {
         let mut choices = div().flex().flex_wrap().gap_2().items_center().child(
             div()
                 .text_xs()
-                .text_color(rgb(0x74808c))
+                .text_color(rgb(0x85858d))
                 .child(self.language.text("CLI")),
+        );
+        let current_name = match agent {
+            "codex" => "Codex",
+            "claude" => "Claude Code",
+            "pi" => "Pi",
+            "agy" => "Antigravity",
+            _ => agent,
+        };
+        choices = choices.child(
+            Button::new("project-cli-menu")
+                .small()
+                .label(format!("{current_name}  ⌄"))
+                .selected(self.cli_open)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cli_open = !this.cli_open;
+                    cx.notify();
+                })),
         );
         for (index, (key, label)) in [
             ("codex", "Codex"),
@@ -258,6 +278,7 @@ impl Render for ProjectTools {
         ]
         .into_iter()
         .enumerate()
+        .take(if self.cli_open { 4 } else { 0 })
         {
             choices = choices.child(
                 Button::new(("standby-cli", index))
@@ -265,9 +286,10 @@ impl Render for ProjectTools {
                     .label(label)
                     .selected(agent == key)
                     .disabled(unavailable || switching || busy || agent == key)
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.request(None, Some(key.into()), cx)),
-                    ),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cli_open = false;
+                        this.request(None, Some(key.into()), cx);
+                    })),
             );
         }
         if transition["phase"] == "startup_failed"
@@ -288,7 +310,7 @@ impl Render for ProjectTools {
         let mut documents = div().flex().flex_wrap().items_center().gap_2().child(
             div()
                 .text_xs()
-                .text_color(rgb(0x74808c))
+                .text_color(rgb(0x85858d))
                 .child(self.language.text("Project files")),
         );
         for (index, document) in [Document::Handoff, Document::Agents]
@@ -306,6 +328,29 @@ impl Render for ProjectTools {
                     ),
             );
         }
+        let folder = self.project["path"].as_str().unwrap_or("").to_owned();
+        let copy_folder = folder.clone();
+        documents = documents
+            .child(
+                Button::new("reveal-project-folder")
+                    .small()
+                    .label(self.language.text("Reveal folder"))
+                    .disabled(folder.is_empty())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.reveal_path(std::path::Path::new(&folder))
+                    })),
+            )
+            .child(
+                Button::new("copy-project-folder")
+                    .small()
+                    .label(self.language.text("Copy path"))
+                    .disabled(copy_folder.is_empty())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_folder.clone()));
+                        this.message = "Path copied".into();
+                        cx.notify();
+                    })),
+            );
         if self.document.is_some() {
             documents = documents.child(
                 Button::new("close-project-document")
@@ -327,7 +372,7 @@ impl Render for ProjectTools {
             .child(choices)
             .child(documents);
         if transition["holds_input"] == true {
-            view = view.child(div().text_xs().text_color(rgb(0x74808c)).child(
+            view = view.child(div().text_xs().text_color(rgb(0x85858d)).child(
                 self.language.text("Messages wait for the selected CLI. Stop pauses the project and cancels the switch."),
             ));
         }
@@ -336,7 +381,7 @@ impl Render for ProjectTools {
         }
         if unavailable {
             view =
-                view.child(div().text_xs().text_color(rgb(0x74808c)).child(
+                view.child(div().text_xs().text_color(rgb(0x85858d)).child(
                     "Resume this project and release terminal input before changing its CLI.",
                 ));
         }
@@ -347,7 +392,7 @@ impl Render for ProjectTools {
             let mut pane = div()
                 .id("project-document-pane")
                 .border_1()
-                .border_color(rgb(0xe6e9ec))
+                .border_color(rgb(0xe3e3e8))
                 .rounded_md()
                 .p_4();
             if let Some(content) = &self.content {

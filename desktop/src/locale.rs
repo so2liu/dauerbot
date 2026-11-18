@@ -45,6 +45,32 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "Show sidebar" => "显示侧栏",
+            "Hide sidebar" => "隐藏侧栏",
+            "Search projects · ⌘F" => "搜索项目 · ⌘F",
+            "No matching projects" => "没有匹配的项目",
+            "Reveal folder" => "在访达中显示",
+            "Copy path" => "复制路径",
+            "Path copied" => "路径已复制",
+            "Your instructions, one message away." => "发条飞书消息，即可开始。",
+            "Managed in Feishu" => "在飞书中管理",
+            "Nothing scheduled yet" => "暂无定时安排",
+            "Native default" => "CLI 默认模型",
+            "Choose model" => "选择模型",
+            "Confirmed by CLI" => "CLI 已确认",
+            "Requested · awaiting native confirmation" => "已选择 · 等待 CLI 确认",
+            "Uses the CLI's own settings" => "使用 CLI 自身设置",
+            "This project only. Native login and global CLI settings stay in place." => {
+                "仅用于当前项目，保留 CLI 的登录和全局设置。"
+            }
+            "Model change requested" => "已请求切换模型",
+            "Model controls are unavailable" => "模型控件暂不可用",
+            "Model ID" => "模型 ID",
+            "Provider (optional)" => "提供方（可选）",
+            "Use model ID" => "使用模型 ID",
+            "Enter a model ID" => "请输入模型 ID",
+            "Loading models…" => "正在加载模型…",
+            "Refresh" => "刷新",
             "Preparing handoff…" | "preparing_handoff" => "正在准备交接…",
             "Switching CLI…" | "switching_cli" => "正在切换 CLI…",
             "Selected CLI is ready." => "所选 CLI 已就绪。",
