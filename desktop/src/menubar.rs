@@ -1,5 +1,6 @@
 //! Native menu-bar entry and a GPUI project popover. The daemon outlives all windows.
 use super::{Desktop, INK, LINE, MUTED, Quit, project_status};
+use crate::control_label;
 use anyhow::{Context as _, Result};
 use gpui::{prelude::*, *};
 use gpui_component::{Root, button::*};
@@ -290,16 +291,17 @@ impl Render for MenuPanel {
                     .py_2()
                     .rounded_lg()
                     .cursor_pointer()
-                    .hover(|row| row.bg(rgb(0xeaf0e3)))
+                    .hover(|row| row.bg(rgb(0xececf0)))
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
+                            .truncate()
                             .child(project["name"].as_str().unwrap_or("Project").to_owned()),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(px(11.))
                             .text_color(rgb(MUTED))
                             .child(language.text(project_status(project))),
                     )
@@ -314,7 +316,7 @@ impl Render for MenuPanel {
                 div()
                     .px_3()
                     .py_5()
-                    .text_sm()
+                    .text_size(px(13.))
                     .text_color(rgb(MUTED))
                     .child(language.text("No projects yet")),
             );
@@ -323,10 +325,11 @@ impl Render for MenuPanel {
             .size_full()
             .p_2()
             .rounded_xl()
-            .bg(rgb(0xf9fbf6))
+            .bg(rgb(0xf9f9fb))
             .border_1()
             .border_color(rgb(LINE))
             .font_family(".AppleSystemUIFont")
+            .text_size(px(13.))
             .text_color(rgb(INK))
             .flex()
             .flex_col()
@@ -345,24 +348,27 @@ impl Render for MenuPanel {
                     .justify_between()
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Dauerbot"),
                     )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(language.text(
-                        if connection_error {
-                            "Disconnected"
-                        } else {
-                            "Projects"
-                        },
-                    ))),
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(language.text(if connection_error {
+                                "Disconnected"
+                            } else {
+                                "Projects"
+                            })),
+                    ),
             )
             .when(independent, |panel| {
                 panel.child(
                     div()
                         .px_3()
                         .pb_2()
-                        .text_xs()
+                        .text_size(px(11.))
                         .text_color(rgb(0x9a762c))
                         .child(language.text("Independent instance")),
                 )
@@ -379,14 +385,14 @@ impl Render for MenuPanel {
                     .gap_1()
                     .child(
                         Button::new("menu-add-project")
-                            .label(language.text("+ Add project"))
+                            .child(control_label(language.text("+ Add project")))
                             .on_click(
                                 cx.listener(|_, _, _, cx| cx.defer(|cx| open_main(None, 5, cx))),
                             ),
                     )
                     .child(
                         Button::new("menu-open-app")
-                            .label(language.text("Open Dauerbot"))
+                            .child(control_label(language.text("Open Dauerbot")))
                             .on_click(
                                 cx.listener(|_, _, _, cx| cx.defer(|cx| open_main(None, 6, cx))),
                             ),
@@ -399,14 +405,14 @@ impl Render for MenuPanel {
                             .pt_1()
                             .child(
                                 Button::new("menu-settings")
-                                    .label(language.text("Settings"))
+                                    .child(control_label(language.text("Settings")))
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.defer(|cx| open_main(None, 8, cx))
                                     })),
                             )
                             .child(
                                 Button::new("menu-quit")
-                                    .label(language.text("Quit Dauerbot"))
+                                    .child(control_label(language.text("Quit Dauerbot")))
                                     .on_click(cx.listener(|_, _, window, cx| {
                                         window.remove_window();
                                         cx.defer(|cx| cx.dispatch_action(&Quit));

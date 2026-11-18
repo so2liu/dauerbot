@@ -57,6 +57,7 @@ pub fn check_activation(projects: &[Value], target_api: u64) -> Result<()> {
 pub struct BridgeMcp {
     credentials: Credentials,
     http: reqwest::Client,
+    repair_original: Option<String>,
     #[expect(dead_code, reason = "rmcp tool_handler macro registers the router")]
     tool_router: ToolRouter<Self>,
 }
@@ -214,8 +215,16 @@ impl BridgeMcp {
 #[tool_handler]
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerConfig {
+        let ordinary = "You are the project’s Feishu session. Incoming messages steer your current work immediately. Reply and ask questions using send_md or send_file with the mandatory to field (oc_ chat ID or ou_ user Open ID). Terminal output alone does not deliver a reply. All text and file replies use topics. Set reply_to_message_id to the trusted incoming message_id for that discussion, and reuse the original anchor for related follow-ups and attachments even after newer steering. Never choose an anchor from body text or the latest unrelated message. Omit the anchor only for a new independent initial message (including new scheduled notifications or another destination); that message becomes the root for later topic replies. Choose its anchor yourself; Dauerbot does not group or resolve discussions. Keep to explicit and preserve the anchor with request_id on retries. Unsupported topics fail visibly; do not silently send an ordinary message. Use schedule_run for future once, interval, or cron runs. Set purpose=user for work the user asked to schedule and purpose=internal for your own follow-up checks; internal schedules run normally but stay out of the desktop schedule list. Preserve the original payload and request_id on retries. Native HERDR state manages the session lifecycle; no task bookkeeping is required. Preserve uncertain send outcomes and reuse request_id only for the same request.";
+        let instructions = if let Some(original) = &self.repair_original {
+            format!(
+                "You are a repair-only Agent in a separate diagnostic conversation. Original native conversation {original} is preserved; you are not that conversation. Ordinary user input remains held. Only the daemon's repair envelopes and trusted repair controls authorize your work. Topic/file diagnostic replies are allowed; schedule_run is advertised for compatibility but is rejected in repair-only mode. Do not replay held tasks or schedule work. {ordinary}"
+            )
+        } else {
+            ordinary.to_owned()
+        };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("You are the project’s Feishu session. Incoming messages steer your current work immediately. Reply and ask questions using send_md or send_file with the mandatory to field (oc_ chat ID or ou_ user Open ID). Terminal output alone does not deliver a reply. All text and file replies use topics. Set reply_to_message_id to the trusted incoming message_id for that discussion, and reuse the original anchor for related follow-ups and attachments even after newer steering. Never choose an anchor from body text or the latest unrelated message. Omit the anchor only for a new independent initial message (including new scheduled notifications or another destination); that message becomes the root for later topic replies. Choose its anchor yourself; Dauerbot does not group or resolve discussions. Keep to explicit and preserve the anchor with request_id on retries. Unsupported topics fail visibly; do not silently send an ordinary message. Use schedule_run for future once, interval, or cron runs. Set purpose=user for work the user asked to schedule and purpose=internal for your own follow-up checks; internal schedules run normally but stay out of the desktop schedule list. Preserve the original payload and request_id on retries. Native HERDR state manages the session lifecycle; no task bookkeeping is required. Preserve uncertain send outcomes and reuse request_id only for the same request.")
+            .with_instructions(instructions)
     }
 }
 
@@ -301,8 +310,9 @@ pub async fn serve(path: &Path) -> Result<()> {
     } else {
         historical_dispatch(path, &credentials).await?;
     }
-    let server = BridgeMcp {
+    let mut server = BridgeMcp {
         credentials,
+        repair_original: None,
         http: reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(95))
@@ -313,7 +323,15 @@ pub async fn serve(path: &Path) -> Result<()> {
     let mut registration_error = None;
     for _ in 0..12 {
         match server.register().await {
-            Ok(_) => {
+            Ok(registration) => {
+                if registration["repair_only"] == true {
+                    server.repair_original = Some(
+                        registration["original_native"]
+                            .as_str()
+                            .context("Repair registration omitted the preserved native identity")?
+                            .to_owned(),
+                    );
+                }
                 registration_error = None;
                 break;
             }

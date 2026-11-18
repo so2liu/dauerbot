@@ -88,7 +88,7 @@ use gpui::Hsla;
 ///     .foreground(0xeb, 0xdb, 0xb2)
 ///     .build();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColorPalette {
     /// The 16 standard ANSI colors (black, red, green, yellow, blue, magenta, cyan, white,
     /// and their bright variants)
@@ -361,7 +361,9 @@ impl ColorPalette {
             }
             Color::Indexed(idx) => {
                 // 256-color mode
-                self.extended_colors[idx as usize]
+                colors[idx as usize]
+                    .map(rgb_to_hsla)
+                    .unwrap_or(self.extended_colors[idx as usize])
             }
         }
     }
