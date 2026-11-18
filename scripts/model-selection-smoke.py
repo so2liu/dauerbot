@@ -139,6 +139,9 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                 return json.load(response)
 
         def project():
+            failure = workspace / ".fixture-native-state-error"
+            if failure.exists():
+                raise AssertionError("Native fixture state detection failed: " + failure.read_text())
             return next(p for p in api("/state")["projects"] if p["id"] == project_id)
 
         def launches():
@@ -391,6 +394,9 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             evidence.update(checks=checks, count=len(checks), launches=launches(), callback_responses=smoke.FIXTURE.callback_responses)
         except Exception as error:
             evidence.update(checks=checks, error=str(error))
+            native_error = workspace / ".fixture-native-state-error"
+            if native_error.exists():
+                evidence["native_state_error"] = json.loads(native_error.read_text())
             try:
                 evidence["state"] = api("/state")
                 evidence["launches"] = launches()

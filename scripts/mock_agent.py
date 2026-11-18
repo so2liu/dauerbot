@@ -21,6 +21,32 @@ sys.stdout.flush()
 
 
 def status(state):
+    native_hook = len(sys.argv) > 6 and json.loads(sys.argv[6]).get("native_session_hook")
+    if native_hook:
+        # HERDR 0.9.5 reserves herdr:codex state reports for identity only;
+        # a different hook source cannot own an officially anchored session.
+        # Exercise its actual Codex OSC-title detector instead. Wait for every
+        # transition so a fast working/idle pair cannot collapse into one poll.
+        if not os.environ.get("CODEX_THREAD_ID"):
+            return
+        title = "⠋ Fixture working" if state == "working" else "Fixture idle"
+        sys.stdout.write("\x1b]0;" + title + "\x07")
+        sys.stdout.flush()
+        deadline = time.monotonic() + 8
+        observed = None
+        while time.monotonic() < deadline:
+            with socket.socket(socket.AF_UNIX) as conn:
+                conn.settimeout(3)
+                conn.connect(os.environ["HERDR_SOCKET_PATH"])
+                conn.sendall((json.dumps({"id":"fixture-native-state", "method":"agent.get", "params":{"target":os.environ["HERDR_PANE_ID"]}}) + "\n").encode())
+                result = json.loads(conn.makefile().readline())
+            if "error" not in result:
+                observed = result.get("result", {}).get("agent", {}).get("agent_status")
+                if observed == state:
+                    return
+            time.sleep(0.05)
+        (Path.cwd() / ".fixture-native-state-error").write_text(json.dumps({"requested":state,"observed":observed,"reply":result}))
+        raise RuntimeError(f"Native Codex OSC state did not become {state}: {observed}")
     request = {"id": "fixture-status", "method": "pane.report_agent", "params": {
         "pane_id": os.environ["HERDR_PANE_ID"], "source": "dauerbot-fixture",
         "agent": sys.argv[5] if len(sys.argv)>5 else "fixture-agent", "state": state, "seq": time.time_ns(),
@@ -65,6 +91,14 @@ if launch_metadata.get("native_session_hook"):
         result = json.loads(conn.makefile().readline())
         if "error" in result:
             raise RuntimeError(result["error"])
+    # HERDR's managed Codex startup acquisition requires the real composer
+    # marker, including when its native session ID was already reported.
+    sys.stdout.write("\r\n› Ask Codex to do anything\r\n")
+    sys.stdout.flush()
+    status("idle")
+    if launch_metadata.get("native_state_probe"):
+        status("working")
+        status("idle")
 with (Path.cwd() / ".fixture-launches").open("a") as launches:
     launch = {"resume": expected, "native": marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}
     if len(sys.argv) > 6:
