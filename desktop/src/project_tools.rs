@@ -324,7 +324,14 @@ impl Render for ProjectTools {
             div()
                 .text_size(px(11.))
                 .text_color(rgb(0x85858d))
-                .child(self.language.text("CLI")),
+                .child(
+                    self.language
+                        .text(if self.project["agent_mode"] == "manager" {
+                            "Coding CLI"
+                        } else {
+                            "CLI"
+                        }),
+                ),
         );
         let current_name = match agent {
             "codex" => "Codex",

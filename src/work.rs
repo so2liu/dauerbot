@@ -245,6 +245,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
     // messages, schedule IDs and occurrences; do not requeue submitted input.
     c.execute_batch("DROP TABLE IF EXISTS work_jobs; DROP TABLE IF EXISTS work_decisions;
         UPDATE work_attention SET status='resolved' WHERE reason IN ('unfinished_run','not_ready');")?;
+    crate::cli_control::classify(c)?;
     sync_inbound(c)?;
     Ok(())
 }
@@ -369,7 +370,7 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
         // Legacy retry/dismiss/receipt endpoints remain authoritative for message delivery.
         let changes=c.prepare(
           "SELECT e.id,m.status,m.error,m.updated_at FROM work_events e JOIN messages m ON m.id=e.message_id
-           WHERE e.status NOT IN ('delivered','completed','cancelled','dismissed') AND m.status!=e.status
+           WHERE e.status NOT IN ('delivered','completed','cancelled','dismissed','managed','consumed','transferred') AND m.status!=e.status
            AND NOT (m.status='submitting' AND e.status='uncertain')
            AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.event_id=e.id AND r.finished_at IS NOT NULL AND r.outcome!='')")?
           .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?
@@ -452,6 +453,7 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
             c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,message_id,payload,status,received_at,error,created_at,updated_at)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![id,project,id,kind,source,id,payload.to_string(),event_state,
                 (status=="acknowledged").then_some(updated),error,created,updated])?;
+            crate::manager::route_event(c, &id)?;
         }
         Ok(count)
     })
@@ -570,9 +572,9 @@ fn claim(
         }
         // Resource preparation runs independently of project reconciliation.
         // Skip only those messages; later steering must not wait for a download.
-        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=work_events.message_id AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
+        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=COALESCE(work_events.message_id,(SELECT origin.message_id FROM work_events origin WHERE work_events.source='management' AND origin.id=json_extract(work_events.payload,'$.origin_event_id'))) AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
         let message = c.query_row(
-            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND message_id IS NOT NULL AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
+            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND (message_id IS NOT NULL OR source='management') AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
             [project], event_row,
         ).optional()?;
         let next = if message.is_some() {
@@ -585,6 +587,9 @@ fn claim(
               [project],event_row).optional()?
         };
         let Some(event) = next else { return Ok(None) };
+        if !crate::manager::bind_event(c, &event, generation)? {
+            return Ok(None);
+        }
         let id = crate::db::id();
         c.execute(
             "UPDATE work_events SET status='submitting',updated_at=? WHERE id=?",
@@ -971,6 +976,7 @@ fn next_after(timer: &Timer, now: i64) -> Result<Option<i64>> {
 /// One transaction records each occurrence, inserts its event, and advances the timer.
 pub fn fire_due(c: &Connection, now: i64) -> Result<Vec<Event>> {
     transaction(c, |c| {
+        crate::manager::settle_sources(c)?;
         let timers=c.prepare(&format!("SELECT {TIMER} FROM work_timers WHERE enabled=1 AND next_fire<=? ORDER BY next_fire,id LIMIT 100"))?
           .query_map([now],timer_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut events = Vec::new();
@@ -982,7 +988,7 @@ pub fn fire_due(c: &Connection, now: i64) -> Result<Vec<Event>> {
                 continue;
             }
             let pending:bool=c.query_row(
-              "SELECT EXISTS(SELECT 1 FROM work_events WHERE task_id=? AND status IN ('queued','submitting','submitted','uncertain'))
+              "SELECT EXISTS(SELECT 1 FROM work_events WHERE task_id=? AND status IN ('queued','submitting','submitted','uncertain','managed'))
                OR EXISTS(SELECT 1 FROM work_runs WHERE task_id=? AND status IN ('submitting','submitted','running','uncertain'))
 ",
               params![timer.task_id,timer.task_id],|r|r.get(0))?;
@@ -1007,6 +1013,7 @@ pub fn fire_due(c: &Connection, now: i64) -> Result<Vec<Event>> {
                     "UPDATE work_tasks SET status='queued',updated_at=? WHERE id=?",
                     params![now, timer.task_id],
                 )?;
+                crate::manager::route_event(c, &event.id)?;
                 events.push(event);
             }
             let next = next_after(&timer, now)?;
@@ -1380,6 +1387,7 @@ pub fn observe_idle(
         c.execute("UPDATE work_events SET status='delivered',updated_at=? WHERE id IN
             (SELECT event_id FROM work_runs WHERE project_id=? AND generation=? AND status='settled')
             AND status IN ('submitted','acknowledged')",params![now,project,generation])?;
+        crate::manager::worker_changed(c, project)?;
         Ok(())
     })
 }

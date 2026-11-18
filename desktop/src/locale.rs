@@ -19,6 +19,9 @@ impl Language {
     pub fn text(self, source: &str) -> String {
         if self == Self::En {
             return match source {
+                "disabled" => "Disabled",
+                "unavailable" => "Manager unavailable",
+                "held" => "Waiting",
                 "sleeping" => "Standby",
                 "preparing_handoff" => "Preparing handoff",
                 "switching_cli" => "Switching CLI",
@@ -49,6 +52,35 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "disabled" => "未启用",
+            "unavailable" => "管理智能体暂不可用",
+            "held" => "等待中",
+            "Project Agent" => "项目主智能体",
+            "Native CLI" => "原生 CLI",
+            "Built-in manager" => "内置管理智能体",
+            "Manager model settings" => "管理模型设置",
+            "Hide manager settings" => "收起管理模型设置",
+            "OpenAI-compatible endpoint" => "OpenAI 兼容接口地址",
+            "Manager model" => "管理模型",
+            "Manager API key" => "管理模型 API 密钥",
+            "API key saved. Leave blank to keep it." => "API 密钥已保存，留空可保留现有密钥。",
+            "No manager API key saved" => "尚未保存管理模型 API 密钥",
+            "Save manager settings" => "保存管理模型设置",
+            "Manager settings saved" => "管理模型设置已保存",
+            "Manager settings are unavailable" => "管理模型设置暂不可用",
+            "Clear saved API key" => "清除已保存的 API 密钥",
+            "Coding CLI" => "编码 CLI",
+            "Coding worker model" => "编码智能体模型",
+            "Coding worker" => "编码智能体",
+            "Show coding terminal" => "查看编码终端",
+            "Coding worker terminal" => "编码智能体终端",
+            "The manager uses its own model and delegates coding to your native CLI. CLI login and model settings stay separate." => {
+                "管理智能体使用独立模型，把编码工作委派给原生 CLI。原生 CLI 的登录和模型设置独立保留。"
+            }
+            "The terminal belongs to the coding worker. Model and repair controls remain available if the manager cannot connect." => {
+                "终端属于编码智能体。管理模型无法连接时，仍可使用模型和修复控制。"
+            }
+            "No shell access" => "无 Shell 工具权限",
             "Show subagents" => "展开子智能体",
             "View Agent details" => "查看智能体信息",
             "Observed subagent · read only" => "已观测的子智能体 · 只读",

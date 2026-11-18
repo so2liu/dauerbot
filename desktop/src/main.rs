@@ -4,6 +4,7 @@ mod activation;
 mod agent_tree;
 mod backend;
 mod locale;
+mod manager_settings;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod model_picker;
@@ -134,6 +135,7 @@ struct Desktop {
     timers: Value,
     project_tools: Entity<project_tools::ProjectTools>,
     model_picker: Entity<model_picker::ModelPicker>,
+    manager_settings: Entity<manager_settings::ManagerSettings>,
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
@@ -198,6 +200,8 @@ impl Desktop {
         let project_tools = cx.new(|cx| project_tools::ProjectTools::new(backend.dir.clone(), cx));
         let model_picker =
             cx.new(|cx| model_picker::ModelPicker::new(backend.dir.clone(), window, cx));
+        let manager_settings =
+            cx.new(|cx| manager_settings::ManagerSettings::new(backend.dir.clone(), window, cx));
         Self {
             focus_handle,
             backend,
@@ -229,6 +233,7 @@ impl Desktop {
             timers: Value::Null,
             project_tools,
             model_picker,
+            manager_settings,
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
@@ -971,6 +976,10 @@ impl Desktop {
         let mut body = div().flex().flex_col().gap_4();
         if let Some(project) = selected {
             let id = self.selected.clone();
+            self.manager_settings.update(cx, |settings, cx| {
+                settings.select(&project, self.setup.language, cx)
+            });
+            body = body.child(self.manager_settings.clone());
             body = body
                 .child(
                     div()
@@ -1124,7 +1133,11 @@ impl Desktop {
                 div()
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr("Project CLI")),
+                    .child(self.tr(if manager_settings::enabled(&project) {
+                        "Coding CLI"
+                    } else {
+                        "Project CLI"
+                    })),
             );
             let mut agents = div().flex().flex_wrap().gap_2();
             for (index, agent) in ["codex", "claude", "pi", "agy"].into_iter().enumerate() {
@@ -1221,14 +1234,20 @@ impl Desktop {
             .gap_2()
             .bg(rgb(0x202a35))
             .child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(rgb(0xe8eeeb))
-                    .child(self.tr(if control {
+                div().text_size(px(13.)).text_color(rgb(0xe8eeeb)).child(
+                    self.tr(if control {
                         "You are in control"
+                    } else if self.state["projects"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|p| p["id"] == self.selected && manager_settings::enabled(p))
+                    {
+                        "Coding worker terminal"
                     } else {
                         "Live terminal"
-                    })),
+                    }),
+                ),
             );
         if let Some(bridge) = &self.terminal {
             let project = bridge.descriptor.project_id.clone();
@@ -1382,6 +1401,7 @@ impl Desktop {
         self.model_picker.update(cx, |picker, cx| {
             picker.select(project, self.setup.language, cx)
         });
+        let manager_enabled = manager_settings::enabled(project);
         let timers = visible_timers(&self.timers);
         let mut content = div()
             .flex()
@@ -1444,6 +1464,15 @@ impl Desktop {
                             .pt_3()
                             .border_t_1()
                             .border_color(rgb(0xececf0))
+                            .when(manager_enabled, |view| {
+                                view.child(
+                                    div()
+                                        .mb_2()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(MUTED))
+                                        .child(self.tr("Coding worker model")),
+                                )
+                            })
                             .child(self.model_picker.clone()),
                     ),
             );
@@ -1844,7 +1873,12 @@ impl Render for Desktop {
             }
             let keyboard_id = id.clone();
             let selected = id == self.selected && page == 6;
-            let status = project_status(project);
+            let manager_enabled = manager_settings::enabled(project);
+            let status = if manager_enabled {
+                manager_settings::status(project)
+            } else {
+                project_status(project)
+            };
             let tree = agent_tree::Tree::from_project(project);
             let fold_scope = format!(
                 "{}:{}:{}",
@@ -1858,7 +1892,7 @@ impl Render for Desktop {
                 .cloned()
                 .unwrap_or_default();
             let tree_rows = tree.rows(&folded);
-            let has_children = !tree.nodes.is_empty();
+            let has_children = manager_enabled || !tree.nodes.is_empty();
             let root_folded = folded.contains("");
             let click_project = id.clone();
             let root_row = div()
@@ -1888,7 +1922,11 @@ impl Render for Desktop {
                         .gap_2()
                         .h_full()
                         .child(agent_tree::cli_icon(
-                            project["agent"].as_str().unwrap_or("custom"),
+                            if manager_enabled {
+                                "manager"
+                            } else {
+                                project["agent"].as_str().unwrap_or("custom")
+                            },
                             format!("project-cli-{id}"),
                         ))
                         .child(
@@ -1949,7 +1987,94 @@ impl Render for Desktop {
                 .min_w_0()
                 .child(root.child(div().flex_1().min_w_0().child(root_row)));
             if !root_folded {
-                for row in tree_rows {
+                let worker_folded = manager_enabled && folded.contains("worker");
+                if manager_enabled {
+                    let scope = fold_scope.clone();
+                    let terminal_project = id.clone();
+                    let mut worker_row = div()
+                        .id(SharedString::from(format!("coding-worker-{id}")))
+                        .h(px(28.))
+                        .pl(px(28.))
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .min_w_0();
+                    if !tree.nodes.is_empty() {
+                        worker_row = worker_row.child(
+                            Button::new(SharedString::from(format!("fold-worker-{id}")))
+                                .xsmall()
+                                .child(div().text_size(px(11.)).child(if worker_folded {
+                                    "›"
+                                } else {
+                                    "⌄"
+                                }))
+                                .tooltip(self.tr(if worker_folded {
+                                    "Show subagents"
+                                } else {
+                                    "Hide subagents"
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let folded =
+                                        this.folded_agents.entry(scope.clone()).or_default();
+                                    if !folded.remove("worker") {
+                                        folded.insert("worker".into());
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    worker_row = worker_row
+                        .child(
+                            div().w(px(12.)).h_full().relative().flex_shrink_0().child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .h(px(14.))
+                                    .w(px(8.))
+                                    .border_l_1()
+                                    .border_b_1()
+                                    .border_color(rgb(0xd7d7df))
+                                    .rounded_bl(px(4.)),
+                            ),
+                        )
+                        .child(agent_tree::cli_icon(
+                            project["agent"].as_str().unwrap_or("custom"),
+                            format!("worker-cli-{id}"),
+                        ))
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Button::new(SharedString::from(format!("open-worker-{id}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .w_full()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .text_left()
+                                            .text_size(px(12.))
+                                            .child(self.tr("Coding worker")),
+                                    )
+                                    .tooltip(self.tr("Show coding terminal"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_project(terminal_project.clone(), cx);
+                                        this.go(6);
+                                        this.setup.terminal_hidden = false;
+                                        this.sync_terminal(cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                        .child(agent_tree::status_dot(
+                            project_status(project),
+                            self.tr(project_status(project)),
+                            format!("worker-state-{id}"),
+                        ));
+                    group = group.child(worker_row);
+                }
+                for row in tree_rows.into_iter().filter(|_| !worker_folded) {
                     let node = row.node;
                     let node_id = node.id.clone();
                     let scope = fold_scope.clone();
@@ -1973,7 +2098,7 @@ impl Render for Desktop {
                         .id(SharedString::from(format!("agent-{id}-{}", node.id)))
                         .h(px(26.))
                         .min_w_0()
-                        .pl(px(28.))
+                        .pl(px(if manager_enabled { 48. } else { 28. }))
                         .pr_2()
                         .flex()
                         .items_center()
@@ -2113,7 +2238,10 @@ impl Render for Desktop {
                     }
                     group = group.child(child);
                 }
-                if project["execution"]["agent_tree"].is_object() && tree.status != "observed" {
+                if !worker_folded
+                    && project["execution"]["agent_tree"].is_object()
+                    && tree.status != "observed"
+                {
                     group = group.child(
                         div()
                             .pl(px(40.))

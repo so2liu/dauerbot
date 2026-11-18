@@ -338,14 +338,16 @@ try:
                 continue
             assert event.tag == "dauerbot_event", event.tag
             status("working")
-            body = event.findtext("feishu_message/body") or event.findtext("body") or ""
+            delegation = event.find("management_delegation")
+            context = delegation if delegation is not None else event
+            body = context.findtext("manager_instructions") or context.findtext("feishu_message/body") or context.findtext("body") or ""
             if body in ("fixture-hold-unacknowledged", "fixture-hold-for-steer"):
                 assert held is None
                 held = event
                 sys.stdout.write("\r\nMOCK_HOLDING_FOR_STEER\r\n")
                 sys.stdout.flush()
                 continue
-            envelope = event.find("feishu_message")
+            envelope = context.find("feishu_message")
             if envelope is not None:
                 source = envelope.attrib["message_id"]
                 to = envelope.find("source").attrib["chat_id"] or "oc_fixture"
@@ -364,9 +366,9 @@ try:
                 source = event.attrib["source"] + ":" + event.attrib["event_id"]
                 to = "oc_fixture"
             with (Path.cwd() / ".fixture-deliveries").open("a") as deliveries:
-                deliveries.write(json.dumps({"source": source, "generation": Path(sys.argv[2]).parent.name}) + "\n")
+                deliveries.write(json.dumps({"source": source, "generation": Path(sys.argv[2]).parent.name, **({"manager_effect_id": delegation.attrib["effect_id"]} if delegation is not None else {})}) + "\n")
             reply_anchor = {"reply_to_message_id": source} if envelope is not None and to == envelope.find("source").attrib["chat_id"] else {}
-            tool("send_md", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + source, **reply_anchor})
+            tool("send_md", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + (delegation.attrib["effect_id"] if delegation is not None else source), **reply_anchor})
             if body == "fixture-create-schedule":
                 due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
                 tool("schedule_run", {"request_id":"fixture-schedule-run", "name":"MCP schedule", "prompt":"scheduled-via-mcp",

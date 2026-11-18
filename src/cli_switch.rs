@@ -277,6 +277,7 @@ pub(crate) fn stopped_mode(
     let tx = c.unchecked_transaction()?;
     let held = holds_input(&tx, project)?;
     if cancel_intake {
+        crate::manager::stop(&tx, project)?;
         tx.execute("UPDATE feishu_group_intake SET status='cancelled' WHERE project_id=? AND status='pending'",[project])?;
     }
     work::finish_execution(

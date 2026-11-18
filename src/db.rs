@@ -162,6 +162,14 @@ pub struct Message {
     pub updated_at: i64,
 }
 
+pub(crate) fn project_by_key(c: &Connection, key: &str) -> Result<Project> {
+    c.query_row(
+        &format!("SELECT {PROJECT} FROM projects WHERE id=?1 OR name=?1"),
+        [key],
+        project,
+    )
+    .context("Project not found")
+}
 fn project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
@@ -273,6 +281,7 @@ fn ingest_message(
             });
         }
     }
+    crate::manager::stamp(&tx, project, &mut attachment)?;
     let key = id();
     let inserted=tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",params![key,project,source,content,attachment.to_string(),now(),now()])?;
     if inserted == 1 && attachment["daemon_control"] == "model" {
@@ -360,6 +369,7 @@ impl Db {
         if recover {
             migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         }
+        crate::manager::migrate(&migration, recover)?;
         crate::work::migrate(&migration)?;
         crate::handoff::migrate(&migration)?;
         crate::cli_switch::migrate(&migration, recover)?;

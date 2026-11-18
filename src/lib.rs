@@ -14,6 +14,8 @@ pub mod feishu;
 mod group_ingress;
 pub mod handoff;
 pub mod herdr;
+pub mod manager;
+pub mod manager_loop;
 pub mod mcp;
 pub mod model_control;
 pub mod models;
@@ -504,7 +506,7 @@ impl App {
         let message = m.clone();
         let admitted=self.db.call(move|c|{
             let tx=c.unchecked_transaction()?;
-            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment) {
+            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment).and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment)) {
                 tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;tx.commit()?;return Ok(false);
             }
             let changed=tx.execute("UPDATE messages SET status='sending',error='',updated_at=? WHERE id=? AND status='pending'",rusqlite::params![db::now(),message.id])?;
@@ -540,6 +542,11 @@ impl App {
                 self.db.state(&m.id, status, &text).await?;
             }
         }
+
+        let observed_project = p.id.clone();
+        self.db
+            .call(move |c| manager::worker_changed(c, &observed_project))
+            .await?;
 
         Ok(())
     }
@@ -1215,7 +1222,9 @@ impl App {
             .call(move |c| work::event(c, &id, &event_id))
             .await?;
         let body_result: Result<String> = async {
-            Ok(if let Some(message_id) = &event.message_id {
+            Ok(if event.source == "management" {
+                manager::body(self, p, &event).await?
+            } else if let Some(message_id) = &event.message_id {
                 let message = self.db.message(message_id).await?;
                 let resources = message.attachment["resources"]
                     .as_array()
@@ -1291,6 +1300,8 @@ impl App {
         tokio::spawn(model_control::run(self.clone()));
         tokio::spawn(feishu::resource_worker(self.clone()));
         tokio::spawn(group_ingress::run(self.clone()));
+        let manager_app = self.clone();
+        tokio::spawn(manager::run(manager_app));
         let app = self.clone();
         tokio::spawn(async move {
             loop {
