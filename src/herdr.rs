@@ -23,7 +23,98 @@ pub mod runtime;
 
 pub use crate::adapter::{launch_args, merge_mcp};
 const PROTOCOL: u64 = 22;
-static START_LOCK: Mutex<()> = Mutex::const_new(());
+struct StartAttempt {
+    retry_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    child: Option<tokio::process::Child>,
+}
+static START_LOCK: Mutex<BTreeMap<PathBuf, StartAttempt>> = Mutex::const_new(BTreeMap::new());
+
+#[derive(Clone, Debug)]
+pub(crate) struct HostBoot {
+    pub id: String,
+    pub started_at: i64,
+}
+pub(crate) fn host_boot() -> Option<HostBoot> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut time: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::timeval>();
+        let mut id = [0u8; 64];
+        let mut id_length = id.len();
+        unsafe {
+            if libc::sysctlbyname(
+                c"kern.boottime".as_ptr(),
+                (&mut time as *mut libc::timeval).cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+                || libc::sysctlbyname(
+                    c"kern.bootsessionuuid".as_ptr(),
+                    id.as_mut_ptr().cast(),
+                    &mut id_length,
+                    std::ptr::null_mut(),
+                    0,
+                ) != 0
+            {
+                return None;
+            }
+        }
+        let id = std::str::from_utf8(&id[..id_length])
+            .ok()?
+            .trim_end_matches('\0');
+        Some(HostBoot {
+            id: uuid::Uuid::parse_str(id).ok()?.to_string(),
+            started_at: time.tv_sec.checked_mul(1000)?,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let seconds = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .parse::<i64>()
+            .ok()?;
+        Some(HostBoot {
+            id: uuid::Uuid::parse_str(id.trim()).ok()?.to_string(),
+            started_at: seconds.checked_mul(1000)?,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+fn execution_predates_boot(execution: &Value, boot: Option<&HostBoot>) -> bool {
+    let Some(boot) = boot.filter(|boot| boot.started_at > 0) else {
+        return false;
+    };
+    if let Some(id) = execution["host_boot_id"].as_str() {
+        return uuid::Uuid::parse_str(id)
+            .ok()
+            .is_some_and(|id| id.to_string() != boot.id);
+    }
+    // Legacy launch time is hydrated only from the matching durable execution
+    // journal. Missing or ambiguous history never weakens child coverage.
+    execution["launch_started_at"]
+        .as_i64()
+        .is_some_and(|at| at > 0 && at < boot.started_at)
+}
+pub(crate) fn runtime_missing(error: &anyhow::Error) -> bool {
+    error.is::<NotSubmitted>()
+        && error
+            .chain()
+            .filter_map(|e| e.downcast_ref::<std::io::Error>())
+            .any(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+            })
+}
 
 #[derive(Debug)]
 pub struct RpcFailure {
@@ -213,12 +304,88 @@ pub async fn probe(config: &Config) -> Result<Value> {
     Ok(value)
 }
 
-pub async fn ensure_server(config: &Config) -> Result<()> {
-    let _guard = START_LOCK.lock().await;
-    if UnixStream::connect(socket_path(config)?).await.is_ok() {
-        probe(config).await?;
-        return Ok(());
+pub(crate) async fn startup_pending(config: &Config) -> Result<bool> {
+    Ok(START_LOCK
+        .lock()
+        .await
+        .get(&socket_path(config)?)
+        .is_some_and(|attempt| attempt.child.is_some()))
+}
+
+async fn expire_owned_start(attempt: &mut StartAttempt) -> Result<bool> {
+    if tokio::time::Instant::now() < attempt.deadline {
+        return Ok(false);
     }
+    let Some(child) = attempt.child.as_mut() else {
+        return Ok(false);
+    };
+    // Child retains the exact unreaped process identity. Never signal a PID
+    // reconstructed from a registry, socket, or another daemon's state.
+    if child.try_wait()?.is_none() {
+        child.start_kill()?;
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .context("Waiting for the owned unready HERDR starter to exit")??;
+    }
+    attempt.child = None;
+    attempt.retry_at = tokio::time::Instant::now() + Duration::from_secs(5);
+    Ok(true)
+}
+
+pub async fn ensure_server(config: &Config) -> Result<()> {
+    let path = socket_path(config)?;
+    let mut attempts = START_LOCK.lock().await;
+    match UnixStream::connect(&path).await {
+        Ok(_) => {
+            // Late readiness wins even after the candidate's deadline. A live
+            // foreign socket is never closed or restarted by this path.
+            if let Err(error) = probe(config).await {
+                if let Some(attempt) = attempts.get_mut(&path) {
+                    expire_owned_start(attempt).await?;
+                }
+                return Err(error);
+            }
+            if let Some(mut attempt) = attempts.remove(&path)
+                && let Some(mut child) = attempt.child.take()
+            {
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+            return Ok(());
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(error) => return Err(error).context("Cannot inspect the configured HERDR socket"),
+    }
+    if let Some(attempt) = attempts.get_mut(&path) {
+        if expire_owned_start(attempt).await? {
+            bail!(
+                "The owned unready HERDR starter exceeded its deadline; retrying after bounded backoff"
+            );
+        }
+        if let Some(child) = attempt.child.as_mut()
+            && child.try_wait()?.is_none()
+        {
+            bail!(
+                "The owned HERDR startup is still running; readiness will be rechecked without launching a second server"
+            );
+        }
+        if tokio::time::Instant::now() < attempt.retry_at {
+            bail!("Retrying the missing HERDR runtime after a bounded startup backoff");
+        }
+    }
+    attempts.insert(
+        path.clone(),
+        StartAttempt {
+            retry_at: tokio::time::Instant::now() + Duration::from_secs(15),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            child: None,
+        },
+    );
     // Only create a missing server; never restart an existing session.
     let version = tokio::time::timeout(
         Duration::from_secs(5),
@@ -239,8 +406,11 @@ pub async fn ensure_server(config: &Config) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(value) = rpc(config, "ping", json!({})).await {
-            if value["protocol"].as_u64() != Some(PROTOCOL) {
-                bail!("HERDR server protocol differs from the supported installation");
+            if value["protocol"].as_u64() != Some(PROTOCOL) || value["version"] != "0.9.5" {
+                attempts.get_mut(&path).expect("recorded startup").child = Some(child);
+                bail!(
+                    "HERDR server version or protocol differs from the supported installation; the owned startup remains supervised"
+                );
             }
             tokio::spawn(async move {
                 let _ = child.wait().await;
@@ -257,11 +427,12 @@ pub async fn ensure_server(config: &Config) -> Result<()> {
             );
         }
         if tokio::time::Instant::now() >= deadline {
-            // A slow live server remains owned by HERDR, not this view or request.
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-            bail!("HERDR server did not become ready; open its session and retry");
+            // Keep the exact owned startup handle. A slow candidate must not
+            // cause concurrent projects or future sweeps to spawn duplicates.
+            attempts.get_mut(&path).expect("recorded startup").child = Some(child);
+            bail!(
+                "HERDR startup has not reached readiness; the same owned process will be reobserved"
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -599,9 +770,11 @@ async fn vanished_execution(
     if !root_has_exited(execution.shell_pid) {
         return Ok(false);
     }
+    let preboot = execution_predates_boot(&p.execution, host_boot().as_ref());
     let children = crate::native_children::observe(p, crate::db::now());
-    if children["state"] == "active"
-        || (p.execution["child_adapter"].is_string() && children["state"] != "quiescent")
+    if !preboot
+        && (children["state"] == "active"
+            || (p.execution["child_adapter"].is_string() && children["state"] != "quiescent"))
     {
         return Ok(false);
     }
@@ -618,9 +791,12 @@ async fn vanished_execution(
     // PID reuse, permission errors, and missing managed child evidence retain
     // the old fence; no signal is sent to either the old or replacement pane.
     let children = crate::native_children::observe(p, crate::db::now());
+    let preboot = preboot && execution_predates_boot(&p.execution, host_boot().as_ref());
     Ok(root_has_exited(execution.shell_pid)
-        && children["state"] != "active"
-        && (!p.execution["child_adapter"].is_string() || children["state"] == "quiescent"))
+        && (preboot
+            || (children["state"] != "active"
+                && (!p.execution["child_adapter"].is_string()
+                    || children["state"] == "quiescent"))))
 }
 fn vanished_record(execution: &ExecutionRef) -> Value {
     json!({"state":"finished","vanished_execution":true,"execution":execution})
@@ -803,8 +979,57 @@ pub fn check_execution_identity(p: &Project, record: &Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) struct NativeSessionChanged;
+impl std::fmt::Display for NativeSessionChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The resumed CLI reported a different native conversation; saved continuity and pending input remain held")
+    }
+}
+impl std::error::Error for NativeSessionChanged {}
+pub(crate) fn same_native_session(agent: &str, expected: &str, actual: &str) -> bool {
+    expected == actual
+        || (agent == "pi"
+            && Path::new(expected).is_absolute()
+            && Path::new(actual).is_absolute()
+            && std::fs::metadata(expected).is_ok_and(|m| m.is_file())
+            && std::fs::metadata(actual).is_ok_and(|m| m.is_file())
+            && std::fs::canonicalize(expected)
+                .ok()
+                .zip(std::fs::canonicalize(actual).ok())
+                .is_some_and(|(a, b)| a == b))
+}
+pub(crate) fn intended_native_resume(p: &Project, resume: bool) -> Option<String> {
+    (resume && !p.native_session.is_empty() && capabilities(&p.agent)["native_resume"] == true)
+        .then(|| p.native_session.clone())
+}
+pub(crate) fn check_native_resume(p: &Project, record: &Value) -> Result<()> {
+    if let (Some(expected), Some(actual)) = (
+        p.execution["intended_native_session"]
+            .as_str()
+            .filter(|s| !s.is_empty()),
+        record["native_session"]["value"]
+            .as_str()
+            .filter(|s| !s.is_empty()),
+    ) && !same_native_session(&p.agent, expected, actual)
+    {
+        return Err(NativeSessionChanged.into());
+    }
+    Ok(())
+}
+
 pub fn check_identity(p: &Project, record: &Value) -> Result<()> {
     check_execution_identity(p, record)?;
+    check_native_resume(p, record)?;
+    if p.execution["intended_native_session"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty())
+        && record["native_session"]["value"]
+            .as_str()
+            .is_none_or(|s| s.is_empty())
+    {
+        return Err(SessionStarting.into());
+    }
     if record["launch_pending"] == true {
         return Err(SessionStarting.into());
     }
@@ -1381,6 +1606,391 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn custom_resume_preserves_explicit_native_argument_without_inventing_native_confirmation()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            herdr_session: dir.path().to_string_lossy().into(),
+            ..Config::default()
+        };
+        let db = crate::db::Db::open(&dir.path().join("db")).unwrap();
+        let mut p = db
+            .create(crate::db::ProjectInput {
+                name: "Custom resume".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "custom".into(),
+                chat_id: String::new(),
+                native_session: "opaque-custom-conversation".into(),
+                extra_args: vec![
+                    "custom-agent".into(),
+                    "--session".into(),
+                    "{native_session}".into(),
+                ],
+            })
+            .await
+            .unwrap();
+        p.generation = "custom-generation".into();
+        p.terminal = Some("custom-terminal".into());
+        p.terminal_pid = Some(100);
+        p.ready = true;
+        p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"custom-terminal","managed_name":"custom-managed","generation":p.generation,"shell_pid":100,"launch_permit":dir.path().join("permit")});
+        if let Some(native) = intended_native_resume(&p, true) {
+            p.execution["intended_native_session"] = json!(native);
+        }
+        let args = crate::adapter::launch_args(
+            &p,
+            &dir.path().join("mcp.json"),
+            &json!({"command":"hfb","args":[]}),
+            "context",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec!["custom-agent", "--session", "opaque-custom-conversation"]
+        );
+        let pane = json!({"pane_id":"w1:p1","workspace_id":"w1","terminal_id":"custom-terminal","agent":"custom-agent","agent_status":"idle","tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":p.generation,"hfb_execution":"custom-managed"}});
+        let listener = tokio::net::UnixListener::bind(socket_path(&cfg).unwrap()).unwrap();
+        let worker = tokio::spawn(async move {
+            for expected in [
+                "pane.get",
+                "agent.get",
+                "pane.process_info",
+                "pane.send_input",
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (input, mut output) = stream.into_split();
+                let request: Value = serde_json::from_str(
+                    &BufReader::new(input)
+                        .lines()
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["method"], expected);
+                let result = match expected {
+                    "pane.get" => json!({"pane":pane}),
+                    "agent.get" => json!({"agent":pane}),
+                    "pane.process_info" => {
+                        json!({"process_info":{"shell_pid":100,"foreground_processes":[{"pid":100,"name":"custom-agent","argv":["custom-agent"]}]}})
+                    }
+                    _ => {
+                        assert_eq!(request["params"]["text"], "new custom input");
+                        assert_eq!(request["params"]["keys"], json!(["Enter"]));
+                        json!({})
+                    }
+                };
+                output
+                    .write_all(
+                        format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        assert!(send(&cfg, &p, "new custom input").await.unwrap()["submitted"] == true);
+        worker.await.unwrap();
+        assert!(p.execution.get("native_confirmed").is_none());
+        assert!(p.execution.get("intended_native_session").is_none());
+        p.agent = "codex".into();
+        assert_eq!(
+            intended_native_resume(&p, true).as_deref(),
+            Some("opaque-custom-conversation")
+        );
+        assert!(intended_native_resume(&p, false).is_none());
+    }
+    #[test]
+    fn reboot_proof_never_uses_age_to_override_a_known_same_boot() {
+        let boot = HostBoot {
+            id: uuid::Uuid::new_v4().to_string(),
+            started_at: 10_000,
+        };
+        assert!(!execution_predates_boot(
+            &json!({"host_boot_id":boot.id,"launch_started_at":1}),
+            Some(&boot)
+        ));
+        assert!(execution_predates_boot(
+            &json!({"host_boot_id":uuid::Uuid::new_v4().to_string()}),
+            Some(&boot)
+        ));
+        assert!(!execution_predates_boot(
+            &json!({"host_boot_id":"unknown","launch_started_at":1}),
+            Some(&boot)
+        ));
+        assert!(execution_predates_boot(
+            &json!({"launch_started_at":9999}),
+            Some(&boot)
+        ));
+        assert!(!execution_predates_boot(
+            &json!({"launch_started_at":10000}),
+            Some(&boot)
+        ));
+        assert!(!execution_predates_boot(&json!({}), Some(&boot)));
+        assert!(!execution_predates_boot(
+            &json!({"launch_started_at":1}),
+            None
+        ));
+        assert!(runtime_missing(&anyhow::Error::new(NotSubmitted(
+            std::io::Error::from(std::io::ErrorKind::NotFound).into()
+        ))));
+        assert!(!runtime_missing(&anyhow::Error::new(NotSubmitted(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()
+        ))));
+    }
+    #[tokio::test]
+    async fn reconcile_expires_owned_starter_even_when_a_bound_socket_returns_rpc_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("herdr");
+        std::fs::write(&executable, "#!/bin/sh\necho 'herdr 0.9.5'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cfg = Config {
+            herdr: executable.to_string_lossy().into(),
+            herdr_session: dir.path().to_string_lossy().into(),
+            ..Config::default()
+        };
+        let app = crate::App::new(dir.path().join("store"), cfg.clone()).unwrap();
+        let p = app
+            .db
+            .create(crate::db::ProjectInput {
+                name: "Bound unready runtime".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "codex".into(),
+                chat_id: String::new(),
+                native_session: "saved-native".into(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        let execution = json!({"api_protocol":7,"mcp_contract":1,"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"saved-terminal","managed_name":"saved-managed","generation":"saved-generation","shell_pid":12345,"launch_permit":dir.path().join("permit")});
+        app.db.sync(|c|{
+            c.execute("UPDATE projects SET paused=1,terminal='saved-terminal',terminal_pid=12345,generation='saved-generation',ready=1,execution=? WHERE id=?",rusqlite::params![execution.to_string(),p.id])?;
+            crate::work::begin_execution(c,&p.id,"saved-generation",crate::db::now())?;
+            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('pending',?,'in','pending','hold','queued',1,1)",[&p.id])?;crate::work::sync_inbound(c)?;Ok(())
+        }).unwrap();
+        let path = socket_path(&cfg).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = calls.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let (input, mut output) = stream.into_split();
+                    let Some(line) = BufReader::new(input).lines().next_line().await.unwrap()
+                    else {
+                        return;
+                    };
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    seen.lock()
+                        .unwrap()
+                        .push(request["method"].as_str().unwrap().to_owned());
+                    output.write_all(format!("{}\n",json!({"id":request["id"],"error":{"code":"runtime_not_ready","message":"bound but not ready"}})).as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let owned_pid = child.id().unwrap();
+        let mut foreign = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .spawn()
+            .unwrap();
+        START_LOCK.lock().await.insert(
+            path.clone(),
+            StartAttempt {
+                retry_at: tokio::time::Instant::now(),
+                deadline: tokio::time::Instant::now(),
+                child: Some(child),
+            },
+        );
+        let paused = app.reconcile(&p.id).await;
+        let paused_preserved = !root_has_exited(Some(i64::from(owned_pid)));
+        app.db.pause(&p.id, false).await.unwrap();
+        app.db
+            .sync(|c| crate::work::set_takeover(c, &p.id, "saved-generation", true, 2))
+            .unwrap();
+        let takeover = app.reconcile(&p.id).await;
+        let takeover_preserved = !root_has_exited(Some(i64::from(owned_pid)));
+        app.db
+            .sync(|c| crate::work::set_takeover(c, &p.id, "saved-generation", false, 3))
+            .unwrap();
+        let recovery = app.reconcile(&p.id).await;
+        let owned_expired = root_has_exited(Some(i64::from(owned_pid)));
+        let foreign_preserved = foreign.try_wait().unwrap().is_none();
+        if let Some(mut attempt) = START_LOCK.lock().await.remove(&path)
+            && let Some(mut child) = attempt.child.take()
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
+        server.abort();
+        let _ = server.await;
+        assert!(paused.is_ok() && paused_preserved);
+        assert!(takeover.is_ok() && takeover_preserved);
+        assert!(recovery.is_err() && owned_expired && foreign_preserved);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|method| matches!(method.as_str(), "pane.get" | "ping")),
+            "No mutation may reach the foreign socket"
+        );
+        let saved = app.db.project(&p.id).await.unwrap();
+        assert_eq!(saved.native_session, "saved-native");
+        assert_eq!(saved.terminal.as_deref(), Some("saved-terminal"));
+        app.db
+            .sync(|c| {
+                assert_eq!(crate::work::event(c, &p.id, "pending")?.status, "queued");
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn expired_owned_starter_is_reaped_with_backoff_without_touching_foreign_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            herdr: "/nonexistent/fixture-herdr".into(),
+            herdr_session: dir.path().to_string_lossy().into(),
+            ..Config::default()
+        };
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let owned_pid = child.id().unwrap();
+        let mut foreign = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .spawn()
+            .unwrap();
+        let path = socket_path(&cfg).unwrap();
+        START_LOCK.lock().await.insert(
+            path.clone(),
+            StartAttempt {
+                retry_at: tokio::time::Instant::now(),
+                deadline: tokio::time::Instant::now(),
+                child: Some(child),
+            },
+        );
+        assert!(startup_pending(&cfg).await.unwrap());
+        let expired = ensure_server(&cfg).await.unwrap_err();
+        assert!(!startup_pending(&cfg).await.unwrap());
+        let backed_off = ensure_server(&cfg).await.unwrap_err();
+        let foreign_preserved = foreign.try_wait().unwrap().is_none();
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
+        let attempt = START_LOCK.lock().await.remove(&path).unwrap();
+        assert!(expired.to_string().contains("exceeded its deadline"));
+        assert!(backed_off.to_string().contains("backoff"));
+        assert!(attempt.child.is_none());
+        assert!(root_has_exited(Some(i64::from(owned_pid))));
+        assert!(foreign_preserved);
+    }
+    #[tokio::test]
+    async fn concurrent_missing_runtime_reconnects_share_one_start_and_preserve_a_live_server() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            herdr_session: dir.path().to_string_lossy().into_owned(),
+            herdr: dir.path().join("herdr").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let script = format!(
+            r#"#!/usr/bin/python3
+import json,os,socket,sys,threading
+from pathlib import Path
+if '--version' in sys.argv: print('herdr 0.9.5');sys.exit(0)
+p=Path({directory:?});(p/'started').open('a').write('start\n');(p/'pid').write_text(str(os.getpid()))
+s=socket.socket(socket.AF_UNIX);s.bind(str(p/'herdr.sock'));s.listen()
+def respond(c):
+ with c:
+  line=c.makefile().readline()
+  if not line:return
+  r=json.loads(line);assert r['method']=='ping'
+  c.sendall((json.dumps({{'id':r['id'],'result':{{'protocol':22,'version':'0.9.5'}}}})+'\n').encode())
+while True:
+ c,_=s.accept();threading.Thread(target=respond,args=(c,),daemon=True).start()
+"#,
+            directory = dir.path().to_string_lossy()
+        );
+        std::fs::write(&cfg.herdr, script).unwrap();
+        std::fs::set_permissions(&cfg.herdr, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A candidate that becomes ready after its deadline wins over timeout
+        // cleanup; retain its exact Child handle until the live probe succeeds.
+        let late = command(&cfg)
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let late_pid = late.id().unwrap();
+        let path = socket_path(&cfg).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while UnixStream::connect(&path).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        START_LOCK.lock().await.insert(
+            path.clone(),
+            StartAttempt {
+                retry_at: tokio::time::Instant::now(),
+                deadline: tokio::time::Instant::now(),
+                child: Some(late),
+            },
+        );
+        let ready = ensure_server(&cfg).await;
+        let late_preserved = !root_has_exited(Some(i64::from(late_pid)));
+        unsafe {
+            libc::kill(late_pid as i32, libc::SIGTERM);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root_has_exited(Some(i64::from(late_pid))) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(ready.is_ok(), "{ready:?}");
+        assert!(late_preserved);
+        let (a, b, c) = tokio::join!(
+            ensure_server(&cfg),
+            ensure_server(&cfg),
+            ensure_server(&cfg)
+        );
+        let pid = std::fs::read_to_string(dir.path().join("pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        // Always clean only the server created by this isolated fixture.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        assert!(a.is_ok(), "{a:?}");
+        assert!(b.is_ok(), "{b:?}");
+        assert!(c.is_ok(), "{c:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("started"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+    #[tokio::test]
     async fn reused_pane_recovery_requires_global_absence_and_never_mutates_foreign_pane() {
         for scenario in [
             "gone",
@@ -1391,6 +2001,8 @@ mod tests {
             "unknown_children",
             "active_children",
             "registry_race",
+            "preboot_pi",
+            "sameboot_pi",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let cfg = Config {
@@ -1424,7 +2036,18 @@ mod tests {
                 _ => Some(dead_pid),
             };
             p.execution = json!({"backend":"legacy","workspace_id":"w1","pane_id":"w1:p1","terminal_id":"old-terminal","managed_name":"old-managed","generation":p.generation,"shell_pid":p.terminal_pid,"launch_permit":dir.path().join("permit")});
-            if matches!(scenario, "unknown_children" | "active_children") {
+            if matches!(
+                scenario,
+                "unknown_children" | "active_children" | "preboot_pi" | "sameboot_pi"
+            ) {
+                p.agent = "pi".into();
+                if scenario == "preboot_pi" {
+                    p.execution["host_boot_id"] = json!(uuid::Uuid::new_v4().to_string());
+                }
+                if scenario == "sameboot_pi" {
+                    p.execution["host_boot_id"] = json!(host_boot().unwrap().id);
+                    p.execution["launch_started_at"] = json!(1);
+                }
                 let adapter = dir.path().join("adapter");
                 std::fs::create_dir(&adapter).unwrap();
                 p.execution["child_adapter"] = json!(adapter);
@@ -1487,7 +2110,7 @@ mod tests {
                 }
             });
             let observed = observe(&cfg, &p).await;
-            if scenario == "gone" {
+            if matches!(scenario, "gone" | "preboot_pi") {
                 assert_eq!(observed.unwrap()["vanished_execution"], true);
                 assert!(stop(&cfg, &p).await.is_ok());
             } else {

@@ -417,16 +417,7 @@ fn native_resume(agent: &str, execution: &Value, observed: &str) -> NativeResume
     if execution["native_confirmed"] != true || observed.is_empty() {
         return NativeResume::Unconfirmed;
     }
-    let same = expected == observed
-        || (agent == "pi"
-            && std::path::Path::new(expected).is_absolute()
-            && std::path::Path::new(observed).is_absolute()
-            && std::fs::metadata(expected).is_ok_and(|m| m.is_file())
-            && std::fs::metadata(observed).is_ok_and(|m| m.is_file())
-            && std::fs::canonicalize(expected)
-                .ok()
-                .zip(std::fs::canonicalize(observed).ok())
-                .is_some_and(|(a, b)| a == b));
+    let same = herdr::same_native_session(agent, expected, observed);
     if same {
         NativeResume::Matching
     } else {
@@ -434,11 +425,10 @@ fn native_resume(agent: &str, execution: &Value, observed: &str) -> NativeResume
     }
 }
 fn target_native_matches(r: &Request, execution: &Value, observed: &str) -> bool {
-    r.source["intent"] != "model"
-        || matches!(
-            native_resume(&r.target, execution, observed),
-            NativeResume::Fresh | NativeResume::Matching
-        )
+    matches!(
+        native_resume(&r.target, execution, observed),
+        NativeResume::Fresh | NativeResume::Matching
+    )
 }
 fn target_launch_state(c: &Connection, project: &str, r: &Request) -> Result<(String, String)> {
     let runtime = &r.source["runtime_target"];
@@ -918,6 +908,10 @@ impl App {
         }
         if r.phase == "starting" {
             if let Some(record) = record {
+                if herdr::check_native_resume(p, record).is_err() {
+                    self.fail_cli_start(&r,"The resumed CLI forked its saved native conversation; keeping ordinary input held and restoring the original repair owner.").await?;
+                    return Ok(true);
+                }
                 if p.agent == r.target
                     && r.source["intent"] == "model"
                     && native_resume(&p.agent, &p.execution, &p.native_session)
@@ -1377,11 +1371,24 @@ impl App {
             return Ok(true);
         }
         self.ensure_cli_source(p, r).await?;
+        let native_fork =
+            record.is_some_and(|record| herdr::check_native_resume(p, record).is_err());
+        if native_fork && r.phase != "recovery_stopping" {
+            let record = record.expect("native fork observation");
+            if herdr::recovery_foreground_quiescent(p, record) {
+                let id = r.id.clone();
+                self.db.call(move|c|phase(c,&id,"recovery_stopping","Replacing the owned forked native execution while preserving the original saved conversation")).await?;
+            } else {
+                self.defer_cli_recovery(r,"Waiting for the forked execution's active work and children before restoring the original saved conversation").await?;
+            }
+            return Ok(true);
+        }
         let source_agent = r.source["agent"].as_str().unwrap_or("").to_owned();
         let candidate = retiring_candidate(r, &p.execution, &p.generation);
         // Hooks may discover native continuity after switch acceptance. Capture
         // only the source's identity, never a failed target's different session.
         if !candidate
+            && !native_fork
             && p.agent == source_agent
             && !p.native_session.is_empty()
             && r.source["native_session"] != p.native_session
@@ -2386,6 +2393,52 @@ mod tests {
             assert_eq!(held.source["uncertain_stops"][0]["result"], "uncertain");
             assert_eq!(app.db.project(&p.id).await.unwrap().terminal, p.terminal);
         }
+    }
+    #[tokio::test]
+    async fn runtime_repair_rejects_fork_before_source_snapshot_and_native_readiness_adoption() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c|{
+            c.execute("UPDATE projects SET execution=json_object('api_protocol',7,'mcp_contract',1,'backend','legacy','workspace_id','workspace','pane_id','old-pane','terminal_id','old-pane','managed_name','managed','generation','old-gen','shell_pid',NULL,'launch_permit','/private/fixture/launch','intended_native_session','old-native') WHERE id=?",[&p.id])?;Ok(())
+        }).unwrap();
+        let p = app.db.project(&p.id).await.unwrap();
+        app.journal_cli_fault(&p.id, "Resume recovery")
+            .await
+            .unwrap();
+        let mut record = json!({"state":"live","status":{"state":"working"},"foreground":{"name":"codex"},"processes":[{"pid":100,"name":"codex","argv":["codex"]}],"native_session":{"value":"forked-native"},"interactive_ready":true,"execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace","agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},"tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"quiescent"}});
+        assert!(
+            herdr::check_identity(&p, &record)
+                .unwrap_err()
+                .is::<herdr::NativeSessionChanged>()
+        );
+        assert!(
+            app.advance_cli_switch(&p, None, Some(&record))
+                .await
+                .unwrap()
+        );
+        let r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(r.source["native_session"], "old-native");
+        assert_eq!(r.source["runtime_target"]["native_session"], "old-native");
+        assert!(r.holds_input);
+        record["status"]["state"] = json!("idle");
+        app.request_cli_repair(&p.id).await.unwrap();
+        assert!(
+            app.advance_cli_switch(&p, None, Some(&record))
+                .await
+                .unwrap()
+        );
+        let r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(r.phase, "recovery_stopping");
+        assert_eq!(r.source["native_session"], "old-native");
+        assert_eq!(
+            app.db.project(&p.id).await.unwrap().native_session,
+            "old-native"
+        );
+        let mut execution = json!({"intended_native_session":"old-native","native_confirmed":true,"mcp_registered":true});
+        assert!(!target_native_matches(&r, &execution, "forked-native"));
+        execution["native_confirmed"] = json!(false);
+        assert!(!target_native_matches(&r, &execution, "old-native"));
+        execution["native_confirmed"] = json!(true);
+        assert!(target_native_matches(&r, &execution, "old-native"));
     }
     #[tokio::test]
     async fn runtime_repair_resumes_target_native_and_arguments_instead_of_erasing_its_conversation()
