@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0 — 2026-11-18
+
+### Added
+
+- Opt in to a restricted built-in project manager from native project settings, with a separate OpenAI-compatible endpoint, model and private API key. Existing projects continue using native coding CLIs by default; native login, model settings and saved conversations remain unchanged (#110).
+- Give the manager exactly seven internal tools: `read_file`, `write_file`, `delegate`, `worker_status`, `steer_worker`, `send_md` and `send_file`. Workspace file access and structured delegation support coordination while native CLI workers do the coding; the manager has no Bash, arbitrary process execution, generic HTTP or arbitrary MCP tools (#110).
+- Use a Chinese management prompt grounded in the actual user project, with scoped group/topic corrections, explicit discussion origins and evidence-based acceptance. Show the manager, its coding worker and observed native children in the project tree (#110).
+- Persist manager inputs, checkpoints and external-effect records across interruptions. Preserve fresh user steering, held CLI-switch input and uncertain effects; respect pause, Stop and terminal takeover, and support an ordered handoff back to native mode without replaying completed effects (#110).
+
+### Fixed
+
+- Left-align child Agent names, including read-only detail buttons, for a consistent sidebar tree (#109).
+
+### Changed
+
+- Raise the minimum Rust version for source builds to 1.95 and pin Rig to 0.44.0 for the optional manager.
+- Advance both application crates to 0.6.0 and bundle build 18. Keep API protocol 7, the three native Agent tools (`send_md`, `send_file` and `schedule_run`) and bundled HERDR 0.9.5 unchanged. Manager provider credentials are configured separately and are never copied from native CLI login.
+
 ## 0.5.2 — 2026-11-18
 
 ### Fixed
