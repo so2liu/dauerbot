@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod api;
 pub mod bot;
+pub mod cli_control;
 pub mod cli_switch;
 pub mod companion;
 pub mod config;
@@ -264,6 +265,9 @@ impl App {
         }
         if let Some(request) = self.cli_switch_launch_id(&p).await? {
             execution["cli_switch_request"] = json!(request);
+        }
+        if let Some(request) = self.cli_recovery_launch_id(&p).await? {
+            execution["cli_recovery_request"] = json!(request);
         }
         execution["api_protocol"] = json!(api::PROTOCOL);
         execution["mcp_contract"] = json!(mcp::CONTRACT);
@@ -632,8 +636,10 @@ impl App {
             match self.start_inner(&p.id, resume).await {
                 Ok(project) => p = project,
                 Err(error) => {
-                    self.attention(&p, "startup", &error.to_string()).await?;
-                    return Err(error);
+                    self.journal_cli_fault(&p.id, &format!("Native startup failed: {error}"))
+                        .await?;
+                    self.set_phase(&p, "recovering_cli", Value::Null).await;
+                    return Ok(());
                 }
             }
         }
@@ -655,62 +661,22 @@ impl App {
             rt.core = "connected".into();
             rt.core_error.clear();
         }
+        if record["state"] != "live"
+            && self.cli_switch_holds_input(&p).await?
+            && self
+                .advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?
+        {
+            return Ok(());
+        }
         if record["state"] != "live" {
-            let exit_error = if !p.ready {
-                let output = herdr::screen(&cfg, &p, 30).await.unwrap_or_default();
-                let start = output
-                    .char_indices()
-                    .rev()
-                    .nth(3999)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                let output = &output[start..];
-                if output.trim().is_empty() {
-                    "The Agent execution exited before connecting".to_owned()
-                } else {
-                    format!("The Agent execution exited before connecting\n\n{output}")
-                }
+            self.journal_cli_fault(&p.id,if p.ready {
+                "The native Agent exited unexpectedly; restoring its supervised repair conversation without replaying uncertain work."
             } else {
-                "The Agent execution exited".to_owned()
-            };
-            // HERDR retains an exited pane until it is closed. Remove only this
-            // generation's pane before forgetting its durable identity.
-            herdr::stop(&cfg, &p).await?;
-            let id = p.id.clone();
-            let generation_id = p.generation.clone();
-            self.db
-                .call(move |c| {
-                    work::finish_execution(c, &id, &generation_id, "exited", &exit_error, db::now())
-                })
+                "The native Agent exited before readiness; recovering its saved CLI and native continuity."
+            }).await?;
+            self.advance_cli_switch(&p, Some(&cfg), Some(&record))
                 .await?;
-            let project_id = p.id.clone();
-            let generation = p.generation.clone();
-            let interrupted = self
-                .db
-                .call(move |c| {
-                    Ok(work::active_execution_run(c, &project_id, &generation)?.is_some())
-                })
-                .await?;
-            if interrupted {
-                self.attention(&p,"execution_lost","The Agent exited during a task. Check the saved result before retrying uncertain work.").await?;
-            } else if queued || !p.ready {
-                self.attention(&p,"startup",
-                    "The CLI exited before it could accept the saved task. Check its installation and login in Environment Check. Dauerbot retries automatically after thirty seconds.").await?;
-            }
-            self.db
-                .set_session(&p.id, None, None, String::new())
-                .await?;
-            self.set_phase(
-                &p,
-                if interrupted || queued || !p.ready {
-                    "needs_attention"
-                } else {
-                    "exited"
-                },
-                record,
-            )
-            .await;
-            self.notify.notify_one();
             return Ok(());
         }
         if let Err(error) = herdr::check_identity(&p, &record) {
@@ -719,12 +685,41 @@ impl App {
             self.db
                 .call(move |c| work::touch_execution(c, &id, &generation, db::now()))
                 .await?;
-            if error.is::<herdr::SessionStarting>() {
-                self.set_phase(&p, "starting", record).await;
+            if self.cli_switch_holds_input(&p).await? {
+                self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                    .await?;
                 return Ok(());
             }
-            self.set_phase(&p, "needs_attention", record).await;
-            return Err(error);
+            if error.is::<herdr::SessionStarting>() {
+                let expired = state
+                    .execution
+                    .as_ref()
+                    .filter(|e| e.generation == p.generation)
+                    .is_some_and(|e| db::now() - e.created_at > 90_000);
+                if expired {
+                    self.journal_cli_fault(&p.id,"The native execution never reached interactive readiness; supervising its safe restart and repair.").await?;
+                    self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                        .await?;
+                } else {
+                    self.set_phase(&p, "starting", record).await;
+                }
+                return Ok(());
+            }
+            let id = p.id.clone();
+            let diagnostic = error.to_string();
+            self.db
+                .call(move |c| {
+                    let r = cli_switch::ensure_repair_request(c, &id)?;
+                    c.execute(
+                        "UPDATE cli_switch_requests SET error=?,source=json_set(source,'$.last_failure',?) WHERE id=?",
+                        rusqlite::params![diagnostic, diagnostic, r.id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?;
+            return Ok(());
         }
         let child_coverage = record["children"].clone();
         let id = p.id.clone();
@@ -793,6 +788,15 @@ impl App {
             self.set_phase(&p, "taken_over", record).await;
             return Ok(());
         }
+        if self.cli_switch_holds_input(&p).await? {
+            let handled = self
+                .advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?;
+            if handled || self.cli_switch_holds_input(&p).await? {
+                return Ok(());
+            }
+            self.notify.notify_one();
+        }
         if native_status == "blocked" {
             if matches!(p.agent.as_str(), "agy" | "claude")
                 && herdr::confirm_project_trust(&cfg, &p).await.is_ok()
@@ -800,7 +804,6 @@ impl App {
                 self.set_phase(&p, "starting", record).await;
                 return Ok(());
             }
-            self.set_phase(&p, "needs_attention", record).await;
             let screen = herdr::screen(&cfg, &p, 0)
                 .await
                 .unwrap_or_default()
@@ -825,16 +828,15 @@ impl App {
                 )
             };
             self.attention(&p, reason, notice).await?;
+            self.journal_cli_fault(&p.id,&format!("Native input is blocked ({reason}); required user decisions remain explicit. Restoring an available repair conversation without guessing that decision.")).await?;
+            self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?;
             return Ok(());
         }
         if native_status == "error" {
-            self.set_phase(&p, "needs_attention", record).await;
-            self.attention(
-                &p,
-                "execution_error",
-                "The Agent reported an error. Open its terminal to see the cause and continue.",
-            )
-            .await?;
+            self.journal_cli_fault(&p.id,"The native Agent reported an error; restoring supervised native diagnostic repair while preserving queued input and uncertain effects.").await?;
+            self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?;
             return Ok(());
         }
         if ["working", "idle", "done"].contains(&native_status) {
@@ -857,7 +859,7 @@ impl App {
             }).await?;
         }
         let busy = native_status == "working";
-        if !p.ready {
+        if !p.ready || p.execution["mcp_registered"] != true {
             self.set_phase(&p, "starting", record.clone()).await;
             let old = state
                 .execution
@@ -865,19 +867,9 @@ impl App {
                 .filter(|e| e.generation == p.generation)
                 .is_some_and(|e| db::now() - e.created_at > 90_000);
             if old {
-                self.attention(&p,"not_ready","The Agent has not connected to Dauerbot yet. Check login and MCP setup in its terminal.").await?;
-            }
-            return Ok(());
-        }
-        if self.cli_switch_holds_input(&p).await? {
-            let advancing = self
-                .advance_cli_switch(&p, Some(&cfg), Some(&record))
-                .await?;
-            if !self.cli_switch_holds_input(&p).await? {
-                self.notify.notify_one();
-                self.set_phase(&p, "ready", record).await;
-            } else if !advancing {
-                self.set_phase(&p, "needs_attention", record).await;
+                self.journal_cli_fault(&p.id,"The native Agent did not establish verified native and MCP readiness; a native diagnostic repair channel will investigate the connection.").await?;
+                self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                    .await?;
             }
             return Ok(());
         }
@@ -1232,6 +1224,7 @@ impl App {
                 if let Err(error) = app
                     .db
                     .call(|c| {
+                        cli_control::classify(c)?;
                         work::sync_inbound(c)?;
                         work::fire_due(c, db::now())?;
                         Ok(())
@@ -1239,6 +1232,9 @@ impl App {
                     .await
                 {
                     tracing::error!("Work scheduler: {error}");
+                }
+                if let Err(error) = cli_control::process(&app).await {
+                    tracing::error!("Repair controls: {error}");
                 }
                 if let Ok(projects) = app.db.projects().await {
                     for p in projects {
