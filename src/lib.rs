@@ -543,6 +543,11 @@ impl App {
             }
         }
 
+        let observed_project = p.id.clone();
+        self.db
+            .call(move |c| manager::worker_changed(c, &observed_project))
+            .await?;
+
         Ok(())
     }
     pub async fn takeover(&self, key: &str, generation: &str, active: bool) -> Result<Value> {

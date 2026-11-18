@@ -60,6 +60,11 @@ pub fn public(c: &Connection, project: &str) -> Result<Value> {
         0,
         String::new(),
     ));
+    let error = if mode == "manager" && (!has_key || model.trim().is_empty()) {
+        "Configure a management endpoint, model and API key".to_owned()
+    } else {
+        error
+    };
     let paused: bool = c.query_row("SELECT paused FROM projects WHERE id=?", [project], |r| {
         r.get(0)
     })?;
@@ -243,13 +248,24 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
     if !enabled {
         return Ok(());
     }
+    let native_event = work::event(c, &project, event)?;
+    let trusted_source = if source == "feishu" || source == "local" {
+        json!({"message_id":if source=="feishu"{Some(&native_event.source_id)}else{None},"local_source_id":if source=="local"{Some(&native_event.source_id)}else{None},"source":payload["attachment"]["source"],"bot_app_id":payload["attachment"]["bot_app_id"]})
+    } else {
+        json!({"timer_id":payload["timer_id"],"to":payload["to"],"scheduled_at":payload["scheduled_at"],"purpose":payload["purpose"]})
+    };
+    let user_input = if source == "timer" {
+        json!({"body":payload["instructions"]})
+    } else {
+        json!({"body":payload["content"],"resources":payload["attachment"]["resources"]})
+    };
     input(
         c,
         &project,
         event,
         Some(event),
         "user",
-        &json!({"event_id":event,"source":source,"payload":payload}),
+        &json!({"event_id":event,"source":source,"trusted_source":trusted_source,"user_input":user_input}),
     )?;
     c.execute(
         "UPDATE work_events SET status='managed' WHERE id=? AND status='queued'",
@@ -338,6 +354,7 @@ pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Resu
         .is_some_and(|s| s == p.native_session);
     if !same_agent || (!same_generation && !same_native) {
         c.execute("UPDATE work_events SET status='failed',error='Worker identity changed before submission; management can replan from this preserved intent',updated_at=? WHERE id=? AND status='queued'",params![db::now(),event.id])?;
+        worker_changed(c, &event.project_id)?;
         return Ok(false);
     }
     c.execute("UPDATE work_events SET payload=json_set(payload,'$.target_generation',?) WHERE id=? AND status='queued'",params![generation,event.id])?;
@@ -607,10 +624,11 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
    "send_md"|"send_file"=>{
     let (to,text,anchor,path)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;(a.to,a.text,a.reply_to_message_id,None)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path))};
     crate::feishu::recipient_type(&to)?;ensure!(!text.trim().is_empty()||path.is_some(),"Message content is empty");ensure!(text.len()<=131072,"Message is too large");
-    let context=ctx.clone();let request=effect.clone();let message=app.db.call(move|c|{let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;let mut attachment=json!({"to":to,"manager_effect":request});if let Some(anchor)=anchor {attachment["reply_to_message_id"]=json!(anchor);}if let Some(path)=path {attachment["path"]=json!(path);}let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;tx.commit()?;Ok(id)}).await?;
+    let context=ctx.clone();let request=effect.clone();let message=app.db.call(move|c|{let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;let mut attachment=json!({"to":to,"manager_effect":request});if let Some(anchor)=anchor {attachment["reply_to_message_id"]=json!(anchor);}
+    if let Some(path)=path {attachment["path"]=json!(path);}let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;tx.commit()?;Ok(id)}).await?;
     // The journal is committed before remote IO. Do not hold the project lock
     // across Feishu: fresh input and deterministic controls remain immediate.
-    drop(guard);let send_error=app.send_out(&message).await.err().map(|e|e.to_string());let m=app.db.message(&message).await?;return Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}));
+    drop(guard);let send_error=app.send_out(&message).await.err().map(|e|e.to_string());let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
    },
    _=>bail!("This management tool is not available"),
   }
@@ -635,6 +653,17 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
         .await?;
     app.notify.notify_one();
     Ok(value)
+}
+pub fn worker_changed(c: &Connection, project: &str) -> Result<()> {
+    let enabled: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager')",
+        [project],
+        |r| r.get(0),
+    )?;
+    if enabled {
+        observe(c, project)?;
+    }
+    Ok(())
 }
 /// Durable observations contain receipts, never invented task-completion signals.
 fn observe(c: &Connection, project: &str) -> Result<()> {
@@ -711,7 +740,6 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
     if p.paused || work::has_takeover(&tx, project, &p.generation)? {
         return Ok(None);
     }
-    observe(&tx, project)?;
     let input_revision: i64 = tx.query_row(
         "SELECT input_revision FROM manager_config WHERE project_id=?",
         [project],
@@ -755,7 +783,23 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             current.push(json!({"kind":kind,"data":v}));
         }
         let notes=tx.prepare("SELECT n.note FROM manager_turn_notes n JOIN manager_runs r ON r.id=n.run_id WHERE r.project_id=? ORDER BY r.rowid DESC LIMIT 8")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let prompt=json!({"manager_decisions":notes,"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"new_inputs":current}).to_string();
+        let active_origin = if let Some(ref id) = origin {
+            let e = work::event(&tx, project, id)?;
+            if let Some(message) = e.message_id {
+                let raw: String = tx.query_row(
+                    "SELECT attachment FROM messages WHERE id=?",
+                    [message],
+                    |r| r.get(0),
+                )?;
+                let a: Value = serde_json::from_str(&raw)?;
+                json!({"message_id":e.source_id,"source":a["source"]})
+            } else {
+                json!({"event_id":e.id,"source":e.source,"to":e.payload["to"]})
+            }
+        } else {
+            Value::Null
+        };
+        let prompt=json!({"active_trusted_source":active_origin,"manager_decisions":notes,"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"new_inputs":current}).to_string();
         ensure!(
             prompt.len() <= 250000,
             "Management context exceeds its bound"
@@ -844,13 +888,33 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
                 let Some(_permit) = app.service.gate.enter() else {
                     return Ok(());
                 };
-                app.db.call(move|c|{let tx=c.unchecked_transaction()?;valid(&tx,&context)?;tx.execute("UPDATE manager_runs SET status='complete' WHERE id=?",[&context.run])?;tx.execute("INSERT OR REPLACE INTO manager_turn_notes(run_id,note) VALUES(?,?)",params![context.run,note.chars().take(8000).collect::<String>()])?;
-                    tx.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN(SELECT input_id FROM manager_run_inputs WHERE run_id=?) AND status='queued'",[&context.run])?;
-                    settle_inputs(&tx,&context.run)?;tx.execute("UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=?",[context.project])?;tx.commit()?;Ok(())}).await?;
+                app.db
+                    .call(move |c| finish_turn(c, &context, &note))
+                    .await?;
                 return Ok(());
             }
         }
     }
+}
+fn finish_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    valid(&tx, context)?;
+    tx.execute(
+        "UPDATE manager_runs SET status='complete' WHERE id=?",
+        [&context.run],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO manager_turn_notes(run_id,note) VALUES(?,?)",
+        params![context.run, note.chars().take(8000).collect::<String>()],
+    )?;
+    tx.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN(SELECT input_id FROM manager_run_inputs WHERE run_id=?) AND status='queued'",[&context.run])?;
+    settle_inputs(&tx, &context.run)?;
+    tx.execute(
+        "UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=?",
+        [&context.project],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 fn failure(c: &Connection, ctx: &Context) -> Result<()> {
     let tx = c.unchecked_transaction()?;
@@ -915,7 +979,7 @@ pub async fn run(app: Arc<App>) {
         let Some(_permit) = app.service.gate.enter() else {
             continue;
         };
-        let projects=app.db.call(|c|Ok(c.prepare("SELECT project_id FROM manager_config WHERE mode='manager' AND next_attempt_at<=?")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
+        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE m.mode='manager' AND p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status='queued') OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
         for project in projects {
             if !running.lock().await.insert(project.clone()) {
                 continue;
@@ -925,7 +989,7 @@ pub async fn run(app: Arc<App>) {
             tokio::spawn(async move {
                 let claim_project = project.clone();
                 let turn = app.db.call(move |c| claim(c, &claim_project)).await;
-                if let Err(_) = &turn {
+                if turn.is_err() {
                     let key = project.clone();
                     let _=app.db.call(move|c|{c.execute("UPDATE manager_config SET error='Management context is unavailable or exceeds the model bound. Input is preserved; native mode handoff remains available.',next_attempt_at=? WHERE project_id=?",params![db::now()+30000,key])?;Ok(())}).await;
                 }
@@ -953,4 +1017,356 @@ pub fn settle_sources(c: &Connection) -> Result<()> {
     c.execute("UPDATE work_occurrences SET status='consumed' WHERE event_id IN(SELECT id FROM work_events WHERE status='consumed')",[])?;
     c.execute("UPDATE work_tasks SET status='consumed',updated_at=? WHERE id IN(SELECT task_id FROM work_events WHERE status='consumed')",[db::now()])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, db::ProjectInput};
+    async fn fixture() -> (tempfile::TempDir, Arc<App>, Project) {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().join("store"), Config::default()).unwrap();
+        let path = dir.path().join("workspace");
+        fs::create_dir(&path).unwrap();
+        let p = app
+            .db
+            .create(ProjectInput {
+                name: "Management fixture".into(),
+                path: path.to_string_lossy().into(),
+                agent: "codex".into(),
+                chat_id: String::new(),
+                native_session: "native-A".into(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        app.db
+            .sync(|c| {
+                crate::bot::save(c, &p.id, "cli_fixture", "private-fixture-key", false)?;
+                save(
+                    c,
+                    &p.id,
+                    ConfigInput {
+                        base_url: "http://127.0.0.1:9/v1".into(),
+                        model: "fixture-manager".into(),
+                        api_key: Some("private-manager-key".into()),
+                        clear_api_key: false,
+                        expected_revision: 0,
+                    },
+                )?;
+                set_mode(
+                    c,
+                    &p.id,
+                    ModeInput {
+                        mode: "manager".into(),
+                        request_id: "enable".into(),
+                        expected_revision: 1,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        (dir, app, p)
+    }
+    fn ingest(app: &App, p: &Project, id: &str, text: &str) {
+        app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
+    }
+    #[tokio::test]
+    async fn disabling_and_stop_materialize_stamped_input_without_replay_or_resurrection() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_before_mode", "preserve this input");
+        app.db
+            .sync(|c| {
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM manager_inputs", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                let request = || ModeInput {
+                    mode: "native".into(),
+                    request_id: "native-mode".into(),
+                    expected_revision: 2,
+                };
+                set_mode(c, &p.id, request())?;
+                set_mode(c, &p.id, request())?;
+                assert_eq!(
+                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
+                        .get::<_, String>(0))?,
+                    "transferred"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                work::sync_inbound(c)?;
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM work_runs", [], |r| r.get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_before_stop", "must not resurrect");
+        app.db
+            .sync(|c| {
+                let tx = c.unchecked_transaction()?;
+                stop(&tx, &p.id)?;
+                tx.commit()?;
+                work::sync_inbound(c)?;
+                assert_eq!(
+                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
+                        .get::<_, String>(0))?,
+                    "cancelled"
+                );
+                assert!(claim(c, &p.id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn exact_batch_completion_keeps_the_33rd_input_and_settles_managed_schedule() {
+        let (_dir, app, p) = fixture().await;
+        for n in 0..33 {
+            ingest(
+                &app,
+                &p,
+                &format!("om_{n}"),
+                &format!("bounded instruction {n}"),
+            );
+        }
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let first = claim(c, &p.id)?.unwrap();
+                finish_turn(c, &first.context, "")?;
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    32
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM manager_inputs WHERE status='queued'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                let second = claim(c, &p.id)?.unwrap();
+                finish_turn(c, &second.context, "completed bounded backlog")?;
+                assert!(claim(c, &p.id)?.is_none());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE status='consumed'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    33
+                );
+                Ok(())
+            })
+            .unwrap();
+        app.db
+            .sync(|c| {
+                let now = db::now();
+                work::create_timer(
+                    c,
+                    &p.id,
+                    work::TimerInput {
+                        name: "Managed repeat".into(),
+                        prompt: "inspect scheduled work".into(),
+                        kind: "interval".into(),
+                        at: None,
+                        interval_seconds: Some(1),
+                        cron: None,
+                        timezone: "UTC".into(),
+                        to: Some("oc_fixture".into()),
+                        purpose: "user".into(),
+                        request_id: None,
+                    },
+                    now,
+                )?;
+                let fired = work::fire_due(c, now + 1000)?;
+                assert_eq!(fired.len(), 1);
+                let turn = claim(c, &p.id)?.unwrap();
+                finish_turn(c, &turn.context, "")?;
+                assert_eq!(
+                    work::fire_due(c, now + 2000)?.len(),
+                    1,
+                    "Consumed managed timer must not suppress every future occurrence"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn fresh_input_fences_stale_effects_and_recovered_submissions_remain_uncertain() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_first", "initial instructions");
+        let turn = app
+            .db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                Ok(claim(c, &p.id)?.unwrap())
+            })
+            .unwrap();
+        ingest(&app, &p, "om_steer", "new steering");
+        app.db.sync(work::sync_inbound).unwrap();
+        let result = tool(
+            &app,
+            &turn.context,
+            ToolCall {
+                occurrence: "turn:1:call:0".into(),
+                name: "write_file".into(),
+                arguments: json!({"path":"stale.txt","content":"late effect"}),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!Path::new(&p.path).join("stale.txt").exists());
+        app.db.sync(|c|{let next=claim(c,&p.id)?.unwrap();c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('uncertain-effect',?,'turn:1:call:0','delegate','{}','submitting')",[next.context.run])?;migrate(c,true)?;assert_eq!(c.query_row("SELECT status FROM manager_effects WHERE id='uncertain-effect'",[],|r|r.get::<_,String>(0))?,"uncertain");Ok(())}).unwrap();
+    }
+    #[tokio::test]
+    async fn long_mode_handoff_is_bounded_ordered_and_preserves_every_input() {
+        let (_dir, app, p) = fixture().await;
+        for index in 0..8 {
+            ingest(
+                &app,
+                &p,
+                &format!("om_long_{index}"),
+                &format!("claimed message_id=fake {index} {}", "x".repeat(150000)),
+            );
+        }
+        app.db
+            .sync(|c| {
+                set_mode(
+                    c,
+                    &p.id,
+                    ModeInput {
+                        mode: "native".into(),
+                        request_id: "long-disable".into(),
+                        expected_revision: 2,
+                    },
+                )?;
+                let records = c
+                    .prepare("SELECT id,payload FROM manager_inputs ORDER BY rowid")?
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut chunks = std::collections::HashMap::<String, String>::new();
+                let payloads = c
+                    .prepare(
+                        "SELECT payload FROM work_events WHERE source='management' ORDER BY rowid",
+                    )?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(payloads.len() > 8);
+                for raw in payloads {
+                    let payload: Value = serde_json::from_str(&raw)?;
+                    let instructions = payload["instructions"].as_str().unwrap();
+                    assert!(instructions.len() < 1048576);
+                    assert!(!instructions.contains("private-manager-key"));
+                    let part: Value = serde_json::from_str(instructions)?;
+                    chunks
+                        .entry(part["input_id"].as_str().unwrap().to_owned())
+                        .or_default()
+                        .push_str(part["input_data_chunk"].as_str().unwrap());
+                }
+                for (index, (id, raw)) in records.iter().enumerate() {
+                    assert_eq!(chunks[id], *raw);
+                    let value: Value = serde_json::from_str(raw)?;
+                    assert_eq!(
+                        value["trusted_source"]["message_id"],
+                        format!("om_long_{index}")
+                    );
+                }
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM manager_inputs WHERE status='transferred'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    8
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn file_capabilities_reject_private_case_aliases_and_symlinks_and_preserve_executability() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "private").unwrap();
+        symlink(outside.path(), dir.path().join("escape")).unwrap();
+        for path in [
+            "../secret",
+            "escape/secret",
+            ".DAUERBOT/sessions/key",
+            ".SSH/id_rsa",
+            ".Env.production",
+            "/tmp/outside",
+        ] {
+            assert!(read_file(dir.path(), path).is_err());
+            assert!(
+                write_file(
+                    dir.path(),
+                    WriteArgs {
+                        path: path.into(),
+                        content: "changed".into(),
+                        expected_sha256: None
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret")).unwrap(),
+            "private"
+        );
+        let path = dir.path().join("run.sh");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let old = read_file(dir.path(), "run.sh").unwrap();
+        assert!(
+            write_file(
+                dir.path(),
+                WriteArgs {
+                    path: "run.sh".into(),
+                    content: "new".into(),
+                    expected_sha256: None
+                }
+            )
+            .is_err()
+        );
+        write_file(
+            dir.path(),
+            WriteArgs {
+                path: "run.sh".into(),
+                content: "new".into(),
+                expected_sha256: old["sha256"].as_str().map(str::to_owned),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 }

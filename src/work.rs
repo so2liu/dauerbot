@@ -1386,6 +1386,7 @@ pub fn observe_idle(
         c.execute("UPDATE work_events SET status='delivered',updated_at=? WHERE id IN
             (SELECT event_id FROM work_runs WHERE project_id=? AND generation=? AND status='settled')
             AND status IN ('submitted','acknowledged')",params![now,project,generation])?;
+        crate::manager::worker_changed(c, project)?;
         Ok(())
     })
 }
