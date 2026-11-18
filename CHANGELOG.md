@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.2 — 2026-11-18
+
+### Fixed
+
+- Admit unmentioned replies in verified project topics as immediate steering, including while the Agent is busy, while ignoring unrelated group traffic. Use native bot mentions and confirmed reply receipts to distinguish project discussions; shared broadcast topics require an explicit bot mention or a reply to that bot's own message (#105).
+- Retain ambiguous mentions durably while bot identities are unavailable, without blocking private messages or proven topic input. Preserve deferred-input deduplication, respect explicit Stop, and keep identity recovery running after an interrupted update handover (#105).
+
+### Changed
+
+- Clarify that receiving unmentioned topic replies requires the Feishu `im:message.group_msg` permission or the Feishu Agent permission preset, approved and published by the application administrator. Dauerbot does not grant platform permissions automatically.
+- Advance both application crates to 0.5.2 and bundle build 17. Keep API protocol 7, the three Agent tools and bundled HERDR 0.9.5 unchanged.
+
 ## 0.5.1 — 2026-11-18
 
 ### Added
