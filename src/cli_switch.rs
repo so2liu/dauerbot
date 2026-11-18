@@ -1970,7 +1970,7 @@ mod tests {
         }).unwrap();
         let p = app.db.project(&p.id).await.unwrap();
         app.journal_cli_fault(&p.id, "native error").await.unwrap();
-        let mut record = json!({"state":"live","status":{"state":"error"},"foreground":{"name":"codex"},"interactive_ready":true,"state_change_seq":22,
+        let mut record = json!({"state":"live","status":{"state":"error"},"foreground":{"name":"codex"},"processes":[{"pid":100,"name":"codex","argv":["codex"]}],"interactive_ready":true,"state_change_seq":22,
             "execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace",
             "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
             "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"active"}});
