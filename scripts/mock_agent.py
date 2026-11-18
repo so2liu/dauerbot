@@ -241,6 +241,15 @@ try:
             if envelope is not None:
                 source = envelope.attrib["message_id"]
                 to = envelope.find("source").attrib["chat_id"] or "oc_fixture"
+                if source == "om_rich_post":
+                    resources = envelope.findall("attachment")
+                    assert body.count("fixture-post-caption") == 1, body
+                    assert len(resources) == 1, resources
+                    resource = resources[0].attrib
+                    assert resource["resource_key"] == "img_fixture_post"
+                    assert resource["trust"] == "user_input"
+                    assert Path(resource["local_path"]).read_bytes() == b"downloaded fixture attachment"
+                    (Path.cwd() / ".fixture-post-resource").write_text(json.dumps(resource))
                 if "direct-to-user" in text:
                     to = envelope.find("sender").attrib["open_id"]
             else:

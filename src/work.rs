@@ -568,8 +568,11 @@ fn claim(
         if has_takeover(c, project, generation)? || crate::cli_switch::holds_input(c, project)? {
             return Ok(None);
         }
+        // Resource preparation runs independently of project reconciliation.
+        // Skip only those messages; later steering must not wait for a download.
+        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=work_events.message_id AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
         let message = c.query_row(
-            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND message_id IS NOT NULL ORDER BY created_at,rowid LIMIT 1"),
+            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND message_id IS NOT NULL AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
             [project], event_row,
         ).optional()?;
         let next = if message.is_some() {
@@ -578,7 +581,7 @@ fn claim(
             if steering_only {
                 return Ok(None);
             }
-            c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' ORDER BY created_at,rowid LIMIT 1"),
+            c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
               [project],event_row).optional()?
         };
         let Some(event) = next else { return Ok(None) };

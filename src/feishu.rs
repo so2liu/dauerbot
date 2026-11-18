@@ -245,13 +245,190 @@ pub fn allowed_file(p: &db::Project, path: &Path, data_dir: &Path) -> Result<Pat
     Ok(absolute)
 }
 
-pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
-    let Some(key) = m.attachment["file_key"].as_str() else {
+pub fn recover_resource_preparation(c: &rusqlite::Connection, recover: bool) -> Result<()> {
+    if recover {
+        c.execute("UPDATE messages SET attachment=json_remove(attachment,'$.resource_preparation') WHERE direction='in' AND json_extract(attachment,'$.resource_preparation') IS NOT NULL AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1",[])?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct ResourcePreparation {
+    pub token: String,
+    pub message_id: String,
+    pub source_id: String,
+    pub bot_app_id: String,
+}
+
+pub fn begin_resource_preparation(
+    c: &rusqlite::Connection,
+    message: &db::Message,
+) -> Result<Option<ResourcePreparation>> {
+    let preparation = ResourcePreparation {
+        token: db::id(),
+        message_id: message.id.clone(),
+        source_id: message.source_id.clone(),
+        bot_app_id: message.attachment["bot_app_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned(),
+    };
+    let changed = c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resource_preparation',?) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND json_extract(attachment,'$.resource_preparation') IS NULL AND status IN ('pending','queued')",rusqlite::params![preparation.token,preparation.message_id,preparation.source_id,preparation.bot_app_id])?;
+    Ok((changed == 1).then_some(preparation))
+}
+
+pub fn finish_resource_preparation(
+    c: &rusqlite::Connection,
+    preparation: &ResourcePreparation,
+    resources: &[Value],
+    context: &Value,
+) -> Result<bool> {
+    let mut resources = resources.to_vec();
+    let current: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM messages m JOIN project_bots b ON b.project_id=m.project_id WHERE m.id=? AND b.app_id=?)",rusqlite::params![preparation.message_id,preparation.bot_app_id],|r|r.get(0))?;
+    if !current {
+        for resource in &mut resources {
+            if let Some(o) = resource.as_object_mut() {
+                o.remove("local_path");
+            }
+            resource["error"] = json!("The source bot binding changed during resource preparation");
+        }
+    }
+    let context = if current {
+        context.clone()
+    } else {
+        json!({"members_status":"unavailable"})
+    };
+    let changed=c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND status IN ('pending','queued')",rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
+    Ok(changed == 1)
+}
+
+/// Only the original message ID and keys are downloaded. Preparation never
+/// holds the project delivery lock; resource names and captions remain user data.
+pub async fn download_resources(app: &App, m: &db::Message) -> Result<Vec<Value>> {
+    let message = m.clone();
+    let preparation = app
+        .db
+        .call(move |c| begin_resource_preparation(c, &message))
+        .await?
+        .context("Resources are already prepared or owned by another attempt")?;
+    let mut resources = m.attachment["resources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if resources.is_empty() && m.attachment["file_key"].is_string() {
+        resources.push(json!({"file_key":m.attachment["file_key"],"file_name":m.attachment["file_name"],"kind":m.attachment["kind"]}));
+    }
+    let mut remaining = MAX_FILE;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(80);
+    for (index, resource) in resources.iter_mut().enumerate() {
+        if let Some(o) = resource.as_object_mut() {
+            o.remove("local_path");
+            o.remove("error");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            resource["error"] = json!("Message resource preparation timed out (80 seconds total)");
+            continue;
+        }
+        if index >= 16 || remaining == 0 {
+            resource["error"] =
+                json!("Message resource download limit reached (16 resources / 100 MB)");
+            continue;
+        }
+        let downloaded = tokio::time::timeout_at(
+            deadline,
+            download_resource(app, m, resource, index, &preparation.token, &mut remaining),
+        )
+        .await;
+        match downloaded {
+            Ok(Ok(Some(path))) => resource["local_path"] = json!(path),
+            Ok(Ok(None)) => resource["error"] = json!("Resource key is missing"),
+            Ok(Err(error)) => resource["error"] = json!(error.to_string()),
+            Err(_) => {
+                resource["error"] =
+                    json!("Message resource preparation timed out (80 seconds total)")
+            }
+        }
+    }
+    let context = tokio::time::timeout_at(deadline, context(app, m))
+        .await
+        .unwrap_or_else(|_| json!({"members_status":"unavailable"}));
+    let prepared = preparation.clone();
+    let result = resources.clone();
+    if !app
+        .db
+        .call(move |c| finish_resource_preparation(c, &prepared, &result, &context))
+        .await?
+    {
+        bail!("Resource preparation no longer owns the original source message");
+    }
+    // Read the committed, binding-fenced result rather than an obsolete local copy.
+    Ok(app.db.message(&m.id).await?.attachment["resources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// A single gated worker owns network preparation. Durable tokens fence restart
+/// and handover; unfinished downloads never claim or submit an Agent run.
+pub async fn resource_worker(app: Arc<App>) {
+    loop {
+        if app.shutdown.is_cancelled() {
+            break;
+        }
+        let Some(permit) = app.service.gate.enter() else {
+            tokio::select! { _=app.shutdown.cancelled()=>break, _=tokio::time::sleep(Duration::from_millis(250))=>{} }
+            continue;
+        };
+        let next = app.db.call(|c| {
+            use rusqlite::OptionalExtension;
+            Ok(c.query_row("SELECT id FROM messages WHERE direction='in' AND status IN ('pending','queued') AND (json_extract(attachment,'$.file_key') IS NOT NULL OR json_array_length(attachment,'$.resources')>0) AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND json_extract(attachment,'$.resource_preparation') IS NULL ORDER BY rowid LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?)
+        }).await;
+        match next {
+            Ok(Some(id)) => {
+                let result = async {
+                    let message = app.db.message(&id).await?;
+                    download_resources(&app, &message).await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!("Incoming resource preparation: {error}");
+                }
+                app.notify.notify_one();
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("Incoming resource queue: {error}"),
+        }
+        drop(permit);
+        tokio::select! { _ = app.shutdown.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
+    }
+}
+
+struct PartialResource(PathBuf);
+impl Drop for PartialResource {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn download_resource(
+    app: &App,
+    m: &db::Message,
+    resource: &Value,
+    index: usize,
+    attempt: &str,
+    remaining: &mut u64,
+) -> Result<Option<PathBuf>> {
+    let Some(key) = resource["file_key"].as_str() else {
         return Ok(None);
     };
-    let kind = m.attachment["kind"].as_str().unwrap_or("file");
+    let kind = resource["kind"].as_str().unwrap_or("file");
     let cfg = app.config.read().await.clone();
     let binding = app.db.bot(&m.project_id).await?;
+    anyhow::ensure!(
+        m.attachment["bot_app_id"] == binding.app_id,
+        "The source bot binding changed before resource download"
+    );
     let token = token(app, &binding).await?;
     let mut url = reqwest::Url::parse(&format!("{}/open-apis/im/v1/messages", cfg.feishu_base))?;
     url.path_segments_mut()
@@ -268,10 +445,10 @@ pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
         .send()
         .await?
         .error_for_status()?;
-    if response.content_length().is_some_and(|n| n > MAX_FILE) {
-        bail!("Incoming file exceeds 100 MB");
+    if response.content_length().is_some_and(|n| n > *remaining) {
+        bail!("Incoming resources exceed the 100 MB message limit");
     }
-    let name = m.attachment["file_name"]
+    let name = resource["file_name"]
         .as_str()
         .and_then(|s| Path::new(s).file_name())
         .and_then(|s| s.to_str())
@@ -280,16 +457,21 @@ pub async fn download(app: &App, m: &db::Message) -> Result<Option<PathBuf>> {
         } else {
             "attachment"
         });
-    let target = app.dir.join("files").join(format!("{}-{name}", m.id));
+    let target = app
+        .dir
+        .join("files")
+        .join(format!("{}-{attempt}-{index}-{name}", m.id));
     let temp = target.with_extension("part");
+    let _cleanup = PartialResource(temp.clone());
     let mut file = tokio::fs::File::create(&temp).await?;
     let result = async {
-        let mut size = 0u64;
         while let Some(chunk) = response.chunk().await? {
-            size += chunk.len() as u64;
-            if size > MAX_FILE {
-                bail!("Incoming file exceeds 100 MB");
+            let bytes = chunk.len() as u64;
+            if bytes > *remaining {
+                *remaining = 0;
+                bail!("Incoming resources exceed the 100 MB message limit");
             }
+            *remaining -= bytes;
             file.write_all(&chunk).await?;
         }
         file.sync_all().await?;
@@ -428,8 +610,15 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
     let content: Value = serde_json::from_str(msg["content"].as_str().unwrap_or("{}"))?;
     let kind = msg["message_type"].as_str().unwrap_or("unknown");
     let mut text = content["text"].as_str().unwrap_or("").to_owned();
+    let mut resources = Vec::new();
     if kind == "post" {
-        collect_text(&content, &mut text);
+        let post = post_document(&content);
+        text = post["title"].as_str().unwrap_or("").to_owned();
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        collect_post(&post["content"], &mut text, &mut resources);
+        text = text.trim().to_owned();
     }
     let mut attachment = if let Some(key) = content["file_key"]
         .as_str()
@@ -448,27 +637,70 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
                 .unwrap_or("")
         );
     }
+    if !resources.is_empty() {
+        attachment["resources"] = json!(resources);
+    }
     attachment["source"] = json!({"chat_id":chat,"chat_type":msg["chat_type"],"message_type":kind,
         "sender":event["sender"]["sender_id"],"mentions":msg["mentions"],"thread_id":msg["thread_id"],"root_id":msg["root_id"],"parent_id":msg["parent_id"],"create_time":msg["create_time"]});
     Ok(Some((chat, source, text, attachment)))
 }
-fn collect_text(v: &Value, out: &mut String) {
-    match v {
-        Value::Array(xs) => {
-            for x in xs {
-                collect_text(x, out)
-            }
-            out.push('\n');
+// A localized post is one document, not a sequence of translations. Prefer the
+// original Chinese variant, then English, then a deterministic available locale.
+fn post_document(content: &Value) -> &Value {
+    let content = content.get("post").unwrap_or(content);
+    if content["content"].is_array() {
+        return content;
+    }
+    for locale in ["zh_cn", "en_us"] {
+        if content[locale]["content"].is_array() {
+            return &content[locale];
         }
-        Value::Object(o) => {
-            if let Some(Value::String(s)) = o.get("text") {
-                out.push_str(s);
-            } else {
-                for (_, x) in o {
-                    collect_text(x, out)
+    }
+    content
+        .as_object()
+        .and_then(|o| o.values().find(|v| v["content"].is_array()))
+        .unwrap_or(content)
+}
+
+fn collect_post(v: &Value, text: &mut String, resources: &mut Vec<Value>) {
+    match v {
+        Value::Array(items) => {
+            for item in items {
+                collect_post(item, text, resources);
+            }
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        Value::Object(_) => match v["tag"].as_str().unwrap_or("") {
+            "img" => {
+                if let Some(key) = v["image_key"].as_str().filter(|k| !k.is_empty()) {
+                    if !resources
+                        .iter()
+                        .any(|r| r["kind"] == "image" && r["file_key"] == key)
+                    {
+                        resources
+                            .push(json!({"kind":"image","file_key":key,"file_name":"image.png"}));
+                    }
+                    text.push_str("[image]");
                 }
             }
-        }
+            "text" | "a" | "code_block" | "md" => {
+                if let Some(t) = v["text"].as_str() {
+                    text.push_str(t);
+                }
+            }
+            "at" => text.push_str(v["user_name"].as_str().unwrap_or("@mention")),
+            "media" => {
+                if let Some(key) = v["file_key"].as_str().filter(|k| !k.is_empty()) {
+                    if !resources.iter().any(|r| r["file_key"] == key) {
+                        resources.push(json!({"kind":"file","file_key":key,"file_name":"video"}));
+                    }
+                    text.push_str("[media]");
+                }
+            }
+            _ => {}
+        },
         _ => {}
     }
 }

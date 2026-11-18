@@ -266,6 +266,7 @@ impl Db {
         crate::cli_switch::migrate(&migration, recover)?;
         crate::models::migrate(&migration)?;
         crate::model_control::migrate(&migration, recover)?;
+        crate::feishu::recover_resource_preparation(&migration, recover)?;
         migration.pragma_update(None, "user_version", 7)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))
