@@ -1122,9 +1122,16 @@ impl App {
         let body_result: Result<String> = async {
             Ok(if let Some(message_id) = &event.message_id {
                 let message = self.db.message(message_id).await?;
-                let file = feishu::download(self, &message).await?;
-                let context = feishu::context(self, &message).await;
-                envelope::render(&message, &context, file.as_deref())
+                let resources = message.attachment["resources"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let context = if message.attachment["resources_ready"] == true {
+                    message.attachment["resource_context"].clone()
+                } else {
+                    feishu::context(self, &message).await
+                };
+                envelope::render_resources(&message, &context, &resources)
             } else {
                 envelope::scheduled_body(&event.payload)?
             })
@@ -1187,6 +1194,7 @@ impl App {
     }
     pub fn workers_with_ingress(self: &Arc<Self>, warm: Option<feishu::WarmIngress>) {
         tokio::spawn(model_control::run(self.clone()));
+        tokio::spawn(feishu::resource_worker(self.clone()));
         let app = self.clone();
         tokio::spawn(async move {
             loop {

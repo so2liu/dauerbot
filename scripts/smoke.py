@@ -105,6 +105,8 @@ class Fixture:
         self.server = None
         self.issued_tokens = set()
         self.callback_responses = []
+        self.resource_started = threading.Event()
+        self.resource_release = threading.Event()
 
     def emit(self, event, app_id="cli_fixture", frame_id=None):
         with self.lock:
@@ -192,6 +194,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/open-apis/im/v1/chats/oc_fixture":
             self.reply({"code":0,"data":{"name":"端到端测试群"}}); return
         if "/resources/" in self.path:
+            if "img_fixture_slow" in self.path:
+                FIXTURE.resource_started.set()
+                assert FIXTURE.resource_release.wait(20), "slow resource fixture was not released"
             data = b"downloaded fixture attachment"
             self.send_response(200); self.send_header("Content-Length", str(len(data)))
             self.send_header("Content-Type", "application/octet-stream")
@@ -604,6 +609,27 @@ def main():
         wait_for(lambda: all(any(m["source_id"] == key and m["status"] == "submitted" for m in api(f"/projects/{project['id']}")["messages"]) for key in ["om_second", "om_third"]), "queued messages failed")
         assert list((run / "files").glob("*incoming.txt"))
         checks.append("ordered follow-up turns and streamed inbound attachment")
+        rich_doc = {"title":"Screenshot", "content":[[{"tag":"text","text":"fixture-post-caption"},{"tag":"img","image_key":"img_fixture_post"},{"tag":"img","image_key":"img_fixture_post"}]]}
+        FIXTURE.emit(message("om_rich_post", "", kind="post", content={"zh_cn":rich_doc,"en_us":rich_doc}))
+        wait_for(lambda: (workspace / ".fixture-post-resource").exists(), "rich-post image did not reach the managed CLI envelope")
+        rich_message = next(m for m in api(f"/projects/{project['id']}")["messages"] if m["source_id"]=="om_rich_post")
+        assert rich_message["content"].count("fixture-post-caption")==1
+        assert len(rich_message["attachment"]["resources"])==1
+        assert rich_message["attachment"]["resources"][0]["local_path"]
+        checks.append("localized rich-post caption and embedded image reach the native CLI once with a readable cached path")
+        wait_for(settled, "rich post did not settle before resource steering check")
+        FIXTURE.emit(message("om_slow_post", "", kind="post", content={"content":[[{"tag":"text","text":"slow resource"},{"tag":"img","image_key":"img_fixture_slow"}]]}))
+        wait_for(FIXTURE.resource_started.is_set, "resource preparation did not start")
+        FIXTURE.emit(message("om_after_slow_post", "steer while image is downloading"))
+        def plain_passed_resource():
+            deliveries=(workspace / ".fixture-deliveries").read_text()
+            return '"source": "om_after_slow_post"' in deliveries
+        wait_for(plain_passed_resource, "slow image preparation blocked later plain steering", timeout=10)
+        slow_state=next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"]=="om_slow_post")
+        assert slow_state["status"]=="queued", slow_state
+        FIXTURE.resource_release.set()
+        wait_for(lambda: any(m["source_id"]=="om_slow_post" and m["status"]=="submitted" for m in api(f"/projects/{key}")["messages"]), "prepared image did not enter normal delivery")
+        checks.append("slow resource preparation leaves its message queued while later plain steering reaches the active Agent")
         FIXTURE.emit(message("om_private", "direct-to-user", chat_type="p2p", chat_id="oc_private"))
         wait_for(lambda: any(c["chat_id"]=="oc_private" for c in api("/conversations")["items"]), "new private chat was not discovered")
         assert next(p for p in api("/state")["projects"] if p["id"] == key)["bot"]["app_id"] == "cli_fixture"

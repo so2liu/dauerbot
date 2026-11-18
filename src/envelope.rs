@@ -123,3 +123,19 @@ pub fn render(message: &Message, context: &Value, attachment: Option<&Path>) -> 
     xml.push_str("\n</feishu_message>");
     xml
 }
+
+/// Local paths are daemon-produced; keys/names/errors remain escaped user data.
+/// Native CLIs may inspect supported images with their own tools. A path is not
+/// evidence that the native model received or viewed the image.
+pub fn render_resources(message: &Message, context: &Value, resources: &[Value]) -> String {
+    let mut xml = render(message, context, None);
+    let end = xml.rfind("\n</feishu_message>").unwrap();
+    let mut refs = String::new();
+    for resource in resources {
+        refs.push_str(&format!("\n<attachment trust=\"user_input\" kind=\"{}\" resource_key=\"{}\" name=\"{}\" local_path=\"{}\" status=\"{}\" error=\"{}\"/>",
+            attr(resource,"kind"),attr(resource,"file_key"),attr(resource,"file_name"),attr(resource,"local_path"),
+            if resource["local_path"].is_string() { "downloaded" } else { "unavailable" },attr(resource,"error")));
+    }
+    xml.insert_str(end, &refs);
+    xml
+}
