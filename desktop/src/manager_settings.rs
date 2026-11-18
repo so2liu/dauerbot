@@ -321,7 +321,7 @@ impl Render for ManagerSettings {
         let mut view=div().flex().flex_col().gap_3().child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(self.language.text("Project Agent")))
             .child(modes).child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("The manager uses its own model and delegates coding to your native CLI. CLI login and model settings stay separate.")))
             .child(Button::new("manager-config-toggle").small().child(control_label(self.language.text(if self.open {"Hide manager settings"}else{"Manager model settings"})))
-                .on_click(cx.listener(|this,_,_,cx|{this.open=!this.open;cx.notify();})));
+                .on_click(cx.listener(|this,_,_,cx|{this.open = !this.open;cx.notify();})));
         if self.open {
             view=view.child(self.field("OpenAI-compatible endpoint",&self.endpoint)).child(self.field("Manager model",&self.model)).child(self.field("Manager API key",&self.key))
                 .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text(if self.config["has_api_key"]==true {"API key saved. Leave blank to keep it."}else{"No manager API key saved"})))
