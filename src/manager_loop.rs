@@ -94,8 +94,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["path", "content"],
         ),
         (
-            "Delegate coding to this project's native CLI worker; returns a durable receipt.",
-            json!({"instructions":{"type":"string"}}),
+            "Delegate coding to this project's native CLI worker; returns a durable receipt. Select source_event_id from trusted_sources when multiple discussions are present.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"}}),
             vec!["instructions"],
         ),
         (
@@ -104,8 +104,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec![],
         ),
         (
-            "Steer this project's current native coding worker.",
-            json!({"instructions":{"type":"string"}}),
+            "Steer this project's current native coding worker. Select source_event_id from trusted_sources when multiple discussions are present.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"}}),
             vec!["instructions"],
         ),
         (
