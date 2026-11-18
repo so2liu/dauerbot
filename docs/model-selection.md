@@ -3,7 +3,9 @@
 Open a project's model control in Dauerbot, or send `/model` or `/models` to
 its Feishu bot. The bot replies in that message's topic with an interactive
 picker. Choose a discovered native model, enter an exact model ID, or select
-the CLI's native default. Pi and Codex also accept an existing provider ID.
+native CLI/session settings. Pi and Codex also accept an existing provider ID.
+Following native settings removes the project's launch override; a resumed
+session may retain its saved model. Choose an explicit model to require one.
 
 Preferences belong to the project and CLI. They do not rewrite global CLI
 settings, replace credentials, sign the user in, or add model providers.

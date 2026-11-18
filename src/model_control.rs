@@ -340,23 +340,46 @@ pub async fn reconcile(app: &Arc<App>) -> Result<()> {
     }).await?;
     // This persisted request ID makes a restart between acceptance and the
     // response safe. The core method owns CLI/generation fencing and dedup.
-    match app.request_model_switch_with_id(&command.project, selection, &command.id,
-        Some(models::Scope { agent: command.agent.clone(), generation: command.generation.clone() })).await {
-        Ok(_) => finish(app, &command, "done", "Model change requested. The CLI's effective model is confirmed separately.").await,
+    match app
+        .request_model_switch_with_id(
+            &command.project,
+            selection,
+            &command.id,
+            Some(models::Scope {
+                agent: command.agent.clone(),
+                generation: command.generation.clone(),
+            }),
+        )
+        .await
+    {
+        Ok(_) => {
+            finish(
+                app,
+                &command,
+                "done",
+                "Model change requested. The CLI's effective model is confirmed separately.",
+            )
+            .await
+        }
         Err(error) => {
             let (id, project) = (command.id.clone(), command.project.clone());
             // A response can fail after the transition transaction committed.
             // Inspect the same request before describing it as rejected.
-            let saved = app.db.call(move |c| Ok(c.query_row(
+            let saved = app
+                .db
+                .call(move |c| {
+                    Ok(c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM cli_switch_requests WHERE id=? AND project_id=?)",
                 params![id,project], |r| r.get::<_,bool>(0),
-            )?)).await?;
+            )?)
+                })
+                .await?;
             if saved {
                 finish(app, &command, "done", "The model-change request is saved. Supervised transition or repair will continue; no duplicate request was created.").await
             } else {
                 finish(app, &command, "failed", &format!("The model change could not be accepted: {error}. Your instructions remain available; send /models to choose again.")).await
             }
-        },
+        }
     }
 }
 
@@ -446,7 +469,8 @@ fn clean(text: &str) -> String {
 /// Card2 schema workflow: one status block, one form block, one guide block;
 /// a single primary action and a bounded native catalogue, never guessed IDs.
 fn picker_card(command: &Command, catalog: &Catalog) -> Value {
-    let mut options = vec![json!({"text":plain("Use the CLI's native default"),"value":"native"})];
+    let mut options =
+        vec![json!({"text":plain("Follow native CLI/session settings"),"value":"native"})];
     for (index, option) in catalog.options.iter().take(MAX_OPTIONS).enumerate() {
         let label = option
             .provider
@@ -467,7 +491,7 @@ fn picker_card(command: &Command, catalog: &Catalog) -> Value {
         .configured
         .as_ref()
         .map(|s| s.model.as_str())
-        .unwrap_or("CLI default");
+        .unwrap_or("Native CLI/session settings");
     let status = format!(
         "**Choose a model for this project**\nCLI: {} · Selection: {}\n<font color='grey'>Selection is not proof of the running model. Native login and global settings are preserved.</font>",
         command.agent, configured

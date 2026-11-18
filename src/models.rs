@@ -96,13 +96,13 @@ pub fn validate(agent: &str, selection: &Selection) -> Result<Selection> {
             }
             ensure!(!value.model.is_empty(), "Provide a model ID");
         }
-    } else if agent == "pi" {
-        if let Some((provider, model)) = value.model.split_once('/') {
-            ensure!(!model.is_empty(), "Provide a model ID after the provider");
-            let (provider, model) = (provider.to_owned(), model.to_owned());
-            value.provider = Some(provider);
-            value.model = model;
-        }
+    } else if agent == "pi"
+        && let Some((provider, model)) = value.model.split_once('/')
+    {
+        ensure!(!model.is_empty(), "Provide a model ID after the provider");
+        let (provider, model) = (provider.to_owned(), model.to_owned());
+        value.provider = Some(provider);
+        value.model = model;
     }
     Ok(value)
 }
@@ -172,7 +172,7 @@ pub fn extra_args(
     remove_model_args(agent, args, selection.provider.is_some())
 }
 
-/// An explicit native-default selection removes project launch overrides only.
+/// Removing a project override follows native CLI and saved-session settings.
 /// The switch source snapshot retains the full original arguments for rollback.
 pub fn clear_model_args(agent: &str, args: &[String]) -> Result<Vec<String>> {
     ensure!(
@@ -239,106 +239,27 @@ fn remove_model_args(agent: &str, args: &[String], remove_provider: bool) -> Res
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    #[test]
-    fn explicit_native_default_clears_only_model_and_provider_overrides() {
-        let codex = args(&[
-            "--model",
-            "old",
-            "-mcompact",
-            "-c",
-            "model=\"older\"",
-            "--config=model_provider=\"local\"",
-            "--config",
-            "model_reasoning_effort=\"high\"",
-            "--profile",
-            "work",
-            "--add-dir",
-            "/project/other",
-        ]);
-        assert_eq!(
-            clear_model_args("codex", &codex).unwrap(),
-            args(&[
-                "--config",
-                "model_reasoning_effort=\"high\"",
-                "--profile",
-                "work",
-                "--add-dir",
-                "/project/other"
-            ])
-        );
-        assert_eq!(
-            clear_model_args(
-                "pi",
-                &args(&["--provider=local", "--model", "old", "--thinking", "high"])
-            )
-            .unwrap(),
-            args(&["--thinking", "high"])
-        );
-        assert_eq!(
-            clear_model_args("agy", &args(&["-model=old", "--settings", "native.json"])).unwrap(),
-            args(&["--settings", "native.json"])
-        );
-        assert_eq!(
-            clear_model_args(
-                "claude",
-                &args(&["--model=old", "--append-system-prompt", "keep me"])
-            )
-            .unwrap(),
-            args(&["--append-system-prompt", "keep me"])
-        );
-        assert!(clear_model_args("codex", &args(&["--model"])).is_err());
-    }
-
-    #[test]
-    fn new_model_keeps_existing_provider_unless_the_user_selects_another() {
-        let original = args(&[
-            "-c",
-            "model_provider=\"existing\"",
-            "-mold",
-            "--add-dir",
-            "/other",
-        ]);
-        let selection = Selection {
-            model: "new-model".into(),
-            provider: None,
-        };
-        assert_eq!(
-            extra_args("codex", &original, Some(&selection)).unwrap(),
-            args(&["-c", "model_provider=\"existing\"", "--add-dir", "/other"])
-        );
-        let selected = Selection {
-            provider: Some("selected".into()),
-            ..selection
-        };
-        assert_eq!(
-            extra_args("codex", &original, Some(&selected)).unwrap(),
-            args(&["--add-dir", "/other"])
-        );
-        assert_eq!(extra_args("codex", &original, None).unwrap(), original);
-    }
-}
-
 fn json_file(path: &Path) -> Option<Value> {
     // Configuration may contain credentials. Only whitelisted model fields are
     // projected below, and no parse error includes file content.
-    let bytes = std::fs::read(path).ok()?;
-    (bytes.len() <= 4_000_000)
-        .then(|| serde_json::from_slice(&bytes).ok())
-        .flatten()
+    serde_json::from_slice(&model_file(path)?).ok()
+}
+
+fn model_file(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(4_000_001)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= 4_000_000).then_some(bytes)
 }
 
 /// Read only simple top-level string assignments; unsupported TOML forms remain
 /// unknown rather than being approximated as an effective native setting.
 fn toml_string(path: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = String::from_utf8(model_file(path)?).ok()?;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -630,5 +551,92 @@ fn parse_agy(catalog: &mut Catalog, text: &str) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn explicit_native_default_clears_only_model_and_provider_overrides() {
+        let codex = args(&[
+            "--model",
+            "old",
+            "-mcompact",
+            "-c",
+            "model=\"older\"",
+            "--config=model_provider=\"local\"",
+            "--config",
+            "model_reasoning_effort=\"high\"",
+            "--profile",
+            "work",
+            "--add-dir",
+            "/project/other",
+        ]);
+        assert_eq!(
+            clear_model_args("codex", &codex).unwrap(),
+            args(&[
+                "--config",
+                "model_reasoning_effort=\"high\"",
+                "--profile",
+                "work",
+                "--add-dir",
+                "/project/other"
+            ])
+        );
+        assert_eq!(
+            clear_model_args(
+                "pi",
+                &args(&["--provider=local", "--model", "old", "--thinking", "high"])
+            )
+            .unwrap(),
+            args(&["--thinking", "high"])
+        );
+        assert_eq!(
+            clear_model_args("agy", &args(&["-model=old", "--settings", "native.json"])).unwrap(),
+            args(&["--settings", "native.json"])
+        );
+        assert_eq!(
+            clear_model_args(
+                "claude",
+                &args(&["--model=old", "--append-system-prompt", "keep me"])
+            )
+            .unwrap(),
+            args(&["--append-system-prompt", "keep me"])
+        );
+        assert!(clear_model_args("codex", &args(&["--model"])).is_err());
+    }
+
+    #[test]
+    fn new_model_keeps_existing_provider_unless_the_user_selects_another() {
+        let original = args(&[
+            "-c",
+            "model_provider=\"existing\"",
+            "-mold",
+            "--add-dir",
+            "/other",
+        ]);
+        let selection = Selection {
+            model: "new-model".into(),
+            provider: None,
+        };
+        assert_eq!(
+            extra_args("codex", &original, Some(&selection)).unwrap(),
+            args(&["-c", "model_provider=\"existing\"", "--add-dir", "/other"])
+        );
+        let selected = Selection {
+            provider: Some("selected".into()),
+            ..selection
+        };
+        assert_eq!(
+            extra_args("codex", &original, Some(&selected)).unwrap(),
+            args(&["--add-dir", "/other"])
+        );
+        assert_eq!(extra_args("codex", &original, None).unwrap(), original);
     }
 }
