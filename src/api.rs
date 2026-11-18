@@ -72,6 +72,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/projects/{id}/agent", post(switch_agent))
         .route("/projects/{id}/agent/standby", post(switch_standby_agent))
         .route("/projects/{id}/agent/transition", post(transition_agent))
+        .route("/projects/{id}/agent/repair", post(repair_agent))
         .route("/projects/{id}/documents/{document}", get(project_document))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
@@ -516,6 +517,17 @@ async fn transition_agent(
     let transition = app
         .db
         .call(move |c| crate::cli_switch::latest(c, &id))
+        .await?;
+    let mut value = json!(project);
+    value["cli_transition"] = json!(transition);
+    Ok(Json(value))
+}
+async fn repair_agent(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    let project = app.request_cli_repair(&id).await?;
+    let key = project.id.clone();
+    let transition = app
+        .db
+        .call(move |c| crate::cli_switch::latest(c, &key))
         .await?;
     let mut value = json!(project);
     value["cli_transition"] = json!(transition);

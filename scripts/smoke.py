@@ -101,6 +101,7 @@ class Fixture:
         self.acks = 0
         self.connects = 0
         self.server = None
+        self.issued_tokens = set()
 
     def emit(self, event, app_id="cli_fixture"):
         with self.lock:
@@ -149,13 +150,15 @@ class Handler(BaseHTTPRequestHandler):
             app_id = json.loads(data)["AppID"]
             self.reply({"code": 0, "msg": "ok", "data": {"URL": f"ws://127.0.0.1:{port}/ws?service_id=1&app_id={app_id}", "ClientConfig": {"PingInterval": 15}}})
         elif self.path.endswith("/tenant_access_token/internal"):
-            self.reply({"code": 0, "tenant_access_token": "fixture-token-" + json.loads(data)["app_id"], "expire": 7200})
+            token = "fixture-token-" + json.loads(data)["app_id"]
+            FIXTURE.issued_tokens.add("Bearer " + token)
+            self.reply({"code": 0, "tenant_access_token": token, "expire": 7200})
         elif self.path.endswith("/files"):
-            assert self.headers.get("Authorization") in {"Bearer fixture-token-cli_fixture", "Bearer fixture-token-cli_second"}
+            assert self.headers.get("Authorization") in FIXTURE.issued_tokens
             FIXTURE.uploads.append(data)
             self.reply({"code": 0, "data": {"file_key": "fixture-file-key"}})
         elif self.path.startswith("/open-apis/im/v1/messages"):
-            assert self.headers.get("Authorization") in {"Bearer fixture-token-cli_fixture", "Bearer fixture-token-cli_second"}
+            assert self.headers.get("Authorization") in FIXTURE.issued_tokens
             value = json.loads(data)
             value["fixture_app_id"] = self.headers["Authorization"].removeprefix("Bearer fixture-token-")
             anchor = None

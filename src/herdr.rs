@@ -594,7 +594,7 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         "native_session":native_agent.get("agent_session").cloned().unwrap_or(Value::Null),
         "interactive_ready":native_agent["interactive_ready"].as_bool().unwrap_or(!pending),
         "launch_pending":pending,"completion_seq":native_agent["completion_seq"],"state_change_seq":native_agent["state_change_seq"],
-        "children":crate::native_children::observe(p, crate::db::now()),"processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"tokens":pane["tokens"],
+        "children":crate::native_children::observe(p, crate::db::now()),"processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"workspace_id":pane["workspace_id"],"tokens":pane["tokens"],
         "cwd":pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("")}),
     )
 }
@@ -637,6 +637,28 @@ fn is_shell(process: &Value) -> bool {
         name,
         "sh" | "bash" | "zsh" | "fish" | "nu" | "pwsh" | "dash" | "login"
     )
+}
+
+/// Raw pane ownership authorizes inspection/closure even when native Agent
+/// detection is stale. It never authorizes sending input to that detection.
+pub fn check_pane_ownership(p: &Project, record: &Value) -> Result<()> {
+    let execution = ExecutionRef::from_project(p)?;
+    anyhow::ensure!(record["state"] == "live", "The main Agent has exited");
+    anyhow::ensure!(
+        record["pane_id"] == execution.pane_id
+            && record["terminal_id"] == execution.terminal_id
+            && record["workspace_id"] == execution.workspace_id
+            && (execution.shell_pid.is_none() || record["pid"].as_i64() == execution.shell_pid),
+        "The owned HERDR pane identity changed; the pane was preserved"
+    );
+    anyhow::ensure!(
+        record["tokens"]["hfb_owner"] == "dauerbot"
+            && record["tokens"]["hfb_project"] == p.id
+            && record["tokens"]["hfb_generation"] == p.generation
+            && record["tokens"]["hfb_execution"] == execution.managed_name,
+        "The owned HERDR pane generation changed; the pane was preserved"
+    );
+    Ok(())
 }
 
 pub fn check_execution_identity(p: &Project, record: &Value) -> Result<()> {
@@ -756,6 +778,19 @@ pub fn foreground_quiescent(p: &Project, record: &Value) -> bool {
     {
         return false;
     }
+    foreground_processes_match(p, record)
+}
+
+/// Recovery can close an owned CLI whose detector is blocked or stale, but a
+/// foreground tool still prevents closure. This never authorizes native input.
+pub fn recovery_foreground_quiescent(p: &Project, record: &Value) -> bool {
+    check_pane_ownership(p, record).is_ok()
+        && record["status"]["state"] != "working"
+        && record["children"]["state"] != "active"
+        && foreground_processes_match(p, record)
+}
+
+fn foreground_processes_match(p: &Project, record: &Value) -> bool {
     let Some(processes) = record["processes"].as_array().filter(|v| !v.is_empty()) else {
         return false;
     };
@@ -939,7 +974,7 @@ pub async fn stop(config: &Config, p: &Project) -> Result<()> {
         )
         .await;
     }
-    match check_execution_identity(p, &record) {
+    match check_pane_ownership(p, &record) {
         Ok(()) => {}
         Err(error) if error.is::<SessionStarting>() => {}
         Err(error) => return Err(error),
