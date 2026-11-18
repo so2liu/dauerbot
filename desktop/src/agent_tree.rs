@@ -24,6 +24,7 @@ impl AssetSource for Assets {
 
 pub fn cli_label(agent: &str) -> &'static str {
     match agent {
+        "manager" => "Built-in manager",
         "codex" => "Codex",
         "claude" => "Claude Code",
         "pi" => "Pi",
@@ -56,8 +57,8 @@ pub fn cli_icon(agent: &str, id: String) -> Stateful<Div> {
 pub fn status_dot(status: &str, label: String, id: String) -> Stateful<Div> {
     let color = match status {
         "busy" | "running" | "working" => 0x4f46e5,
-        "error" | "offline" | "needs_attention" | "failed" => 0xc44e4e,
-        "blocked" | "paused" | "taken_over" | "pending" => 0xb88a36,
+        "error" | "offline" | "needs_attention" | "failed" | "unavailable" => 0xc44e4e,
+        "blocked" | "paused" | "taken_over" | "pending" | "held" => 0xb88a36,
         "done" | "ready" | "completed" => 0x4f8870,
         "aborted" => 0x70707c,
         _ => 0x96969e,
