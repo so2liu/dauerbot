@@ -5,7 +5,7 @@ use crate::{
     db::{self, Project},
     handoff, herdr, native_children, work,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -352,7 +352,7 @@ pub fn proof(r: &Request, text: Option<&str>, sequence: Option<i64>) -> bool {
     }) && sequence.is_some_and(|s| s > r.sequence)
 }
 fn stop_retry_safe(p: &Project, r: &Request, record: &Value, text: Option<&str>) -> bool {
-    herdr::foreground_quiescent(p, record)
+    crate::repair_lane::foreground_quiescent(p, record)
         && record["children"]["state"] != "active"
         && record["state_change_seq"]
             .as_i64()
@@ -425,10 +425,11 @@ fn native_resume(agent: &str, execution: &Value, observed: &str) -> NativeResume
     }
 }
 fn target_native_matches(r: &Request, execution: &Value, observed: &str) -> bool {
-    matches!(
-        native_resume(&r.target, execution, observed),
-        NativeResume::Fresh | NativeResume::Matching
-    )
+    execution.get("repair_lane").is_none()
+        && matches!(
+            native_resume(&r.target, execution, observed),
+            NativeResume::Fresh | NativeResume::Matching
+        )
 }
 fn target_launch_state(c: &Connection, project: &str, r: &Request) -> Result<(String, String)> {
     let runtime = &r.source["runtime_target"];
@@ -688,6 +689,7 @@ impl App {
                 tx.execute("UPDATE cli_repair_instructions SET request_id=? WHERE request_id=? AND prompt_id=''",params![request_id,previous.id])?;
                 if !recovery_generation.is_empty() {
                     tx.execute("UPDATE projects SET execution=json_set(execution,'$.cli_recovery_request',?) WHERE id=? AND generation=?",params![request_id,id,generation])?;
+                    tx.execute("UPDATE projects SET execution=json_set(execution,'$.repair_lane.request_id',?) WHERE id=? AND generation=? AND json_type(execution,'$.repair_lane')='object'",params![request_id,id,generation])?;
                 }
             }
             if direct_resume {
@@ -815,6 +817,28 @@ impl App {
             .await;
             return Ok(true);
         }
+        if crate::repair_lane::descriptor(p).is_some() {
+            let current = p.clone();
+            self.db
+                .call(move |c| crate::repair_lane::authorize(c, &current, false).map(|_| ()))
+                .await?;
+        }
+        if crate::repair_lane::descriptor(p).is_some() && r.phase == "requested" {
+            let current = p.clone();
+            let rid = r.id.clone();
+            let generation_id = p.generation.clone();
+            let retry=self.db.call(move|c|{
+                let lane=crate::repair_lane::authorize(c,&current,false)?.context("Repair role retired")?;
+                crate::repair_lane::effect_phase(c,&lane)?;
+                let last:Option<String>=c.query_row("SELECT status FROM cli_repair_prompts WHERE request_id=? AND generation=? ORDER BY rowid DESC LIMIT 1",params![rid,generation_id],|row|row.get(0)).optional()?;
+                if last.as_deref()==Some("not_sent") {c.execute("UPDATE cli_switch_requests SET phase='recovery_pending',next_attempt_at=0 WHERE id=? AND phase='requested' AND holds_input=1",[rid])?;return Ok(true);}
+                Ok(false)
+            }).await?;
+            if retry {
+                self.notify.notify_one();
+                return Ok(true);
+            }
+        }
         if matches!(
             r.phase.as_str(),
             "failed"
@@ -908,8 +932,19 @@ impl App {
         }
         if r.phase == "starting" {
             if let Some(record) = record {
-                if herdr::check_native_resume(p, record).is_err() {
-                    self.fail_cli_start(&r,"The resumed CLI forked its saved native conversation; keeping ordinary input held and restoring the original repair owner.").await?;
+                if crate::repair_lane::descriptor(p).is_none()
+                    && herdr::check_native_resume(p, record).is_err()
+                {
+                    let current = p.clone();
+                    let observed = record.clone();
+                    let admitted = self
+                        .db
+                        .call(move |c| crate::repair_lane::admit(c, &current, &observed))
+                        .await?;
+                    if admitted.is_none() {
+                        self.fail_cli_start(&r,"The resumed CLI forked its saved conversation; restoring the original repair owner with ordinary input held.").await?;
+                    }
+                    self.notify.notify_one();
                     return Ok(true);
                 }
                 if p.agent == r.target
@@ -922,7 +957,7 @@ impl App {
                 }
                 if p.agent == r.target
                     && target_native_matches(&r, &p.execution, &p.native_session)
-                    && herdr::check_identity(p, record).is_ok()
+                    && crate::repair_lane::check_identity(p, record).is_ok()
                     && target_selection_matches(&r, &p.execution)
                     && p.ready
                     && p.execution["mcp_registered"] == true
@@ -1088,7 +1123,9 @@ impl App {
             return Ok(true);
         }
         self.set_phase(p, "preparing_handoff", record.clone()).await;
-        if !herdr::foreground_quiescent(p, record) || record["children"]["state"] == "active" {
+        if !crate::repair_lane::foreground_quiescent(p, record)
+            || record["children"]["state"] == "active"
+        {
             return Ok(true);
         }
         let id = p.id.clone();
@@ -1114,7 +1151,7 @@ impl App {
             return Ok(true);
         }
         let check = herdr::observe(cfg, p).await?;
-        if !herdr::foreground_quiescent(p, &check)
+        if !crate::repair_lane::foreground_quiescent(p, &check)
             || check["children"]["state"] == "active"
             || check["children"] != record["children"]
             || !proof(&r, text.as_deref(), check["state_change_seq"].as_i64())
@@ -1125,7 +1162,11 @@ impl App {
         // registry: explicit user intent + the Agent's nonce acknowledgement is
         // cooperative evidence, not a claim of native child coverage.
         let gate = if p.agent == "pi" && p.execution["child_adapter"].is_string() {
-            match native_children::RetirementGate::acquire(p, &check["children"], db::now()) {
+            match native_children::RetirementGate::acquire(
+                &crate::repair_lane::child_view(p),
+                &check["children"],
+                db::now(),
+            ) {
                 Ok(g) => Some(g),
                 Err(_) => return Ok(true),
             }
@@ -1133,7 +1174,7 @@ impl App {
             None
         };
         let final_check = herdr::observe(cfg, p).await?;
-        if !herdr::foreground_quiescent(p, &final_check)
+        if !crate::repair_lane::foreground_quiescent(p, &final_check)
             || final_check["children"]["state"] == "active"
             || final_check["children"] != check["children"]
         {
@@ -1211,7 +1252,7 @@ impl App {
         reason: &str,
     ) -> Result<bool> {
         if herdr::check_pane_ownership(p, record).is_err()
-            || herdr::check_identity(p, record).is_err()
+            || crate::repair_lane::check_identity(p, record).is_err()
             || record["state_change_seq"].as_i64().is_none()
         {
             return Ok(false);
@@ -1351,7 +1392,7 @@ impl App {
             && p.ready
             && p.execution["mcp_registered"] == true
             && record.is_some_and(|v| {
-                herdr::check_identity(p, v).is_ok()
+                crate::repair_lane::check_identity(p, v).is_ok()
                     && matches!(
                         v["status"]["state"].as_str(),
                         Some("idle" | "done" | "working")
@@ -1371,9 +1412,21 @@ impl App {
             return Ok(true);
         }
         self.ensure_cli_source(p, r).await?;
-        let native_fork =
-            record.is_some_and(|record| herdr::check_native_resume(p, record).is_err());
+        let lane = crate::repair_lane::descriptor(p);
+        let native_fork = lane.is_none()
+            && record.is_some_and(|record| herdr::check_native_resume(p, record).is_err());
         if native_fork && r.phase != "recovery_stopping" {
+            let current = p.clone();
+            let observed = record.expect("fork observation").clone();
+            if self
+                .db
+                .call(move |c| crate::repair_lane::admit(c, &current, &observed))
+                .await?
+                .is_some()
+            {
+                self.notify.notify_one();
+                return Ok(true);
+            }
             let record = record.expect("native fork observation");
             if herdr::recovery_foreground_quiescent(p, record) {
                 let id = r.id.clone();
@@ -1388,6 +1441,7 @@ impl App {
         // Hooks may discover native continuity after switch acceptance. Capture
         // only the source's identity, never a failed target's different session.
         if !candidate
+            && lane.is_none()
             && !native_fork
             && p.agent == source_agent
             && !p.native_session.is_empty()
@@ -1550,7 +1604,7 @@ impl App {
             .await?;
             return Ok(true);
         }
-        if let Err(error) = herdr::check_identity(p, record) {
+        if let Err(error) = crate::repair_lane::check_identity(p, record) {
             if error.is::<herdr::SessionStarting>() && db::now() - r.phase_started_at < BUDGET_MS {
                 self.defer_cli_recovery(
                     r,
@@ -1631,12 +1685,21 @@ impl App {
         let baseline = rr.baseline.clone();
         let sequence = rr.sequence;
         self.db.call(move|c|{
-            c.execute("UPDATE cli_switch_requests SET phase='requested',phase_started_at=?,next_attempt_at=0,generation=?,recovery_generation=?,nonce=?,baseline=?,sequence=?,attempts=attempts+1 WHERE id=? AND holds_input=1",params![db::now(),generation,generation,nonce,baseline,sequence,id])?;
+            ensure!(c.execute("UPDATE cli_switch_requests SET phase_started_at=?,next_attempt_at=0,generation=?,recovery_generation=?,nonce=?,baseline=?,sequence=?,attempts=attempts+1 WHERE id=? AND holds_input=1 AND phase IN ('recovery_pending','recovery_starting','repairing','failed','startup_failed') AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=(SELECT project_id FROM cli_switch_requests WHERE id=?))",params![db::now(),generation,generation,nonce,baseline,sequence,id,id])?==1,"Repair request changed before diagnostic preparation");
             c.execute("UPDATE projects SET execution=json_set(execution,'$.cli_recovery_request',?) WHERE id=(SELECT project_id FROM cli_switch_requests WHERE id=?) AND generation=?",params![id,id,generation])?;
             Ok(())
         }).await?;
+        let repair_context = if let Some(lane) = crate::repair_lane::descriptor(p) {
+            format!(
+                " repair_only=\"true\" original_native=\"{}\" observed_native=\"{}\"",
+                crate::xml(&lane.expected_native).replace('"', "&quot;"),
+                crate::xml(&lane.observed_native).replace('"', "&quot;")
+            )
+        } else {
+            String::new()
+        };
         let diagnostic = format!(
-            "<dauerbot_cli_repair request_id=\"{}\">The requested switch to {} failed. You are the original CLI's recovery owner, not the selected successor. Diagnose and fix the safe handoff or target startup cause using the existing local CLI, project and runtime. The daemon may submit this diagnostic through verified native input before MCP is registered; fix MCP connectivity when needed. Native input alone does not mean MCP readiness or successful user replies. Preserve native login/model settings, queued user input, files and already completed effects. Do not change the daemon database, unlock delivery, close your own terminal, start a second project Agent, or replay held tasks. Investigate actively and finish the repair; reporting a stuck state alone is not completion. Latest diagnostic: {}\nAfter repair, {}\n</dauerbot_cli_repair>",
+            "<dauerbot_cli_repair{repair_context} request_id=\"{}\">The requested switch to {} failed. You are a repair-only Agent, not the selected successor. If repair_only is true, observed_native is a separate diagnostic conversation; original_native remains preserved and unavailable for ordinary work. Do not claim to be that original conversation. Diagnose and fix the safe handoff or target startup cause using the existing local CLI, project and runtime. The daemon may submit this diagnostic through verified native input before MCP is registered; fix MCP connectivity when needed. Native input alone does not mean MCP readiness or successful user replies. Preserve native login/model settings, queued user input, files and already completed effects. Do not change the daemon database, unlock delivery, close your own terminal, start a second project Agent, or replay held tasks. Investigate actively and finish the repair; reporting a stuck state alone is not completion. Latest diagnostic: {}\nAfter repair, {}\n</dauerbot_cli_repair>",
             rr.id,
             rr.target,
             crate::xml(&format!(
@@ -1666,13 +1729,19 @@ impl App {
         let body = body.to_owned();
         let sequence = r.sequence;
         let baseline = r.baseline.clone();
+        let nonce = r.nonce.clone();
+        let current = p.clone();
         let journal = self.db.call(move|c| {
             let tx=c.unchecked_transaction()?;
+            if crate::repair_lane::descriptor(&current).is_some() && let Some(lane)=crate::repair_lane::authorize(&tx,&current,false)? {crate::repair_lane::effect_phase(&tx,&lane)?;}
             let controls:Vec<(String,String)>=tx.prepare("SELECT instruction_id,payload FROM cli_repair_instructions WHERE request_id=? AND prompt_id='' ORDER BY rowid")?
                 .query_map([&rid],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
             if !initial && controls.is_empty() { return Ok(None); }
             if !initial {
                 tx.execute("UPDATE cli_switch_requests SET baseline=?,sequence=?,phase_started_at=? WHERE id=? AND holds_input=1",params![baseline,sequence,db::now(),rid])?;
+            }
+            if initial {
+                ensure!(tx.execute("UPDATE cli_switch_requests SET phase='requested',phase_started_at=? WHERE id=? AND holds_input=1 AND generation=? AND nonce=? AND phase IN ('recovery_pending','recovery_starting','repairing','failed','startup_failed')",params![db::now(),rid,generation,nonce])?==1,"Repair request changed before prompt admission");
             }
             let id=db::id();
             let controls_payload:Vec<Value>=controls.iter().map(|(_,raw)|serde_json::from_str(raw).unwrap_or(Value::Null)).collect();
@@ -1685,7 +1754,23 @@ impl App {
         let Some((id, payload)) = journal else {
             return Ok(false);
         };
-        let result = herdr::send(cfg, p, &payload).await;
+        let result = if let Some(lane) = crate::repair_lane::descriptor(p) {
+            let current = p.clone();
+            match self
+                .db
+                .call(move |c| {
+                    let lane = crate::repair_lane::authorize(c, &current, false)?
+                        .context("Repair lane retired")?;
+                    crate::repair_lane::effect_phase(c, &lane)
+                })
+                .await
+            {
+                Ok(()) => herdr::send(cfg, &crate::repair_lane::view(p, &lane), &payload).await,
+                Err(error) => Err(herdr::NotSubmitted(error).into()),
+            }
+        } else {
+            herdr::send(cfg, p, &payload).await
+        };
         let (status, error) = match result {
             Ok(_) => ("submitted", String::new()),
             Err(error) if herdr::definitely_not_sent(&error) => ("not_sent", error.to_string()),
@@ -1709,6 +1794,18 @@ impl App {
                 Ok(())
             })
             .await?;
+        if retry && crate::repair_lane::descriptor(p).is_some() {
+            let current = p.clone();
+            let request = r.id.clone();
+            self.db.call(move|c|{
+                if let Ok(Some(lane))=crate::repair_lane::authorize(c,&current,false)
+                    && crate::repair_lane::effect_phase(c,&lane).is_ok() {
+                    c.execute("UPDATE cli_switch_requests SET phase='recovery_pending',next_attempt_at=0,error='A repair prompt was proven not sent; reobserving before retry' WHERE id=? AND holds_input=1 AND phase IN ('requested','repairing','recovery_pending','recovery_starting')",[request])?;
+                }
+                Ok(())
+            }).await?;
+            return Ok(true);
+        }
         if retry {
             self.fail_cli_switch(
                 r,
@@ -2404,7 +2501,7 @@ mod tests {
         app.journal_cli_fault(&p.id, "Resume recovery")
             .await
             .unwrap();
-        let mut record = json!({"state":"live","status":{"state":"working"},"foreground":{"name":"codex"},"processes":[{"pid":100,"name":"codex","argv":["codex"]}],"native_session":{"value":"forked-native"},"interactive_ready":true,"execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace","agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},"tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"quiescent"}});
+        let record = json!({"state":"live","status":{"state":"working"},"foreground":{"name":"codex"},"processes":[{"pid":100,"name":"codex","argv":["codex"]}],"native_session":{"value":"forked-native"},"interactive_ready":true,"execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace","agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},"tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"quiescent"}});
         assert!(
             herdr::check_identity(&p, &record)
                 .unwrap_err()
@@ -2419,26 +2516,65 @@ mod tests {
         assert_eq!(r.source["native_session"], "old-native");
         assert_eq!(r.source["runtime_target"]["native_session"], "old-native");
         assert!(r.holds_input);
-        record["status"]["state"] = json!("idle");
-        app.request_cli_repair(&p.id).await.unwrap();
-        assert!(
-            app.advance_cli_switch(&p, None, Some(&record))
-                .await
-                .unwrap()
-        );
-        let r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
-        assert_eq!(r.phase, "recovery_stopping");
-        assert_eq!(r.source["native_session"], "old-native");
-        assert_eq!(
-            app.db.project(&p.id).await.unwrap().native_session,
-            "old-native"
-        );
+        let current = app.db.project(&p.id).await.unwrap();
+        let lane = crate::repair_lane::descriptor(&current).unwrap();
+        assert_eq!(lane.expected_native, "old-native");
+        assert_eq!(lane.observed_native, "forked-native");
+        assert!(!current.ready);
+        assert_ne!(current.execution["mcp_registered"], true);
+        assert!(crate::repair_lane::check_identity(&current, &record).is_ok());
+        assert!(herdr::check_identity(&current, &record).is_err());
         let mut execution = json!({"intended_native_session":"old-native","native_confirmed":true,"mcp_registered":true});
         assert!(!target_native_matches(&r, &execution, "forked-native"));
         execution["native_confirmed"] = json!(false);
         assert!(!target_native_matches(&r, &execution, "old-native"));
         execution["native_confirmed"] = json!(true);
         assert!(target_native_matches(&r, &execution, "old-native"));
+    }
+    #[tokio::test]
+    async fn retiring_repair_lane_rejects_prompt_without_reactivating_its_phase() {
+        let (_dir, app, p, _record) = crate::repair_lane::tests::fixture("codex").await;
+        app.db.sync(|c|{
+            let r=latest(c,&p.id)?.unwrap();
+            c.execute("UPDATE cli_switch_requests SET phase='switching',nonce='accepted',generation=?,baseline='accepted-proof' WHERE id=?",params![p.generation,r.id])?;
+            journal_repair_instruction(c,&p.id,"late-control",&json!({"content":"repair-only control"}))?;
+            Ok(())
+        }).unwrap();
+        let r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        for initial in [true, false] {
+            assert!(
+                app.send_cli_repair_prompt(
+                    &p,
+                    &r,
+                    &Config::default(),
+                    "<dauerbot_cli_repair />",
+                    initial
+                )
+                .await
+                .is_err()
+            );
+        }
+        app.db
+            .sync(|c| {
+                let current = latest(c, &p.id)?.unwrap();
+                assert_eq!(current.phase, "switching");
+                assert_eq!(current.nonce, "accepted");
+                assert!(current.holds_input);
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM cli_repair_prompts WHERE request_id=?",
+                        [&r.id],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                assert!(
+                    crate::repair_lane::authorize(c, &p, false)?.is_some(),
+                    "cleanup authority remains available while effects are revoked"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
     #[tokio::test]
     async fn runtime_repair_resumes_target_native_and_arguments_instead_of_erasing_its_conversation()

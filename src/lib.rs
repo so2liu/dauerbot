@@ -17,6 +17,7 @@ pub mod models;
 pub mod native_children;
 pub mod project_documents;
 pub mod project_instructions;
+mod repair_lane;
 pub mod service;
 pub mod update;
 pub mod work;
@@ -474,7 +475,38 @@ impl App {
             }
         }
         let p = self.db.project(&m.project_id).await?;
-        self.db.state(&m.id, "sending", "").await?;
+        if m.attachment.get(repair_lane::OUTBOX_KEY).is_some() {
+            let current = p.clone();
+            let attachment = m.attachment.clone();
+            let checked: Result<()> = async {
+                self.db
+                    .call(move |c| repair_lane::validate_outbox(c, &current.id, &attachment))
+                    .await?;
+                let cfg = self.config.read().await.clone();
+                let observed = herdr::observe(&cfg, &p).await?;
+                repair_lane::check_identity(&p, &observed)?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = checked {
+                let id = m.id.clone();
+                let error = error.to_string();
+                self.db.call(move|c|{c.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error,db::now(),id])?;Ok(())}).await?;
+                return Ok(());
+            }
+        }
+        let message = m.clone();
+        let admitted=self.db.call(move|c|{
+            let tx=c.unchecked_transaction()?;
+            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment) {
+                tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;tx.commit()?;return Ok(false);
+            }
+            let changed=tx.execute("UPDATE messages SET status='sending',error='',updated_at=? WHERE id=? AND status='pending'",rusqlite::params![db::now(),message.id])?;
+            tx.commit()?;Ok(changed==1)
+        }).await?;
+        if !admitted {
+            return Ok(());
+        }
 
         match feishu::send(self, &p, &m).await {
             Ok(receipt) => {
@@ -516,7 +548,7 @@ impl App {
         if active {
             let cfg = self.config.read().await.clone();
             let record = herdr::observe(&cfg, &p).await?;
-            herdr::check_identity(&p, &record)?;
+            repair_lane::check_identity(&p, &record)?;
         }
         let id = p.id.clone();
         let generation_id = generation.to_owned();
@@ -736,6 +768,11 @@ impl App {
             rt.core = "connected".into();
             rt.core_error.clear();
         }
+        if repair_lane::descriptor(&p).is_some() {
+            self.advance_cli_switch(&p, Some(&cfg), Some(&record))
+                .await?;
+            return Ok(());
+        }
         if record["state"] != "live"
             && self.cli_switch_holds_input(&p).await?
             && self
@@ -806,15 +843,14 @@ impl App {
             .as_str()
             .filter(|s| !s.is_empty())
         {
-            self.db.native_session(&p.id, native).await?;
+            if !self.db.observe_native(&p.id, &p.generation, native).await? {
+                // Registration may have admitted a repair role after the native
+                // observation. Never publish old normal readiness into that role.
+                self.notify.notify_one();
+                return Ok(());
+            }
             p.native_session = native.into();
             p.execution["native_confirmed"] = json!(true);
-            let id = p.id.clone();
-            let generation_id = p.generation.clone();
-            let native = native.to_owned();
-            self.db
-                .call(move |c| work::set_native_session(c, &id, &generation_id, &native, db::now()))
-                .await?;
         }
         let id = p.id.clone();
         let generation = p.generation.clone();

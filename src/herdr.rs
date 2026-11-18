@@ -129,7 +129,7 @@ impl std::fmt::Display for RpcFailure {
 }
 impl std::error::Error for RpcFailure {}
 #[derive(Debug)]
-pub struct NotSubmitted(anyhow::Error);
+pub struct NotSubmitted(pub(crate) anyhow::Error);
 impl std::fmt::Display for NotSubmitted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -885,7 +885,7 @@ pub async fn observe(config: &Config, p: &Project) -> Result<Value> {
         "native_session":native_agent.get("agent_session").cloned().unwrap_or(Value::Null),
         "interactive_ready":native_agent["interactive_ready"].as_bool().unwrap_or(!pending),
         "launch_pending":pending,"completion_seq":native_agent["completion_seq"],"state_change_seq":native_agent["state_change_seq"],
-        "children":crate::native_children::observe(p, crate::db::now()),"processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"workspace_id":pane["workspace_id"],"tokens":pane["tokens"],
+        "children":crate::native_children::observe(&crate::repair_lane::child_view(p), crate::db::now()),"processes":processes,"execution":execution,"agent":native_agent,"pane_id":pane["pane_id"],"terminal_id":pane["terminal_id"],"workspace_id":pane["workspace_id"],"tokens":pane["tokens"],
         "cwd":pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or("")}),
     )
 }

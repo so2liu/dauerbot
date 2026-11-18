@@ -123,7 +123,7 @@ fn authority(session: Session) -> Option<SessionAuthority> {
     session.map(|Extension(value)| value)
 }
 /// Recheck at the database operation, after any asynchronous handler work.
-fn authorize_session(
+fn authorize_generation(
     c: &rusqlite::Connection,
     authority: &Option<SessionAuthority>,
     project: &str,
@@ -139,6 +139,21 @@ fn authorize_session(
                 && !current.is_empty()
                 && equal(&authority.generation, &current),
             "This Agent execution changed; reconnect before using its tools"
+        );
+    }
+    Ok(())
+}
+fn authorize_session(
+    c: &rusqlite::Connection,
+    authority: &Option<SessionAuthority>,
+    project: &str,
+) -> anyhow::Result<()> {
+    authorize_generation(c, authority, project)?;
+    if authority.is_some() && crate::repair_lane::current(c, project, true)?.is_none() {
+        let registered:bool=c.query_row("SELECT ready=1 AND COALESCE(json_extract(execution,'$.mcp_registered'),0)=1 AND json_type(execution,'$.repair_lane') IS NULL FROM projects WHERE id=?",[project],|r|r.get(0))?;
+        anyhow::ensure!(
+            registered,
+            "Register the verified native execution before using its tools"
         );
     }
     Ok(())
@@ -728,17 +743,25 @@ async fn outbox(
     let message_id = app
         .db
         .call(move |c| {
-            authorize_session(c, &authority, &p.id)?;
-            let binding =
-                crate::bot::get(c, &p.id)?.context("Connect a Feishu bot to this project first")?;
-            db::enqueue_out_request(
-                c,
+            let tx = c.unchecked_transaction()?;
+            authorize_session(&tx, &authority, &p.id)?;
+            if authority.is_some()
+                && let Some(lane) = crate::repair_lane::current(&tx, &p.id, true)?
+            {
+                attachment[crate::repair_lane::OUTBOX_KEY] = serde_json::to_value(lane)?;
+            }
+            let binding = crate::bot::get(&tx, &p.id)?
+                .context("Connect a Feishu bot to this project first")?;
+            let message = db::enqueue_out_request(
+                &tx,
                 &p.id,
                 &binding.app_id,
                 &input.request_id,
                 &input.content,
                 attachment,
-            )
+            )?;
+            tx.commit()?;
+            Ok(message)
         })
         .await?;
     app.send_out(&message_id).await?;
@@ -758,26 +781,54 @@ async fn register(
     session: Session,
     Json(input): Json<Registration>,
 ) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    if p.execution["pane_id"].as_str() != Some(&input.terminal) || p.generation != input.generation
-    {
-        return Err(anyhow::anyhow!("Session identity does not match").into());
-    }
-    let contract =
-        crate::mcp::generation_contract(&p.execution).context("Unsupported Agent MCP contract")?;
-    if input.mcp_contract.is_some_and(|value| value != contract) {
-        return Err(anyhow::anyhow!("Agent MCP contract differs from its execution").into());
-    }
-    let registration_api = p.execution["api_protocol"].as_u64().unwrap_or(PROTOCOL);
+    let authority = authority(session);
     let cfg = app.config.read().await.clone();
-    // MCP can be ready just before HERDR's native-agent detection tick.
-    // Keep this request alive briefly rather than requiring a model to recover
-    // from a transient first-tool error. No project lock is held here.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let observed = loop {
-        let t = herdr::observe(&cfg, &p).await?;
-        match herdr::check_identity(&p, &t) {
-            Ok(()) => break t,
+    // Reread every probe: the daemon may admit a repair-only role while this
+    // companion is waiting for native detection, without changing generation.
+    let (p, observed) = loop {
+        let p = app.db.project(&id).await?;
+        if p.execution["pane_id"].as_str() != Some(&input.terminal)
+            || p.generation != input.generation
+            || authority
+                .as_ref()
+                .is_some_and(|a| a.project != p.id || a.generation != p.generation)
+        {
+            return Err(anyhow::anyhow!("Session identity does not match").into());
+        }
+        let contract = crate::mcp::generation_contract(&p.execution)
+            .context("Unsupported Agent MCP contract")?;
+        if input.mcp_contract.is_some_and(|v| v != contract) {
+            return Err(anyhow::anyhow!("Agent MCP contract differs from its execution").into());
+        }
+        let observed = herdr::observe(&cfg, &p).await?;
+        let checked = if crate::repair_lane::descriptor(&p).is_some() {
+            crate::repair_lane::check_identity(&p, &observed)
+        } else {
+            herdr::check_identity(&p, &observed)
+        };
+        match checked {
+            Ok(()) => break (p, observed),
+            Err(error)
+                if error.is::<herdr::NativeSessionChanged>()
+                    && crate::repair_lane::descriptor(&p).is_none() =>
+            {
+                let current = p.clone();
+                let record = observed.clone();
+                let admission_authority = authority.clone();
+                let admitted = app
+                    .db
+                    .call(move |c| {
+                        authorize_generation(c, &admission_authority, &current.id)?;
+                        crate::repair_lane::admit(c, &current, &record)
+                    })
+                    .await?;
+                if admitted.is_some() {
+                    app.notify.notify_one();
+                    continue;
+                }
+                return Err(error.into());
+            }
             Err(error)
                 if error.is::<herdr::SessionStarting>()
                     && tokio::time::Instant::now() < deadline =>
@@ -787,32 +838,45 @@ async fn register(
             Err(error) => return Err(error.into()),
         }
     };
+    let contract =
+        crate::mcp::generation_contract(&p.execution).context("Unsupported Agent MCP contract")?;
+    if input.mcp_contract.is_some_and(|v| v != contract) {
+        return Err(anyhow::anyhow!("Agent MCP contract differs from its execution").into());
+    }
+    let registration_api = p.execution["api_protocol"].as_u64().unwrap_or(PROTOCOL);
     let native = observed["native_session"]["value"]
         .as_str()
         .unwrap_or("")
         .to_owned();
-    let authority = authority(session);
+    let repair = crate::repair_lane::descriptor(&p);
+    let expected = repair.as_ref().map(|lane| lane.expected_native.clone());
     let name = p.name.clone();
     app.db.call(move|c|{
-        let tx=c.unchecked_transaction()?;
-        authorize_session(c,&authority,&p.id)?;
+        let tx=c.unchecked_transaction()?;authorize_generation(&tx,&authority,&p.id)?;
         let terminal=p.terminal.as_deref().context("Execution is not running")?;
-        let changed=c.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,
-          execution=json_set(CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END,'$.mcp_registered',json('true'))
-          WHERE id=?2 AND generation=?3 AND terminal=?4",rusqlite::params![native,p.id,input.generation,terminal])?;
-        anyhow::ensure!(changed==1,"Session identity changed; reconnect MCP");
-        if !native.is_empty(){
-            work::set_native_session(c,&p.id,&input.generation,&native,db::now())?;
+        if let Some(lane)=repair {
+            let current=crate::repair_lane::authorize(&tx,&p,false)?.context("Repair role retired")?;
+            crate::repair_lane::effect_phase(&tx,&current)?;
+            anyhow::ensure!(herdr::same_native_session(&p.agent,&lane.observed_native,&native),"The observed repair identity changed");
+            let changed=tx.execute("UPDATE projects SET execution=json_set(execution,'$.repair_lane.mcp_registered',json('true')) WHERE id=? AND generation=? AND terminal=? AND ready=0",rusqlite::params![p.id,input.generation,terminal])?;
+            anyhow::ensure!(changed==1,"Repair session changed before registration");
+        }else{
+            // A concurrently admitted repair role must never inherit this old
+            // normal-readiness result after the native observation.
+            let repair_exists:bool=tx.query_row("SELECT json_type(execution,'$.repair_lane') IS NOT NULL FROM projects WHERE id=?",[&p.id],|r|r.get(0))?;
+            anyhow::ensure!(!repair_exists,"Session became repair-only; retry registration");
+            let changed=tx.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,execution=json_set(CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END,'$.mcp_registered',json('true')) WHERE id=?2 AND generation=?3 AND terminal=?4",rusqlite::params![native,p.id,input.generation,terminal])?;
+            anyhow::ensure!(changed==1,"Session identity changed; reconnect MCP");
+            if !native.is_empty(){work::set_native_session(&tx,&p.id,&input.generation,&native,db::now())?;}
         }
-        tx.commit()?;
-        Ok(())
+        tx.commit()?;Ok(())
     }).await?;
     app.notify.notify_one();
-
     Ok(Json(
-        json!({"ok":true,"project":name,"api_protocol":registration_api,"mcp_contract":contract,"service_api_protocol":PROTOCOL}),
+        json!({"ok":true,"project":name,"api_protocol":registration_api,"mcp_contract":contract,"service_api_protocol":PROTOCOL,"repair_only":expected.is_some(),"original_native":expected}),
     ))
 }
+
 async fn retry(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     let m = app.db.message(&id).await?;
     let lock = app.project_lock(&m.project_id).await;
@@ -949,6 +1013,10 @@ async fn create_timer(
         .db
         .call(move |c| {
             authorize_session(c, &authority, &p.id)?;
+            anyhow::ensure!(
+                authority.is_none() || crate::repair_lane::current(c, &p.id, true)?.is_none(),
+                "A repair-only Agent may not schedule work; restore the intended conversation first"
+            );
             work::create_timer(c, &p.id, input, db::now())
         })
         .await?;
@@ -1045,4 +1113,53 @@ async fn resolve_event(
         .await?;
     app.notify.notify_one();
     Ok(Json(json!(result)))
+}
+
+#[cfg(test)]
+mod repair_authority_tests {
+    use super::*;
+    #[tokio::test]
+    async fn repair_tools_require_registered_role_and_cannot_schedule_or_survive_retirement() {
+        let (_dir, app, p, _record) = crate::repair_lane::tests::fixture("codex").await;
+        let authority = Some(SessionAuthority {
+            project: p.id.clone(),
+            generation: p.generation.clone(),
+        });
+        app.db.sync(|c|{
+            assert!(authorize_session(c,&authority,&p.id).is_err());
+            c.execute("UPDATE projects SET execution=json_set(execution,'$.repair_lane.mcp_registered',json('true')) WHERE id=?",[&p.id])?;
+            assert!(authorize_session(c,&authority,&p.id).is_ok());Ok(())
+        }).unwrap();
+        let input:work::TimerInput=serde_json::from_value(json!({"name":"not authorized","prompt":"must not run","kind":"once","at":db::now()+60000,"request_id":"repair-schedule"})).unwrap();
+        let denied = create_timer(
+            State(app.clone()),
+            Path(p.id.clone()),
+            Some(Extension(authority.clone().unwrap())),
+            Json(input),
+        )
+        .await;
+        assert!(denied.is_err());
+        app.db.sync(|c|{
+            assert_eq!(c.query_row("SELECT count(*) FROM work_timers WHERE project_id=?",[&p.id],|r|r.get::<_,i64>(0))?,0);
+            c.execute("UPDATE cli_switch_requests SET phase='switching' WHERE project_id=?",[&p.id])?;
+            assert!(authorize_session(c,&authority,&p.id).is_err());
+            c.execute("UPDATE projects SET generation='successor',execution='null',ready=0 WHERE id=?",[&p.id])?;
+            assert!(authorize_generation(c,&authority,&p.id).is_err());Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn unregistered_native_credential_cannot_bypass_repair_admission_through_outbox() {
+        let (_dir, app, p, _record) = crate::repair_lane::tests::fixture("codex").await;
+        let authority = Some(SessionAuthority {
+            project: p.id.clone(),
+            generation: p.generation.clone(),
+        });
+        app.db.sync(|c|{
+            c.execute("UPDATE cli_switch_requests SET holds_input=0,phase='cancelled' WHERE project_id=?",[&p.id])?;
+            c.execute("UPDATE projects SET execution=json_remove(execution,'$.repair_lane') WHERE id=?",[&p.id])?;
+            assert!(authorize_generation(c,&authority,&p.id).is_ok());
+            assert!(authorize_session(c,&authority,&p.id).is_err());
+            assert!(authorize_session(c,&None,&p.id).is_ok(),"daemon/admin messages keep their existing authority");Ok(())
+        }).unwrap();
+    }
 }

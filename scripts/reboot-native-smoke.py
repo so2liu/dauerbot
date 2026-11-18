@@ -159,10 +159,10 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                     raise AssertionError('old native root survived private runtime shutdown')
                 except ProcessLookupError:
                     pass
-            # One native CLI deliberately reports a fork on its first resume.
-            # The saved descriptor must stay original and recovery must retry
-            # safely; no user input may reach that forked generation.
-            (Path(projects[0]['path']) / '.fixture-fork-on-resume').write_text('once')
+            # Every attempted resume of saved A reports a fork B until the
+            # authenticated repair-only Agent receives a real /repair instruction.
+            # A blind restart loop can never pass this fixture.
+            (Path(projects[0]['path']) / '.fixture-fork-on-resume').write_text('persistent')
             old_boot = str(uuid.uuid4())
             with sqlite3.connect(data / 'bridge.sqlite3', timeout=10) as db:
                 for index,p in enumerate(projects):
@@ -196,18 +196,88 @@ os.execv({cfg["herdr"]!r},[{cfg["herdr"]!r}]+a)
                 while not sample_stop.wait(0.05):
                     try:
                         p=state(projects[0]['id'])
-                        native_samples.append({'native':p['native_session'],'generation':p['generation']})
+                        with sqlite3.connect(data / 'bridge.sqlite3', timeout=2) as db:
+                            journals=[row[0] for row in db.execute('SELECT native_session FROM work_executions WHERE project_id=?',[p['id']])]
+                            sources=[json.loads(row[0]) for row in db.execute('SELECT source FROM cli_switch_requests WHERE project_id=?',[p['id']])]
+                        native_samples.append({'native':p['native_session'],'generation':p['generation'],
+                            'journals':journals,'sources':[row.get('native_session') for row in sources],
+                            'targets':[row.get('runtime_target',{}).get('native_session') for row in sources]})
                     except Exception:
                         pass
             sample_thread=threading.Thread(target=observe_native,daemon=True)
             sample_thread.start()
+            repair_project = projects[0]
+            repair_path = Path(repair_project['path'])
+            lane_ready = repair_path / '.fixture-repair-lane-ready'
+            smoke.wait_for(lane_ready.exists, 'persistent native fork did not receive an authenticated repair-only Agent envelope', timeout=80)
+            lane_proof = json.loads(lane_ready.read_text())
+            lane_state = state(repair_project['id'])
+            lane = lane_state['execution']['repair_lane']
+            assert lane['mcp_registered'] is True and lane['generation'] == lane_proof['generation'], lane_state
+            assert lane_state['ready'] is False and lane_state['cli_transition']['holds_input'] is True
+            assert lane_state['execution'].get('mcp_registered') is not True and lane_state['execution'].get('native_confirmed') is not True
+            assert lane_state['native_session'] == lane['expected_native'] == repair_project['old']['native_session']
+            assert lane['observed_native'] == lane_proof['observed'] != lane['expected_native']
+            forks = [json.loads(line) for line in (repair_path / '.fixture-native-forks').read_text().splitlines()]
+            fork = next(row for row in forks if row['generation'] == lane['generation'])
+            stale_credentials = json.loads(Path(fork['credentials']).read_text())
+
+            def session_post(operation, body):
+                request = urllib.request.Request(stale_credentials['url'] + '/api/projects/' + stale_credentials['project'] + '/' + operation,
+                    data=json.dumps(body).encode(), headers={'Authorization':'Bearer ' + stale_credentials['token'],
+                    'x-hfb-generation':stale_credentials['generation'],'Content-Type':'application/json'})
+                try:
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        return response.status, json.load(response)
+                except urllib.error.HTTPError as error:
+                    return error.code, json.loads(error.read())
+
+            registration = {'generation':lane['generation'],'terminal':fork['pane'],'mcp_contract':1}
+            code, registered = session_post('register', registration)
+            assert code == 200 and registered['repair_only'] is True, (code, registered)
+            held = api(f"/projects/{repair_project['id']}/work")
+            pending_event = next(e for e in held['events'] if e['source_id'] == repair_project['pending'])
+            timers = [e for e in held['events'] if e['source'] == 'timer']
+            assert pending_event['status'] == 'queued' and len(timers) == 1 and timers[0]['status'] == 'queued', held
+            assert not any(r['event_id'] in {pending_event['id'],timers[0]['id']} for r in held['runs']), held
+            assert len(api(f"/projects/{repair_project['id']}/timers")) == 1, 'repair-only schedule_run created a timer'
+            assert (repair_path / '.fixture-fork-on-resume').read_text() == 'persistent'
+            assert not (repair_path / '.fixture-native-repaired').exists()
+            assert not any(d['generation'] == lane['generation'] for d in deliveries(repair_path))
+            smoke.wait_for(lambda:any(m.get('fixture_reply_to') == repair_project['warm'] and
+                'repair-only Agent is investigating' in m.get('content','') for m in smoke.FIXTURE.messages),
+                'repair-only MCP diagnostic did not reach its Feishu topic')
+            smoke.FIXTURE.emit(smoke.message('om_reboot_repair_0', '/repair fixture-repair-persistent-native-resume'), 'cli_reboot_0')
+            smoke.wait_for(lambda:(repair_path / '.fixture-native-repaired').exists(), 'trusted /repair instruction did not reach the repair Agent', timeout=35)
+            repaired = json.loads((repair_path / '.fixture-native-repaired').read_text())
+            assert repaired['generation'] == lane['generation'] and repaired['original'] == repair_project['old']['native_session']
+            assert not (repair_path / '.fixture-fork-on-resume').exists()
+            evidence['repair_only_lane'] = {'original_native_preserved':True,'persistent_fork':True,
+                'authenticated_mcp_registration':True,'topic_diagnostic':True,'schedule_denied':True,
+                'ordinary_input_and_timer_held':True,'trusted_repair_control':True,'request':lane['request_id']}
             smoke.wait_for(lambda:all(state(p['id'])['cli_transition'] and state(p['id'])['cli_transition']['phase'] == 'ready' and state(p['id'])['execution'].get('mcp_registered') and state(p['id'])['execution'].get('native_confirmed') for p in projects), 'saved native reboot recovery stalled', timeout=100)
             assert starts.read_text().splitlines() == ['start']
-            fork=json.loads((Path(projects[0]['path'])/'.fixture-native-fork').read_text())
             assert fork['expected']==projects[0]['old']['native_session'] and fork['observed']!=fork['expected']
-            assert native_samples and all(row['native']==fork['expected'] for row in native_samples), native_samples
+            assert native_samples and all(row['native']==fork['expected'] and
+                all(value in {'',fork['expected']} for value in row['journals']) and
+                all(value in {None,'',fork['expected']} for value in row['sources'] + row['targets']) for row in native_samples), native_samples
             assert not any(row['generation']==fork['generation'] for row in deliveries(Path(projects[0]['path']))), fork
             evidence['fork_rejected_without_native_adoption']=True
+            assert (repair_path / 'HANDOFF.md').read_text().find('<!-- dauerbot-switch-ready:' + repaired['nonce'] + ' -->') >= 0
+            final_a = state(repair_project['id'])
+            assert final_a['generation'] != lane['generation'] and not final_a['execution'].get('repair_lane')
+            assert final_a['execution']['mcp_registered'] is True and final_a['execution']['native_confirmed'] is True
+            stale_results = []
+            for operation, payload in [('register', registration), ('outbox', {'to':'oc_fixture',
+                'content':'Stale repair lane must never send this', 'request_id':'stale-repair-lane-effect',
+                'reply_to_message_id':repair_project['warm']})]:
+                code, rejected = session_post(operation, payload)
+                assert code in {401,403,409}, (operation, code, rejected)
+                stale_results.append({'operation':operation,'status':code})
+            assert not any('Stale repair lane must never send this' in m.get('content','') for m in smoke.FIXTURE.messages)
+            with sqlite3.connect(data / 'bridge.sqlite3', timeout=2) as db:
+                assert db.execute("SELECT count(*) FROM messages WHERE source_id='stale-repair-lane-effect'").fetchone()[0] == 0
+            evidence['repair_only_lane']['stale_authority_rejected'] = stale_results
             results = []
             for p in projects:
                 current = state(p['id'])

@@ -49,6 +49,26 @@ async fn project_tools_are_generation_scoped_and_cannot_manage_other_projects() 
             .header("x-hfb-generation", "active-generation")
             .json(&payload)
     };
+    let unregistered = request().send().await.unwrap();
+    assert!(!unregistered.status().is_success());
+    // The fixture now represents a normally registered native generation.
+    app.db
+        .save_execution(
+            &a.id,
+            json!({"terminal_id":"legacy-terminal","shell_pid":1,"api_protocol":api::PROTOCOL,"mcp_registered":true}),
+            "active-generation",
+        )
+        .await
+        .unwrap();
+    app.db
+        .ready(
+            &a.id,
+            "active-generation",
+            "legacy-terminal",
+            "native-history",
+        )
+        .await
+        .unwrap();
     let first = request().send().await.unwrap();
     assert!(first.status().is_success());
     let first: serde_json::Value = first.json().await.unwrap();

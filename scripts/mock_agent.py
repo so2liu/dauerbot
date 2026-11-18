@@ -102,7 +102,10 @@ if launch_metadata.get("native_session_hook"):
     native_session_value = marker.read_text()
     fork = Path.cwd() / ".fixture-fork-on-resume"
     if expected and fork.exists():
-        fork.unlink()
+        # Default remains the original one-shot fixture. The reboot recovery
+        # regression opts into a persistent fork that only its repair Agent clears.
+        if fork.read_text().strip() != "persistent":
+            fork.unlink()
         import uuid
         observed = str(uuid.uuid4())
         if agent == "pi":
@@ -110,7 +113,11 @@ if launch_metadata.get("native_session_hook"):
             file.write_text(json.dumps({"type":"session","version":3,"id":observed}) + "\n")
             observed = str(file)
         native_session_value = observed
-        (Path.cwd() / ".fixture-native-fork").write_text(json.dumps({"expected":expected,"observed":observed,"generation":Path(sys.argv[2]).parent.name}))
+        fork_record = {"expected":expected,"observed":observed,"generation":Path(sys.argv[2]).parent.name,
+                       "pane":os.environ["HERDR_PANE_ID"],"credentials":sys.argv[2]}
+        (Path.cwd() / ".fixture-native-fork").write_text(json.dumps(fork_record))
+        with (Path.cwd() / ".fixture-native-forks").open("a") as forks:
+            forks.write(json.dumps(fork_record) + "\n")
     params = {"pane_id":os.environ["HERDR_PANE_ID"],"source":"herdr:" + agent,"agent":agent,
               "seq":time.time_ns(),"session_start_source":"resume" if expected else ("new" if agent == "pi" else "startup")}
     params["agent_session_path" if agent == "pi" else "agent_session_id"] = native_session_value
@@ -173,7 +180,7 @@ def rpc(method, params=None):
     raise RuntimeError("MCP closed unexpectedly")
 
 
-rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-fixture", "version": "2"}, "capabilities": {}})
+initialization = rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "hfb-fixture", "version": "2"}, "capabilities": {}})
 proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 proc.stdin.flush()
 tools = rpc("tools/list")
@@ -194,6 +201,7 @@ buffer = b""
 held = None
 switch_held = None
 repair_held = None
+repair_lane = None
 
 
 def switch_handoff(event):
@@ -213,6 +221,56 @@ def repair_handoff(event):
     handoff = event.find("dauerbot_cli_switch")
     assert handoff is not None, "Repair control did not contain the fresh handoff request"
     switch_handoff(handoff)
+
+
+def native_repair_control(event, wrapped):
+    global repair_lane
+    if event.tag == "dauerbot_cli_repair" and event.attrib.get("repair_only") == "true":
+        assert repair_lane is None, "Repair lane received duplicate initial prompt"
+        assert event.attrib["original_native"] == marker.read_text()
+        assert event.attrib["observed_native"] == native_session_value != marker.read_text()
+        instructions = initialization.get("instructions", "")
+        assert "repair-only" in instructions.lower() and marker.read_text() in instructions, initialization
+        repair_lane = event
+        generation = Path(sys.argv[2]).parent.name
+        diagnostic = tool("send_md", {"to":"oc_fixture", "text":"Fixture repair-only Agent is investigating preserved native continuity.",
+            "request_id":"repair-lane-diagnostic-" + generation, "reply_to_message_id":"om_reboot_warm_0"})
+        due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+        denied = rpc("tools/call", {"name":"schedule_run", "arguments":{"request_id":"repair-lane-denied-" + generation,
+            "name":"Must be denied", "prompt":"repair lane must not schedule ordinary work", "kind":"once", "at":due.isoformat(),
+            "timezone":"UTC", "to":"oc_fixture", "purpose":"internal"}})
+        assert denied.get("isError") and "repair" in json.dumps(denied).lower(), denied
+        (Path.cwd() / ".fixture-repair-lane-ready").write_text(json.dumps({"generation":generation,
+            "original":marker.read_text(),"observed":native_session_value,"request":event.attrib["request_id"],
+            "nonce":event.find("dauerbot_cli_switch").attrib["handoff_nonce"],
+            "diagnostic":diagnostic,"schedule_denied":denied}))
+    if repair_lane is None:
+        return False
+    instructions = []
+    for element in wrapped.findall("repair_user_instructions"):
+        assert element.attrib.get("trust") == "user_input"
+        instructions.extend(json.loads(element.text or "[]"))
+    controls = [item for item in instructions if item.get("content") == "fixture-repair-persistent-native-resume"]
+    if not controls:
+        status("idle")
+        return True
+    assert len(controls) == 1, controls
+    control = controls[0]
+    assert control["message_id"] == "om_reboot_repair_0", control
+    assert control["source"]["chat_id"] == "oc_fixture" and control["source"]["sender"]["open_id"] == "ou_fixture", control
+    tool("send_md", {"to":"oc_fixture", "text":"Fixture repair-only Agent received trusted repair instructions; restoring the saved conversation.",
+        "request_id":"repair-lane-control-" + Path(sys.argv[2]).parent.name, "reply_to_message_id":control["message_id"]})
+    # This changes only the fixture's private simulated CLI failure. Saved A and
+    # the daemon journal remain untouched by the diagnostic Agent.
+    (Path.cwd() / ".fixture-fork-on-resume").unlink()
+    handoff = event.find("dauerbot_cli_switch")
+    if handoff is None:
+        handoff = repair_lane.find("dauerbot_cli_switch")
+    assert handoff is not None
+    (Path.cwd() / ".fixture-native-repaired").write_text(json.dumps({"generation":Path(sys.argv[2]).parent.name,
+        "original":marker.read_text(),"observed":native_session_value,"control":control,"nonce":handoff.attrib["handoff_nonce"]}))
+    switch_handoff(handoff)
+    return True
 
 
 try:
@@ -242,6 +300,8 @@ try:
                 event = ET.fromstring(text)
             if event.tag in {"dauerbot_cli_repair", "dauerbot_cli_repair_control"}:
                 status("working")
+                if native_repair_control(event, wrapped):
+                    continue
                 with (Path.cwd() / ".fixture-repairs").open("a") as repairs:
                     repairs.write(json.dumps({"generation": Path(sys.argv[2]).parent.name, "native": marker.read_text(), "payload": text}) + "\n")
                 mode = Path.cwd() / ".fixture-repair-mode"
