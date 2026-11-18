@@ -1096,7 +1096,7 @@ impl App {
             let mut source = match historical {
                 Some((agent,native)) if current.generation != generation =>
                     json!({"agent":agent,"native_session":native,"extra_args":[],"generation":generation,"historical_arguments_unavailable":true}),
-                _ => json!({"agent":current.agent,"native_session":native,"extra_args":args,"generation":generation}),
+                _ => json!({"agent":current.agent,"native_session":current.native_session,"extra_args":current.extra_args,"generation":generation}),
             };
             if !last_failure.is_null() { source["last_failure"] = last_failure; }
             source["selection"]=json!(crate::models::load(c,&id,source["agent"].as_str().unwrap_or(""))?);
