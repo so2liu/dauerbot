@@ -39,7 +39,8 @@ jobs:
         run: python3 scripts/prebuilt-macos.py inspect --tag "$RELEASE_TAG"
   macos-arm64:
     needs: preflight
-    runs-on: macos-15
+    # Signing/notarization does not execute or compile the staged ARM binaries.
+    runs-on: macos-15-intel
     timeout-minutes: 80
     permissions:
       contents: write

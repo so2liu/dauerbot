@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.2 — 2026-11-19
+
+### Fixed
+
+- Restore automatic upgrade handover from 0.5.x by canonicalizing configuration fingerprints across JSON map-ordering changes; retain the 0.6.0 predecessor encoding and specific service failure diagnostics (#113). This includes the fixes prepared in unpublished 0.6.1.
+- Use an Intel macOS runner for signing and notarizing the locally staged Apple Silicon package when hosted ARM runners are unavailable. Keep native runtime execution in mandatory local ARM staging; signing CI verifies payload metadata, SHA-256, size, Mach-O architecture, attribution and code signatures without compiling or executing ARM binaries.
+
+### Changed
+
+- Advance both application crates to 0.6.2 and bundle build 20; keep API protocol 7.
+
 ## 0.6.1 — 2026-11-19
 
 ### Fixed

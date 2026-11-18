@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
@@ -32,8 +33,14 @@ def verify(bundle):
     payload = bundle / "Contents/MacOS/herdr"
     if payload.read_bytes()[:8] != bytes.fromhex("cffaedfe0c000001"):
         raise ValueError("Bundled HERDR requires Apple Silicon")
-    if subprocess.check_output([str(payload), "--version"], text=True, timeout=5).strip() != "herdr 0.9.5":
-        raise ValueError("Unsupported bundled HERDR version")
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        # Mandatory local ARM staging executes the pinned runtime. Intel CI
+        # only signs this already verified ARM package; it cannot execute it.
+        if subprocess.check_output([str(payload), "--version"], text=True, timeout=5).strip() != "herdr 0.9.5":
+            raise ValueError("Unsupported bundled HERDR version")
+    elif sys.platform != "darwin" or machine not in ("x86_64", "amd64"):
+        raise ValueError("Bundled HERDR verification requires a supported macOS host")
     for name in ("LICENSE", "ATTRIBUTION.txt", "libghostty-vt-LICENSE", "portable-pty-LICENSE"):
         if (bundle / "Contents/Resources/herdr" / name).read_bytes() != (ROOT / "packaging/herdr" / name).read_bytes():
             raise ValueError("Missing or changed HERDR attribution: " + name)
