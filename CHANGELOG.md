@@ -16,12 +16,8 @@
 
 ### Changed
 
-- Adapt Herdr App terminal rendering and input mechanisms for the native legacy transport, including ANSI colors, fixed-column shaping, bounded frame ingestion, takeover focus and AGY Alt+M. Native checks verified control release, history scrolling, selection and clipboard copy; input-method candidate composition and commit acceptance remains open under #85.
+- Adapt Herdr App terminal rendering and input mechanisms for the native legacy transport, including ANSI colors, fixed-column shaping, bounded frame ingestion, takeover focus and AGY Alt+M. Native checks verified control release, history scrolling, selection and clipboard copy. Input-method candidate composition and commit remains an unverified, nonblocking follow-up under #85.
 - Advance both application crates to 0.5.0 and bundle build 15. Keep API protocol 7, the three Agent tools and bundled HERDR 0.9.5 unchanged.
-
-### Pending final acceptance
-
-- Input-method candidate composition and commit remains the only unverified terminal acceptance check under #85. The automation surface could not activate an input source even in TextEdit; publication remains gated on this check.
 
 ## 0.4.9 — 2026-11-17
 
