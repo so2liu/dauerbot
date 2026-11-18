@@ -1,8 +1,8 @@
 """Private model/card integration through actual SDK WebSockets, HERDR and MCP.
 
-The Codex executable is a deterministic CLI shim. Its native ID is seeded only
-in this private store: these checks do not establish live-model/account or
-vendor-native resume acceptance. No real configuration or bot is touched.
+The Codex executable is a deterministic CLI shim. It reports its own native ID
+through HERDR 0.9.5's Codex SessionStart RPC before authenticated MCP registration;
+these checks do not establish live-model/account or vendor-native resume acceptance. No real configuration or bot is touched.
 """
 import argparse
 import json
@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import urllib.request
+import urllib.error
 import uuid
 from http.server import ThreadingHTTPServer
 
@@ -47,6 +48,9 @@ def main():
     daemon = None
     cfg = None
     project_id = None
+    sample_stop = threading.Event()
+    sample_thread = None
+    continuity_samples = []
     session = "model-" + uuid.uuid4().hex[:8]
     evidence = {"scope": "Private deterministic Codex CLI shim; real SDK WebSocket/card callback, HERDR and MCP; not live model acceptance"}
     with tempfile.TemporaryDirectory(prefix="db-model-", dir="/tmp") as folder:
@@ -80,7 +84,13 @@ for i,value in enumerate(a):
  elif value.startswith('--model='):model=value.split('=',1)[1]
  elif value.startswith('model_provider='):provider=json.loads(value.split('=',1)[1])
 native=a[a.index('resume')+1] if 'resume' in a else ''
-metadata={{'argv':a,'model':model,'provider':provider,'native_resume':native,'pid':os.getpid()}}
+metadata={{'argv':a,'model':model,'provider':provider,'native_resume':native,'pid':os.getpid(),'native_session_hook':True}}
+if model=='unavailable-fixture-model':
+ from pathlib import Path
+ credentials=json.loads(Path(config[-1]).read_text());credentials['terminal']=os.environ['HERDR_PANE_ID']
+ private=Path('.fixture-bad-credentials');private.write_text(json.dumps(credentials));private.chmod(0o600)
+ with Path('.fixture-bad-attempts').open('a') as attempts:attempts.write(json.dumps({{'model':model,'native_resume':native,'generation':credentials['generation'],'pid':os.getpid()}})+'\\n')
+ sys.exit(42)
 sys.argv=[{str(ROOT / 'scripts/mock_agent.py')!r},entry,config[-1],native,a[-1],'codex',json.dumps(metadata)]
 runpy.run_path(sys.argv[0],run_name='__main__')
 ''')
@@ -104,7 +114,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
         shutil.copyfile(shutil.which("herdr"), runtime)
         runtime.chmod(0o700)
         env = {k: v for k, v in os.environ.items() if not k.startswith(("HERDR_", "HC_", "SSH_")) and k not in {
-            "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "GEMINI_CLI_HOME"}}
+            "CODEX_HOME", "CODEX_THREAD_ID", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "GEMINI_CLI_HOME"}}
         env.update(HOME=str(home), CODEX_HOME=str(codex), XDG_CONFIG_HOME=str(base / "xdg"),
                    XDG_STATE_HOME=str(base / "state"), SHELL="/bin/sh", PATH=str(bindir) + ":" + os.environ["PATH"])
         smoke.FIXTURE = smoke.Fixture()
@@ -185,9 +195,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             smoke.wait_for(lambda: project()["ready"] and project()["execution"].get("mcp_registered") and launches(), "native shim/MCP not ready")
             native = (workspace / ".fixture-session-codex").read_text()
             original = project()
-            with sqlite3.connect(data / "bridge.sqlite3", timeout=10) as db:
-                db.execute("UPDATE projects SET native_session=?,execution=json_set(execution,'$.native_confirmed',json('true')) WHERE id=? AND generation=?", (native, project_id, original["generation"]))
-                db.execute("UPDATE work_executions SET native_session=? WHERE project_id=? AND generation=?", (native, project_id, original["generation"]))
+            assert original["native_session"] == native and original["execution"].get("native_confirmed"), original
             catalog = api(f"/projects/{project_id}/models")
             assert "fixture-model-two" in json.dumps(catalog) and "fixture-hidden" not in json.dumps(catalog), catalog
             for source in ["om_model_picker", "om_model_stale_picker"]:
@@ -271,6 +279,114 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             assert sql("SELECT count(*) FROM project_model_preferences WHERE project_id=?", (project_id,))[0][0] == 0
             assert reset["execution"]["model_selection"] is None
             checks.append("inherit-native-settings form action removes only project model/provider flags, preserves unrelated args and same native session, and clears explicit preference without claiming the session's effective model")
+            # An unavailable selected model fails before MCP. The restored
+            # healthy source must accept a corrected model through a NEW card,
+            # without letting old callbacks/readiness release held input.
+            (workspace / ".fixture-repair-mode").write_text("hold")
+            smoke.FIXTURE.emit(smoke.message("om_model_unavailable", "/models"), APP)
+            bad_card = smoke.wait_for(lambda: card_for("om_model_unavailable"), "no picker for unavailable-model scenario")
+            bad_action = callback(bad_card, "evt_model_unavailable")
+            bad_action["event"]["action"]["form_value"] = {"model_id": "unavailable-fixture-model"}
+            emit_action(bad_action)
+            bad_id = bad_card["command"]
+            def sample_continuity():
+                while not sample_stop.is_set():
+                    try:
+                        state = project()
+                        transition = state.get("cli_transition") or {}
+                        continuity_samples.append({"id": transition.get("id"), "phase": transition.get("phase"),
+                            "holds_input": transition.get("holds_input"), "generation": state["generation"]})
+                    except (OSError, urllib.error.URLError):
+                        pass
+                    sample_stop.wait(.08)
+            sample_thread = threading.Thread(target=sample_continuity, daemon=True)
+            sample_thread.start()
+            def repairs():
+                path = workspace / ".fixture-repairs"
+                return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+            def bad_attempts():
+                path = workspace / ".fixture-bad-attempts"
+                return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+            def repair_available():
+                state = project()
+                transition = state["cli_transition"]
+                return state if transition["id"] == bad_id and transition["phase"] == "requested" and transition["recovery_generation"] == state["generation"] and state["execution"].get("mcp_registered") and repairs() else None
+            repair_source = smoke.wait_for(repair_available, "unavailable model did not restore a usable native/MCP repair source", timeout=55)
+            assert len(bad_attempts()) == 1 and len(launches()) == 4
+            assert repair_source["native_session"] == native
+            assert launches()[-1]["resume"] == native and "--model" not in launches()[-1]["launch"]["argv"]
+            assert repair_source["cli_transition"]["holds_input"]
+            assert sql("SELECT count(*) FROM project_model_preferences WHERE project_id=?", (project_id,))[0][0] == 0
+            repair_generation = repair_source["generation"]
+            old_nonce = repair_source["cli_transition"]["nonce"]
+            correction_input = "om_model_correction_held"
+            smoke.FIXTURE.emit(smoke.message(correction_input, "process once after the corrected model is ready"), APP)
+            smoke.wait_for(lambda: held(correction_input), "ordinary input escaped the failed-model hold")
+            smoke.FIXTURE.emit(smoke.message("om_model_corrected_picker", "/models"), APP)
+            corrected_card = smoke.wait_for(lambda: card_for("om_model_corrected_picker"), "no fresh picker while the repair source is available")
+            correct_option = next(i for i, option in enumerate(corrected_card["options"]) if option["model"] == "fixture-model-two")
+            corrected_action = callback(corrected_card, "evt_model_corrected", f"m{correct_option}")
+            emit_action(corrected_action)
+            correct_id = corrected_card["command"]
+            def corrected_repair_ready():
+                state = project()
+                transition = state["cli_transition"]
+                observed = repairs()
+                return state if transition["id"] == correct_id and transition["phase"] == "requested" and observed and correct_id in observed[-1]["payload"] else None
+            corrected_source = smoke.wait_for(corrected_repair_ready, "corrected selection did not reach the same healthy repair source", timeout=35)
+            assert corrected_source["generation"] == repair_generation
+            assert corrected_source["cli_transition"]["recovery_generation"] == repair_generation
+            assert corrected_source["execution"]["cli_recovery_request"] == correct_id
+            assert corrected_source["cli_transition"]["nonce"] != old_nonce
+            assert corrected_source["cli_transition"]["requested_model"]["model"] == "fixture-model-two"
+            assert len(launches()) == 4 and len(bad_attempts()) == 1
+            assert sql("SELECT phase FROM cli_switch_requests WHERE id=?", (bad_id,))[0][0] == "superseded"
+            held(correction_input)
+            emit_action(bad_action, "evt_bad_model_callback_after_supersession")
+            old_credentials = json.loads((workspace / ".fixture-bad-credentials").read_text())
+            late_registration = urllib.request.Request(old_credentials["url"] + f"/api/projects/{project_id}/register",
+                data=json.dumps({"generation": old_credentials["generation"], "terminal": old_credentials["terminal"], "mcp_contract": 1}).encode(),
+                headers={"Authorization": "Bearer " + old_credentials["token"], "x-hfb-generation": old_credentials["generation"], "Content-Type": "application/json"}, method="POST")
+            try:
+                urllib.request.urlopen(late_registration, timeout=10)
+                raise AssertionError("late readiness from retired bad candidate was accepted")
+            except urllib.error.HTTPError as rejected:
+                assert rejected.code in {400, 401, 409}, rejected.code
+            assert project()["cli_transition"]["id"] == correct_id and project()["cli_transition"]["holds_input"]
+            held(correction_input)
+            (workspace / ".fixture-mcp-hold").write_text("hold corrected target readiness")
+            (workspace / ".fixture-repair-release").write_text("acknowledge fresh corrected-model nonce")
+            smoke.wait_for(lambda: len(launches()) == 5, "corrected model did not resume the same native conversation", timeout=50)
+            corrected_launch = launches()[-1]
+            assert corrected_launch["resume"] == native == corrected_launch["native"]
+            assert corrected_launch["launch"]["model"] == "fixture-model-two"
+            assert project()["cli_transition"]["holds_input"]
+            held(correction_input)
+            (workspace / ".fixture-mcp-hold").unlink()
+            corrected = smoke.wait_for(lambda: project() if project()["cli_transition"]["id"] == correct_id and project()["cli_transition"]["phase"] == "ready" else None, "corrected target did not become ready", timeout=50)
+            def correction_delivered():
+                rows = [json.loads(line) for line in (workspace / ".fixture-deliveries").read_text().splitlines()]
+                accepted = [line for line in rows if line["source"] == correction_input]
+                if not accepted:
+                    return None
+                assert accepted == [{"source": correction_input, "generation": corrected["generation"]}], rows
+                work = api(f"/projects/{project_id}/work")
+                event = next(e for e in work["events"] if e["source_id"] == correction_input)
+                runs = [r for r in work["runs"] if r["event_id"] == event["id"]]
+                assert len(runs) == 1 and runs[0]["generation"] == corrected["generation"], work
+                return accepted
+            smoke.wait_for(correction_delivered, "corrected-model input was not delivered exactly once")
+            sample_stop.set()
+            sample_thread.join(timeout=25)
+            assert not sample_thread.is_alive()
+            relevant = [sample for sample in continuity_samples if sample["id"] in {bad_id, correct_id}]
+            assert relevant and all(sample["holds_input"] is True or sample["id"] == correct_id and sample["phase"] == "ready" for sample in relevant), relevant
+            assert len(bad_attempts()) == 1 and corrected["native_session"] == native
+            emit_action(corrected_action, "evt_corrected_callback_after_ready")
+            assert len(launches()) == 5 and len(bad_attempts()) == 1
+            checks.append("an unavailable model fails once before MCP; a fresh authenticated card corrects its held repair on the same healthy source, supersedes the old request without an input gap, rejects old readiness/callback effects, and resumes the corrected model/native session before one delivery")
+            evidence.update(correction={"bad_request": bad_id, "corrected_request": correct_id,
+                "repair_generation": repair_generation, "bad_attempts": bad_attempts(), "continuity_samples": relevant})
             api(f"/projects/{project_id}/stop", {})
             evidence.update(checks=checks, count=len(checks), launches=launches(), callback_responses=smoke.FIXTURE.callback_responses)
         except Exception as error:
@@ -288,21 +404,47 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                 evidence["diagnostic_error"] = str(diagnostic_error)
             raise
         finally:
+            sample_stop.set()
+            if sample_thread is not None:
+                sample_thread.join(timeout=25)
             if daemon is not None:
                 daemon.terminate()
                 daemon.wait(timeout=15)
             log.close()
             if cfg:
                 try:
-                    subprocess.run([cfg["herdr"], "--session", session, "server", "stop"], env=env, capture_output=True, timeout=10)
+                    stopped = subprocess.run([cfg["herdr"], "--session", session, "server", "stop"], env=env, capture_output=True, timeout=10)
+                    evidence["herdr_stop_code"] = stopped.returncode
                 except (OSError, subprocess.TimeoutExpired) as cleanup_error:
                     evidence["cleanup_error"] = str(cleanup_error)
             smoke.FIXTURE.server.shutdown()
             smoke.FIXTURE.server.server_close()
+            owned_pids = [row.get("launch", {}).get("pid") for row in evidence.get("launches", launches())]
+            bad_path = workspace / ".fixture-bad-attempts"
+            if bad_path.exists():
+                owned_pids.extend(json.loads(line)["pid"] for line in bad_path.read_text().splitlines())
+            alive = []
+            for pid in filter(None, owned_pids):
+                try:
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except ProcessLookupError:
+                    pass
+            prefix = str(base.resolve())
+            remaining = []
+            for line in subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True).splitlines():
+                fields = line.strip().split(None, 2)
+                if len(fields) == 3 and int(fields[0]) not in {os.getpid(), os.getppid()} and (prefix in fields[2] or str(base) in fields[2]):
+                    remaining.append(line.strip())
+            evidence["cleanup"] = {"owned_native_pids": list(filter(None, owned_pids)), "surviving_native_pids": alive,
+                "remaining_fixture_processes": remaining, "sampler_joined": sample_thread is None or not sample_thread.is_alive()}
             result = ROOT / "test-results/model-selection-smoke.json"
             result.parent.mkdir(exist_ok=True)
             result.write_text(json.dumps(evidence, indent=2) + "\n")
-    print(json.dumps({"checks": checks, "count": len(checks), "scope": evidence["scope"]}))
+    evidence["cleanup"]["temporary_directory_removed"] = not base.exists()
+    result.write_text(json.dumps(evidence, indent=2) + "\n")
+    assert not evidence["cleanup"]["surviving_native_pids"] and not evidence["cleanup"]["remaining_fixture_processes"] and evidence["cleanup"]["sampler_joined"] and evidence["cleanup"]["temporary_directory_removed"], evidence["cleanup"]
+    print(json.dumps({"checks": checks, "count": len(checks), "scope": evidence["scope"], "cleanup": evidence["cleanup"]}))
 
 
 if __name__ == "__main__":

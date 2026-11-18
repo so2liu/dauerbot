@@ -276,8 +276,14 @@ impl App {
         if let Some(dir) = child_adapter {
             execution["child_adapter"] = json!(dir);
         }
-        if let Some(request) = self.cli_switch_launch_id(&p).await? {
+        if let Some((request, intended_native)) = self.cli_switch_launch_context(&p, resume).await?
+        {
             execution["cli_switch_request"] = json!(request);
+            // Capture the exact resume identity passed to this launch, after
+            // source settlement; the original request snapshot may be older.
+            if let Some(native) = intended_native {
+                execution["intended_native_session"] = json!(native);
+            }
         }
         if let Some(request) = self.cli_recovery_launch_id(&p).await? {
             execution["cli_recovery_request"] = json!(request);

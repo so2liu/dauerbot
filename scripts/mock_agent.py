@@ -47,6 +47,24 @@ if expected:
 else:
     import uuid
     marker.write_text(str(uuid.uuid4()))
+launch_metadata = json.loads(sys.argv[6]) if len(sys.argv) > 6 else {}
+if launch_metadata.get("native_session_hook"):
+    # The installed HERDR 0.9.5 Codex SessionStart integration reports this
+    # separate RPC; pane.report_agent alone never confirms native continuity.
+    assert sys.argv[5] == "codex"
+    os.environ["CODEX_THREAD_ID"] = marker.read_text()
+    request = {"id": "fixture-native-session", "method": "pane.report_agent_session", "params": {
+        "pane_id": os.environ["HERDR_PANE_ID"], "source": "herdr:codex", "agent": "codex",
+        "seq": time.time_ns(), "agent_session_id": marker.read_text(),
+        "session_start_source": "resume" if expected else "startup",
+    }}
+    with socket.socket(socket.AF_UNIX) as conn:
+        conn.settimeout(3)
+        conn.connect(os.environ["HERDR_SOCKET_PATH"])
+        conn.sendall((json.dumps(request) + "\n").encode())
+        result = json.loads(conn.makefile().readline())
+        if "error" in result:
+            raise RuntimeError(result["error"])
 with (Path.cwd() / ".fixture-launches").open("a") as launches:
     launch = {"resume": expected, "native": marker.read_text(), "generation": Path(sys.argv[2]).parent.name, "instructions": sys.argv[4] if len(sys.argv) > 4 else ""}
     if len(sys.argv) > 6:

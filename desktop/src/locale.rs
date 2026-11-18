@@ -49,6 +49,30 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "Requested · switching model" => "已请求 · 正在切换模型",
+            "Invalid or stale model catalogue response" => "模型目录响应无效或已过期，请刷新",
+            "Model unavailable" => "模型信息暂不可用",
+            "Model unknown" => "模型信息未知",
+            "Native model catalogue could not be loaded" => "无法加载 CLI 模型目录",
+            "Refreshing model catalogue…" => "正在刷新模型目录…",
+            "Native model selection is unknown" => "尚未获知 CLI 的模型设置",
+            "Native CLI/session settings" => "CLI 与原生会话设置",
+            "Remove project model override" => "移除项目模型覆盖",
+            "Choose model" => "选择模型",
+            "Confirmed by CLI" => "CLI 已确认",
+            "Requested · awaiting native confirmation" => "已选择 · 等待 CLI 确认",
+            "Uses native CLI/session settings" => "沿用 CLI 与原生会话设置",
+            "This project only. Native login and global CLI settings stay in place." => {
+                "仅用于当前项目，保留 CLI 的登录和全局设置。"
+            }
+            "Model change requested" => "已请求切换模型",
+            "Model controls are unavailable" => "模型控件暂不可用",
+            "Model ID" => "模型 ID",
+            "Provider (optional)" => "提供方（可选）",
+            "Use model ID" => "使用模型 ID",
+            "Enter a model ID" => "请输入模型 ID",
+            "Loading models…" => "正在加载模型…",
+            "Refresh" => "刷新",
             "Preparing handoff…" | "preparing_handoff" => "正在准备交接…",
             "Switching CLI…" | "switching_cli" => "正在切换 CLI…",
             "Selected CLI is ready." => "所选 CLI 已就绪。",
