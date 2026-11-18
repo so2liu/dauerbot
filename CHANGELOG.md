@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Repaint the terminal after native window resizing so a narrowed panel shows the latest PTY content without a click or reconnect. Refresh only its owning window on the existing coalesced output cadence (#103).
 - Separate automatic terminal viewport sizing from keyboard takeover. Bind viewport ownership to the immutable terminal, preserve the single terminal stream across input control changes, and keep displaced views from reacquiring another view's viewport (#98).
 
 ### Changed
