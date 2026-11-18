@@ -266,8 +266,19 @@ pub fn cancel(c: &Connection, project: &str, error: &str) -> Result<()> {
 /// Only after a verified stop: abandon the transition and pause atomically, so
 /// releasing its delivery hold cannot automatically wake the old CLI.
 pub fn stopped(c: &Connection, project: &str, generation: &str) -> Result<()> {
+    stopped_mode(c, project, generation, true)
+}
+pub(crate) fn stopped_mode(
+    c: &Connection,
+    project: &str,
+    generation: &str,
+    cancel_intake: bool,
+) -> Result<()> {
     let tx = c.unchecked_transaction()?;
     let held = holds_input(&tx, project)?;
+    if cancel_intake {
+        tx.execute("UPDATE feishu_group_intake SET status='cancelled' WHERE project_id=? AND status='pending'",[project])?;
+    }
     work::finish_execution(
         &tx,
         project,

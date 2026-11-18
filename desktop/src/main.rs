@@ -864,7 +864,7 @@ impl Desktop {
         let selected = self.selected.clone();
         let status = self.state["runtime"]["bots"][&selected].clone();
         div().flex().flex_col().gap_4()
-            .child(self.title("FEISHU BOT", "Connect this project's bot", "Every project has its own bot. Direct and group messages received by this bot go to this project."))
+            .child(self.title("FEISHU BOT", "Connect this project's bot", "Every project has its own bot. Direct messages, bot mentions and verified topic replies reach its project."))
             .child(choices)
             .child(self.field("App ID", &self.app_id))
             .child(self.field("App Secret", &self.secret))
@@ -899,7 +899,7 @@ impl Desktop {
             .child(self.btn("copy-scopes-full", "Copy full permission JSON (all group messages)", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(true)).unwrap())), cx).primary())
             .child(self.btn("copy-scopes", "Copy basic permission JSON (group mentions)", |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(serde_json::to_string_pretty(&backend::scopes(false)).unwrap())), cx))
             .child(self.card("2. Receive events over a long connection", "Under Events and Callbacks, choose long connections. Save valid credentials in Dauerbot and keep it running before saving the subscription. Add im.message.receive_v1 to receive messages."))
-            .child(self.card("Need every group reply?", "The full JSON includes im:message.group_msg for all user messages in groups; your administrator may need to approve it. The basic set only receives bot mentions. All messages this bot receives reach its fixed project."))
+            .child(self.card("Reply in a topic without @mentions", "Use the Feishu Agent permission preset or the full JSON with im:message.group_msg to receive topic replies without mentioning the bot. Obtain approval and publish if the scope is not already effective. The basic set only receives mentions. Dauerbot admits known project discussions and ignores unrelated group traffic; an ambiguous shared topic needs an explicit bot mention."))
             .child(self.card("3. Publish the app and add the bot", "Create a version in Version Management and Release, choose its availability, and publish it. Wait for administrator approval if required. Add the bot to a group or use direct messages. Publish a new version after changing permissions or subscriptions."))
             .child(self.btn("confirmed-events", if confirmed.events_confirmed { "✓ Events and permissions confirmed manually" } else { "I configured permissions and event subscriptions" }, move |this, _, _| { let setup=this.setup.bots.entry(event_key.clone()).or_default(); setup.events_confirmed = !setup.events_confirmed; this.go(3); }, cx))
             .child(self.btn("confirmed-release", if confirmed.published { "✓ Publishing and bot access confirmed manually" } else { "I published the app and made the bot available" }, move |this, _, _| { let setup=this.setup.bots.entry(release_key.clone()).or_default(); setup.published = !setup.published; this.go(3); }, cx))

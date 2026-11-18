@@ -569,7 +569,7 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
         if model_command {
             attachment["daemon_control"] = json!("model");
         }
-        app.db.ingest_bot(
+        app.db.ingest_routed_bot(
             &binding.project_id,
             &binding.app_id,
             &chat,
@@ -641,7 +641,7 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
         attachment["resources"] = json!(resources);
     }
     attachment["source"] = json!({"chat_id":chat,"chat_type":msg["chat_type"],"message_type":kind,
-        "sender":event["sender"]["sender_id"],"mentions":msg["mentions"],"thread_id":msg["thread_id"],"root_id":msg["root_id"],"parent_id":msg["parent_id"],"create_time":msg["create_time"]});
+        "sender":event["sender"]["sender_id"],"mentions":msg["mentions"],"mention_all":crate::group_ingress::mention_all(kind,&content,&msg["mentions"]),"thread_id":msg["thread_id"],"root_id":msg["root_id"],"parent_id":msg["parent_id"],"create_time":msg["create_time"]});
     Ok(Some((chat, source, text, attachment)))
 }
 // A localized post is one document, not a sequence of translations. Prefer the
