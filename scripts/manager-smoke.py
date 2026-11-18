@@ -181,6 +181,7 @@ def run_checks(h):
         {"tool": "write_file", "id": "same-provider-call-id", "arguments": {"path": "manager-note.txt", "content": "restricted manager fixture\n"}},
         {"tool": "read_file", "id": "same-provider-call-id", "arguments": {"path": "manager-note.txt"}},
         {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_write", "text": "manager-file-roundtrip-ok"}},
+        {"tool": "send_file", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_write", "path": "manager-note.txt"}},
         {"text": ""},
     )
     fixture.FIXTURE.emit(fixture.message("om_manager_write", "Write and read a project note, then reply in this topic."))
@@ -188,6 +189,8 @@ def run_checks(h):
     assert (h.workspace / "manager-note.txt").read_text() == "restricted manager fixture\n"
     sent = [m for m in fixture.FIXTURE.messages if "manager-file-roundtrip-ok" in m["content"]]
     assert len(sent) == 1 and sent[0]["fixture_reply_to"] == "om_manager_write", sent
+    fixture.wait_for(lambda: any(m.get("msg_type") == "file" and m.get("fixture_reply_to") == "om_manager_write" for m in fixture.FIXTURE.messages), "manager did not send its project file into the same topic")
+    assert fixture.FIXTURE.uploads and b"restricted manager fixture" in fixture.FIXTURE.uploads[-1]
     assert not h.api(route + "/work")["runs"], "raw manager input was also dispatched to native CLI"
     advertised = {t["function"]["name"] for t in MODEL.requests[0]["tools"]}
     assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file"}, advertised
