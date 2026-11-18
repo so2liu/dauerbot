@@ -2037,6 +2037,7 @@ impl Render for Desktop {
                                     .ghost()
                                     .xsmall()
                                     .w_full()
+                                    .justify_start()
                                     .h(px(24.))
                                     .tooltip(self.tr("View Agent details"))
                                     .child(
