@@ -245,6 +245,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
     // messages, schedule IDs and occurrences; do not requeue submitted input.
     c.execute_batch("DROP TABLE IF EXISTS work_jobs; DROP TABLE IF EXISTS work_decisions;
         UPDATE work_attention SET status='resolved' WHERE reason IN ('unfinished_run','not_ready');")?;
+    crate::cli_control::classify(c)?;
     sync_inbound(c)?;
     Ok(())
 }
@@ -571,7 +572,7 @@ fn claim(
         }
         // Resource preparation runs independently of project reconciliation.
         // Skip only those messages; later steering must not wait for a download.
-        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=work_events.message_id AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
+        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=COALESCE(work_events.message_id,(SELECT origin.message_id FROM work_events origin WHERE work_events.source='management' AND origin.id=json_extract(work_events.payload,'$.origin_event_id'))) AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
         let message = c.query_row(
             &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND (message_id IS NOT NULL OR source='management') AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
             [project], event_row,

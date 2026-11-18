@@ -369,11 +369,11 @@ impl Db {
         if recover {
             migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         }
+        crate::manager::migrate(&migration, recover)?;
         crate::work::migrate(&migration)?;
         crate::handoff::migrate(&migration)?;
         crate::cli_switch::migrate(&migration, recover)?;
         crate::models::migrate(&migration)?;
-        crate::manager::migrate(&migration, recover)?;
         crate::model_control::migrate(&migration, recover)?;
         crate::feishu::recover_resource_preparation(&migration, recover)?;
         migration.pragma_update(None, "user_version", 7)?;
