@@ -52,6 +52,29 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "View model context" => "查看模型上下文",
+            "Read-only. Prepared requests are not proof of provider acceptance. Redacted snapshots are temporary and disappear after restart." => {
+                "只读。准备好的请求不代表服务端已接收。脱敏快照临时保存在内存中，重启后消失。"
+            }
+            "Loading model context…" => "正在读取模型上下文…",
+            "Model context is unavailable. No request was replayed." => {
+                "暂时无法读取模型上下文；没有重放请求。"
+            }
+            "No captured manager requests are available." => "暂无可查看的管理模型请求。",
+            "Prepared logical request — not proof of provider acceptance" => {
+                "已准备的逻辑请求，不代表服务端已接收"
+            }
+            "Normalized checkpoint — not a historical wire request; original timing unavailable" => {
+                "规范化检查点，并非历史网络请求；原始时间不可用"
+            }
+            "Unknown source — exact provider input is unverified" => {
+                "未知来源，尚未确认实际模型输入"
+            }
+            "Some context was truncated or omitted." => "部分上下文已截断或省略。",
+            "Sensitive content was redacted." => "敏感内容已脱敏。",
+            "Truncated in captured context" => "保存的上下文中已截断",
+            "Show full captured block" => "展开已保存的完整片段",
+            "Collapse block" => "折叠片段",
             "Light" => "浅色",
             "Dark" => "深色",
             "Appearance" => "外观",

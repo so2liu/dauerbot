@@ -1558,7 +1558,9 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
             "Management turn superseded"
         );
         let cancel = CancellationToken::new();
-        let model = manager_loop::advance(&turn.config, turn.checkpoint.clone(), cancel.clone());
+        let model = manager_loop::advance_observed(&turn.config, turn.checkpoint.clone(), cancel.clone(), Some(crate::manager_context::Observer {
+            store: app.manager_context.clone(), project: turn.context.project.clone(), run: turn.context.run.clone(),
+        }));
         tokio::pin!(model);
         let step = loop {
             tokio::select! {result=&mut model=>break result?,_=tokio::time::sleep(Duration::from_millis(100))=>{if app.shutdown.is_cancelled()||!current(&app,&turn.context).await{cancel.cancel();bail!("Management turn superseded");}}}

@@ -5,6 +5,7 @@ mod agent_tree;
 mod backend;
 mod finder;
 mod locale;
+mod manager_context;
 mod manager_settings;
 #[cfg(target_os = "macos")]
 mod menubar;
@@ -157,6 +158,7 @@ struct Desktop {
     project_tools: Entity<project_tools::ProjectTools>,
     model_picker: Entity<model_picker::ModelPicker>,
     manager_settings: Entity<manager_settings::ManagerSettings>,
+    manager_context: Entity<manager_context::ManagerContext>,
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
@@ -268,6 +270,7 @@ impl Desktop {
             cx.new(|cx| model_picker::ModelPicker::new(backend.dir.clone(), window, cx));
         let manager_settings =
             cx.new(|cx| manager_settings::ManagerSettings::new(backend.dir.clone(), window, cx));
+        let manager_context = cx.new(|cx| manager_context::ManagerContext::new(backend.dir.clone(), cx));
         Self {
             focus_handle,
             backend,
@@ -301,6 +304,7 @@ impl Desktop {
             project_tools,
             model_picker,
             manager_settings,
+            manager_context,
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
@@ -1071,6 +1075,8 @@ impl Desktop {
                 settings.select(&project, self.setup.language, cx)
             });
             body = body.child(self.manager_settings.clone());
+            self.manager_context.update(cx, |context, cx| context.select(&project, self.setup.language, cx));
+            body = body.child(self.manager_context.clone());
             body = body
                 .child(
                     div()

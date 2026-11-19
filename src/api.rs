@@ -82,6 +82,7 @@ pub fn router(app: Arc<App>) -> Router {
             get(manager_config).put(manager_save),
         )
         .route("/projects/{id}/agent/mode", post(manager_mode))
+        .route("/projects/{id}/manager/context", get(manager_context))
         .route("/projects/{id}/models", get(project_models))
         .route("/projects/{id}/model", post(select_project_model))
         .route("/projects/{id}/documents/{document}", get(project_document))
@@ -708,6 +709,22 @@ async fn manager_config(State(app): State<Arc<App>>, Path(id): Path<String>) -> 
             .await?,
     ))
 }
+async fn manager_context(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    let p = app.db.project(&id).await?;
+    let mut view = app.manager_context.view(&p.id);
+    if view["requests"].as_array().is_some_and(Vec::is_empty) {
+        let project = p.id;
+        let fallback = app.db.call(move |c| {
+            use rusqlite::OptionalExtension;
+            let row: Option<(String,String)> = c.query_row("SELECT id,checkpoint FROM manager_runs WHERE project_id=? ORDER BY rowid DESC LIMIT 1", [&project], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+            Ok(row.and_then(|(run,checkpoint)| serde_json::from_str(&checkpoint).ok().and_then(|checkpoint| crate::manager_context::normalized(&checkpoint,&run))))
+        }).await?;
+        if let Some(fallback) = fallback {
+            view["requests"] = json!([fallback]);
+        }
+    }
+    Ok(Json(crate::manager_context::bounded(view)))
+}
 async fn manager_save(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
@@ -1168,6 +1185,66 @@ async fn resolve_event(
         .await?;
     app.notify.notify_one();
     Ok(Json(json!(result)))
+}
+
+#[cfg(test)]
+mod manager_context_tests {
+    use super::*;
+    #[tokio::test]
+    async fn context_endpoint_requires_admin_and_does_not_mutate_store_or_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().join("store"), crate::config::Config::default()).unwrap();
+        let project = app
+            .db
+            .create(ProjectInput {
+                name: "Context fixture".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "codex".into(),
+                chat_id: String::new(),
+                native_session: String::new(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        let before = app.db.sync(|c| Ok(c.total_changes())).unwrap();
+        let request = rig_core::completion::CompletionRequest::new("fixture context");
+        let guard = app
+            .manager_context
+            .capture(&project.id, "fixture-run", 1, &request);
+        let snapshot = app.manager_context.view(&project.id);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(server_app)).await.unwrap();
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!(
+            "http://{address}/api/projects/{}/manager/context",
+            project.id
+        );
+        assert_eq!(
+            http.get(&url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response: Value = http
+            .get(&url)
+            .bearer_auth(&app.config.read().await.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response, snapshot);
+        assert_eq!(app.manager_context.view(&project.id), snapshot);
+        assert_eq!(app.db.sync(|c| Ok(c.total_changes())).unwrap(), before);
+        assert_eq!(response["project_id"], project.id);
+        assert_eq!(response["requests"][0]["status"], "prepared");
+        drop(guard);
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 #[cfg(test)]

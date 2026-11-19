@@ -16,8 +16,9 @@ pub mod handoff;
 pub mod herdr;
 pub mod manager;
 mod manager_close;
-mod manager_terminal;
+pub mod manager_context;
 pub mod manager_loop;
+mod manager_terminal;
 pub mod mcp;
 pub mod model_control;
 pub mod models;
@@ -67,6 +68,7 @@ pub struct App {
     pub notify: Notify,
     pub settings_tx: watch::Sender<u64>,
     pub shutdown: CancellationToken,
+    pub manager_context: Arc<manager_context::Store>,
     project_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     outbound_lock: Mutex<()>,
     companion: std::sync::OnceLock<companion::Retained>,
@@ -108,6 +110,7 @@ impl App {
             notify: Notify::new(),
             settings_tx,
             shutdown: CancellationToken::new(),
+            manager_context: Arc::new(manager_context::Store::default()),
             project_locks: Mutex::new(HashMap::new()),
             outbound_lock: Mutex::new(()),
             companion: std::sync::OnceLock::new(),

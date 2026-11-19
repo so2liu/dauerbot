@@ -261,6 +261,21 @@ fn definitions() -> Vec<ToolDefinition> {
     ];
     TOOLS.into_iter().zip(schemas).map(|(name,(description,properties,required))|ToolDefinition::new(name.try_into().expect("static tool name"),description,json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}))).collect()
 }
+/// Existing persisted context, without claiming hydration or historical wire identity.
+pub(crate) fn normalized_context(checkpoint: Value) -> Option<CompletionRequest> {
+    let state = decode(checkpoint).ok()?;
+    let AgentRunStep::CallModel {
+        prompt, history, ..
+    } = state.pending
+    else {
+        return None;
+    };
+    Some(
+        CompletionRequest::new(prompt)
+            .messages(history)
+            .preamble(state.system),
+    )
+}
 fn encode(state: &Checkpoint) -> Result<Value> {
     let bytes = serde_json::to_vec(state)?;
     ensure!(
@@ -377,6 +392,15 @@ pub async fn advance(
     checkpoint: Value,
     cancellation: CancellationToken,
 ) -> Result<LoopStep> {
+    advance_observed(config, checkpoint, cancellation, None).await
+}
+/// Diagnostics observe prepared logical content only; they cannot affect admission.
+pub(crate) async fn advance_observed(
+    config: &ProviderConfig,
+    checkpoint: Value,
+    cancellation: CancellationToken,
+    observer: Option<crate::manager_context::Observer>,
+) -> Result<LoopStep> {
     let mut state = decode(checkpoint)?;
     ensure!(!cancellation.is_cancelled(), "Manager turn cancelled");
     let AgentRunStep::CallModel {
@@ -415,6 +439,11 @@ pub async fn advance(
         .messages(history)
         .preamble(&system)
         .tools(definitions);
+    let mut observation = observer.map(|observer| {
+        observer
+            .store
+            .capture(&observer.project, &observer.run, turn as u64, &request)
+    });
     let client = OpenAIConfig::new(config.api_key.clone())
         .with_base_url(&config.base_url)
         .client();
@@ -426,15 +455,22 @@ pub async fn advance(
         result=tokio::time::timeout(Duration::from_secs(120),model.call(request))=>match result {
             Ok(Ok(response))=>response,
             Ok(Err(error))=>{
+                if let Some(observation) = &mut observation { observation.finish("failed"); }
                 let error=Failure::provider(error).elapsed(started);
                 if error.kind=="invalid_response" && !state.correction_used {
                     return corrected(&mut state,error);
                 }
                 return Err(error.into());
             },
-            Err(_)=>return Err(Failure::timeout().elapsed(started).into()),
+            Err(_)=>{
+                if let Some(observation) = &mut observation { observation.finish("failed"); }
+                return Err(Failure::timeout().elapsed(started).into());
+            },
         }
     };
+    if let Some(observation) = &mut observation {
+        observation.finish("provider_responded");
+    }
     ensure!(!cancellation.is_cancelled(), "Manager turn cancelled");
     if response.finish_reason() == Some(FinishReason::Length) {
         let mut error = Failure::invalid_response().elapsed(started);
@@ -843,6 +879,76 @@ mod tests {
                 .unwrap()
                 .contains("private-fixture-secret")
         );
+        server.abort();
+        let _ = server.await;
+    }
+    #[tokio::test]
+    async fn prepared_context_observer_tracks_provider_response_failure_and_abandoned_future() {
+        let store = Arc::new(crate::manager_context::Store::default());
+        let observer = || {
+            Some(crate::manager_context::Observer {
+                store: store.clone(),
+                project: "fixture-project".into(),
+                run: "fixture-run".into(),
+            })
+        };
+        let (config, f, server) = fixture(vec![answer(json!("late"), Value::Null)], true).await;
+        let observation = observer();
+        let task = tokio::spawn(async move {
+            advance_observed(
+                &config,
+                begin(
+                    "additional user message".into(),
+                    "system instructions".into(),
+                )
+                .unwrap(),
+                CancellationToken::new(),
+                observation,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), f.started.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.view("fixture-project")["requests"][0]["status"],
+            "prepared"
+        );
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            store.view("fixture-project")["requests"][0]["status"],
+            "abandoned"
+        );
+        f.release.notify_one();
+        server.abort();
+        let _ = server.await;
+        let (config, _, server) = fixture(vec![answer(json!("done"), Value::Null)], false).await;
+        advance_observed(
+            &config,
+            begin("user".into(), "system".into()).unwrap(),
+            CancellationToken::new(),
+            observer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.view("fixture-project")["requests"][1]["status"],
+            "provider_responded"
+        );
+        server.abort();
+        let _ = server.await;
+        let (config, _, server) = fixture(vec![json!({"fixture_error":true})], false).await;
+        let _ = advance_observed(
+            &config,
+            begin("user".into(), "system".into()).unwrap(),
+            CancellationToken::new(),
+            observer(),
+        )
+        .await;
+        let view = store.view("fixture-project");
+        assert_eq!(view["requests"][2]["status"], "failed");
+        assert!(!view.to_string().contains("private-fixture-secret"));
         server.abort();
         let _ = server.await;
     }
