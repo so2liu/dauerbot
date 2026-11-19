@@ -1,12 +1,13 @@
 //! Native menu-bar entry and a GPUI project popover. The daemon outlives all windows.
 use super::{Desktop, Quit, project_status};
-use crate::control_label;
+use crate::{action_icons::ActionIcon, agent_tree, control_label, manager_settings};
 use anyhow::{Context as _, Result};
 use gpui::{prelude::*, *};
-use gpui_component::{Root, button::*};
+use gpui_component::{Root, Sizable, button::*, tooltip::Tooltip};
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{NSView, NSWindow};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use serde_json::Value;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 struct StatusBar {
@@ -134,11 +135,12 @@ fn toggle_popover(cx: &mut App) {
         return;
     }
     let desktop = cx.global::<StatusBar>().desktop.clone();
-    let language = desktop.read(cx).setup.language;
-    let count = desktop.read(cx).state["projects"]
-        .as_array()
-        .map_or(0, Vec::len);
-    let height = (222. + count.clamp(1, 7) as f32 * 58.).min(640.);
+    let state = desktop.read(cx);
+    let language = state.setup.language;
+    let count = state.state["projects"].as_array().map_or(0, Vec::len);
+    // Header, footer and panel padding, plus up to eight visible project rows.
+    let height =
+        96. + count.clamp(1, 8) as f32 * 40. + if state.independent_data { 22. } else { 0. };
     let result = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -240,6 +242,26 @@ fn constrained_popover(panel: [f64; 2], anchor: [f64; 2], visible: [f64; 4]) -> 
     [left, top - height, width, height]
 }
 
+fn menu_project_status(project: &Value) -> &str {
+    if manager_settings::enabled(project) {
+        manager_settings::status(project)
+    } else {
+        project_status(project)
+    }
+}
+
+fn show_status_label(status: &str) -> bool {
+    matches!(
+        status,
+        "needs_attention"
+            | "error"
+            | "offline"
+            | "unavailable"
+            | "update_required"
+            | "switching_cli"
+    )
+}
+
 struct MenuPanel {
     desktop: Entity<Desktop>,
     focus: FocusHandle,
@@ -283,29 +305,73 @@ impl Render for MenuPanel {
             .flex()
             .flex_col()
             .gap_1();
-        for project in projects.iter() {
+        for project in &projects {
             let id = project["id"].as_str().unwrap_or("").to_owned();
+            let name = project["name"].as_str().unwrap_or("Project").to_owned();
+            let managed = manager_settings::enabled(project);
+            let status = menu_project_status(project);
+            let status_label = language.text(status);
+            let mut detail = format!("{name} · {status_label}");
+            let worker_status = project_status(project);
+            if managed && show_status_label(worker_status) {
+                detail.push_str(&format!(
+                    "\n{} · {}",
+                    language.text("Coding worker"),
+                    language.text(worker_status)
+                ));
+            }
             rows = rows.child(
                 div()
                     .id(SharedString::from(format!("menu-project-{id}")))
-                    .px_3()
-                    .py_2()
-                    .rounded_lg()
+                    .focusable()
+                    .tab_index(0)
+                    .h(px(36.))
+                    .flex_shrink_0()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgba(0x00000000))
+                    .focus(|row| row.border_color(rgb(palette.accent)))
                     .cursor_pointer()
                     .hover(|row| row.bg(rgb(palette.hover)))
+                    .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
+                    .child(agent_tree::cli_icon(
+                        if managed {
+                            "manager"
+                        } else {
+                            project["agent"].as_str().unwrap_or("custom")
+                        },
+                        format!("menu-cli-{id}"),
+                        palette,
+                    ))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
                             .truncate()
-                            .child(project["name"].as_str().unwrap_or("Project").to_owned()),
+                            .child(name),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(palette.muted))
-                            .child(language.text(project_status(project))),
-                    )
+                    .when(show_status_label(status), |row| {
+                        row.child(
+                            div()
+                                .max_w(px(106.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(palette.muted))
+                                .child(status_label.clone()),
+                        )
+                    })
+                    .child(agent_tree::status_dot(
+                        status,
+                        status_label,
+                        format!("menu-status-{id}"),
+                        palette,
+                    ))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         let id = id.clone();
                         cx.defer(move |cx| open_main(Some(id), 6, cx));
@@ -316,7 +382,7 @@ impl Render for MenuPanel {
             rows = rows.child(
                 div()
                     .px_3()
-                    .py_5()
+                    .py_2()
                     .text_size(px(13.))
                     .text_color(rgb(palette.muted))
                     .child(language.text("No projects yet")),
@@ -342,33 +408,45 @@ impl Render for MenuPanel {
             }))
             .child(
                 div()
-                    .px_3()
-                    .py_3()
+                    .h(px(34.))
+                    .flex_shrink_0()
+                    .mb_1()
+                    .px_1()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_2()
+                    .child(ActionIcon::Brand.draw(palette.accent, 20.))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .flex_1()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Dauerbot"),
                     )
+                    .when(connection_error, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(palette.error))
+                                .child(language.text("Disconnected")),
+                        )
+                    })
                     .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(palette.muted))
-                            .child(language.text(if connection_error {
-                                "Disconnected"
-                            } else {
-                                "Projects"
-                            })),
+                        ActionIcon::Plus
+                            .button(
+                                "menu-add-project",
+                                language.text("Add project"),
+                                palette.accent,
+                            )
+                            .on_click(
+                                cx.listener(|_, _, _, cx| cx.defer(|cx| open_main(None, 5, cx))),
+                            ),
                     ),
             )
             .when(independent, |panel| {
                 panel.child(
                     div()
-                        .px_3()
-                        .pb_2()
+                        .px_2()
+                        .pb_1()
                         .text_size(px(11.))
                         .text_color(rgb(palette.warning))
                         .child(language.text("Independent instance")),
@@ -377,48 +455,45 @@ impl Render for MenuPanel {
             .child(rows)
             .child(
                 div()
-                    .mt_2()
-                    .pt_2()
+                    .mt_1()
+                    .pt_1()
                     .border_t_1()
                     .border_color(rgb(palette.line))
                     .flex()
-                    .flex_col()
+                    .flex_shrink_0()
+                    .items_center()
                     .gap_1()
                     .child(
-                        Button::new("menu-add-project")
-                            .child(control_label(language.text("+ Add project")))
+                        div().flex_1().child(
+                            Button::new("menu-open-app")
+                                .ghost()
+                                .small()
+                                .compact()
+                                .h(px(28.))
+                                .cursor_pointer()
+                                .child(ActionIcon::Window.draw(palette.accent, 16.))
+                                .child(control_label(language.text("Open Dauerbot")))
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| {
+                                        cx.defer(|cx| open_main(None, 6, cx))
+                                    }),
+                                ),
+                        ),
+                    )
+                    .child(
+                        ActionIcon::Settings
+                            .button("menu-settings", language.text("Settings"), palette.muted)
                             .on_click(
-                                cx.listener(|_, _, _, cx| cx.defer(|cx| open_main(None, 5, cx))),
+                                cx.listener(|_, _, _, cx| cx.defer(|cx| open_main(None, 8, cx))),
                             ),
                     )
                     .child(
-                        Button::new("menu-open-app")
-                            .child(control_label(language.text("Open Dauerbot")))
-                            .on_click(
-                                cx.listener(|_, _, _, cx| cx.defer(|cx| open_main(None, 6, cx))),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .pt_1()
-                            .child(
-                                Button::new("menu-settings")
-                                    .child(control_label(language.text("Settings")))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.defer(|cx| open_main(None, 8, cx))
-                                    })),
-                            )
-                            .child(
-                                Button::new("menu-quit")
-                                    .child(control_label(language.text("Quit Dauerbot")))
-                                    .on_click(cx.listener(|_, _, window, cx| {
-                                        window.remove_window();
-                                        cx.defer(|cx| cx.dispatch_action(&Quit));
-                                    })),
-                            ),
+                        ActionIcon::Power
+                            .button("menu-quit", language.text("Quit Dauerbot"), palette.muted)
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.remove_window();
+                                cx.defer(|cx| cx.dispatch_action(&Quit));
+                            })),
                     ),
             )
     }
@@ -464,5 +539,28 @@ mod placement_tests {
         assert!(frame[3] < 628.);
         let frame = constrained_popover([324., 628.], [1400., 920.], [0., 0., 1440., 900.]);
         assert_eq!(frame[3], 628.);
+    }
+}
+
+#[cfg(test)]
+mod project_status_tests {
+    use super::menu_project_status;
+    use serde_json::json;
+
+    #[test]
+    fn menu_status_follows_the_displayed_agent_identity() {
+        let mut project = json!({
+            "agent_mode": "manager",
+            "manager": {"status": "unavailable"},
+            "lifecycle": "ready"
+        });
+        assert_eq!(menu_project_status(&project), "unavailable");
+
+        project["manager"]["status"] = json!("working");
+        project["lifecycle"] = json!("sleeping");
+        assert_eq!(menu_project_status(&project), "working");
+
+        project["agent_mode"] = json!("native");
+        assert_eq!(menu_project_status(&project), "sleeping");
     }
 }

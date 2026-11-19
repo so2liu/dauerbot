@@ -12,7 +12,7 @@ impl AssetSource for Assets {
             "cli/pi.svg" => include_bytes!("../assets/cli-icons/pi.svg"),
             "cli/agy.svg" => include_bytes!("../assets/cli-icons/antigravity.svg"),
             "cli/custom.svg" => include_bytes!("../assets/cli-icons/agent.svg"),
-            _ => return Ok(None),
+            _ => return Ok(crate::action_icons::asset(path).map(Cow::Borrowed)),
         };
         Ok(Some(Cow::Borrowed(bytes)))
     }
@@ -281,6 +281,7 @@ pub struct RowLayout {
     pub elbow_y: f32,
     pub branch_column: f32,
     pub disclosure_width: f32,
+    pub name_width: f32,
 }
 
 pub fn row_layout(
@@ -300,9 +301,12 @@ pub fn row_layout(
     let compressed = ancestors.len() + 1 > capacity && !ancestors.is_empty();
     let elbow = capacity > usize::from(compressed);
     let visible = capacity.saturating_sub(usize::from(compressed) + usize::from(elbow));
+    let continuations = ancestors[ancestors.len().saturating_sub(visible)..].to_vec();
+    let connector_width = (continuations.len() + usize::from(compressed && capacity > 0)
+        + usize::from(elbow)) as f32 * 12.;
     RowLayout {
         expandable,
-        continuations: ancestors[ancestors.len().saturating_sub(visible)..].to_vec(),
+        continuations,
         compressed: compressed && capacity > 0,
         elbow,
         left_padding,
@@ -310,6 +314,9 @@ pub fn row_layout(
         elbow_y: height / 2.,
         branch_column: 12.,
         disclosure_width: 20.,
+        // Match the actual fixed columns and four 4px gaps in the rendered row.
+        // In particular, a popover trigger must not retain its intrinsic text width.
+        name_width: (width - left_padding - connector_width - 78.).max(0.),
     }
 }
 
@@ -317,6 +324,19 @@ impl RowLayout {
     pub fn connector_width(&self) -> f32 {
         (self.continuations.len() + usize::from(self.compressed) + usize::from(self.elbow)) as f32 * self.branch_column
     }
+}
+
+/// Button adds an unconstrained inner flex row around custom children. Bound
+/// the text itself, not just its containing popover or button.
+pub fn name_label(name: String, column_width: f32) -> Div {
+    let width = (column_width - 2.).max(0.); // Reserve the button's two borders.
+    div()
+        .w(px(width))
+        .max_w(px(width))
+        .min_w_0()
+        .flex_shrink_0()
+        .truncate()
+        .child(name)
 }
 
 pub fn disclosure(layout: &RowLayout) -> Div {
@@ -379,9 +399,34 @@ pub fn branches(layout: &RowLayout, palette: crate::ui_theme::Palette) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, Tree, project_target, row_layout};
+    use super::{Node, Tree, name_label, project_target, row_layout};
+    use gpui::{Styled, px};
     use serde_json::{Value, json};
     use std::collections::HashSet;
+
+    #[test]
+    fn long_names_are_bounded_before_the_fixed_status_column_at_every_depth() {
+        for width in [164., 208., 304., 404.] {
+            let mut previous = width;
+            for depth in 0..16 {
+                let layout = row_layout(&vec![true; depth], false, true, 26., width, 48.);
+                let name_left = layout.left_padding + layout.connector_width() + 20. + 18. + 12.;
+                let status_left = width - 8. - 16.;
+                // Assert the actual rendered text element has its own definite
+                // bound; a bounded wrapper alone did not prevent this regression.
+                let mut text = name_label("Implementation review".repeat(100), layout.name_width);
+                assert_eq!(text.style().size.width, Some(px(layout.name_width - 2.).into()));
+                assert_eq!(text.style().max_size.width, Some(px(layout.name_width - 2.).into()));
+                let intrinsic_long_name = 1200_f32;
+                let painted_name_right = name_left + intrinsic_long_name.min(layout.name_width);
+                assert!(painted_name_right <= status_left - 4.);
+                assert_eq!(name_left + layout.name_width + 4., status_left);
+                assert!(layout.name_width <= previous);
+                assert!(layout.name_width >= 24.);
+                previous = layout.name_width;
+            }
+        }
+    }
 
     #[test]
     fn leaves_and_expandable_siblings_reserve_the_same_disclosure_column() {
