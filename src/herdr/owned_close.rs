@@ -4,7 +4,7 @@
 use crate::{config::Config, db::Project};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{process::Stdio, time::Duration};
 
 fn owns(p: &Project, generation: &str, terminal: &str, pane: &Value) -> bool {
     pane["terminal_id"] == terminal
@@ -18,105 +18,71 @@ fn owns(p: &Project, generation: &str, terminal: &str, pane: &Value) -> bool {
             .is_some_and(|id| !id.is_empty())
 }
 
-fn shell_snapshot(info: &Value) -> Result<Value> {
-    let processes = info["foreground_processes"]
-        .as_array()
-        .context("Foreground state is unknown")?;
-    ensure!(!processes.is_empty(), "Foreground state is unknown");
-    let mut ids = Vec::new();
-    for process in processes {
-        let name = process["name"]
-            .as_str()
-            .context("Process identity is unknown")?;
-        let basename = Path::new(name)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .trim_start_matches('-');
-        ensure!(
-            matches!(
-                basename,
-                "sh" | "bash" | "zsh" | "fish" | "dash" | "nu" | "pwsh" | "login"
-            ),
-            "A native or other foreground process is still alive"
-        );
-        let pid = process["pid"]
-            .as_i64()
-            .filter(|pid| *pid > 0)
-            .context("Process identity is unknown")?;
-        ids.push(json!({"pid":pid,"name":basename}));
-    }
-    ids.sort_by_key(|v| v["pid"].as_i64());
-    let shell_pid = info["shell_pid"]
-        .as_i64()
-        .filter(|pid| *pid > 0)
-        .context("Shell identity is unknown")?;
-    Ok(json!({"shell_pid":shell_pid,"foreground":ids}))
-}
-
 #[derive(Clone)]
 struct Process {
     pid: i32,
     parent: i32,
     group: i32,
     session: i32,
-    started: String,
-    name: String,
 }
-fn process_census(root: i32, rows: &[Process]) -> Result<Value> {
-    let leader = rows
-        .iter()
-        .find(|p| p.pid == root)
-        .context("Owned shell process is unavailable")?;
+fn exited_census(root: i32, foreground_group: Option<i32>, rows: &[Process]) -> Result<()> {
     ensure!(
-        leader.session == root && leader.group > 0,
-        "Owned process session is unknown or shared"
+        rows.iter().all(|process| process.session >= 0),
+        "Process session inspection is incomplete"
     );
-    let mut included = std::collections::BTreeSet::from([root]);
-    loop {
-        let count = included.len();
-        for process in rows {
-            if included.contains(&process.parent)
-                || process.session == leader.session
-                || process.group == leader.group
-            {
-                included.insert(process.pid);
-            }
-        }
-        if included.len() == count {
-            break;
-        }
-    }
-    let mut evidence = Vec::new();
-    for process in rows.iter().filter(|p| included.contains(&p.pid)) {
-        ensure!(
-            process.session > 0 && process.pid > 0 && !process.started.is_empty(),
-            "Process lineage is unknown"
-        );
-        ensure!(
-            matches!(
-                process.name.as_str(),
-                "sh" | "bash" | "zsh" | "fish" | "dash" | "nu" | "pwsh" | "login"
-            ),
-            "A native or background process is still alive"
-        );
-        evidence.push(json!({"pid":process.pid,"parent":process.parent,"group":process.group,"session":process.session,"started":process.started,"name":process.name}));
-    }
-    evidence.sort_by_key(|v| v["pid"].as_i64());
-    Ok(json!(evidence))
+    ensure!(
+        rows.iter().all(|process| process.pid != root
+            && process.parent != root
+            && process.session != root
+            && process.group != root
+            && foreground_group.is_none_or(|group| process.group != group)),
+        "An owned root, descendant or process-session member is still alive"
+    );
+    Ok(())
 }
-async fn process_snapshot(info: &Value) -> Result<Value> {
-    let foreground = shell_snapshot(info)?;
+fn confirmed_zombie(state: &str, session_error: Option<i32>) -> bool {
+    // macOS getsid returns ESRCH for zombies even while signal zero sees their
+    // unreaped PID. Exclude only this positively dead state, never EPERM/unknown.
+    state.starts_with('Z') && session_error == Some(libc::ESRCH)
+}
+async fn process_snapshot(info: &Value, pane: &str) -> Result<Value> {
+    ensure!(
+        info.is_object() && !pane.is_empty() && info["pane_id"] == pane,
+        "Runtime process evidence belongs to an unknown pane"
+    );
     let root = info["shell_pid"]
         .as_i64()
         .and_then(|v| i32::try_from(v).ok())
         .filter(|v| *v > 0)
-        .context("Owned shell identity is unavailable")?;
-    // Fixed host inspection only: no shell, user-supplied command or arguments.
+        .context("Original runtime process identity is unavailable")?;
+    // A stable live shell can run builtin-only foreground or background work.
+    // Legacy 0.9.5 exposes no positive idle-prompt fact, so never infer idleness.
+    ensure!(
+        super::root_has_exited(Some(i64::from(root))),
+        "Legacy runtime cannot prove a live shell is idle; preserve the execution"
+    );
+    // 0.9.5 omits this Vec when empty. Null/malformed values are not that contract.
+    match info.get("foreground_processes") {
+        None => {}
+        Some(Value::Array(processes)) if processes.is_empty() => {}
+        _ => anyhow::bail!("Runtime still reports foreground work or unknown process evidence"),
+    }
+    let foreground_group = match info.get("foreground_process_group_id") {
+        None => None,
+        Some(Value::Number(number)) => Some(
+            number
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .filter(|v| *v > 0)
+                .context("Foreground process group is unknown")?,
+        ),
+        _ => anyhow::bail!("Foreground process group is unknown"),
+    };
+    // Only fixed host inspection, never commands or argv selected by the model.
     let output = tokio::time::timeout(
         Duration::from_secs(2),
         tokio::process::Command::new("/bin/ps")
-            .args(["-axo", "pid=,ppid=,pgid=,lstart=,comm="])
+            .args(["-axo", "pid=,ppid=,pgid=,stat="])
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output(),
@@ -131,40 +97,39 @@ async fn process_snapshot(info: &Value) -> Result<Value> {
     let mut rows = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let fields: Vec<_> = line.split_whitespace().collect();
-        ensure!(fields.len() >= 9, "Process inspection is incomplete");
+        ensure!(fields.len() == 4, "Process inspection is incomplete");
         let pid: i32 = fields[0].parse()?;
-        let parent: i32 = fields[1].parse()?;
-        let group: i32 = fields[2].parse()?;
-        let executable = fields[8..].join(" ");
-        let name = Path::new(&executable)
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("")
-            .trim_start_matches('-')
-            .to_owned();
+        if pid <= 0 {
+            continue;
+        }
+        let parent = fields[1].parse()?;
+        let group = fields[2].parse()?;
         let session = unsafe { libc::getsid(pid) };
+        let session_error = (session < 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        if session < 0
+            && (super::root_has_exited(Some(i64::from(pid)))
+                || confirmed_zombie(fields[3], session_error))
+        {
+            continue;
+        }
         rows.push(Process {
             pid,
             parent,
             group,
             session,
-            started: fields[3..8].join(" "),
-            name,
         });
     }
-    let census = process_census(root, &rows)?;
-    for process in foreground["foreground"]
-        .as_array()
-        .context("Foreground inspection is unavailable")?
-    {
-        ensure!(
-            census
-                .as_array()
-                .is_some_and(|rows| rows.iter().any(|p| p["pid"] == process["pid"])),
-            "Foreground process lineage changed"
-        );
-    }
-    Ok(json!({"foreground":foreground,"process_census":census}))
+    exited_census(root, foreground_group, &rows)?;
+    ensure!(
+        super::root_has_exited(Some(i64::from(root))),
+        "Original runtime PID is alive or reused"
+    );
+    Ok(
+        json!({"state":"verified_exited","pane_id":pane,"original_pid":root,
+        "foreground_group":foreground_group,"owned_lineage_absent":true}),
+    )
 }
 
 fn workspace_scope(pane: &Value, list: &Value) -> Result<Value> {
@@ -240,7 +205,13 @@ pub(crate) async fn inspect(
         json!({"pane_id":pane["pane_id"]}),
     )
     .await?;
-    process_snapshot(&info["process_info"]).await?;
+    process_snapshot(
+        &info["process_info"],
+        pane["pane_id"]
+            .as_str()
+            .context("Pane identity is unknown")?,
+    )
+    .await?;
     workspace_snapshot(config, &pane).await?;
     Ok(pane["pane_id"].clone())
 }
@@ -294,7 +265,13 @@ pub(crate) async fn prepare(
         json!({"pane_id":pane["pane_id"]}),
     )
     .await?;
-    let snapshot = process_snapshot(&info["process_info"]).await?;
+    let snapshot = process_snapshot(
+        &info["process_info"],
+        pane["pane_id"]
+            .as_str()
+            .context("Pane identity is unknown")?,
+    )
+    .await?;
     let scope = workspace_snapshot(config, &pane).await?;
     let fresh = super::rpc(config, "pane.get", json!({"pane_id":pane["pane_id"]})).await?;
     ensure!(
@@ -309,8 +286,15 @@ pub(crate) async fn prepare(
     )
     .await?;
     ensure!(
-        process_snapshot(&final_info["process_info"]).await? == snapshot,
-        "Foreground identity changed before close"
+        process_snapshot(
+            &final_info["process_info"],
+            pane["pane_id"]
+                .as_str()
+                .context("Pane identity is unknown")?
+        )
+        .await?
+            == snapshot,
+        "Process exit evidence changed before close"
     );
     ensure!(
         workspace_snapshot(config, &pane).await? == scope,
@@ -326,62 +310,141 @@ pub(crate) async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    fn command(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/bash");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+    #[tokio::test]
+    async fn finite_builtin_root_and_background_shell_are_never_idle_evidence() {
+        for script in [
+            "printf 'ready\\n'; end=$((SECONDS+2)); while ((SECONDS<end)); do :; done",
+            "(end=$((SECONDS+2)); while ((SECONDS<end)); do :; done) & printf 'ready\\n'; wait",
+        ] {
+            let mut child = command(script).spawn().unwrap();
+            let pid = child.id().unwrap();
+            let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+            assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("ready"));
+            let info = json!({"pane_id":"p","shell_pid":pid,"foreground_processes":[{"pid":pid,"name":"bash"}]});
+            let error = process_snapshot(&info, "p").await.unwrap_err().to_string();
+            assert!(error.contains("cannot prove a live shell is idle"));
+            child.wait().await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn exited_runtime_contract_requires_absence_and_rejects_malformed_or_reused_identity() {
+        let mut child = command("exit 0").spawn().unwrap();
+        let pid = child.id().unwrap();
+        child.wait().await.unwrap();
+        // Real 0.9.5 omits foreground_processes when its Vec is empty.
+        let info = json!({"pane_id":"p","shell_pid":pid});
+        assert_eq!(
+            process_snapshot(&info, "p").await.unwrap()["state"],
+            "verified_exited"
+        );
+        let mut explicit = info.clone();
+        explicit["foreground_processes"] = json!([]);
+        assert!(process_snapshot(&explicit, "p").await.is_ok());
+        for invalid in [
+            json!({}),
+            json!({"pane_id":"p"}),
+            json!({"pane_id":"other","shell_pid":pid}),
+            json!({"pane_id":"p","shell_pid":pid,"foreground_processes":null}),
+            json!({"pane_id":"p","shell_pid":std::process::id()}),
+        ] {
+            assert!(process_snapshot(&invalid, "p").await.is_err());
+        }
+    }
     #[test]
-    fn background_and_orphan_session_processes_veto_closure() {
-        let shell = Process {
-            pid: 10,
-            parent: 1,
-            group: 10,
-            session: 10,
-            started: "start".into(),
-            name: "zsh".into(),
-        };
-        assert!(process_census(10, std::slice::from_ref(&shell)).is_ok());
+    fn only_positive_zombie_state_resolves_a_missing_session_lookup() {
+        assert!(confirmed_zombie("Z", Some(libc::ESRCH)));
+        assert!(confirmed_zombie("Z+", Some(libc::ESRCH)));
+        assert!(!confirmed_zombie("S", Some(libc::ESRCH)));
+        assert!(!confirmed_zombie("Z", Some(libc::EPERM)));
+        assert!(!confirmed_zombie("", None));
+    }
+    #[test]
+    fn exited_root_cannot_hide_any_remaining_child_group_or_session_member() {
+        assert!(exited_census(10, None, &[]).is_ok());
         for process in [
+            Process {
+                pid: 10,
+                parent: 1,
+                group: 10,
+                session: 10,
+            },
             Process {
                 pid: 11,
                 parent: 10,
                 group: 11,
-                session: 10,
-                started: "start".into(),
-                name: "codex".into(),
+                session: 11,
             },
             Process {
                 pid: 12,
                 parent: 1,
                 group: 12,
                 session: 10,
-                started: "start".into(),
-                name: "agy".into(),
             },
             Process {
                 pid: 13,
-                parent: 10,
-                group: 13,
+                parent: 1,
+                group: 10,
+                session: 13,
+            },
+            Process {
+                pid: 14,
+                parent: 1,
+                group: 14,
                 session: -1,
-                started: "start".into(),
-                name: "sh".into(),
             },
         ] {
-            assert!(process_census(10, &[shell.clone(), process]).is_err());
+            assert!(exited_census(10, None, &[process]).is_err());
         }
-        assert!(process_census(99, &[shell]).is_err());
-    }
-    #[test]
-    fn shell_identity_cannot_be_missing_or_change_unnoticed() {
-        assert!(shell_snapshot(&json!({"foreground_processes":[]})).is_err());
-        assert!(shell_snapshot(&json!({"foreground_processes":[{"pid":2,"name":"zsh"}]})).is_err());
         assert!(
-            shell_snapshot(
-                &json!({"shell_pid":1,"foreground_processes":[{"pid":2,"name":"codex"}]})
+            exited_census(
+                10,
+                Some(20),
+                &[Process {
+                    pid: 21,
+                    parent: 1,
+                    group: 20,
+                    session: 21
+                }]
             )
             .is_err()
         );
-        assert_ne!(
-            shell_snapshot(&json!({"shell_pid":1,"foreground_processes":[{"pid":2,"name":"zsh"}]}))
-                .unwrap(),
-            shell_snapshot(&json!({"shell_pid":1,"foreground_processes":[{"pid":3,"name":"zsh"}]}))
-                .unwrap()
-        );
+    }
+    #[tokio::test]
+    async fn reaped_root_with_a_finite_remaining_session_child_is_preserved() {
+        // The owned job naturally exits. No kill, user pane or background service
+        // is involved, and the test waits until its session is genuinely empty.
+        let mut root=command(r#"(end=$((SECONDS+3)); while ((SECONDS<end)); do :; done) & printf '%s\n' "$!"; exit 0"#).spawn().unwrap();
+        let pid = root.id().unwrap();
+        let mut lines = BufReader::new(root.stdout.take().unwrap()).lines();
+        let job: u32 = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        root.wait().await.unwrap();
+        let info = json!({"pane_id":"p","shell_pid":pid});
+        assert!(process_snapshot(&info, "p").await.is_err());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while !super::super::root_has_exited(Some(i64::from(job)))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(super::super::root_has_exited(Some(i64::from(job))));
+        assert!(process_snapshot(&info, "p").await.is_ok());
     }
 }
