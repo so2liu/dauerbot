@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.5 — 2026-11-19
+
+### Added
+
+- Select, search and navigate native model choices with the keyboard. Keep model-list scrolling inside the picker, including at its boundaries. (#137, #139)
+- Resize the sidebar and retain its width; choose light, dark or system appearance, and use Cmd+K to find projects, sessions and settings. Align Agent tree disclosure and status columns. (#139, #140, #141)
+- Let managers explicitly select a supported CLI for delegation or steering through the existing cooperative handoff and delivery lock. Omitting the target preserves the current CLI. (#142)
+- Give managers scoped terminal text/key sequences and read-only screen inspection, while retaining generation, pause, Stop and takeover guards. (#143)
+- Inspect recorded manager model context in a read-only desktop panel, with bounded output and redaction of sensitive content. (#144)
+
+### Fixed
+
+- Drain an active manager step to a checkpoint boundary before upgrade handover. Defer activation and reopen admission when the bounded precommit drain cannot finish, preserving the active service and native worker. (#135)
+- Supervise native runtime observation failures after a completed CLI switch without replaying repair effects. Refresh model selection controls and distinguish requested models from observed models. (#136)
+- Make the native metadata test fixture independent of PATH-provided interpreters. (#138)
+
+### Changed
+
+- Advance both application crates to 0.6.5 and bundle build 23; keep API protocol 7 and the native three-tool interface.
+
 ## 0.6.4 — 2026-11-19
 
 ### Added
