@@ -133,6 +133,10 @@ impl Language {
             "Model controls are unavailable" => "模型控件暂不可用",
             "Model ID" => "模型 ID",
             "Provider (optional)" => "提供方（可选）",
+            "Search models or providers" => "搜索模型或提供方",
+            "No matching models. Enter an exact model ID below or clear the search." => {
+                "没有匹配的模型。可在下方输入精确模型 ID，或清空搜索。"
+            }
             "Use model ID" => "使用模型 ID",
             "Enter a model ID" => "请输入模型 ID",
             "Loading models…" => "正在加载模型…",
