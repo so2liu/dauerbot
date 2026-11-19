@@ -2119,6 +2119,7 @@ impl Render for Desktop {
         let visible = self.visible_project_ids(cx);
         let mut project_list = div()
             .id("sidebar-project-list")
+            .overflow_x_hidden()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -2275,6 +2276,7 @@ impl Render for Desktop {
                 .child(root_row);
             let mut group = div()
                 .id(SharedString::from(format!("project-tree-{id}")))
+                .w_full()
                 .flex()
                 .flex_col()
                 .min_w_0()
@@ -2321,6 +2323,7 @@ impl Render for Desktop {
                     }
                     let worker_row = div()
                         .id(SharedString::from(format!("coding-worker-{id}")))
+                        .w_full()
                         .h(px(28.))
                         .pl(px(worker_layout.left_padding))
                         .pr_2()
@@ -2337,7 +2340,7 @@ impl Render for Desktop {
                             palette,
                         ))
                         .child(
-                            div().flex_1().min_w_0().child(
+                            div().w(px(worker_layout.name_width)).flex_shrink_0().min_w_0().child(
                                 Button::new(SharedString::from(format!("open-worker-{id}")))
                                     .ghost()
                                     .xsmall()
@@ -2347,6 +2350,8 @@ impl Render for Desktop {
                                     .child(
                                         div()
                                             .w_full()
+                                            .min_w_0()
+                                            .truncate()
                                             .text_left()
                                             .text_size(px(12.))
                                             .child(self.tr("Coding worker")),
@@ -2399,6 +2404,7 @@ impl Render for Desktop {
                     );
                     let mut child = div()
                         .id(SharedString::from(format!("agent-{id}-{}", node.id)))
+                        .w_full()
                         .h(px(26.))
                         .min_w_0()
                         .pl(px(layout.left_padding))
@@ -2457,7 +2463,7 @@ impl Render for Desktop {
                         let observation = node.observation.clone();
                         let read_only = self.tr("Observed subagent · read only");
                         child = child.child(
-                            div().flex_1().min_w_0().child(
+                            div().w(px(layout.name_width)).flex_shrink_0().min_w_0().child(
                                 gpui_component::popover::Popover::new(SharedString::from(format!(
                                     "agent-details-{id}-{node_id}"
                                 )))
@@ -2513,7 +2519,8 @@ impl Render for Desktop {
                     } else {
                         child = child.child(
                             div()
-                                .flex_1()
+                                .w(px(layout.name_width))
+                                .flex_shrink_0()
                                 .min_w_0()
                                 .truncate()
                                 .text_size(px(12.))

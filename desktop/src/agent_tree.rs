@@ -281,6 +281,7 @@ pub struct RowLayout {
     pub elbow_y: f32,
     pub branch_column: f32,
     pub disclosure_width: f32,
+    pub name_width: f32,
 }
 
 pub fn row_layout(
@@ -300,9 +301,12 @@ pub fn row_layout(
     let compressed = ancestors.len() + 1 > capacity && !ancestors.is_empty();
     let elbow = capacity > usize::from(compressed);
     let visible = capacity.saturating_sub(usize::from(compressed) + usize::from(elbow));
+    let continuations = ancestors[ancestors.len().saturating_sub(visible)..].to_vec();
+    let connector_width = (continuations.len() + usize::from(compressed && capacity > 0)
+        + usize::from(elbow)) as f32 * 12.;
     RowLayout {
         expandable,
-        continuations: ancestors[ancestors.len().saturating_sub(visible)..].to_vec(),
+        continuations,
         compressed: compressed && capacity > 0,
         elbow,
         left_padding,
@@ -310,6 +314,9 @@ pub fn row_layout(
         elbow_y: height / 2.,
         branch_column: 12.,
         disclosure_width: 20.,
+        // Match the actual fixed columns and four 4px gaps in the rendered row.
+        // In particular, a popover trigger must not retain its intrinsic text width.
+        name_width: (width - left_padding - connector_width - 78.).max(0.),
     }
 }
 
@@ -382,6 +389,25 @@ mod tests {
     use super::{Node, Tree, project_target, row_layout};
     use serde_json::{Value, json};
     use std::collections::HashSet;
+
+    #[test]
+    fn long_names_are_bounded_before_the_fixed_status_column_at_every_depth() {
+        for width in [164., 208., 304., 404.] {
+            let mut previous = width;
+            for depth in 0..16 {
+                let layout = row_layout(&vec![true; depth], false, true, 26., width, 48.);
+                let name_left = layout.left_padding + layout.connector_width() + 20. + 18. + 12.;
+                let status_left = width - 8. - 16.;
+                let intrinsic_long_name = 1200_f32;
+                let painted_name_right = name_left + intrinsic_long_name.min(layout.name_width);
+                assert!(painted_name_right <= status_left - 4.);
+                assert_eq!(name_left + layout.name_width + 4., status_left);
+                assert!(layout.name_width <= previous);
+                assert!(layout.name_width >= 24.);
+                previous = layout.name_width;
+            }
+        }
+    }
 
     #[test]
     fn leaves_and_expandable_siblings_reserve_the_same_disclosure_column() {
