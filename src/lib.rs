@@ -15,6 +15,7 @@ mod group_ingress;
 pub mod handoff;
 pub mod herdr;
 pub mod manager;
+mod manager_close;
 pub mod manager_loop;
 pub mod mcp;
 pub mod model_control;

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_CHECKPOINT: usize = 2 * 1024 * 1024;
 const MAX_CONTENT: usize = 256 * 1024;
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 8] = [
     "read_file",
     "write_file",
     "delegate",
@@ -26,6 +26,7 @@ const TOOLS: [&str; 7] = [
     "steer_worker",
     "send_md",
     "send_file",
+    "close_agent",
 ];
 
 /// Only host-controlled diagnostics cross into durable state or user notices.
@@ -231,6 +232,11 @@ fn definitions() -> Vec<ToolDefinition> {
             "Send a project file through Feishu with an explicitly chosen discussion anchor.",
             json!({"to":{"type":"string"},"path":{"type":"string"},"reply_to_message_id":{"type":"string"}}),
             vec!["to", "path"],
+        ),
+        (
+            "Explicitly close an obsolete owned execution selected from worker_status. Never close automatically: verify task completion, give a reason, and retain unknown/current/live/referenced targets. Returns an audited refusal, verified closure or uncertain receipt.",
+            json!({"generation":{"type":"string"},"terminal_id":{"type":"string"},"reason":{"type":"string"},"task_finished":{"type":"boolean"}}),
+            vec!["generation", "terminal_id", "reason", "task_finished"],
         ),
     ];
     TOOLS.into_iter().zip(schemas).map(|(name,(description,properties,required))|ToolDefinition::new(name.try_into().expect("static tool name"),description,json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}))).collect()

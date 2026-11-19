@@ -206,7 +206,7 @@ def run_checks(h):
     assert not h.api(route + "/work")["runs"], "raw manager input was also dispatched to native CLI"
     assert "om_manager_write" in json.dumps(MODEL.requests[0]), "manager context omitted the trusted source message ID required for a topic reply"
     advertised = {t["function"]["name"] for t in MODEL.requests[0]["tools"]}
-    assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file"}, advertised
+    assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file", "close_agent"}, advertised
     h.checks.append("scripted model → bounded file write/read → real SDK topic outbox; no raw native delivery or Bash tool")
 
     MODEL.script(
