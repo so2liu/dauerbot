@@ -126,6 +126,17 @@ impl ModelCursor {
     }
 }
 
+/// GPUI applies the wheel delta before this containment step. Clamp that
+/// resulting offset and consume every wheel inside the list, including edges
+/// and lists too short to scroll. Outside events keep their normal behavior.
+fn contain_list_wheel(offset: Pixels, maximum: Pixels, inside: bool) -> (Pixels, bool) {
+    if inside {
+        (offset.clamp(-maximum.max(px(0.)), px(0.)), true)
+    } else {
+        (offset, false)
+    }
+}
+
 fn selection_enabled(project: &Value, catalog: &Value, busy: bool, catalog_error: bool) -> bool {
     !busy
         && !catalog_error
@@ -561,6 +572,22 @@ impl Render for ModelPicker {
                 .max_h(px(220.))
                 .overflow_y_scroll()
                 .track_scroll(&self.options_scroll)
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    // GPUI registers the native listener after this callback and
+                    // dispatches bubble listeners in reverse. It has already applied
+                    // the delta once; do not apply it again or scroll an ancestor.
+                    let offset = this.options_scroll.offset();
+                    let (y, consume) = contain_list_wheel(
+                        offset.y,
+                        this.options_scroll.max_offset().height,
+                        this.options_scroll.bounds().contains(&event.position),
+                    );
+                    if consume {
+                        this.options_scroll.set_offset(point(offset.x, y));
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
                 .flex()
                 .flex_col()
                 .gap_1();
@@ -747,8 +774,42 @@ impl Render for ModelPicker {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelCursor, matching_models, selection_enabled};
+    use super::{ModelCursor, contain_list_wheel, matching_models, selection_enabled};
+    use gpui::px;
     use serde_json::json;
+
+    #[test]
+    fn wheel_containment_clamps_native_offsets_and_consumes_at_both_edges() {
+        // Native GPUI has already added each delta to the list's offset.
+        assert_eq!(
+            contain_list_wheel(px(-30.), px(100.), true),
+            (px(-30.), true)
+        );
+        assert_eq!(contain_list_wheel(px(20.), px(100.), true), (px(0.), true));
+        assert_eq!(
+            contain_list_wheel(px(-140.), px(100.), true),
+            (px(-100.), true)
+        );
+        assert_eq!(contain_list_wheel(px(0.), px(100.), true), (px(0.), true));
+        assert_eq!(
+            contain_list_wheel(px(-100.), px(100.), true),
+            (px(-100.), true)
+        );
+    }
+
+    #[test]
+    fn wheel_containment_handles_empty_short_lists_and_preserves_outside_events() {
+        for maximum in [px(0.), px(-10.)] {
+            for offset in [px(-25.), px(0.), px(25.)] {
+                assert_eq!(contain_list_wheel(offset, maximum, true), (px(0.), true));
+            }
+        }
+        assert_eq!(
+            contain_list_wheel(px(-140.), px(100.), false),
+            (px(-140.), false)
+        );
+        assert_eq!(contain_list_wheel(px(20.), px(0.), false), (px(20.), false));
+    }
 
     #[test]
     fn cursor_wraps_and_hover_preserves_catalogue_identity() {
