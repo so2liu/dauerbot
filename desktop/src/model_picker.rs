@@ -1,5 +1,5 @@
 //! Native project model controls. HTTP work stays off the GPUI thread.
-use crate::locale::Language;
+use crate::{action_icons::ActionIcon, agent_tree, locale::Language};
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Selectable, Sizable,
@@ -452,29 +452,9 @@ impl ModelPicker {
     }
 }
 
-impl Render for ModelPicker {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ModelPicker {
+    pub fn trigger(&self, cx: &mut Context<Self>) -> Button {
         let palette = crate::ui_theme::palette(cx);
-        if std::mem::take(&mut self.clear_inputs) {
-            self.search
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.model
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.provider
-                .update(cx, |input, cx| input.set_value("", window, cx));
-        }
-        if self.input_language != self.language {
-            self.input_language = self.language;
-            self.model.update(cx, |input, cx| {
-                input.set_placeholder(self.language.text("Model ID"), window, cx)
-            });
-            self.provider.update(cx, |input, cx| {
-                input.set_placeholder(self.language.text("Provider (optional)"), window, cx)
-            });
-            self.search.update(cx, |input, cx| {
-                input.set_placeholder(self.language.text("Search models or providers"), window, cx)
-            });
-        }
         let supported = matches!(
             self.project["agent"].as_str(),
             Some("codex" | "claude" | "pi" | "agy")
@@ -519,55 +499,100 @@ impl Render for ModelPicker {
         } else {
             "Uses native CLI/session settings"
         };
+
+        let status = if pending {
+            "pending"
+        } else if self.catalog_error {
+            "error"
+        } else if busy
+            || (configured["model"].is_string() && !effective["model"].is_string())
+        {
+            "pending"
+        } else if effective["model"].is_string() {
+            "ready"
+        } else {
+            "unknown"
+        };
+        let title = self
+            .language
+            .text(if crate::manager_settings::enabled(&self.project) {
+                "Coding worker model"
+            } else {
+                "Model"
+            });
+        let label = self.language.text(label);
+        let caption = self.language.text(caption);
+        let display = if label == self.language.text("Native CLI/session settings") {
+            self.language.text("CLI default")
+        } else {
+            label.clone()
+        };
+        Button::new("choose-project-model")
+            .small()
+            .compact()
+            .h(px(28.))
+            .max_w_full()
+            .cursor_pointer()
+            .child(ActionIcon::Model.draw(palette.accent, 14.))
+            .child(control_label(display).max_w(px(92.)).truncate())
+            .child(agent_tree::status_dot(
+                status,
+                caption.clone(),
+                "model-confirmation".into(),
+                palette,
+            ))
+            .child(ActionIcon::Chevron.draw(palette.muted, 13.))
+            .tooltip(format!("{title} · {label}\n{caption}"))
+            .disabled(!supported)
+            .selected(self.open)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open = !this.open;
+                if this.open {
+                    this.cursor = ModelCursor::default();
+                    this.search.update(cx, |search, cx| {
+                        search.set_value("", window, cx);
+                        search.focus(window, cx);
+                    });
+                }
+                // Native catalogues and Feishu preferences can change without a
+                // new generation. Reopening must not reuse a stale snapshot.
+                if this.open && this.ticket.is_none() {
+                    this.request(None, cx);
+                }
+                cx.notify();
+            }))
+    }
+}
+
+impl Render for ModelPicker {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = crate::ui_theme::palette(cx);
+        if std::mem::take(&mut self.clear_inputs) {
+            self.search
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.model
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.provider
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        if self.input_language != self.language {
+            self.input_language = self.language;
+            self.model.update(cx, |input, cx| {
+                input.set_placeholder(self.language.text("Model ID"), window, cx)
+            });
+            self.provider.update(cx, |input, cx| {
+                input.set_placeholder(self.language.text("Provider (optional)"), window, cx)
+            });
+            self.search.update(cx, |input, cx| {
+                input.set_placeholder(self.language.text("Search models or providers"), window, cx)
+            });
+        }
+        let configured = &self.catalog["configured"];
+        let busy = self.ticket.is_some();
         let unavailable =
             self.project["paused"] == true || self.project["lifecycle"] == "taken_over";
         let can_choose = selection_enabled(&self.project, &self.catalog, busy, self.catalog_error);
-        let mut view = div().flex().flex_col().gap_2().min_w_0().child(
-            div()
-                .flex()
-                .items_center()
-                .flex_wrap()
-                .gap_2()
-                .child(
-                    Button::new("choose-project-model")
-                        .small()
-                        .text_size(px(13.))
-                        .max_w_full()
-                        .child(
-                            control_label(format!(
-                                "{}  ·  {}  ⌄",
-                                self.language.text("Model"),
-                                self.language.text(label)
-                            ))
-                            .w(px(200.))
-                            .truncate(),
-                        )
-                        .disabled(!supported)
-                        .selected(self.open)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open = !this.open;
-                            if this.open {
-                                this.cursor = ModelCursor::default();
-                                this.search.update(cx, |search, cx| {
-                                    search.set_value("", window, cx);
-                                    search.focus(window, cx);
-                                });
-                            }
-                            // Native catalogues and Feishu preferences can change without a
-                            // new generation. Reopening must not reuse a stale snapshot.
-                            if this.open && this.ticket.is_none() {
-                                this.request(None, cx);
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(palette.muted))
-                        .child(self.language.text(caption)),
-                ),
-        );
+        let mut view = div().flex().flex_col().gap_2().min_w_0();
         if self.open {
             let mut panel = div()
                 .rounded_lg()
@@ -590,21 +615,15 @@ impl Render for ModelPicker {
                                 .child(self.language.text("Choose model")),
                         )
                         .child(
-                            Button::new("reload-model-catalog")
-                                .small()
-                                .text_size(px(13.))
-                                .child(control_label(self.language.text("Refresh")))
+                            ActionIcon::Refresh
+                                .button(
+                                    "reload-model-catalog",
+                                    self.language.text("Refresh"),
+                                    palette.muted,
+                                )
                                 .disabled(busy)
                                 .on_click(cx.listener(|this, _, _, cx| this.request(None, cx))),
                         ),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(palette.muted))
-                        .child(self.language.text(
-                        "This project only. Native login and global CLI settings stay in place.",
-                    )),
                 );
             let mut options = div()
                 .id("native-model-options")

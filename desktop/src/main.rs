@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 mod access;
+mod action_icons;
 mod activation;
 mod agent_tree;
 mod backend;
@@ -16,6 +17,7 @@ mod terminal;
 mod ui_theme;
 mod updater;
 
+use action_icons::ActionIcon;
 use backend::{Backend, CommandRequest, Reply};
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -203,7 +205,7 @@ impl Desktop {
             cx.new(|cx| InputState::new(window, cx).placeholder(setup.language.text(placeholder)))
         };
         let name = input("For example: personal website", cx);
-        let project_search = input("Search projects · ⌘F", cx);
+        let project_search = input("Search projects", cx);
         cx.subscribe(&project_search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.move_project(0, cx);
@@ -268,6 +270,8 @@ impl Desktop {
         let project_tools = cx.new(|cx| project_tools::ProjectTools::new(backend.dir.clone(), cx));
         let model_picker =
             cx.new(|cx| model_picker::ModelPicker::new(backend.dir.clone(), window, cx));
+        cx.observe(&project_tools, |_, _, cx| cx.notify()).detach();
+        cx.observe(&model_picker, |_, _, cx| cx.notify()).detach();
         let manager_settings =
             cx.new(|cx| manager_settings::ManagerSettings::new(backend.dir.clone(), window, cx));
         let manager_context = cx.new(|cx| manager_context::ManagerContext::new(backend.dir.clone(), cx));
@@ -1319,43 +1323,50 @@ impl Desktop {
             .terminal
             .as_ref()
             .is_some_and(|bridge| bridge.controlling);
-        let mut header = div()
-            .min_h(px(52.))
-            .py_2()
-            .flex_wrap()
-            .flex_shrink_0()
-            .px_4()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .bg(rgb(0x202a35))
-            .child(
-                div().text_size(px(13.)).text_color(rgb(0xe8eeeb)).child(
-                    self.tr(if control {
-                        "You are in control"
-                    } else if self.state["projects"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|p| p["id"] == self.selected && manager_settings::enabled(p))
-                    {
-                        "Coding worker terminal"
-                    } else {
-                        "Live terminal"
-                    }),
-                ),
-            );
+        let foreground = 0xe8eeeb;
+        let muted = 0xa7b5c2;
+        let title = self.tr(
+            if self.state["projects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|project| project["id"] == self.selected && manager_settings::enabled(project))
+            {
+                "Coding worker terminal"
+            } else {
+                "Terminal"
+            },
+        );
+        let mut actions = div().flex().items_center().gap_1();
         if let Some(bridge) = &self.terminal {
             let project = bridge.descriptor.project_id.clone();
             let generation = bridge.descriptor.generation.clone();
-            header = header.child(
+            let label = self.tr(if control {
+                "Release control"
+            } else {
+                "Take control"
+            });
+            actions = actions.child(
                 Button::new("terminal-control")
-                    .child(control_label(self.tr(if control {
-                        "Release control"
+                    .small()
+                    .compact()
+                    .h(px(28.))
+                    .cursor_pointer()
+                    .when(control, |button| button.primary())
+                    .child(ActionIcon::Keyboard.draw(
+                        if control {
+                            self.palette().on_accent
+                        } else {
+                            self.palette().foreground
+                        },
+                        16.,
+                    ))
+                    .child(control_label(label.clone()))
+                    .tooltip(if control {
+                        label
                     } else {
-                        "Take control"
-                    })))
+                        self.tr("Viewing only · Take control to scroll app history")
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.takeover_requested = !control;
                         let _ = this.backend.tx.send(CommandRequest::Takeover {
@@ -1367,17 +1378,62 @@ impl Desktop {
                     })),
             );
         }
-        header = header.child(self.btn(
-            "collapse-terminal",
-            "Hide terminal",
-            |this, _, cx| {
-                this.setup.terminal_hidden = true;
-                this.release_terminal();
-                this.terminal_key.clear();
-                cx.notify();
-            },
-            cx,
-        ));
+        let header = div()
+            .h(px(40.))
+            .flex_shrink_0()
+            .px_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .bg(rgb(0x202a35))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(ActionIcon::Terminal.draw(foreground, 16.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(rgb(foreground))
+                            .child(title),
+                    )
+                    .when(control, |header| {
+                        header.child(
+                            div()
+                                .size(px(7.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(rgb(0xffcf89)),
+                        )
+                    }),
+            )
+            .child(
+                actions
+                    .child(
+                        ActionIcon::Refresh
+                            .button("reconnect-terminal", self.tr("Reconnect"), muted)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.release_terminal();
+                                this.terminal_key.clear();
+                                this.sync_terminal(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        ActionIcon::PanelRight
+                            .button("collapse-terminal", self.tr("Hide terminal"), muted)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.setup.terminal_hidden = true;
+                                this.release_terminal();
+                                this.terminal_key.clear();
+                                cx.notify();
+                            })),
+                    ),
+            );
         let mut panel = div()
             .size_full()
             .min_w_0()
@@ -1396,16 +1452,6 @@ impl Desktop {
                         .text_size(px(11.))
                         .text_color(rgb(0xffcf89))
                         .child(self.tr(&bridge.notice)),
-                );
-            }
-            if !control {
-                panel = panel.child(
-                    div()
-                        .px_4()
-                        .py_2()
-                        .text_size(px(11.))
-                        .text_color(rgb(0xa7b5c2))
-                        .child(self.tr("Viewing only · Take control to scroll app history")),
                 );
             }
         } else {
@@ -1446,21 +1492,82 @@ impl Desktop {
                     .child(self.terminal_error.clone()),
             );
         }
-        panel
-            .child(
-                Button::new("reconnect-terminal")
-                    .child(control_label(self.tr("Reconnect")))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.release_terminal();
-                        this.terminal_key.clear();
-                        this.sync_terminal(cx);
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
+        panel.into_any_element()
     }
-    fn workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar_toggle(&self, hidden: bool, cx: &mut Context<Self>) -> Button {
+        ActionIcon::Sidebar
+            .button(
+                "toggle-sidebar",
+                self.tr(if hidden {
+                    "Show sidebar"
+                } else {
+                    "Hide sidebar"
+                }),
+                self.palette().muted,
+            )
+            .tooltip_with_action(
+                self.tr(if hidden {
+                    "Show sidebar"
+                } else {
+                    "Hide sidebar"
+                }),
+                &ToggleSidebar,
+                Some("Dauerbot"),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))
+    }
+    fn language_toggle(&self, cx: &mut Context<Self>) -> Button {
+        ActionIcon::Language
+            .button(
+                "language",
+                if self.setup.language == Language::En {
+                    "简体中文"
+                } else {
+                    "English"
+                },
+                self.palette().muted,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.setup.language = this.setup.language.other();
+                this.go(this.setup.page);
+                this.name.update(cx, |input, cx| {
+                    input.set_placeholder(
+                        this.setup.language.text("For example: personal website"),
+                        window,
+                        cx,
+                    )
+                });
+                this.project_search.update(cx, |input, cx| {
+                    input.set_placeholder(this.setup.language.text("Search projects"), window, cx)
+                });
+                this.path.update(cx, |input, cx| {
+                    input.set_placeholder(
+                        this.setup
+                            .language
+                            .text("Leave empty to create a private project folder"),
+                        window,
+                        cx,
+                    )
+                });
+                this.secret.update(cx, |input, cx| {
+                    input.set_placeholder(
+                        this.setup.language.text("Stored only on this Mac"),
+                        window,
+                        cx,
+                    )
+                });
+                set_menus(this.setup.language, cx);
+                cx.notify();
+            }))
+    }
+    fn workspace(&self, sidebar_hidden: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette();
+        let top_actions = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.sidebar_toggle(sidebar_hidden, cx))
+            .when(sidebar_hidden, |row| row.child(self.language_toggle(cx)));
         let project = self.state["projects"].as_array().and_then(|projects| {
             projects
                 .iter()
@@ -1471,109 +1578,106 @@ impl Desktop {
                 .size_full()
                 .flex()
                 .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_4()
-                .p_8()
+                .child(top_actions)
                 .child(
                     div()
-                        .text_2xl()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(self.tr("No projects yet")),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(rgb(palette.muted))
-                        .child(self.tr("Add a project, then send instructions in Feishu.")),
-                )
-                .child(
-                    self.btn("first-project", "Add project", |this, _, _| this.go(5), cx)
-                        .primary(),
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .p_6()
+                        .child(ActionIcon::Brand.draw(palette.accent, 28.))
+                        .child(
+                            div()
+                                .text_size(px(17.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(self.tr("No projects yet")),
+                        )
+                        .child(
+                            self.btn("first-project", "Add project", |this, _, _| this.go(5), cx)
+                                .primary(),
+                        ),
                 )
                 .into_any_element();
         };
-        self.project_tools.update(cx, |tools, cx| {
-            tools.select(project, self.setup.language, cx)
+        let (cli, files) = self.project_tools.update(cx, |tools, cx| {
+            tools.select(project, self.setup.language, cx);
+            (tools.cli_trigger(cx), tools.file_actions(cx))
         });
-        self.model_picker.update(cx, |picker, cx| {
-            picker.select(project, self.setup.language, cx)
+        let model = self.model_picker.update(cx, |picker, cx| {
+            picker.select(project, self.setup.language, cx);
+            picker.trigger(cx)
         });
-        let manager_enabled = manager_settings::enabled(project);
+        let status = project_status(project);
         let timers = visible_timers(&self.timers);
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .gap_6()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(
-                                        project["name"].as_str().unwrap_or("Project").to_owned(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(palette.muted))
-                                    .child(self.tr("Your instructions, one message away.")),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .bg(rgb(palette.pill))
-                            .text_size(px(11.))
-                            .text_color(rgb(palette.muted))
-                            .child(self.tr(project_status(project))),
-                    ),
-            )
-            .child(
-                div()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(rgb(palette.line))
-                    .bg(rgb(palette.surface))
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(self.project_tools.clone())
-                    .child(
-                        div()
-                            .pt_3()
-                            .border_t_1()
-                            .border_color(rgb(palette.hover))
-                            .when(manager_enabled, |view| {
-                                view.child(
+        let content = div().flex().flex_col().gap_4().child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(top_actions)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(17.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(project["name"].as_str().unwrap_or("Project").to_owned()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_2()
+                                .py_1()
+                                .max_w(px(160.))
+                                .rounded_full()
+                                .bg(rgb(palette.pill))
+                                .child(agent_tree::status_dot(
+                                    status,
+                                    self.tr(status),
+                                    "workspace-project-status".into(),
+                                    palette,
+                                ))
+                                .child(
                                     div()
-                                        .mb_2()
+                                        .truncate()
                                         .text_size(px(11.))
                                         .text_color(rgb(palette.muted))
-                                        .child(self.tr("Coding worker model")),
-                                )
-                            })
-                            .child(self.model_picker.clone()),
-                    ),
-            );
+                                        .child(self.tr(status)),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .justify_between()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div().flex().flex_wrap().max_w_full().items_center().gap_1()
+                                .child(cli)
+                                .child(model),
+                        )
+                        .child(files),
+                )
+                .child(
+                    div().flex().flex_col()
+                        .child(self.project_tools.clone())
+                        .child(self.model_picker.clone()),
+                ),
+        );
         let mut schedules = div()
             .rounded_xl()
             .border_1()
@@ -1581,78 +1685,49 @@ impl Desktop {
             .bg(rgb(palette.surface))
             .overflow_hidden()
             .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(self.tr("Scheduled runs")),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(palette.pill))
-                                    .text_size(px(11.))
-                                    .text_color(rgb(palette.muted))
-                                    .child(timers.len().to_string()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(palette.muted))
-                            .child(self.tr("Managed in Feishu")),
-                    ),
+                div().px_4().py_2().flex().items_center().gap_2().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(ActionIcon::Clock.draw(palette.accent, 16.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(self.tr("Scheduled runs")),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(palette.pill))
+                                .text_size(px(11.))
+                                .text_color(rgb(palette.muted))
+                                .child(timers.len().to_string()),
+                        ),
+                ),
             );
         if timers.is_empty() {
             schedules = schedules.child(
                 div()
-                    .px_6()
-                    .py_8()
+                    .px_4()
+                    .py_5()
                     .border_t_1()
-                    .border_color(rgb(palette.hover))
+                    .border_color(rgb(palette.line))
                     .flex()
-                    .flex_col()
                     .items_center()
                     .gap_3()
-                    .child(
-                        div()
-                            .size(px(40.))
-                            .rounded_full()
-                            .bg(rgb(palette.pill))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xl()
-                            .text_color(rgb(palette.muted))
-                            .child("◷"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(self.tr("Nothing scheduled yet")),
-                    )
+                    .child(ActionIcon::Clock.draw(palette.muted, 20.))
                     .child(
                         div()
                             .text_size(px(13.))
                             .text_color(rgb(palette.muted))
-                            .child(self.tr(
+                            .child(self.tr("Nothing scheduled yet"))
+                            .child(div().text_size(px(11.)).child(self.tr(
                                 "Ask the Agent in Feishu to schedule something when you need it.",
-                    )),
+                            ))),
                     ),
             );
         }
@@ -1663,46 +1738,43 @@ impl Desktop {
                 &timer["next_fire"],
                 timer["timezone"].as_str().unwrap_or("UTC"),
             );
-            let mut details = div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .truncate()
-                        .child(timer["name"].as_str().unwrap_or("Scheduled run").to_owned()),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(palette.muted))
-                        .child(timer_description(&timer, self.setup.language)),
-                );
-            if !next.is_empty() && enabled {
-                details = details.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(palette.muted))
-                        .child(format!("{} · {next}", self.tr("Next run"))),
-                );
+            let timezone = timer["timezone"].as_str().unwrap_or("UTC");
+            let name = timer["name"].as_str().unwrap_or("Scheduled run");
+            let schedule = timer_description(&timer, self.setup.language);
+            let mut detail = format!("{name}\n{schedule} · {timezone}");
+            if let Some(cron) = timer["cron"]
+                .as_str()
+                .filter(|cron| !cron.is_empty() && *cron != schedule)
+            {
+                detail.push_str(&format!("\n{cron}"));
             }
+            let metadata = if enabled && !next.is_empty() && next != schedule {
+                detail.push_str(&format!("\n{} · {next}", self.tr("Next run")));
+                format!("{schedule} · {next}")
+            } else {
+                if !enabled {
+                    detail.push_str(&format!("\n{}", self.tr("paused")));
+                }
+                schedule
+            };
             schedules = schedules.child(
                 div()
+                    .id(SharedString::from(format!("schedule-row-{id}")))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
+                    })
                     .px_4()
-                    .py_4()
+                    .py_2()
                     .border_t_1()
-                    .border_color(rgb(palette.hover))
+                    .border_color(rgb(palette.line))
                     .flex()
                     .items_center()
                     .gap_3()
                     .child(
                         div()
-                            .size(px(30.))
-                            .rounded_lg()
+                            .size(px(28.))
+                            .flex_shrink_0()
+                            .rounded_md()
                             .bg(rgb(if enabled {
                                 palette.selected
                             } else {
@@ -1711,41 +1783,59 @@ impl Desktop {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(rgb(if enabled {
-                                palette.accent
+                            .child(if enabled {
+                                ActionIcon::Clock.draw(palette.accent, 16.)
                             } else {
-                                palette.muted
-                            }))
-                            .child("◷"),
+                                ActionIcon::Pause.draw(palette.muted, 16.)
+                            }),
                     )
-                    .child(details)
                     .child(
-                        Button::new(SharedString::from(format!("timer-{id}")))
-                            .small()
-                            .text_size(px(13.))
-                            .child(control_label(self.tr(if enabled {
-                                "Pause"
-                            } else {
-                                "Enable"
-                            })))
-                            .disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.api(
-                                    "POST",
-                                    format!("/timers/{id}/pause"),
-                                    Some(json!({"enabled":!enabled})),
-                                    "Schedule saved",
-                                );
-                                this.work_checked =
-                                    std::time::Instant::now() - Duration::from_secs(30);
-                                cx.notify();
-                            })),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(name.to_owned()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(palette.muted))
+                                    .child(metadata),
+                            ),
+                    )
+                    .child(
+                        (if enabled {
+                            ActionIcon::Pause
+                        } else {
+                            ActionIcon::Play
+                        })
+                        .button(
+                            SharedString::from(format!("timer-{id}")),
+                            self.tr(if enabled { "Pause" } else { "Enable" }),
+                            palette.muted,
+                        )
+                        .disabled(self.busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.api(
+                                "POST",
+                                format!("/timers/{id}/pause"),
+                                Some(json!({"enabled":!enabled})),
+                                "Schedule saved",
+                            );
+                            this.work_checked = std::time::Instant::now() - Duration::from_secs(30);
+                            cx.notify();
+                        })),
                     ),
             );
         }
-        content = content.child(schedules).child(div().text_size(px(11.)).text_color(rgb(palette.muted))
-            .child(self.tr("Send instructions in Feishu. New messages immediately steer the Agent, even while it is working.")));
-        content.into_any_element()
+        content.child(schedules).into_any_element()
     }
     fn workspace_layout(
         &mut self,
@@ -1757,30 +1847,41 @@ impl Desktop {
         let center = div()
             .id("scheduled-work")
             .size_full()
+            .min_w_0()
             .overflow_y_scroll()
-            .p_6()
+            .p_4()
             .bg(rgb(palette.canvas))
             .child(content);
         if self.setup.terminal_hidden {
+            let project = self.state["projects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|project| project["id"] == self.selected);
             return div()
                 .size_full()
                 .flex()
                 .child(center.flex_1())
                 .child(
                     div()
-                        .w(px(54.))
+                        .w(px(40.))
                         .h_full()
                         .flex_shrink_0()
                         .border_l_1()
                         .border_color(rgb(palette.line))
                         .bg(rgb(palette.surface))
-                        .pt_5()
+                        .pt_4()
                         .flex()
                         .flex_col()
                         .items_center()
                         .child(
-                            Button::new("expand-terminal")
-                                .child(control_label("›_"))
+                            ActionIcon::Terminal
+                                .button("expand-terminal", self.tr("Terminal"), palette.muted)
+                                .tooltip_with_action(
+                                    self.tr("Terminal"),
+                                    &ToggleTerminal,
+                                    Some("Dauerbot"),
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.setup.terminal_hidden = false;
                                     this.terminal_key.clear();
@@ -1788,13 +1889,15 @@ impl Desktop {
                                     cx.notify();
                                 })),
                         )
-                        .child(
-                            div()
-                                .mt_3()
-                                .text_size(px(11.))
-                                .text_color(rgb(palette.muted))
-                                .child(self.tr("Terminal")),
-                        ),
+                        .when_some(project, |rail, project| {
+                            let status = project_status(project);
+                            rail.child(agent_tree::status_dot(
+                                status,
+                                self.tr(status),
+                                "terminal-status".into(),
+                                palette,
+                            ))
+                        }),
                 )
                 .into_any_element();
         }
@@ -2057,7 +2160,7 @@ impl Render for Desktop {
                 .focusable()
                 .tab_index(0)
                 .border_1()
-                .border_color(rgb(palette.canvas))
+                .border_color(rgba(0x00000000))
                 .focus(|style| style.border_color(rgb(palette.accent)))
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                     if matches!(event.keystroke.key.as_str(), "enter" | "space") {
@@ -2066,23 +2169,19 @@ impl Render for Desktop {
                         cx.stop_propagation();
                     }
                 }))
-                .px_2()
-                .h(px(32.))
+                .flex_1()
+                .min_w_0()
+                .pr_2()
+                .h_full()
                 .rounded_md()
                 .cursor_pointer()
-                .bg(rgb(if selected {
-                    palette.selected
-                } else {
-                    palette.canvas
-                }))
-                .hover(|style| style.bg(rgb(palette.hover)))
                 .child(
                     div()
                         .flex()
                         .w_full()
                         .min_w_0()
                         .items_center()
-                        .gap_2()
+                        .gap_1p5()
                         .h_full()
                         .child(agent_tree::cli_icon(
                             if manager_enabled {
@@ -2118,7 +2217,14 @@ impl Render for Desktop {
                     this.go(6);
                     cx.notify();
                 }));
-            let root_layout = agent_tree::row_layout(&[], true, has_children, 32., f32::from(geometry.sidebar) - 16., 0.);
+            let root_layout = agent_tree::row_layout(
+                &[],
+                true,
+                has_children,
+                32.,
+                f32::from(geometry.sidebar) - 16.,
+                0.,
+            );
             let mut root_toggle = agent_tree::disclosure(&root_layout);
             if root_layout.expandable {
                 let scope = fold_scope.clone();
@@ -2145,19 +2251,47 @@ impl Render for Desktop {
                         })),
                 );
             }
-            let root = div().flex().items_center().w_full().min_w_0().child(root_toggle);
+            let root = div()
+                .flex()
+                .items_center()
+                .w_full()
+                .min_w_0()
+                .h(px(32.))
+                .pl_1()
+                .rounded_md()
+                .bg(rgb(if selected {
+                    palette.selected
+                } else {
+                    palette.canvas
+                }))
+                .hover(|style| {
+                    style.bg(rgb(if selected {
+                        palette.selected
+                    } else {
+                        palette.hover
+                    }))
+                })
+                .child(root_toggle)
+                .child(root_row);
             let mut group = div()
                 .id(SharedString::from(format!("project-tree-{id}")))
                 .flex()
                 .flex_col()
                 .min_w_0()
-                .child(root.child(div().flex_1().min_w_0().child(root_row)));
+                .child(root);
             if !root_folded {
                 let worker_folded = manager_enabled && folded.contains("worker");
                 if manager_enabled {
                     let scope = fold_scope.clone();
                     let terminal_project = id.clone();
-                    let worker_layout = agent_tree::row_layout(&[], true, !tree.nodes.is_empty(), 28., f32::from(geometry.sidebar) - 16., 28.);
+                    let worker_layout = agent_tree::row_layout(
+                        &[],
+                        true,
+                        !tree.nodes.is_empty(),
+                        28.,
+                        f32::from(geometry.sidebar) - 16.,
+                        28.,
+                    );
                     let mut worker_toggle = agent_tree::disclosure(&worker_layout);
                     if worker_layout.expandable {
                         worker_toggle = worker_toggle.child(
@@ -2175,7 +2309,8 @@ impl Render for Desktop {
                                     "Hide subagents"
                                 }))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let folded = this.folded_agents.entry(scope.clone()).or_default();
+                                    let folded =
+                                        this.folded_agents.entry(scope.clone()).or_default();
                                     if !folded.remove("worker") {
                                         folded.insert("worker".into());
                                     }
@@ -2207,6 +2342,8 @@ impl Render for Desktop {
                                     .ghost()
                                     .xsmall()
                                     .w_full()
+                                    .px_0()
+                                    .justify_start()
                                     .child(
                                         div()
                                             .w_full()
@@ -2234,7 +2371,14 @@ impl Render for Desktop {
                 }
                 for row in tree_rows.into_iter().filter(|_| !worker_folded) {
                     let node = row.node;
-                    let layout = agent_tree::row_layout(&row.branches, row.last, row.has_children, 26., f32::from(geometry.sidebar) - 16., if manager_enabled { 48. } else { 28. });
+                    let layout = agent_tree::row_layout(
+                        &row.branches,
+                        row.last,
+                        row.has_children,
+                        26.,
+                        f32::from(geometry.sidebar) - 16.,
+                        if manager_enabled { 48. } else { 28. },
+                    );
                     let node_id = node.id.clone();
                     let scope = fold_scope.clone();
                     let target = if tree.status == "observed" {
@@ -2301,7 +2445,7 @@ impl Render for Desktop {
                     child = child.child(disclosure).child(agent_tree::cli_icon(
                         &node.cli,
                         format!("agent-cli-{id}-{node_id}"),
-                            palette,
+                        palette,
                     ));
                     if target.is_none() {
                         let name = node.name.clone();
@@ -2324,6 +2468,7 @@ impl Render for Desktop {
                                     .ghost()
                                     .xsmall()
                                     .w_full()
+                                    .px_0()
                                     .justify_start()
                                     .h(px(24.))
                                     .tooltip(self.tr("View Agent details"))
@@ -2407,154 +2552,161 @@ impl Render for Desktop {
                     && project["execution"]["agent_tree"].is_object()
                     && tree.status != "observed"
                 {
+                    let detail = self.tr(if tree.status == "stale" {
+                        "Agent details may be out of date"
+                    } else {
+                        "Some Agent details are unavailable"
+                    });
                     group = group.child(
                         div()
-                            .pl(px(40.))
-                            .pr_2()
-                            .py_1()
-                            .text_size(px(10.))
-                            .text_color(rgb(palette.muted))
-                            .child(self.tr(if tree.status == "stale" {
-                                "Agent details may be out of date"
-                            } else {
-                                "Some Agent details are unavailable"
-                            })),
+                            .id(SharedString::from(format!("agent-observation-{id}")))
+                            .ml(px(40.))
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
+                            })
+                            .child(ActionIcon::Info.draw(palette.muted, 14.)),
                     );
                 }
             }
             project_list = project_list.child(group);
         }
         let sidebar = div()
-                .relative()
-                .w(geometry.sidebar)
-                .flex_shrink_0()
-                .h_full()
-                .flex()
-                .flex_col()
+            .relative()
+            .w(geometry.sidebar)
+            .flex_shrink_0()
+            .h_full()
+            .flex()
+            .flex_col()
             .bg(rgb(palette.canvas))
-                .border_r_1()
+            .border_r_1()
             .border_color(rgb(palette.line))
-                .child(
-                    div()
-                        .id("sidebar-resize")
-                        .absolute()
-                        .top_0()
-                        .right(px(-4.))
-                        .w(px(8.))
-                        .h_full()
-                        .cursor_col_resize()
-                        .on_drag(
-                            SidebarDrag {
-                                offset: Default::default(),
-                            },
-                            |drag, position, _, cx| {
-                                cx.stop_propagation();
-                                drag.offset.set(px(4.) - position.x);
-                                cx.new(|_| drag.clone())
-                            },
-                        )
-                        .on_drag_move(cx.listener(
-                            |this, event: &DragMoveEvent<SidebarDrag>, window, cx| {
-                                let wanted =
-                                    f32::from(event.event.position.x + event.drag(cx).offset.get());
-                                this.setup.sidebar_width = sidebar::SidebarWidth::from_drag(
-                                    wanted,
-                                    f32::from(window.viewport_size().width),
-                                );
-                                this.sidebar_resizing = true;
-                                cx.notify();
-                            },
-                        ))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, _| this.finish_sidebar_resize()),
-                        )
-                        .on_mouse_up_out(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, _| this.finish_sidebar_resize()),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(54.))
-                        .px_4()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .size(px(24.))
-                                .rounded_md()
-                            .bg(rgb(palette.accent))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(palette.on_accent))
-                                .child("D"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Dauerbot"),
-                        ),
-                )
-                .child(
-                    div()
-                        .px_5()
-                        .pt_3()
-                        .pb_2()
-                        .text_size(px(11.))
-                    .text_color(rgb(palette.muted))
-                        .child(self.tr("Projects")),
-                )
-                .child(
-                    div()
-                        .px_3()
-                        .pb_3()
-                        .child(Input::new(&self.project_search).small().text_size(px(13.))),
-                )
-                .child(project_list)
-                .when(visible.is_empty(), |view| {
-                    view.child(
-                        div()
-                            .px_4()
-                            .py_3()
-                            .text_size(px(11.))
-                        .text_color(rgb(palette.muted))
-                            .child(self.tr("No matching projects")),
+            .child(
+                div()
+                    .id("sidebar-resize")
+                    .absolute()
+                    .top_0()
+                    .right(px(-4.))
+                    .w(px(8.))
+                    .h_full()
+                    .cursor_col_resize()
+                    .on_drag(
+                        SidebarDrag {
+                            offset: Default::default(),
+                        },
+                        |drag, position, _, cx| {
+                            cx.stop_propagation();
+                            drag.offset.set(px(4.) - position.x);
+                            cx.new(|_| drag.clone())
+                        },
                     )
-                })
-                .child(
-                    div()
-                        .px_3()
-                        .py_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                    .child(self.btn("sidebar-add", "+ Add project", |this, _, _| this.go(5), cx))
+                    .on_drag_move(cx.listener(
+                        |this, event: &DragMoveEvent<SidebarDrag>, window, cx| {
+                            let wanted =
+                                f32::from(event.event.position.x + event.drag(cx).offset.get());
+                            this.setup.sidebar_width = sidebar::SidebarWidth::from_drag(
+                                wanted,
+                                f32::from(window.viewport_size().width),
+                            );
+                            this.sidebar_resizing = true;
+                            cx.notify();
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| this.finish_sidebar_resize()),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| this.finish_sidebar_resize()),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(42.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(ActionIcon::Brand.draw(palette.accent, 20.))
                     .child(
                         div()
-                            .pt_3()
-                            .border_t_1()
-                            .border_color(rgb(palette.hover))
-                        .child(self.btn(
-                                "sidebar-settings",
-                                "Settings",
-                                |this, _, _| this.go(8),
-                            cx,
-                            )),
-                    )
-                        .child(
-                            div()
-                                .px_2()
-                                .text_size(px(11.))
-                            .text_color(rgb(palette.muted))
-                                .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Dauerbot"),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.project_search)
+                                .small()
+                                .text_size(px(12.))
+                                .prefix(ActionIcon::Search.draw(palette.muted, 14.)),
                         ),
-                );
+                    )
+                    .child(
+                        ActionIcon::Plus
+                            .button("sidebar-add", self.tr("Add project"), palette.accent)
+                            .tooltip_with_action(
+                                self.tr("Add project"),
+                                &AddProject,
+                                Some("Dauerbot"),
+                            )
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.go(5);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(project_list.when(visible.is_empty(), |list| {
+                list.child(
+                    div()
+                        .p_2()
+                        .text_size(px(11.))
+                        .text_color(rgb(palette.muted))
+                        .child(self.tr("No matching projects")),
+                )
+            }))
+            .child(
+                div()
+                    .px_2()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(rgb(palette.line))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        ActionIcon::Settings
+                            .button("sidebar-settings", self.tr("Settings"), palette.muted)
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.go(8);
+                                cx.notify();
+                            })),
+                    )
+                    .child(self.language_toggle(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .pr_1()
+                            .text_right()
+                            .text_size(px(11.))
+                            .text_color(rgb(palette.muted))
+                            .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                    ),
+            );
         let content = match page {
             0 => self.welcome(cx),
             1 => self.bot(cx),
@@ -2562,13 +2714,15 @@ impl Render for Desktop {
             3 => self.events(cx),
             4 => self.permissions(cx),
             5 => self.project_form(cx),
-            6 => self.workspace(cx),
+            6 => self.workspace(geometry.sidebar_hidden, cx),
             7 => self.updates_page(cx).into_any_element(),
             _ => self.settings_page(cx),
         };
         let finder_allowed = self.finder_allowed();
         self.finder.update(cx, |finder, cx| {
-            if !finder_allowed { finder.dismiss(window, cx); }
+            if !finder_allowed {
+                finder.dismiss(window, cx);
+            }
             finder.sync(&self.state, self.setup.language, cx)
         });
         div()
@@ -2613,34 +2767,23 @@ impl Render for Desktop {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .h(px(54.))
-                            .px_6()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(rgb(palette.line))
-                            .text_size(px(11.))
-                            .text_color(rgb(palette.muted))
-                            .child(div().flex().items_center().gap_3()
-                                .child(Button::new("toggle-sidebar").small().text_size(px(13.)).child(control_label(self.tr(if geometry.sidebar_hidden { "Show sidebar" } else { "Hide sidebar" })))
-                                    .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx))))
-                                .child(self.tr(if page == 6 { "Projects" } else { STEPS[page] })))
-                            .child(Button::new("language").child(control_label(if self.setup.language == Language::En { "简体中文" } else { "English" })).on_click(cx.listener(|this, _, window, cx| {
-                                this.setup.language = this.setup.language.other();
-                                this.go(this.setup.page);
-                                this.name.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("For example: personal website"), window, cx));
-                                this.project_search.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Search projects · ⌘F"), window, cx));
-                                this.path.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Leave empty to create a private project folder"), window, cx));
-                                this.secret.update(cx, |input, cx| input.set_placeholder(this.setup.language.text("Stored only on this Mac"), window, cx));
-                                set_menus(this.setup.language, cx);
-                                cx.notify();
-                            }))),
-                    )
+                    .when(page != 6, |view| {
+                        view.child(
+                            div()
+                                .h(px(42.))
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .border_b_1()
+                                .border_color(rgb(palette.line))
+                                .child(self.sidebar_toggle(geometry.sidebar_hidden, cx))
+                                .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(self.tr(STEPS[page])))
+                                .when(geometry.sidebar_hidden, |row| row.child(self.language_toggle(cx))),
+                        )
+                    })
                     .child(if page == 6 {
-                        self.workspace_layout(content, geometry, cx)
+                        div().flex_1().min_h_0().child(self.workspace_layout(content, geometry, cx)).into_any_element()
                     } else {
                         div()
                             .id(("content-scroll", page))
@@ -2676,16 +2819,26 @@ impl Render for Desktop {
                             )
                             .into_any_element()
                     })
-                    .child(
-                        div()
-                            .px_6()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(rgb(palette.line))
-                            .text_size(px(11.))
-                            .text_color(rgb(if self.error { palette.error } else { palette.muted }))
-                            .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
-                    ),
+                    .when(
+                        page != 6
+                            || self.connection_error.is_some()
+                            || self.error
+                            || !matches!(self.notice.as_str(), ""
+                                | "Local service ready. Connect a bot or create a local project."
+                                | "Local service connection restored"),
+                        |view| {
+                            view.child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .border_t_1()
+                                    .border_color(rgb(palette.line))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if self.error || self.connection_error.is_some() { palette.error } else { palette.muted }))
+                                    .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
+                            )
+                        },
+                    )
             ).child(self.finder.clone()).into_any_element()
     }
 }
@@ -2730,7 +2883,7 @@ fn visible_timers(value: &Value) -> Vec<Value> {
 }
 fn timer_description(timer: &Value, language: Language) -> String {
     let timezone = timer["timezone"].as_str().unwrap_or("UTC");
-    let schedule = match timer["kind"].as_str().unwrap_or("") {
+    match timer["kind"].as_str().unwrap_or("") {
         "once" => timer_time(&timer["at"], timezone),
         "interval" => {
             let seconds = timer["interval_seconds"].as_u64().unwrap_or(0);
@@ -2766,8 +2919,7 @@ fn timer_description(timer: &Value, language: Language) -> String {
                 cron.to_owned()
             }
         }
-    };
-    format!("{schedule} · {timezone}")
+    }
 }
 fn connection_status(status: &str) -> &str {
     match status {

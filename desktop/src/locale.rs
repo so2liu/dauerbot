@@ -149,7 +149,8 @@ impl Language {
 
             "Show sidebar" => "显示侧栏",
             "Hide sidebar" => "隐藏侧栏",
-            "Search projects · ⌘F" => "搜索项目 · ⌘F",
+            "Search projects" => "搜索项目",
+            "CLI default" => "CLI 默认",
             "No matching projects" => "没有匹配的项目",
             "Reveal folder" => "在访达中显示",
             "Copy path" => "复制路径",

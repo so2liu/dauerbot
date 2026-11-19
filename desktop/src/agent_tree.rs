@@ -12,7 +12,7 @@ impl AssetSource for Assets {
             "cli/pi.svg" => include_bytes!("../assets/cli-icons/pi.svg"),
             "cli/agy.svg" => include_bytes!("../assets/cli-icons/antigravity.svg"),
             "cli/custom.svg" => include_bytes!("../assets/cli-icons/agent.svg"),
-            _ => return Ok(None),
+            _ => return Ok(crate::action_icons::asset(path).map(Cow::Borrowed)),
         };
         Ok(Some(Cow::Borrowed(bytes)))
     }
