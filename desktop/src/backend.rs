@@ -12,14 +12,17 @@ use std::{
     time::Duration,
 };
 
-pub enum DesktopPreferences {
+enum DesktopPreferences {
     Save(Vec<u8>),
     Flush(mpsc::Sender<()>),
 }
 
 fn apply_desktop_preferences(dir: &std::path::Path, request: DesktopPreferences) -> Result<()> {
     match request {
-        DesktopPreferences::Save(bytes) => config::write_private(&dir.join("desktop.json"), &bytes),
+        DesktopPreferences::Save(bytes) => {
+            config::private_dir(dir)?;
+            config::write_private(&dir.join("desktop.json"), &bytes)
+        }
         DesktopPreferences::Flush(done) => {
             let _ = done.send(());
             Ok(())
@@ -27,8 +30,27 @@ fn apply_desktop_preferences(dir: &std::path::Path, request: DesktopPreferences)
     }
 }
 
+fn start_desktop_preferences(
+    dir: PathBuf,
+    replies: mpsc::Sender<Reply>,
+) -> (
+    mpsc::Sender<DesktopPreferences>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, requests) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for request in requests {
+            if let Err(error) = apply_desktop_preferences(&dir, request) {
+                let _ = replies.send(Reply::Error(format!(
+                    "Could not save desktop preferences: {error}"
+                )));
+            }
+        }
+    });
+    (tx, worker)
+}
+
 pub enum CommandRequest {
-    DesktopPreferences(DesktopPreferences),
     Api {
         method: &'static str,
         path: String,
@@ -95,6 +117,7 @@ pub enum Reply {
 }
 
 pub struct Backend {
+    preferences: mpsc::Sender<DesktopPreferences>,
     pub tx: mpsc::Sender<CommandRequest>,
     pub rx: mpsc::Receiver<Reply>,
     pub dir: PathBuf,
@@ -118,13 +141,16 @@ impl Backend {
         });
         receiver
     }
-    /// A FIFO barrier lets pending local preferences reach disk before a normal exit.
+    pub fn save_preferences(&self, bytes: Vec<u8>) {
+        let _ = self.preferences.send(DesktopPreferences::Save(bytes));
+    }
+    /// The independent FIFO is unaffected by slow daemon/network requests.
     pub fn flush_preferences_before_exit(&self) -> flume::Receiver<()> {
         let (done, receiver) = flume::bounded(1);
         let (acknowledge, acknowledged) = mpsc::channel();
-        let _ = self.tx.send(CommandRequest::DesktopPreferences(
-            DesktopPreferences::Flush(acknowledge),
-        ));
+        let _ = self
+            .preferences
+            .send(DesktopPreferences::Flush(acknowledge));
         std::thread::spawn(move || {
             let _ = acknowledged.recv_timeout(Duration::from_secs(3));
             let _ = done.send(());
@@ -141,6 +167,7 @@ impl Backend {
         let candidate_ready = candidate.as_ref().map(|candidate| candidate.2.clone());
         let (tx, requests) = mpsc::channel();
         let (replies, rx) = mpsc::channel();
+        let (preferences, _) = start_desktop_preferences(dir.clone(), replies.clone());
         let startup_updates = Arc::new(AtomicBool::new(false));
         let update_ready = startup_updates.clone();
         let updates = crate::updater::start(
@@ -203,11 +230,6 @@ impl Backend {
                 let mut lease_checked = std::time::Instant::now();
                 loop {
                     match requests.recv_timeout(Duration::from_millis(1200)) {
-                        Ok(CommandRequest::DesktopPreferences(preferences)) => {
-                            if let Err(error) = apply_desktop_preferences(&data, preferences) {
-                                let _ = replies.send(Reply::Error(error.to_string()));
-                            }
-                        }
                         Ok(CommandRequest::Update(action)) => {
                             let retry = async {
                                 let executable = std::env::current_exe()?.with_file_name("hfb");
@@ -356,6 +378,7 @@ impl Backend {
             }
         });
         Self {
+            preferences,
             tx,
             rx,
             dir,
@@ -1013,19 +1036,33 @@ mod connection_tests {
 
 #[cfg(test)]
 mod desktop_preference_tests {
-    use super::{DesktopPreferences, apply_desktop_preferences};
+    use super::{DesktopPreferences, start_desktop_preferences};
     use std::{os::unix::fs::PermissionsExt, sync::mpsc, time::Duration};
+
+    #[test]
+    fn preference_write_failure_is_reported_without_blocking_the_flush() {
+        let data = tempfile::tempdir().unwrap();
+        let blocked = data.path().join("not-a-directory");
+        std::fs::write(&blocked, b"fixture").unwrap();
+        let (replies, errors) = mpsc::channel();
+        let (tx, worker) = start_desktop_preferences(blocked, replies);
+        tx.send(DesktopPreferences::Save(b"{}".to_vec())).unwrap();
+        let (done, acknowledged) = mpsc::channel();
+        tx.send(DesktopPreferences::Flush(done)).unwrap();
+        acknowledged.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            matches!(errors.recv_timeout(Duration::from_secs(3)).unwrap(), super::Reply::Error(message) if message.starts_with("Could not save desktop preferences:"))
+        );
+        drop(tx);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn queued_preferences_are_ordered_private_and_flushed_before_exit() {
         let data = tempfile::tempdir().unwrap();
         let dir = data.path().to_owned();
-        let (tx, rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            for request in rx {
-                apply_desktop_preferences(&dir, request).unwrap();
-            }
-        });
+        let (replies, errors) = mpsc::channel();
+        let (tx, worker) = start_desktop_preferences(dir, replies);
         tx.send(DesktopPreferences::Save(
             br#"{"sidebar_width":224}"#.to_vec(),
         ))
@@ -1043,6 +1080,7 @@ mod desktop_preference_tests {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert!(errors.try_recv().is_err());
         drop(tx);
         worker.join().unwrap();
     }

@@ -516,6 +516,7 @@ impl Desktop {
         if self.quitting {
             return;
         }
+        self.finish_sidebar_resize();
         self.quitting = true;
         let pending = self
             .terminal
@@ -528,20 +529,15 @@ impl Desktop {
                 )
             });
         self.release_terminal();
-        if let Some(pending) = pending {
-            cx.spawn(async move |_, cx| {
+        let preferences = self.backend.flush_preferences_before_exit();
+        cx.spawn(async move |_, cx| {
+            if let Some(pending) = pending {
                 let _ = pending.recv_async().await;
-                let _ = cx.update(|cx| cx.quit());
-            })
-            .detach();
-        } else {
-            let pending = self.backend.flush_preferences_before_exit();
-            cx.spawn(async move |_, cx| {
-                let _ = pending.recv_async().await;
-                let _ = cx.update(|cx| cx.quit());
-            })
-            .detach();
-        }
+            }
+            let _ = preferences.recv_async().await;
+            let _ = cx.update(|cx| cx.quit());
+        })
+        .detach();
     }
     fn sync_terminal(&mut self, _: &mut Context<Self>) {
         if self.setup.page != 6 || self.setup.terminal_hidden {
@@ -706,9 +702,7 @@ impl Desktop {
         }
         self.setup.page = page.min(8);
         if let Ok(bytes) = serde_json::to_vec(&self.setup) {
-            let _ = self.backend.tx.send(CommandRequest::DesktopPreferences(
-                backend::DesktopPreferences::Save(bytes),
-            ));
+            self.backend.save_preferences(bytes);
         }
     }
     fn api(&mut self, method: &'static str, path: String, body: Option<Value>, message: &str) {
