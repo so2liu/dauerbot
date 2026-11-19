@@ -1257,7 +1257,7 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
     } else {
         i64::MAX
     };
-    let diagnostic = json!({"incident_id":incident,"attempt":attempts,"kind":error.kind,"http_status":error.http_status,"retryable":error.retryable,"elapsed_ms":error.elapsed_ms,"output_tokens":error.output_tokens,"output_budget":error.output_budget,"finish_reason":error.finish_reason,"failed_at":db::now(),"next_attempt_at":if error.retryable{Some(next_attempt)}else{None}}).to_string();
+    let diagnostic = json!({"incident_id":incident,"attempt":attempts,"kind":error.kind,"http_status":error.http_status,"retryable":error.retryable,"elapsed_ms":error.elapsed_ms,"output_tokens":error.output_tokens,"finish_reason":error.finish_reason,"failed_at":db::now(),"next_attempt_at":if error.retryable{Some(next_attempt)}else{None}}).to_string();
     tx.execute("INSERT INTO manager_failures(project_id,revision,incident_id,attempts,diagnostic,notified) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision,incident_id=excluded.incident_id,attempts=excluded.attempts,diagnostic=excluded.diagnostic,notified=excluded.notified,repair_probe=CASE WHEN manager_failures.incident_id=excluded.incident_id THEN manager_failures.repair_probe ELSE 0 END",params![ctx.project,ctx.revision,incident,attempts,diagnostic,notified])?;
     tx.execute(
         "UPDATE manager_runs SET error=json_set(CASE WHEN json_valid(error) THEN error ELSE '{}' END,'$.last_failure',json(?)) WHERE id=?",
@@ -1508,7 +1508,7 @@ mod tests {
             })
             .unwrap();
         let mut corrected = next.checkpoint.clone();
-        corrected["last_correction"] = json!({"kind":"invalid_response","http_status":200,"retryable":false,"elapsed_ms":21000,"output_tokens":4096,"output_budget":4096,"finish_reason":"length"});
+        corrected["last_correction"] = json!({"kind":"invalid_response","http_status":200,"retryable":false,"elapsed_ms":21000,"output_tokens":4096,"finish_reason":"length"});
         checkpoint(&app, &next.context, &corrected, false)
             .await
             .unwrap();

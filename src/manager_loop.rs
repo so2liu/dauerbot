@@ -37,7 +37,6 @@ pub struct Failure {
     pub retryable: bool,
     pub elapsed_ms: u64,
     pub output_tokens: Option<u64>,
-    pub output_budget: Option<u64>,
     pub finish_reason: Option<String>,
 }
 impl Failure {
@@ -63,7 +62,6 @@ impl Failure {
             retryable: true,
             elapsed_ms: 0,
             output_tokens: None,
-            output_budget: None,
             finish_reason: None,
         }
     }
@@ -74,7 +72,6 @@ impl Failure {
             retryable: false,
             elapsed_ms: 0,
             output_tokens: None,
-            output_budget: None,
             finish_reason: None,
         }
     }
@@ -85,7 +82,6 @@ impl Failure {
             retryable: false,
             elapsed_ms: 0,
             output_tokens: None,
-            output_budget: None,
             finish_reason: None,
         }
     }
@@ -117,7 +113,6 @@ impl Failure {
             retryable: !context && report.retryable,
             elapsed_ms: 0,
             output_tokens: None,
-            output_budget: None,
             finish_reason: None,
         }
     }
@@ -195,15 +190,10 @@ struct Checkpoint {
     system: String,
     run: AgentRun,
     pending: AgentRunStep,
-    #[serde(default = "initial_output_budget")]
-    output_budget: u64,
     #[serde(default)]
     correction_used: bool,
     #[serde(default)]
     last_correction: Option<Failure>,
-}
-fn initial_output_budget() -> u64 {
-    4096
 }
 fn definitions() -> Vec<ToolDefinition> {
     let schemas = [
@@ -253,18 +243,19 @@ fn encode(state: &Checkpoint) -> Result<Value> {
     );
     Ok(serde_json::from_slice(&bytes)?)
 }
-fn decode(value: Value) -> Result<Checkpoint> {
+fn decode(mut value: Value) -> Result<Checkpoint> {
     ensure!(
         serde_json::to_vec(&value)?.len() <= MAX_CHECKPOINT,
         "Manager checkpoint is too large"
     );
+    // Format 1 checkpoints from earlier releases may carry a retired local
+    // output cap. Discard it rather than applying or re-encoding any limit.
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("output_budget");
+    }
     let mut state: Checkpoint = serde_json::from_value(value)?;
     state.run = state.run.max_invalid_tool_call_retries(1);
     ensure!(state.format == 1, "Unsupported manager checkpoint version");
-    ensure!(
-        matches!(state.output_budget, 4096 | 8192),
-        "Unsupported manager output budget"
-    );
     Ok(state)
 }
 pub fn begin(input: String, system: String) -> Result<Value> {
@@ -283,7 +274,6 @@ pub fn begin(input: String, system: String) -> Result<Value> {
         system,
         run,
         pending,
-        output_budget: initial_output_budget(),
         correction_used: false,
         last_correction: None,
     })
@@ -371,8 +361,7 @@ pub async fn advance(
     let request = CompletionRequest::new(prompt)
         .messages(history)
         .preamble(&system)
-        .tools(definitions)
-        .max_tokens(state.output_budget);
+        .tools(definitions);
     let client = OpenAIConfig::new(config.api_key.clone())
         .with_base_url(&config.base_url)
         .client();
@@ -397,18 +386,14 @@ pub async fn advance(
     if response.finish_reason() == Some(FinishReason::Length) {
         let mut error = Failure::invalid_response().elapsed(started);
         error.output_tokens = response.usage.output_tokens;
-        error.output_budget = Some(state.output_budget);
         error.finish_reason = Some("length".into());
-        if state.correction_used || state.output_budget >= 8192 {
-            return Err(error.into());
-        }
-        // No part of a truncated turn may execute. Retry the same pending
-        // model request once with room for reasoning plus valid tool JSON.
-        return corrected(&mut state, error);
+        // The provider ended this output early. Do not execute any sibling
+        // tool or replay the same request; the host retains input and repairs.
+        return Err(error.into());
     }
     if response.choice.iter().any(|part| matches!(part,AssistantContent::ToolCall(call) if call.function.invalid_arguments.is_some())) {
         let mut error=Failure::invalid_response().elapsed(started);
-        error.output_tokens=response.usage.output_tokens;error.output_budget=Some(state.output_budget);error.finish_reason=Some("invalid_tool_arguments".into());
+        error.output_tokens=response.usage.output_tokens;error.finish_reason=Some("invalid_tool_arguments".into());
         if state.correction_used { return Err(error.into()); }
         return corrected(&mut state,error);
     }
@@ -422,7 +407,6 @@ pub async fn advance(
     if matches!(outcome, ModelTurnOutcome::NeedsResolution(_)) {
         let mut error = Failure::invalid_response().elapsed(started);
         error.output_tokens = response.usage.output_tokens;
-        error.output_budget = Some(state.output_budget);
         error.finish_reason = Some("invalid_tool_call".into());
         if state.correction_used {
             return Err(error.into());
@@ -443,7 +427,6 @@ pub async fn advance(
     step(state, true)
 }
 fn corrected(state: &mut Checkpoint, error: Failure) -> Result<LoopStep> {
-    state.output_budget = 8192;
     state.correction_used = true;
     state.last_correction = Some(error);
     Ok(LoopStep {
@@ -506,6 +489,7 @@ mod tests {
     #[derive(Clone)]
     struct Fixture {
         requests: Arc<AtomicUsize>,
+        corrective_requests: Arc<AtomicUsize>,
         script: Arc<Vec<Value>>,
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -517,6 +501,7 @@ mod tests {
     ) -> (ProviderConfig, Fixture, tokio::task::JoinHandle<()>) {
         let fixture = Fixture {
             requests: Arc::new(AtomicUsize::new(0)),
+            corrective_requests: Arc::new(AtomicUsize::new(0)),
             script: Arc::new(script),
             started: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
@@ -540,22 +525,26 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(names, TOOLS);
             assert!(!body.to_string().contains("private-fixture-secret"));
+            if body["messages"].as_array().unwrap().iter().any(|message| {
+                message["role"] == "system"
+                    && message["content"]
+                        .to_string()
+                        .contains("<management_response_feedback>")
+            }) {
+                f.corrective_requests.fetch_add(1, Ordering::SeqCst);
+            }
             let n = f.requests.fetch_add(1, Ordering::SeqCst);
             f.started.notify_one();
             if f.hold {
                 f.release.notified().await;
             }
-            let mut response = f.script[n].clone();
-            if let Some(budget) = response
-                .get("fixture_expected_budget")
-                .and_then(Value::as_u64)
-            {
-                assert_eq!(body["max_tokens"], budget);
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("fixture_expected_budget");
+            for field in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                assert!(
+                    body.get(field).is_none(),
+                    "Unexpected output-token parameter: {field}"
+                );
             }
+            let response = f.script[n].clone();
             if response["fixture_error"] == true {
                 return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -708,7 +697,7 @@ mod tests {
         let _ = server.await;
     }
     #[tokio::test]
-    async fn truncated_response_retries_once_with_more_budget_without_exposing_any_tools() {
+    async fn provider_length_is_finite_without_executing_any_tool_or_replaying_the_request() {
         let mut truncated = answer(
             Value::Null,
             json!([
@@ -717,48 +706,72 @@ mod tests {
             ]),
         );
         truncated["choices"][0]["finish_reason"] = json!("length");
-        truncated["usage"]["completion_tokens"] = json!(4096);
-        truncated["fixture_expected_budget"] = json!(4096);
-        let mut complete = answer(json!("recovered"), Value::Null);
-        complete["fixture_expected_budget"] = json!(8192);
-        let (config, f, server) = fixture(vec![truncated.clone(), complete], false).await;
-        let mut old = begin("input".into(), "system".into()).unwrap();
-        for field in ["output_budget", "correction_used", "last_correction"] {
-            old.as_object_mut().unwrap().remove(field);
-        }
-        let step = advance(&config, old, CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(matches!(step.action, LoopAction::Continue));
-        assert!(!step.model_responded);
-        assert_eq!(
-            step.checkpoint["last_correction"]["finish_reason"],
-            "length"
-        );
-        let next = advance(&config, step.checkpoint, CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(matches!(next.action,LoopAction::Done(ref text) if text=="recovered"));
-        assert!(next.model_responded);
-        assert_eq!(f.requests.load(Ordering::SeqCst), 2);
-        server.abort();
-        let _ = server.await;
-        truncated["fixture_expected_budget"] = json!(8192);
+        truncated["usage"]["completion_tokens"] = json!(17000);
         let (config, f, server) = fixture(vec![truncated], false).await;
-        let mut checkpoint = begin("input".into(), "system".into()).unwrap();
-        checkpoint["output_budget"] = json!(8192);
-        checkpoint["correction_used"] = json!(true);
-        let error = advance(&config, checkpoint, CancellationToken::new())
-            .await
-            .err()
-            .unwrap();
+        let error = advance(
+            &config,
+            begin("input".into(), "system".into()).unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .unwrap();
         let error = error.downcast_ref::<Failure>().unwrap();
         assert_eq!(error.kind, "invalid_response");
         assert_eq!(error.http_status, Some(200));
         assert!(!error.retryable);
+        assert_eq!(error.finish_reason.as_deref(), Some("length"));
+        assert_eq!(error.output_tokens, Some(17000));
         assert_eq!(f.requests.load(Ordering::SeqCst), 1);
         server.abort();
         let _ = server.await;
+    }
+    #[tokio::test]
+    async fn legacy_checkpoint_caps_are_ignored_for_initial_and_followup_requests() {
+        for cap in [4096, 8192] {
+            let call = json!([{"id":"read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"HANDOFF.md\"}"}}]);
+            let (config, f, server) = fixture(
+                vec![
+                    answer(Value::Null, call),
+                    answer(json!("finished"), Value::Null),
+                ],
+                false,
+            )
+            .await;
+            let mut old = begin("input".into(), "system".into()).unwrap();
+            old["output_budget"] = json!(cap);
+            old["correction_used"] = json!(cap == 8192);
+            let mut old_diagnostic = serde_json::to_value(Failure::invalid_response()).unwrap();
+            old_diagnostic["output_budget"] = json!(cap);
+            old["last_correction"] = old_diagnostic;
+            let step = advance(&config, old, CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(step.checkpoint.get("output_budget").is_none());
+            assert!(
+                step.checkpoint["last_correction"]
+                    .get("output_budget")
+                    .is_none()
+            );
+            let LoopAction::Tools(calls) = step.action else {
+                panic!("expected valid tool");
+            };
+            let next = supply_tool_results(
+                step.checkpoint,
+                vec![(calls[0].occurrence.clone(), json!({"content":"context"}))],
+            )
+            .unwrap();
+            assert!(matches!(
+                advance(&config, next, CancellationToken::new())
+                    .await
+                    .unwrap()
+                    .action,
+                LoopAction::Done(_)
+            ));
+            assert_eq!(f.requests.load(Ordering::SeqCst), 2);
+            server.abort();
+            let _ = server.await;
+        }
     }
     #[tokio::test]
     async fn malformed_200_and_unknown_tool_receive_only_one_safe_correction() {
@@ -781,6 +794,7 @@ mod tests {
             "invalid_response"
         );
         assert_eq!(f.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(f.corrective_requests.load(Ordering::SeqCst), 1);
         server.abort();
         let _ = server.await;
         let bad = answer(
@@ -806,6 +820,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(f.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(f.corrective_requests.load(Ordering::SeqCst), 1);
         server.abort();
         let _ = server.await;
     }
@@ -841,16 +856,14 @@ mod tests {
     #[tokio::test]
     async fn invalid_known_tool_arguments_discard_valid_siblings_even_without_length_finish_reason()
     {
-        let mut bad = answer(
+        let bad = answer(
             Value::Null,
             json!([
                 {"id":"sibling","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"x\",\"content\":\"bad\"}"}},
                 {"id":"partial","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}
             ]),
         );
-        bad["fixture_expected_budget"] = json!(4096);
-        let mut good = answer(json!("recovered"), Value::Null);
-        good["fixture_expected_budget"] = json!(8192);
+        let good = answer(json!("recovered"), Value::Null);
         let (config, f, server) = fixture(vec![bad, good], false).await;
         let step = advance(
             &config,
