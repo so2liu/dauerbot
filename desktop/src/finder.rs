@@ -70,7 +70,7 @@ fn entries(state: &Value, language: Language) -> Vec<Entry> {
         (
             8,
             "Settings",
-            "settings appearance theme dark light 设置 外观 主题 暗色 浅色",
+            "settings appearance theme dark light 设置 外观 主题 暗色 深色 浅色",
         ),
         (1, "Feishu bot setup", "feishu bot setup 飞书 机器人"),
         (4, "macOS permissions", "permissions access 权限"),
@@ -466,6 +466,10 @@ mod tests {
         assert!(matches!(model.selected(), Some(Target::Session { .. })));
         model.reconcile(all.clone(), "permissions");
         assert_eq!(model.selected(), Some(Target::Page(4)));
+        model.reconcile(all.clone(), "dark theme");
+        assert_eq!(model.selected(), Some(Target::Page(8)));
+        model.reconcile(all.clone(), "深色");
+        assert_eq!(model.selected(), Some(Target::Page(8)));
         model.reconcile(all, "research project");
         assert_eq!(model.selected(), Some(Target::Project("q".into())));
     }
