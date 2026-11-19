@@ -326,6 +326,19 @@ impl RowLayout {
     }
 }
 
+/// Button adds an unconstrained inner flex row around custom children. Bound
+/// the text itself, not just its containing popover or button.
+pub fn name_label(name: String, column_width: f32) -> Div {
+    let width = (column_width - 2.).max(0.); // Reserve the button's two borders.
+    div()
+        .w(px(width))
+        .max_w(px(width))
+        .min_w_0()
+        .flex_shrink_0()
+        .truncate()
+        .child(name)
+}
+
 pub fn disclosure(layout: &RowLayout) -> Div {
     div()
         .w(px(layout.disclosure_width))
@@ -386,7 +399,8 @@ pub fn branches(layout: &RowLayout, palette: crate::ui_theme::Palette) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, Tree, project_target, row_layout};
+    use super::{Node, Tree, name_label, project_target, row_layout};
+    use gpui::{Styled, px};
     use serde_json::{Value, json};
     use std::collections::HashSet;
 
@@ -398,6 +412,11 @@ mod tests {
                 let layout = row_layout(&vec![true; depth], false, true, 26., width, 48.);
                 let name_left = layout.left_padding + layout.connector_width() + 20. + 18. + 12.;
                 let status_left = width - 8. - 16.;
+                // Assert the actual rendered text element has its own definite
+                // bound; a bounded wrapper alone did not prevent this regression.
+                let mut text = name_label("Implementation review".repeat(100), layout.name_width);
+                assert_eq!(text.style().size.width, Some(px(layout.name_width - 2.).into()));
+                assert_eq!(text.style().max_size.width, Some(px(layout.name_width - 2.).into()));
                 let intrinsic_long_name = 1200_f32;
                 let painted_name_right = name_left + intrinsic_long_name.min(layout.name_width);
                 assert!(painted_name_right <= status_left - 4.);

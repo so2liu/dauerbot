@@ -2348,13 +2348,9 @@ impl Render for Desktop {
                                     .px_0()
                                     .justify_start()
                                     .child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .truncate()
+                                        agent_tree::name_label(self.tr("Coding worker"), worker_layout.name_width)
                                             .text_left()
-                                            .text_size(px(12.))
-                                            .child(self.tr("Coding worker")),
+                                            .text_size(px(12.)),
                                     )
                                     .tooltip(self.tr("Show coding terminal"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2479,13 +2475,9 @@ impl Render for Desktop {
                                     .h(px(24.))
                                     .tooltip(self.tr("View Agent details"))
                                     .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
+                                        agent_tree::name_label(node.name.clone(), layout.name_width)
                                             .text_size(px(12.))
-                                            .text_color(rgb(palette.muted))
-                                            .child(node.name.clone()),
+                                            .text_color(rgb(palette.muted)),
                                     ),
                                 )
                                 .content(move |_, _, _| {
