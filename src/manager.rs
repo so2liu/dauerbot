@@ -1134,7 +1134,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         let mut trusted_sources = Vec::new();
         let latest_steering = match &latest_context {
             Some((id, origin, raw, status)) => {
-                json!({"input_id":id,"source_event_id":origin,"history_only_not_reply_target":status=="consumed","already_consumed":status=="consumed","context_only_not_batch_member":true,"data":continuation_input(raw,origin.as_deref())?})
+                json!({"input_id":id,"source_event_id":origin,"history_only_not_reply_target":status=="consumed","already_consumed":status=="consumed","context_only_not_batch_member":true,"data":prompt_input(raw,origin.as_deref())?})
             }
             None => Value::Null,
         };
@@ -2617,6 +2617,38 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+    #[tokio::test]
+    async fn off_batch_latest_user_control_preserves_its_tail_and_counts_toward_context_budget() {
+        for older_size in [20, 8000] {
+            let (_dir, app, p) = fixture().await;
+            for n in 0..32 {
+                ingest(
+                    &app,
+                    &p,
+                    &format!("om_tail_old_{n}"),
+                    &format!("old instruction {n}: {}", "x".repeat(older_size)),
+                );
+            }
+            let latest = format!(
+                "{}\n不要发布。Do not release or deploy.",
+                "latest control context ".repeat(150)
+            );
+            assert!(latest.len() > 2400);
+            ingest(&app, &p, "om_tail_latest", &latest);
+            app.db.sync(|c|{
+                work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();let context=prompt_context(&turn.checkpoint).unwrap();
+                let batch=context["new_inputs"].as_array().unwrap();assert!(!batch.is_empty()&&batch.len()<=32);
+                for (n,item) in batch.iter().enumerate(){assert!(item["data"]["user_input"]["body"].as_str().unwrap().starts_with(&format!("old instruction {n}: ")));}
+                assert_eq!(context["latest_user_steering"]["data"]["user_input"]["body"],latest);
+                assert_eq!(context["latest_user_steering"]["context_only_not_batch_member"],true);
+                assert_eq!(context["latest_user_steering"]["present_in_new_inputs"],false);
+                assert!(context.to_string().len()<=250000);
+                assert_eq!(c.query_row("SELECT i.status FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id WHERE e.source_id='om_tail_latest'",[],|r|r.get::<_,String>(0))?,"queued");
+                if older_size==20 {assert_eq!(batch.len(),32);}else{assert!(batch.len()<32,"The complete mandatory control must share the same bounded context budget");}
+                Ok(())
+            }).unwrap();
+        }
     }
     #[tokio::test]
     async fn exact_batch_completion_keeps_the_33rd_input_and_settles_managed_schedule() {
