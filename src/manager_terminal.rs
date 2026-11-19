@@ -58,13 +58,73 @@ pub(crate) async fn send(
     authority: &manager::Context,
     args: SendArgs,
 ) -> Result<Value> {
+    let config = app.config.read().await.clone();
+    let inspect_config = config.clone();
+    send_with(
+        app,
+        authority,
+        args,
+        move |project| {
+            let config = inspect_config.clone();
+            async move { herdr::terminal_control::inspect_input(&config, &project).await }
+        },
+        move |project, observed, segment| {
+            let config = config.clone();
+            async move {
+                herdr::terminal_control::submit_observed(&config, &project, &observed, &segment)
+                    .await
+            }
+        },
+    )
+    .await
+}
+
+async fn send_with<O, OF, S, SF>(
+    app: &Arc<App>,
+    authority: &manager::Context,
+    args: SendArgs,
+    mut inspect: O,
+    mut submit: S,
+) -> Result<Value>
+where
+    O: FnMut(Project) -> OF,
+    OF: std::future::Future<Output = Result<Value>>,
+    S: FnMut(Project, Value, herdr::terminal_control::Segment) -> SF,
+    SF: std::future::Future<Output = Result<()>>,
+{
     herdr::terminal_control::validate(&args.segments)?;
     let initial = project(app, authority, &args.generation).await?;
-    let config = app.config.read().await.clone();
     let mut confirmed = 0;
     for segment in &args.segments {
-        // Do not queue a sequence behind Stop/takeover, or pin the project lock
-        // while waiting for the terminal. Revalidate before every separate RPC.
+        // Slow observation never holds the control lock. Recheck after it, so
+        // completed pause/Stop/takeover operations revoke input admission.
+        let before = match project(app, authority, &args.generation).await {
+            Ok(project) => project,
+            Err(error) if confirmed == 0 => return Err(error),
+            Err(_) => {
+                return Ok(uncertain(
+                    &initial,
+                    confirmed,
+                    "Project control changed after part of the sequence",
+                ));
+            }
+        };
+        let observed = tokio::time::timeout(Duration::from_secs(3), inspect(before)).await;
+        let observed = match observed {
+            Ok(Ok(observed)) => observed,
+            _ if confirmed == 0 => {
+                anyhow::bail!("Current CLI identity could not be verified before input")
+            }
+            _ => {
+                return Ok(uncertain(
+                    &initial,
+                    confirmed,
+                    "CLI observation failed after part of the sequence",
+                ));
+            }
+        };
+        let lock = app.project_lock(&initial.id).await;
+        let guard = lock.lock().await;
         let fresh = match project(app, authority, &args.generation).await {
             Ok(fresh) => fresh,
             Err(error) if confirmed == 0 => return Err(error),
@@ -79,14 +139,18 @@ pub(crate) async fn send(
         if fresh.terminal != initial.terminal || fresh.native_session != initial.native_session {
             return Ok(uncertain(&initial, confirmed, "The bound terminal changed"));
         }
+        // All public pause/Stop/takeover paths use this same project lock.
+        // Serialize only the final RPC (at most 3s), not observation or the
+        // complete sequence. Once admitted, a timeout remains uncertain.
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            herdr::terminal_control::submit(&config, &fresh, segment),
+            submit(fresh, observed, segment.clone()),
         )
         .await;
+        drop(guard);
         match result {
             Ok(Ok(())) => confirmed += 1,
-            Ok(Err(_)) | Err(_) => {
+            _ => {
                 return Ok(uncertain(
                     &initial,
                     confirmed,
@@ -131,6 +195,106 @@ pub(crate) async fn view(
 mod tests {
     use super::current;
     use crate::{App, config::Config, db::ProjectInput, manager};
+
+    #[tokio::test]
+    async fn completed_controls_during_observation_prevent_input_submission() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for control in ["pause", "takeover", "stop"] {
+            let dir = tempfile::tempdir().unwrap();
+            let app = App::new(dir.path().join("store"), Config::default()).unwrap();
+            let p = app
+                .db
+                .create(ProjectInput {
+                    name: "blocked observation".into(),
+                    path: dir.path().to_string_lossy().into(),
+                    agent: "codex".into(),
+                    chat_id: String::new(),
+                    native_session: String::new(),
+                    extra_args: vec![],
+                })
+                .await
+                .unwrap();
+            let context = manager::Context {
+                project: p.id.clone(),
+                run: "run".into(),
+                revision: 0,
+                input_revision: 0,
+            };
+            app.db.sync(|c| {
+                c.execute("INSERT INTO manager_config(project_id,mode) VALUES(?,'manager')", [&p.id])?;
+                c.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES('run',?,0,0,'{}','working',?,0)", rusqlite::params![p.id,manager::owner()])?;
+                c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&p.id])?;
+                Ok(())
+            }).unwrap();
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (resume, blocked) = tokio::sync::oneshot::channel();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let submitted = calls.clone();
+            let worker = app.clone();
+            let mut entered = Some(entered);
+            let mut blocked = Some(blocked);
+            let task = tokio::spawn(async move {
+                super::send_with(
+                    &worker,
+                    &context,
+                    super::SendArgs {
+                        generation: "g".into(),
+                        segments: vec![crate::herdr::terminal_control::Segment::Key {
+                            key: "enter".into(),
+                        }],
+                    },
+                    move |_| {
+                        let entered = entered.take().unwrap();
+                        let blocked = blocked.take().unwrap();
+                        async move {
+                            entered.send(()).unwrap();
+                            blocked.await.unwrap();
+                            Ok(serde_json::Value::Null)
+                        }
+                    },
+                    move |_, _, _| {
+                        submitted.fetch_add(1, Ordering::SeqCst);
+                        async { Ok(()) }
+                    },
+                )
+                .await
+            });
+            waiting.await.unwrap();
+            // Match the public control paths' project-lock serialization while
+            // the preflight observer is deterministically blocked.
+            let lock = app.project_lock(&p.id).await;
+            let guard = tokio::time::timeout(std::time::Duration::from_secs(1), lock.lock())
+                .await
+                .expect("observation must not pin the control lock");
+            app.db
+                .sync(|c| match control {
+                    "pause" => {
+                        c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
+                        Ok(())
+                    }
+                    "takeover" => {
+                        crate::work::set_takeover(c, &p.id, "g", true, crate::db::now()).map(|_| ())
+                    }
+                    "stop" => crate::cli_switch::stopped(c, &p.id, "g"),
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            drop(guard);
+            resume.send(()).unwrap();
+            assert!(
+                task.await.unwrap().is_err(),
+                "{control} must revoke admission after observation"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{control} must prevent the final input RPC from starting"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn native_terminal_authority_rejects_pause_takeover_generation_and_unready() {

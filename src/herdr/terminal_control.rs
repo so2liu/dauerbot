@@ -10,11 +10,36 @@ pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_SCREEN_BYTES: usize = 32 * 1024;
 pub const MAX_SCREEN_LINES: usize = 200;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
 pub enum Segment {
     Text { text: String },
     Key { key: String },
+}
+
+// Emit the compact form; retain strict legacy decoding for saved checkpoints.
+impl<'de> Deserialize<'de> for Segment {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Legacy {
+            Text { text: String },
+            Key { key: String },
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Input {
+            Text { text: String },
+            Key { key: String },
+            Legacy(Legacy),
+        }
+        Ok(match Input::deserialize(deserializer)? {
+            Input::Text { text } | Input::Legacy(Legacy::Text { text }) => Self::Text { text },
+            Input::Key { key } | Input::Legacy(Legacy::Key { key }) => Self::Key { key },
+        })
+    }
 }
 
 /// Parse every segment before submitting any input. Strings never imply keys.
@@ -102,10 +127,22 @@ pub fn input_params(pane: &str, segment: &Segment) -> Result<Value> {
     })
 }
 
-/// The caller revalidates project control authority before each submission.
-pub async fn submit(config: &Config, project: &Project, segment: &Segment) -> Result<()> {
+/// Inspect immutable execution identity without admitting any input.
+pub async fn inspect_input(config: &Config, project: &Project) -> Result<Value> {
     let observed = observe(config, project).await?;
     check_identity(project, &observed)?;
+    Ok(observed)
+}
+
+/// Submit only after the caller's final control-authority check. No observation
+/// RPC may be inserted between that check and this bounded input RPC.
+pub async fn submit_observed(
+    config: &Config,
+    project: &Project,
+    observed: &Value,
+    segment: &Segment,
+) -> Result<()> {
+    check_identity(project, observed)?;
     let execution = ExecutionRef::from_project(project)?;
     rpc(
         config,
@@ -114,6 +151,13 @@ pub async fn submit(config: &Config, project: &Project, segment: &Segment) -> Re
     )
     .await?;
     Ok(())
+}
+
+/// Standalone transport helper for isolated backend fixtures. Manager input uses
+/// inspect_input followed by its project-control lock and submit_observed.
+pub async fn submit(config: &Config, project: &Project, segment: &Segment) -> Result<()> {
+    let observed = inspect_input(config, project).await?;
+    submit_observed(config, project, &observed, segment).await
 }
 
 /// The legacy pane API returns rendered visible text, not an ANSI byte replay.
@@ -208,8 +252,9 @@ mod tests {
     #[test]
     fn typed_input_is_unambiguous_and_prevalidates_the_entire_sequence() {
         let segments: Vec<Segment> = serde_json::from_value(json!([
-            {"type":"text","text":"停止当前工作\n下一行"},{"type":"key","key":"alt+m"},{"type":"key","key":"enter"}
-        ])).unwrap();
+            {"text":"停止当前工作\n下一行"},{"key":"alt+m"},{"key":"enter"}
+        ]))
+        .unwrap();
         validate(&segments).unwrap();
         assert_eq!(
             input_params("p", &segments[0]).unwrap()["text"],
@@ -224,6 +269,19 @@ mod tests {
         assert!(
             serde_json::from_value::<Segment>(json!({"type":"text","text":"x","key":"enter"}))
                 .is_err()
+        );
+        for invalid in [
+            json!({}),
+            json!({"text":"x","key":"enter"}),
+            json!({"key":"enter","other":1}),
+            json!({"type":"key","text":"x"}),
+        ] {
+            assert!(serde_json::from_value::<Segment>(invalid).is_err());
+        }
+        let legacy: Segment = serde_json::from_value(json!({"type":"key","key":"enter"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            json!({"key":"enter"})
         );
         let literal = Segment::Text {
             text: "enter".into(),

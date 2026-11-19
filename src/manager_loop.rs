@@ -249,8 +249,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["generation", "terminal_id", "reason", "task_finished"],
         ),
         (
-            "Send an ordered, explicitly typed text/key sequence to the current project's owned CLI. Use generation from worker_status. Text is UTF-8 with LF unchanged; keys are separate segments. Text never implies a key. Keys: enter, tab, esc, backspace, delete, up/down/left/right, home/end, pageup/pagedown, space; ctrl/alt/shift modifiers and modified letters, for example alt+m. Unknown keys fail before sending. Use cli_view to inspect results; a submitted sequence does not prove task completion. Do not repeat uncertain input.",
-            json!({"generation":{"type":"string"},"segments":{"type":"array","minItems":1,"maxItems":32,"items":{"oneOf":[{"type":"object","properties":{"type":{"const":"text"},"text":{"type":"string"}},"required":["type","text"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"key"},"key":{"type":"string"}},"required":["type","key"],"additionalProperties":false}]}}}),
+            "Send an ordered, compact text/key sequence, with each segment exactly {text: string} or {key: string} to the current project's owned CLI. Use generation from worker_status. Text is UTF-8 with LF unchanged; keys are separate segments. Text never implies a key. Keys: enter, tab, esc, backspace, delete, up/down/left/right, home/end, pageup/pagedown, space; ctrl/alt/shift modifiers and modified letters, for example alt+m. Unknown keys fail before sending. Use cli_view to inspect results; a submitted sequence does not prove task completion. Do not repeat uncertain input.",
+            json!({"generation":{"type":"string"},"segments":{"type":"array","minItems":1,"maxItems":32,"items":{"oneOf":[{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false},{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}]}}}),
             vec!["generation", "segments"],
         ),
         (
