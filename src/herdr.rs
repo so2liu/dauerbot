@@ -20,6 +20,7 @@ use tokio::{
 };
 
 pub mod runtime;
+pub(crate) mod owned_close;
 
 pub use crate::adapter::{launch_args, merge_mcp};
 const PROTOCOL: u64 = 22;

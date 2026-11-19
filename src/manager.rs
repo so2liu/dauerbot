@@ -885,7 +885,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
    },
-   "worker_status"=>{let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete,"input_effect_journal":journal}))},
+   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();app.db.call(move|c|valid(c,&authority)).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete,"input_effect_journal":journal}))},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
    "send_md"|"send_file"=>{
     let (to,text,anchor,path,receipt)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;ensure!(a.intent.is_some()||a.source_event_id.is_none(),"source_event_id is only used for a receipt");let receipt=a.intent.as_ref().map(|_|MessageArgs{to:a.to.clone(),text:a.text.clone(),reply_to_message_id:a.reply_to_message_id.clone(),intent:Some(MessageIntent::Receipt),source_event_id:a.source_event_id.clone()});(a.to,a.text,a.reply_to_message_id,None,receipt)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),None)};
@@ -2408,22 +2408,169 @@ mod tests {
             })
             .unwrap();
     }
+    async fn stalled_status_fixture() -> (
+        tempfile::TempDir,
+        Arc<App>,
+        Project,
+        Turn,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (dir, app, p) = fixture().await;
+        app.config.write().await.herdr_session = dir.path().to_string_lossy().into();
+        let config = app.config.read().await.clone();
+        let listener =
+            tokio::net::UnixListener::bind(crate::herdr::socket_path(&config).unwrap()).unwrap();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = arrived.clone();
+        let permit = release.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let line = BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "pane.list");
+            seen.notify_one();
+            permit.notified().await;
+            let response = json!({"id":request["id"],"result":{"panes":[]}}).to_string() + "\n";
+            let _ = write.write_all(response.as_bytes()).await;
+        });
+        ingest(
+            &app,
+            &p,
+            "om_slow_inventory",
+            "Inspect only; do not close anything",
+        );
+        let turn=app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            c.execute("INSERT INTO work_executions(generation,project_id,agent,terminal,status,last_activity,created_at,updated_at) VALUES('old-inspection',?,'codex','obsolete-terminal','exited',1,1,1)",[&p.id])?;
+            Ok(claim(c,&p.id)?.unwrap())
+        }).unwrap();
+        (dir, app, p, turn, arrived, release, server)
+    }
+    #[tokio::test]
+    async fn stalled_status_does_not_hold_stop_lock_or_publish_stale_observations() {
+        let (_dir, app, p, turn, arrived, release, server) = stalled_status_fixture().await;
+        let acting = app.clone();
+        let authority = turn.context.clone();
+        let inspection = tokio::spawn(async move {
+            tool(
+                &acting,
+                &authority,
+                ToolCall {
+                    occurrence: "stalled-status".into(),
+                    name: "worker_status".into(),
+                    arguments: json!({}),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .unwrap();
+        // The runtime request is still blocked. Stop must acquire the actual
+        // project mutex and complete, rather than waiting for the 3s budget.
+        app.db.sync(|c| {c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES('keep-uncertain',?,'prior-send','send_md','{}','uncertain','{}')",[&turn.context.run])?;Ok(())}).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), app.stop(&p.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!inspection.is_finished());
+        release.notify_one();
+        server.await.unwrap();
+        let result = inspection.await.unwrap().unwrap();
+        assert!(result["error"].is_string());
+        assert!(result.get("obsolete_executions").is_none());
+        app.db
+            .sync(|c| {
+                assert!(valid(c, &turn.context).is_err());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT status FROM manager_effects WHERE id='keep-uncertain'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "uncertain"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM manager_inputs WHERE status='cancelled'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn stalled_inventory_has_one_total_budget_and_never_claims_eligibility() {
+        let (_dir, app, p, turn, arrived, _release, server) = stalled_status_fixture().await;
+        let acting = app.clone();
+        let authority = turn.context.clone();
+        let inspection = tokio::spawn(async move {
+            tool(
+                &acting,
+                &authority,
+                ToolCall {
+                    occurrence: "bounded-status".into(),
+                    name: "worker_status".into(),
+                    arguments: json!({}),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), inspection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["obsolete_executions"][0]["close_eligible"], false);
+        assert_eq!(
+            result["obsolete_executions"][0]["observation"],
+            "incomplete"
+        );
+        assert!(app.db.sync(|c| valid(c, &turn.context)).is_ok());
+        assert!(p.terminal.is_none());
+        server.abort();
+        let _ = server.await;
+    }
     #[test]
     fn prompt_keeps_receipt_cohesion_disclosure_exceptions_and_truthful_failures_together() {
         // These are the explicitly requested policy invariants, not an LLM quality test.
         for policy in [
-            "优先用 send_md",
+            "prioritize one brief, outcome-oriented acknowledgement using send_md",
             "intent=\"receipt\"",
-            "简单问题能直接完整回答时直接回答",
-            "同一任务的补充、纠正",
-            "默认保持任务整体",
+            "Answer simple questions directly",
+            "follow-ups, corrections, work results, recovery retries",
+            "Keep related work together by default",
             "调研 A 和 B",
             "并行开发互不依赖的 feature A、B、C",
-            "用户自然语言指定的组织方式优先",
-            "内部执行机制默认不对用户展示",
-            "唯一例外是用户明确询问架构",
-            "这些名称属于任务内容",
-            "不能因隐藏内部机制而隐瞒失败",
+            "The user's natural-language organization overrides this default",
+            "Keep internal execution mechanisms private by default",
+            "The only exception is an explicit question about the architecture",
+            "is the user's actual task",
+            "Never hide failures, blockers, unfinished work or capability limits",
         ] {
             assert!(SYSTEM.contains(policy), "Missing policy: {policy}");
         }
