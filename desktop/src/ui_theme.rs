@@ -1,5 +1,5 @@
-//! Explicit local appearance; no daemon settings or native CLI palette changes.
-use gpui::{App, rgb};
+//! Local desktop appearance; no daemon settings or native CLI palette changes.
+use gpui::{App, Window, WindowAppearance, rgb};
 use gpui_component::{Theme, ThemeColor, ThemeMode};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -9,21 +9,32 @@ pub enum Appearance {
     #[default]
     Light,
     Dark,
+    System,
 }
 impl<'de> Deserialize<'de> for Appearance {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
-        Ok(if value.as_str() == Some("dark") {
-            Self::Dark
-        } else {
-            Self::Light
+        Ok(match value.as_str() {
+            Some("dark") => Self::Dark,
+            Some("system") => Self::System,
+            _ => Self::Light,
         })
     }
 }
 impl Appearance {
+    /// Resolve an OS observation without changing the saved preference.
+    /// A missing observation keeps the backwards-compatible light fallback.
+    pub fn resolve(self, system: Option<WindowAppearance>) -> Self {
+        match (self, system) {
+            (Self::System, Some(WindowAppearance::Dark | WindowAppearance::VibrantDark)) => Self::Dark,
+            (Self::System, _) => Self::Light,
+            (explicit, _) => explicit,
+        }
+    }
+
     pub fn palette(self) -> Palette {
         match self {
-            Self::Light => Palette {
+            Self::Light | Self::System => Palette {
                 asset_surface: 0xffffff,
                 foreground: 0x1c1c21,
                 muted: 0x595963,
@@ -114,9 +125,17 @@ pub fn palette(cx: &App) -> Palette {
     .palette()
 }
 pub fn apply(appearance: Appearance, cx: &mut App) {
+    apply_resolved(appearance.resolve(Some(cx.window_appearance())), cx);
+}
+
+pub fn apply_in_window(appearance: Appearance, window: &Window, cx: &mut App) {
+    apply_resolved(appearance.resolve(Some(window.appearance())), cx);
+}
+
+fn apply_resolved(appearance: Appearance, cx: &mut App) {
     Theme::change(
         match appearance {
-            Appearance::Light => ThemeMode::Light,
+            Appearance::Light | Appearance::System => ThemeMode::Light,
             Appearance::Dark => ThemeMode::Dark,
         },
         None,
@@ -133,6 +152,32 @@ pub fn apply(appearance: Appearance, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{Appearance, Palette};
+    use gpui::WindowAppearance;
+
+    #[test]
+    fn system_observations_resolve_both_palettes_and_keep_explicit_choices() {
+        for os in [WindowAppearance::Light, WindowAppearance::VibrantLight] {
+            let actual = Appearance::System.resolve(Some(os));
+            assert_eq!(actual, Appearance::Light);
+            assert_eq!(actual.palette().canvas, Appearance::Light.palette().canvas);
+            assert_eq!(Appearance::Dark.resolve(Some(os)), Appearance::Dark);
+        }
+        for os in [WindowAppearance::Dark, WindowAppearance::VibrantDark] {
+            let actual = Appearance::System.resolve(Some(os));
+            assert_eq!(actual, Appearance::Dark);
+            assert_eq!(actual.palette().canvas, Appearance::Dark.palette().canvas);
+            assert_eq!(Appearance::Light.resolve(Some(os)), Appearance::Light);
+        }
+        assert_eq!(Appearance::System.resolve(None), Appearance::Light);
+        assert_eq!(Appearance::default(), Appearance::Light);
+        // A changing observation never overwrites the stored System choice.
+        let saved = Appearance::System;
+        let observed: Vec<_> = [WindowAppearance::Dark, WindowAppearance::Light, WindowAppearance::VibrantDark]
+            .into_iter().map(|os| saved.resolve(Some(os))).collect();
+        assert_eq!(observed, [Appearance::Dark, Appearance::Light, Appearance::Dark]);
+        assert_eq!(saved, Appearance::System);
+    }
+
     fn luminance(rgb: u32) -> f64 {
         fn linear(v: u32) -> f64 {
             let v = v as f64 / 255.;

@@ -55,6 +55,7 @@ impl Language {
             "Light" => "浅色",
             "Dark" => "深色",
             "Appearance" => "外观",
+            "Follow system" => "跟随系统",
             "Quick find" => "快速查找",
             "Search projects, sessions and settings" => "搜索项目、会话和设置",
             "No matching projects, sessions or settings" => "没有匹配的项目、会话或设置",

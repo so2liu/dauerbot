@@ -164,10 +164,15 @@ struct Desktop {
     activation_frozen: bool,
     restored: bool,
     sidebar_resizing: bool,
+    system_appearance: WindowAppearance,
+    _appearance_subscription: Subscription,
 }
 impl Desktop {
     fn tr(&self, text: &str) -> String {
         self.setup.language.text(text)
+    }
+    fn palette(&self) -> ui_theme::Palette {
+        self.setup.appearance.resolve(Some(self.system_appearance)).palette()
     }
     fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
@@ -178,6 +183,20 @@ impl Desktop {
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
         setup.prepare_startup();
+        let system_appearance = window.appearance();
+        ui_theme::apply_in_window(setup.appearance, window, cx);
+        let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
+            let previous = this.setup.appearance.resolve(Some(this.system_appearance));
+            this.system_appearance = window.appearance();
+            if this.setup.appearance == ui_theme::Appearance::System
+                && previous != this.setup.appearance.resolve(Some(this.system_appearance))
+            {
+                // Reapply our palette after the native mode; changing mode alone
+                // restores gpui-component's defaults instead of our semantic colors.
+                ui_theme::apply_in_window(this.setup.appearance, window, cx);
+                cx.notify();
+            }
+        });
         let mut input = |placeholder: &'static str, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(setup.language.text(placeholder)))
         };
@@ -289,6 +308,8 @@ impl Desktop {
             activation_frozen: false,
             restored: false,
             sidebar_resizing: false,
+            system_appearance,
+            _appearance_subscription: appearance_subscription,
         }
     }
     fn finder_allowed(&self) -> bool {
@@ -513,7 +534,7 @@ impl Desktop {
 
         if let Ok(setup) = serde_json::from_value(snapshot["setup"].clone()) {
             self.setup = setup;
-            ui_theme::apply(self.setup.appearance, cx);
+            ui_theme::apply_in_window(self.setup.appearance, window, cx);
         }
         self.selected = snapshot["selected"].as_str().unwrap_or("").into();
         self.picked_path = snapshot["picked_path"].as_str().unwrap_or("").into();
@@ -824,7 +845,7 @@ impl Desktop {
             }))
     }
     fn title(&self, _kicker: &str, title: &str, description: &str) -> Div {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         div()
             .flex()
             .flex_col()
@@ -848,7 +869,7 @@ impl Desktop {
         self.card_detail(title, &self.tr(text))
     }
     fn card_detail(&self, title: &str, text: &str) -> Div {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         div()
             .min_w_0()
             .p_5()
@@ -909,7 +930,7 @@ impl Desktop {
             .child(self.btn("bot-next", "Bot enabled. Add credentials →", |this, _, _| this.go(2), cx).primary()).into_any_element()
     }
     fn credentials(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         let projects = self.state["projects"]
             .as_array()
             .cloned()
@@ -1001,7 +1022,7 @@ impl Desktop {
             .into_any_element()
     }
     fn project_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         let picked = self.picked_path.clone();
         let agents = ["Codex", "Claude Code", "Pi", "Antigravity"];
         let mut choices = div().flex().gap_2();
@@ -1037,7 +1058,7 @@ impl Desktop {
             .into_any_element()
     }
     fn project_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         let projects = self.state["projects"]
             .as_array()
             .cloned()
@@ -1433,7 +1454,7 @@ impl Desktop {
             .into_any_element()
     }
     fn workspace(&self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         let project = self.state["projects"].as_array().and_then(|projects| {
             projects
                 .iter()
@@ -1726,7 +1747,7 @@ impl Desktop {
         geometry: WorkspaceGeometry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         let center = div()
             .id("scheduled-work")
             .size_full()
@@ -1787,7 +1808,7 @@ impl Desktop {
             .into_any_element()
     }
     fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         let mut links = div().flex().flex_wrap().gap_2();
         for (index, label) in [
             (1, "Feishu bot setup"),
@@ -1808,12 +1829,24 @@ impl Desktop {
             .gap_2()
             .child(self.tr("Appearance"))
             .child(
+                Button::new("appearance-system")
+                    .child(self.tr("Follow system"))
+                    .selected(appearance == ui_theme::Appearance::System)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.system_appearance = window.appearance();
+                        this.setup.appearance = ui_theme::Appearance::System;
+                        ui_theme::apply_in_window(this.setup.appearance, window, cx);
+                        this.go(this.setup.page);
+                        cx.notify();
+                    })),
+            )
+            .child(
                 Button::new("appearance-light")
                     .child(self.tr("Light"))
                     .selected(appearance == ui_theme::Appearance::Light)
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.setup.appearance = ui_theme::Appearance::Light;
-                        ui_theme::apply(this.setup.appearance, cx);
+                        ui_theme::apply_in_window(this.setup.appearance, window, cx);
                         this.go(this.setup.page);
                         cx.notify();
                     })),
@@ -1822,9 +1855,9 @@ impl Desktop {
                 Button::new("appearance-dark")
                     .child(self.tr("Dark"))
                     .selected(appearance == ui_theme::Appearance::Dark)
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.setup.appearance = ui_theme::Appearance::Dark;
-                        ui_theme::apply(this.setup.appearance, cx);
+                        ui_theme::apply_in_window(this.setup.appearance, window, cx);
                         this.go(this.setup.page);
                         cx.notify();
                     })),
@@ -1862,7 +1895,7 @@ impl Desktop {
             .into_any_element()
     }
     fn environment_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         div()
             .flex()
             .flex_col()
@@ -1956,7 +1989,7 @@ impl Desktop {
 }
 impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = self.setup.appearance.palette();
+        let palette = self.palette();
         if self.activation_frozen {
             return div()
                 .size_full()
@@ -3000,6 +3033,15 @@ mod preference_tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["appearance"],
             "dark"
         );
+        setup.appearance = super::ui_theme::Appearance::System;
+        setup.sidebar_width = super::sidebar::SidebarWidth::from_drag(280., 1400.);
+        let bytes = serde_json::to_vec(&setup).unwrap();
+        let reopened: Setup = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reopened.appearance, super::ui_theme::Appearance::System);
+        assert_eq!(reopened.page, 6);
+        assert_eq!(reopened.language, Language::Zh);
+        assert_eq!(serde_json::to_value(reopened.sidebar_width).unwrap(), 280.);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["appearance"], "system");
     }
 
     #[test]
