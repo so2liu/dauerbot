@@ -4,7 +4,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Selectable, Sizable,
     button::*,
-    input::{Input, InputEvent, InputState},
+    input::{Enter, Escape, Input, InputEvent, InputState, MoveDown, MoveUp},
 };
 use herdr_feishu_bridge::config::Config;
 use serde_json::{Value, json};
@@ -76,6 +76,71 @@ fn matching_models<'a>(options: &'a [Value], query: &str) -> Vec<(usize, &'a Val
         .collect()
 }
 
+/// Cursor identity is the original catalogue index, never a filtered position.
+/// Updating results only changes navigation; it never requests a preference.
+#[derive(Default, Debug)]
+struct ModelCursor {
+    items: Vec<usize>,
+    current: Option<usize>,
+}
+
+impl ModelCursor {
+    fn reconcile(&mut self, items: Vec<usize>) {
+        self.current = self
+            .current
+            .filter(|item| items.contains(item))
+            .or_else(|| items.first().copied());
+        self.items = items;
+    }
+
+    fn step(&mut self, forward: bool) {
+        if self.items.is_empty() {
+            self.current = None;
+            return;
+        }
+        let position = self
+            .current
+            .and_then(|item| self.items.iter().position(|candidate| *candidate == item));
+        let next = match position {
+            None => 0,
+            Some(position) if forward => (position + 1) % self.items.len(),
+            Some(position) => (position + self.items.len() - 1) % self.items.len(),
+        };
+        self.current = Some(self.items[next]);
+    }
+
+    fn hover(&mut self, item: usize) {
+        if self.items.contains(&item) {
+            self.current = Some(item);
+        }
+    }
+
+    fn selected(&self, enabled: bool) -> Option<usize> {
+        self.current
+            .filter(|item| enabled && self.items.contains(item))
+    }
+
+    fn position(&self) -> Option<usize> {
+        self.current
+            .and_then(|item| self.items.iter().position(|candidate| *candidate == item))
+    }
+}
+
+fn selection_enabled(project: &Value, catalog: &Value, busy: bool, catalog_error: bool) -> bool {
+    !busy
+        && !catalog_error
+        && project["paused"] != true
+        && project["lifecycle"] != "taken_over"
+        && matches!(
+            project["agent"].as_str(),
+            Some("codex" | "claude" | "pi" | "agy")
+        )
+        && catalog["agent"] == project["agent"]
+        && catalog["generation"] == project["generation"]
+        && catalog["options"].is_array()
+        && catalog.get("configured").is_some()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Ticket {
     project: String,
@@ -105,6 +170,8 @@ pub struct ModelPicker {
     revision: u64,
     message: String,
     tx: mpsc::Sender<Work>,
+    cursor: ModelCursor,
+    options_scroll: ScrollHandle,
     search: Entity<InputState>,
     model: Entity<InputState>,
     provider: Entity<InputState>,
@@ -243,6 +310,8 @@ impl ModelPicker {
             revision: 0,
             message: String::new(),
             tx,
+            cursor: ModelCursor::default(),
+            options_scroll: ScrollHandle::new(),
             search,
             model,
             provider,
@@ -256,12 +325,61 @@ impl ModelPicker {
         self.project = project.clone();
         self.language = language;
         if changed {
+            self.cursor = ModelCursor::default();
             self.catalog = Value::Null;
             self.catalog_error = false;
             self.clear_inputs = true;
             self.open = false;
             self.message.clear();
             self.request(None, cx);
+        }
+    }
+
+    fn search_owns_action(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.open
+            && self.search.read(cx).focus_handle(cx).is_focused(window)
+            && self.search.update(cx, |input, cx| {
+                input.marked_text_range(window, cx).is_none()
+            })
+    }
+
+    fn reconcile_cursor(&mut self, cx: &App) {
+        let query = self.search.read(cx).value().to_string();
+        let items = matching_models(
+            self.catalog["options"]
+                .as_array()
+                .map_or(&[], Vec::as_slice),
+            &query,
+        )
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+        self.cursor.reconcile(items);
+    }
+
+    fn move_cursor(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.reconcile_cursor(cx);
+        self.cursor.step(forward);
+        if let Some(position) = self.cursor.position() {
+            // The explicit native-default button precedes the filtered model rows.
+            self.options_scroll.scroll_to_item(position + 1);
+        }
+        cx.notify();
+    }
+
+    fn choose_cursor(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_cursor(cx);
+        let enabled = selection_enabled(
+            &self.project,
+            &self.catalog,
+            self.ticket.is_some(),
+            self.catalog_error,
+        );
+        if let Some(index) = self.cursor.selected(enabled)
+            && let Some(option) = self.catalog["options"].get(index)
+        {
+            let selection = json!({"model":option["id"], "provider":option["provider"]});
+            self.request(Some(selection), cx);
         }
     }
 
@@ -356,6 +474,7 @@ impl Render for ModelPicker {
         };
         let unavailable =
             self.project["paused"] == true || self.project["lifecycle"] == "taken_over";
+        let can_choose = selection_enabled(&self.project, &self.catalog, busy, self.catalog_error);
         let mut view = div().flex().flex_col().gap_2().min_w_0().child(
             div()
                 .flex()
@@ -381,6 +500,7 @@ impl Render for ModelPicker {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open = !this.open;
                             if this.open {
+                                this.cursor = ModelCursor::default();
                                 this.search.update(cx, |search, cx| {
                                     search.set_value("", window, cx);
                                     search.focus(window, cx);
@@ -440,6 +560,7 @@ impl Render for ModelPicker {
                 .id("native-model-options")
                 .max_h(px(220.))
                 .overflow_y_scroll()
+                .track_scroll(&self.options_scroll)
                 .flex()
                 .flex_col()
                 .gap_1();
@@ -451,7 +572,7 @@ impl Render for ModelPicker {
                         self.language.text("Remove project model override"),
                     ))
                     .selected(!configured["model"].is_string())
-                    .disabled(busy || unavailable)
+                    .disabled(!can_choose)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.request(Some(json!({"model":"","provider":null})), cx)
                     })),
@@ -463,6 +584,14 @@ impl Render for ModelPicker {
                     .map_or(&[], Vec::as_slice),
                 &query,
             );
+            let previous_cursor = (self.cursor.current, self.cursor.position());
+            self.cursor
+                .reconcile(matches.iter().map(|(index, _)| *index).collect());
+            if previous_cursor != (self.cursor.current, self.cursor.position())
+                && let Some(position) = self.cursor.position()
+            {
+                self.options_scroll.scroll_to_item(position + 1);
+            }
             let no_matches = !query.trim().is_empty() && matches.is_empty();
             for (index, option) in matches {
                 let id = option["id"].as_str().unwrap_or("").to_owned();
@@ -476,21 +605,79 @@ impl Render for ModelPicker {
                 let selected = configured["model"] == id
                     && configured["provider"].as_str() == provider.as_deref();
                 options = options.child(
-                    Button::new(("native-model", index))
-                        .small()
-                        .text_size(px(13.))
-                        .max_w_full()
-                        .overflow_hidden()
-                        .child(control_label(name).max_w(px(180.)).truncate())
-                        .selected(selected)
-                        .disabled(busy || unavailable)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.request(Some(json!({"model":id,"provider":provider})), cx)
-                        })),
+                    div()
+                        .border_1()
+                        .rounded_md()
+                        .border_color(if self.cursor.current == Some(index) {
+                            rgb(0x6678cc)
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .child(
+                            Button::new(("native-model", index))
+                                .small()
+                                .text_size(px(13.))
+                                .max_w_full()
+                                .overflow_hidden()
+                                .child(control_label(name).max_w(px(180.)).truncate())
+                                .selected(selected)
+                                .disabled(!can_choose)
+                                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                                    if *hovered {
+                                        this.cursor.hover(index);
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reconcile_cursor(cx);
+                                    if this.cursor.items.contains(&index) {
+                                        this.cursor.hover(index);
+                                        this.choose_cursor(cx);
+                                    }
+                                })),
+                        ),
                 );
             }
             panel = panel
-                .child(Input::new(&self.search).small().text_size(px(13.)))
+                .child(
+                    div()
+                        // Input key bindings dispatch actions before raw key-down events.
+                        // Capture only this search field, leaving manual IDs and Terminal alone.
+                        .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                            if this.search_owns_action(window, cx) {
+                                cx.stop_propagation();
+                                this.move_cursor(true, cx);
+                            } else {
+                                cx.propagate();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                            if this.search_owns_action(window, cx) {
+                                cx.stop_propagation();
+                                this.move_cursor(false, cx);
+                            } else {
+                                cx.propagate();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+                            if !action.secondary && this.search_owns_action(window, cx) {
+                                cx.stop_propagation();
+                                this.choose_cursor(cx);
+                            } else {
+                                cx.propagate();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                            if this.search_owns_action(window, cx) {
+                                cx.stop_propagation();
+                                this.open = false;
+                                cx.notify();
+                            } else {
+                                cx.propagate();
+                            }
+                        }))
+                        .child(Input::new(&self.search).small().text_size(px(13.))),
+                )
                 .child(options);
             if no_matches && !busy && !self.catalog_error {
                 panel = panel.child(div().text_size(px(11.)).child(self.language.text(
@@ -560,8 +747,67 @@ impl Render for ModelPicker {
 
 #[cfg(test)]
 mod tests {
-    use super::matching_models;
+    use super::{ModelCursor, matching_models, selection_enabled};
     use serde_json::json;
+
+    #[test]
+    fn cursor_wraps_and_hover_preserves_catalogue_identity() {
+        let mut cursor = ModelCursor::default();
+        cursor.reconcile(vec![8, 2, 5]);
+        assert_eq!(cursor.selected(true), Some(8));
+        cursor.step(false);
+        assert_eq!(cursor.selected(true), Some(5));
+        cursor.step(true);
+        assert_eq!(cursor.selected(true), Some(8));
+        cursor.hover(2);
+        assert_eq!(cursor.position(), Some(1));
+        cursor.step(true);
+        assert_eq!(cursor.selected(true), Some(5));
+        cursor.hover(99);
+        assert_eq!(cursor.selected(true), Some(5));
+    }
+
+    #[test]
+    fn filtering_reconciles_identity_and_empty_results_cannot_select() {
+        let mut cursor = ModelCursor::default();
+        cursor.reconcile(vec![4, 7, 9]);
+        cursor.hover(9);
+        cursor.reconcile(vec![9, 7]);
+        assert_eq!(cursor.position(), Some(0));
+        cursor.reconcile(vec![7]);
+        assert_eq!(cursor.selected(true), Some(7));
+        cursor.reconcile(vec![]);
+        cursor.step(true);
+        cursor.step(false);
+        assert_eq!(cursor.selected(true), None);
+        assert_eq!(cursor.position(), None);
+        cursor.reconcile(vec![4]);
+        assert_eq!(cursor.selected(false), None);
+        assert_eq!(cursor.selected(true), Some(4));
+    }
+
+    #[test]
+    fn keyboard_and_pointer_selection_share_scope_and_control_guards() {
+        let project = json!({"agent":"codex", "generation":"current"});
+        let catalog =
+            json!({"agent":"codex", "generation":"current", "options":[], "configured":null});
+        assert!(selection_enabled(&project, &catalog, false, false));
+        assert!(!selection_enabled(&project, &catalog, true, false));
+        assert!(!selection_enabled(&project, &catalog, false, true));
+        for changed in [
+            json!({"paused":true}),
+            json!({"lifecycle":"taken_over"}),
+            json!({"generation":"new"}),
+            json!({"agent":"pi"}),
+        ] {
+            let mut project = project.clone();
+            for (key, value) in changed.as_object().unwrap() {
+                project[key] = value.clone();
+            }
+            assert!(!selection_enabled(&project, &catalog, false, false));
+        }
+        assert!(!selection_enabled(&project, &json!(null), false, false));
+    }
 
     #[test]
     fn model_search_ranks_names_before_provider_matches_and_preserves_catalogue_order() {
