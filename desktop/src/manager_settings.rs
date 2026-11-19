@@ -46,6 +46,7 @@ pub struct ManagerSettings {
     fill_inputs: bool,
     open: bool,
     dirty: bool,
+    supports_images: bool,
     message: String,
     tx: mpsc::Sender<Work>,
     endpoint: Entity<InputState>,
@@ -175,10 +176,11 @@ impl ManagerSettings {
             }
         })
         .detach();
-        for input in [&endpoint, &model, &key] {
+        for (index, input) in [&endpoint, &model, &key].into_iter().enumerate() {
             cx.subscribe(
                 input,
-                |this, _, _: &gpui_component::input::InputEvent, cx| {
+                move |this, _, _: &gpui_component::input::InputEvent, cx| {
+                    if index < 2 { this.supports_images = false; }
                     this.dirty = true;
                     cx.notify();
                 },
@@ -195,6 +197,7 @@ impl ManagerSettings {
             fill_inputs: false,
             open: false,
             dirty: false,
+            supports_images: false,
             message: String::new(),
             tx,
             endpoint,
@@ -212,6 +215,7 @@ impl ManagerSettings {
             self.fill_inputs = false;
             self.open = false;
             self.dirty = false;
+            self.supports_images = false;
             self.message.clear();
             self.request("GET", "manager", None, cx);
         } else if self.ticket.is_none()
@@ -291,6 +295,7 @@ impl Render for ManagerSettings {
                     )
                 });
             }
+            self.supports_images = self.config["supports_images"] == true;
             self.dirty = false;
         }
         self.dirty = !self.config.is_null()
@@ -298,7 +303,8 @@ impl Render for ManagerSettings {
                 != self.config["base_url"].as_str().unwrap_or("")
                 || self.model.read(cx).value().as_ref()
                     != self.config["model"].as_str().unwrap_or("")
-                || !self.key.read(cx).value().is_empty());
+                || !self.key.read(cx).value().is_empty()
+                || self.supports_images != (self.config["supports_images"] == true));
         let busy = self.ticket.is_some();
         let mode = self.config["mode"]
             .as_str()
@@ -324,12 +330,17 @@ impl Render for ManagerSettings {
                 .on_click(cx.listener(|this,_,_,cx|{this.open = !this.open;cx.notify();})));
         if self.open {
             view=view.child(self.field("OpenAI-compatible endpoint",&self.endpoint)).child(self.field("Manager model",&self.model)).child(self.field("Manager API key",&self.key))
+                .child(Button::new("manager-image-capability").small().selected(self.supports_images).disabled(busy||!self.config["supports_images"].is_boolean())
+                    .child(control_label(self.language.text(if self.supports_images {"Image input declared supported"}else{"Declare image input support"})))
+                    .on_click(cx.listener(|this,_,_,cx| { this.supports_images = !this.supports_images; cx.notify(); })))
+                .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references.")))
                 .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text(if self.config["has_api_key"]==true {"API key saved. Leave blank to keep it."}else{"No manager API key saved"})))
                 .child(div().flex().flex_wrap().gap_2()
                     .child(Button::new("save-manager-config").small().primary().child(control_label(self.language.text("Save manager settings")))
                         .disabled(busy||revision.is_none())
                         .on_click(cx.listener(|this,_,_,cx| {
                             let mut body=json!({"base_url":this.endpoint.read(cx).value().to_string(),"model":this.model.read(cx).value().to_string(),"expected_revision":this.config["revision"]});
+                            if this.config["supports_images"].is_boolean() { body["supports_images"] = json!(this.supports_images); }
                             let key=this.key.read(cx).value().to_string();if !key.is_empty(){body["api_key"]=json!(key);}
                             this.request("PUT","manager",Some(body),cx);
                         })))

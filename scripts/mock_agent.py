@@ -358,7 +358,9 @@ try:
                     resource = resources[0].attrib
                     assert resource["resource_key"] == "img_fixture_post"
                     assert resource["trust"] == "user_input"
-                    assert Path(resource["local_path"]).read_bytes() == b"downloaded fixture attachment"
+                    assert Path(resource["local_path"]).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+                    assert envelope.find("image_delivery").attrib["mode"] == "path_only"
+                    assert "not attached image pixels" in envelope.find("image_delivery").text
                     (Path.cwd() / ".fixture-post-resource").write_text(json.dumps(resource))
                 if "direct-to-user" in text:
                     to = envelope.find("sender").attrib["open_id"]

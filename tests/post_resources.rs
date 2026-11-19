@@ -65,7 +65,15 @@ async fn resource(
     if key == "img_missing" {
         return (StatusCode::FORBIDDEN, "fixture unavailable").into_response();
     }
-    (StatusCode::OK, format!("bytes:{key}")).into_response()
+    if key == "img_not_image" {
+        return (StatusCode::OK, "not image pixels").into_response();
+    }
+    if query["type"] == "file" {
+        return (StatusCode::OK, "document bytes").into_response();
+    }
+    let mut bytes = include_bytes!("fixtures/input.png").to_vec();
+    bytes.extend_from_slice(key.as_bytes());
+    (StatusCode::OK, bytes).into_response()
 }
 
 #[tokio::test]
@@ -150,11 +158,27 @@ async fn multiple_resources_are_bounded_cached_and_delivered_with_durable_failur
         .filter(|(i, _)| *i != 1 && *i != 2)
     {
         let path = std::path::Path::new(r["local_path"].as_str().unwrap());
-        assert!(path.starts_with(dir.path().join("files")));
+        assert!(path.starts_with(dir.path().canonicalize().unwrap().join("files")));
         assert_eq!(
-            std::fs::read_to_string(path).unwrap(),
-            format!("bytes:img_{i}")
+            std::fs::read(path).unwrap(),
+            [
+                include_bytes!("fixtures/input.png").as_slice(),
+                format!("img_{i}").as_bytes()
+            ]
+            .concat()
         );
+        assert!(
+            path.starts_with(
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("files")
+                    .join(&project.id)
+            )
+        );
+        assert_eq!(r["cache_project_id"], project.id);
+        assert_eq!(r["cache_message_id"], message.id);
+        assert_eq!(r["media_type"], "image/png");
     }
     assert_ne!(resources[0]["local_path"], resources[2]["local_path"]);
     assert_eq!(
@@ -189,6 +213,76 @@ async fn multiple_resources_are_bounded_cached_and_delivered_with_durable_failur
             .unwrap()
             .len(),
         1
+    );
+
+    let (_, _, _, bad_attachment) =
+        feishu::normalize(&event("image", json!({"image_key":"img_not_image"})))
+            .unwrap()
+            .unwrap();
+    let bad_id = app
+        .db
+        .ingest_bot(
+            &project.id,
+            "cli_fixture",
+            "oc_real",
+            "om_bad_type",
+            "bad image",
+            &bad_attachment,
+        )
+        .unwrap()
+        .unwrap();
+    let bad = app.db.message(&bad_id).await.unwrap();
+    let rejected = feishu::download_resources(&app, &bad).await.unwrap();
+    assert!(rejected[0]["local_path"].is_null());
+    assert!(
+        rejected[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported media type")
+    );
+    assert!(
+        std::fs::read_dir(dir.path().join("files").join(&project.id))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".part"))
+    );
+    let (_, _, _, file_attachment) = feishu::normalize(&event(
+        "file",
+        json!({"file_key":"doc_fixture","file_name":"note.txt"}),
+    ))
+    .unwrap()
+    .unwrap();
+    let file_id = app
+        .db
+        .ingest_bot(
+            &project.id,
+            "cli_fixture",
+            "oc_real",
+            "om_document",
+            "document",
+            &file_attachment,
+        )
+        .unwrap()
+        .unwrap();
+    let document = app.db.message(&file_id).await.unwrap();
+    let documents = feishu::download_resources(&app, &document).await.unwrap();
+    assert_eq!(documents[0]["kind"], "file");
+    assert!(documents[0]["media_type"].is_null());
+    assert_eq!(
+        std::fs::read(documents[0]["local_path"].as_str().unwrap()).unwrap(),
+        b"document bytes"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(message, key, kind)| message == "om_document"
+                && key == "doc_fixture"
+                && kind == "file")
     );
 
     // A warm handover preserves ownership; only cold recovery abandons an attempt.

@@ -37,6 +37,18 @@ fn installed(c: &Connection) -> Result<bool> {
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'native',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id),note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_failures(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,incident_id TEXT NOT NULL,attempts INTEGER NOT NULL,diagnostic TEXT NOT NULL,notified INTEGER NOT NULL DEFAULT 0,repair_probe INTEGER NOT NULL DEFAULT 0);")?;
+    if !c
+        .prepare("PRAGMA table_info(manager_config)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "supports_images")
+    {
+        c.execute(
+            "ALTER TABLE manager_config ADD COLUMN supports_images INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     crate::manager_close::migrate(c, recover)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_input_claims(input_id TEXT PRIMARY KEY REFERENCES manager_inputs(id) ON DELETE CASCADE,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS manager_claim_run ON manager_input_claims(run_id);")?;
     if recover {
@@ -53,6 +65,8 @@ pub struct ConfigInput {
     #[serde(default)]
     pub clear_api_key: bool,
     pub expected_revision: i64,
+    #[serde(default)]
+    pub supports_images: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +90,14 @@ pub fn public(c: &Connection, project: &str) -> Result<Value> {
     } else {
         error
     };
+    let supports_images: bool = c
+        .query_row(
+            "SELECT supports_images FROM manager_config WHERE project_id=?",
+            [project],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
     let paused: bool = c.query_row("SELECT paused FROM projects WHERE id=?", [project], |r| {
         r.get(0)
     })?;
@@ -92,7 +114,7 @@ pub fn public(c: &Connection, project: &str) -> Result<Value> {
         )
         .optional()?;
     Ok(
-        json!({"mode":mode,"base_url":base,"model":model,"has_api_key":has_key,"revision":revision,"status":if mode=="native"{"disabled"}else if paused{"paused"}else if !error.is_empty(){"unavailable"}else if active{"working"}else{"ready"},"error":error,"failure":failure.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?}),
+        json!({"mode":mode,"base_url":base,"model":model,"supports_images":supports_images,"has_api_key":has_key,"revision":revision,"status":if mode=="native"{"disabled"}else if paused{"paused"}else if !error.is_empty(){"unavailable"}else if active{"working"}else{"ready"},"error":error,"failure":failure.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?}),
     )
 }
 pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> {
@@ -122,6 +144,7 @@ pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> 
     let config = ProviderConfig {
         base_url: input.base_url.clone(),
         model: input.model.clone(),
+        supports_images: false,
         api_key: if key.is_empty() {
             "configuration-placeholder".into()
         } else {
@@ -129,7 +152,17 @@ pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> 
         },
     };
     config.validate()?;
+    // An omitted declaration survives only for the exact configured provider/model.
+    let supports_images = input.supports_images.unwrap_or_else(|| {
+        current["base_url"] == input.base_url
+            && current["model"] == input.model
+            && current["supports_images"] == true
+    });
     tx.execute("INSERT INTO manager_config(project_id,base_url,model,api_key,revision) VALUES(?,?,?,?,1) ON CONFLICT(project_id) DO UPDATE SET base_url=excluded.base_url,model=excluded.model,api_key=excluded.api_key,revision=manager_config.revision+1,input_revision=manager_config.input_revision+1,error='',next_attempt_at=0",params![project,input.base_url,input.model,key])?;
+    tx.execute(
+        "UPDATE manager_config SET supports_images=? WHERE project_id=?",
+        params![supports_images, project],
+    )?;
     tx.execute(
         "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
         [project],
@@ -1066,11 +1099,116 @@ fn continuation_input(raw: &str, origin: Option<&str>) -> Result<Value> {
         json!({"source_event_id":origin,"full_input_retained":true,"preview":preview,"continuation":"Already owned input, not a new request. Its full original payload and attachments remain durable; inspect through the original trusted source before declaring completion. Do not repeat confirmed or uncertain effects."}),
     )
 }
+const PREPARED_INPUT: &str = "NOT EXISTS(SELECT 1 FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.id=manager_inputs.origin_event_id AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
+fn image_source(
+    c: &Connection,
+    project: &str,
+    origin: &str,
+) -> Result<Option<(String, Value, String)>> {
+    let row: Option<(String, String, String)> = c.query_row("SELECT m.id,m.source_id,m.attachment FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.id=? AND e.project_id=? AND m.project_id=? AND m.direction='in'", params![origin,project,project], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let Some((id, source_id, raw)) = row else {
+        return Ok(None);
+    };
+    let mut a: Value = serde_json::from_str(&raw)?;
+    a["source_message_id"] = json!(source_id);
+    let source = &a["source"];
+    let discussion = source["root_id"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .or_else(|| source["thread_id"].as_str().filter(|v| !v.is_empty()))
+        .unwrap_or(if source["chat_type"] == "group" {
+            &source_id
+        } else {
+            "main"
+        });
+    let scope = json!([a["bot_app_id"], source["chat_id"], discussion]).to_string();
+    Ok(Some((id, a, scope)))
+}
+fn prepare_images(
+    c: &Connection,
+    project: &str,
+    origin: Option<&str>,
+    scope: Option<&str>,
+    supports_images: bool,
+    used: usize,
+    data: &mut Value,
+) -> Result<Vec<crate::multimodal::ImageRef>> {
+    let Some(origin) = origin else {
+        return Ok(vec![]);
+    };
+    let Some((message, attachment, source_scope)) = image_source(c, project, origin)? else {
+        return Ok(vec![]);
+    };
+    let mut resources = attachment["resources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut images = Vec::new();
+    for resource in &mut resources {
+        if resource["kind"] != "image"
+            && !resource["media_type"]
+                .as_str()
+                .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            continue;
+        }
+        let verified = (|| {
+            ensure!(
+                resource["cache_source_id"] == attachment["source_message_id"],
+                "Image source identity changed"
+            );
+            let database_root = std::path::Path::new(
+                c.path()
+                    .context("Image cache needs a persistent project store")?,
+            )
+            .parent()
+            .context("Image cache store is unavailable")?
+            .canonicalize()?;
+            crate::multimodal::ImageRef::from_resource(
+                project,
+                &message,
+                resource,
+                &database_root.join("files").join(project),
+            )
+        })();
+        let reason = if !supports_images {
+            "image_capability_not_declared"
+        } else if scope != Some(source_scope.as_str()) {
+            "different_discussion_scope"
+        } else if used + images.len() >= crate::multimodal::MAX_IMAGES {
+            "image_count_limit"
+        } else if !resource["local_path"].is_string() {
+            "image_resource_unavailable"
+        } else if resource["bytes"]
+            .as_u64()
+            .is_some_and(|size| size > crate::multimodal::MAX_IMAGE_BYTES)
+        {
+            "image_size_limit"
+        } else if resource["media_type"].as_str().is_some_and(|mime| {
+            !matches!(
+                mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            )
+        }) {
+            "unsupported_image_type"
+        } else if verified.is_err() {
+            "image_cache_metadata_unverified"
+        } else {
+            "image_part"
+        };
+        resource["image_delivery"] = json!({"mode":if reason == "image_part" {"image_part"}else{"path_only"},"reason":reason,"note":if reason == "image_part" {"Image bytes will be verified and supplied as image content to this configured model."}else{"The current model has not received image pixels. Inline input requires an explicit endpoint/model declaration, verified PNG/JPEG/GIF/WebP files up to 2 MiB, and at most 4 images. A local path is only a file reference; do not claim to have viewed the image. Delegate inspection when needed and report any inability."}});
+        if reason == "image_part" {
+            images.push(verified?);
+        }
+    }
+    data["user_input"]["resources"] = json!(resources);
+    Ok(images)
+}
 fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
     let tx = c.unchecked_transaction()?;
     let p = db::project_by_key(&tx, project)?;
-    let config:Option<(String,String,String,i64,i64)>=tx.query_row("SELECT base_url,model,api_key,revision,input_revision FROM manager_config WHERE project_id=? AND mode='manager' AND next_attempt_at<=?",params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-    let Some((base_url, model, api_key, revision, _)) = config else {
+    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row("SELECT base_url,model,api_key,revision,input_revision,supports_images FROM manager_config WHERE project_id=? AND mode='manager' AND next_attempt_at<=?",params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let Some((base_url, model, api_key, revision, _, supports_images)) = config else {
         return Ok(None);
     };
     if p.paused || work::has_takeover(&tx, project, &p.generation)? {
@@ -1093,7 +1231,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         }
         (run, origin, serde_json::from_str(&raw)?)
     } else {
-        let candidates=tx.prepare("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' ORDER BY rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {PREPARED_INPUT} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         if candidates.is_empty() && continuing.is_empty() {
             tx.commit()?;
@@ -1115,7 +1253,17 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             }
         }
         let notes=tx.prepare("SELECT n.note FROM manager_turn_notes n JOIN manager_runs r ON r.id=n.run_id WHERE r.project_id=? ORDER BY r.rowid DESC LIMIT 8")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let latest=tx.query_row("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
+        let latest=tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {PREPARED_INPUT} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
+        // A new trusted user source selects the discussion; otherwise retain only
+        // the selected, still-owned user objective, never consumed conversation history.
+        let image_scope = latest
+            .as_ref()
+            .or_else(|| continuing.iter().find(|v| v.2 == "user"))
+            .and_then(|v| v.1.as_deref())
+            .map(|origin| image_source(&tx, project, origin))
+            .transpose()?
+            .flatten()
+            .map(|(_, _, scope)| scope);
         let latest_context=tx.query_row("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','processing','consumed') ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
         // User steering may interrupt an owned batch; observations never do. Reserve
         // one of the 32 NEW claim slots for that control input, without reordering
@@ -1131,6 +1279,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         let mut origins = HashSet::new();
         let mut current = Vec::new();
         let mut previous = Vec::new();
+        let mut images = Vec::new();
         let mut trusted_sources = Vec::new();
         let latest_steering = match &latest_context {
             Some((id, origin, raw, status)) => {
@@ -1141,7 +1290,21 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         let mut selected_continuing = Vec::new();
         for candidate in continuing {
             let (id, origin, kind, raw) = &candidate;
-            let item = json!({"input_id":id,"kind":kind,"journal_available":true,"journal_instructions":"Before any external action, call worker_status with this input_id to inspect its paginated original-run effect journal, including confirmed and uncertain effects. Do not treat this input as a new task.","data":continuation_input(raw,origin.as_deref())?});
+            let mut data = continuation_input(raw, origin.as_deref())?;
+            let candidate_images = if kind == "user" {
+                prepare_images(
+                    &tx,
+                    project,
+                    origin.as_deref(),
+                    image_scope.as_deref(),
+                    supports_images,
+                    images.len(),
+                    &mut data,
+                )?
+            } else {
+                vec![]
+            };
+            let item = json!({"input_id":id,"kind":kind,"journal_available":true,"journal_instructions":"Before any external action, call worker_status with this input_id to inspect its paginated original-run effect journal, including confirmed and uncertain effects. Do not treat this input as a new task.","data":data});
             let mut next = previous.clone();
             next.push(item.clone());
             let metadata = origin
@@ -1173,6 +1336,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 break;
             }
             previous.push(item);
+            images.extend(candidate_images);
             if let Some(metadata) = metadata {
                 trusted_sources.push(metadata);
             }
@@ -1184,7 +1348,21 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         let continuing = selected_continuing;
         for candidate in ordered {
             let (_, origin, kind, raw) = &candidate;
-            let item = json!({"kind":kind,"data":prompt_input(raw,origin.as_deref())?});
+            let mut data = prompt_input(raw, origin.as_deref())?;
+            let candidate_images = if kind == "user" {
+                prepare_images(
+                    &tx,
+                    project,
+                    origin.as_deref(),
+                    image_scope.as_deref(),
+                    supports_images,
+                    images.len(),
+                    &mut data,
+                )?
+            } else {
+                vec![]
+            };
+            let item = json!({"kind":kind,"data":data});
             let metadata = origin
                 .as_ref()
                 .filter(|id| !origins.contains(*id))
@@ -1206,6 +1384,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 "Trusted input metadata exceeds the management context bound"
             );
             current.push(item);
+            images.extend(candidate_images);
             if let Some(metadata) = metadata {
                 trusted_sources.push(metadata);
             }
@@ -1260,7 +1439,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             prompt.len() <= 250000,
             "Management context exceeds its bound"
         );
-        let checkpoint = manager_loop::begin(prompt, SYSTEM.into())?;
+        let checkpoint = manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?;
         let run = db::id();
         tx.execute(
             "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
@@ -1288,6 +1467,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             base_url,
             model,
             api_key,
+            supports_images,
         },
         checkpoint,
     }))
@@ -1681,6 +1861,7 @@ mod tests {
                         api_key: Some("private-manager-key".into()),
                         clear_api_key: false,
                         expected_revision: 0,
+                        supports_images: None,
                     },
                 )?;
                 set_mode(
@@ -1699,6 +1880,167 @@ mod tests {
     }
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
+    }
+    #[tokio::test]
+    async fn image_capability_is_explicit_and_resets_when_provider_identity_changes() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c| {
+            let original = public(c, &p.id)?;
+            assert_eq!(original["supports_images"], false);
+            let configure = |model: &str, declared: Option<bool>| -> Result<Value> {
+                let current = public(c, &p.id)?;
+                save(c, &p.id, ConfigInput { base_url: current["base_url"].as_str().unwrap().into(), model: model.into(), api_key: None, clear_api_key: false, expected_revision: current["revision"].as_i64().unwrap(), supports_images: declared })
+            };
+            assert_eq!(configure("fixture-vision-name-is-not-proof", None)?["supports_images"], false);
+            assert_eq!(configure("fixture-vision-name-is-not-proof", Some(true))?["supports_images"], true);
+            assert_eq!(configure("fixture-vision-name-is-not-proof", None)?["supports_images"], true);
+            assert_eq!(configure("different-model", None)?["supports_images"], false);
+            assert_eq!(configure("different-model", Some(true))?["supports_images"], true);
+            let current = public(c, &p.id)?;
+            let changed: ConfigInput = serde_json::from_value(json!({"base_url":"http://127.0.0.1:8/v1","model":"different-model","expected_revision":current["revision"]}))?;
+            assert_eq!(save(c, &p.id, changed)?["supports_images"], false);
+            Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn prepared_image_claim_uses_fresh_host_metadata_and_plain_steering_does_not_wait() {
+        let (_dir, app, p) = fixture().await;
+        let id = app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture","om_pixels","Inspect picture",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p"},"resources":[{"kind":"image","file_key":"img_fixture","local_path":"/untrusted/body/spy.png"}]})).unwrap().unwrap();
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                assert!(claim(c, &p.id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        ingest(&app, &p, "om_plain_after_pixels", "Change direction now");
+        let inline_checkpoint = app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            let plain = claim(c, &p.id)?.unwrap();
+            assert!(plain.checkpoint["images"].as_array().unwrap().is_empty());
+            finish_turn(c, &plain.context, "accepted steering")?;
+            let mut resource = crate::multimodal::fixture_resource(&app.dir, &p.id, &id);
+            resource["cache_source_id"] = json!("om_pixels");
+            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true'),'$.resources',json(?)) WHERE id=?",params![json!([resource]).to_string(),id])?;
+            let text_only = claim(c, &p.id)?.unwrap();
+            assert!(text_only.checkpoint["images"].as_array().unwrap().is_empty());
+            assert!(text_only.checkpoint.to_string().contains("image_capability_not_declared"));
+            let image_input: String = c.query_row("SELECT i.id FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id WHERE e.message_id=?", [&id], |r|r.get(0))?;
+            assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE id=?", [&image_input], |r|r.get::<_,String>(0))?, "processing");
+            let current = public(c,&p.id)?;
+            let config: ConfigInput = serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?;
+            save(c,&p.id,config)?;
+            let inline = claim(c,&p.id)?.unwrap();
+            assert_eq!(inline.checkpoint["images"].as_array().unwrap().len(),1);
+            assert_eq!(inline.checkpoint["images"][0]["message_id"],id);
+            assert!(!inline.checkpoint.to_string().contains("/untrusted/body/spy.png"));
+            assert_eq!(c.query_row("SELECT run_id FROM manager_input_claims WHERE input_id=?", [&image_input], |r|r.get::<_,String>(0))?, inline.context.run);
+            Ok(inline.checkpoint)
+        }).unwrap();
+        let rig_agent::run::AgentRunStep::CallModel {
+            mut prompt,
+            mut history,
+            ..
+        } = serde_json::from_value(inline_checkpoint["pending"].clone()).unwrap()
+        else {
+            panic!("initial model request")
+        };
+        let refs: Vec<crate::multimodal::ImageRef> =
+            serde_json::from_value(inline_checkpoint["images"].clone()).unwrap();
+        let decisions = crate::multimodal::hydrate(
+            &mut prompt,
+            &mut history,
+            &refs,
+            inline_checkpoint["image_input_digest"].as_str(),
+            true,
+        )
+        .await;
+        assert_eq!(decisions[0]["mode"], "image_part");
+        let encoded_prompt = serde_json::to_string(&prompt).unwrap();
+        assert!(encoded_prompt.contains(r#""type":"image""#));
+        assert!(encoded_prompt.contains("continuing_inputs"));
+    }
+    #[tokio::test]
+    async fn image_pixels_never_cross_the_newest_trusted_discussion_scope() {
+        let (_dir, app, p) = fixture().await;
+        let mut messages = Vec::new();
+        for (index, chat) in ["oc_first", "oc_second", "oc_second"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = app.db.ingest_bot(&p.id,"cli_fixture",chat,&format!("om_{chat}_{index}"),"Inspect image",&json!({"source":{"chat_id":chat,"chat_type":"p2p"},"resources":[{"kind":"image","file_key":"img_fixture"}]})).unwrap().unwrap();
+            let mut resource = crate::multimodal::fixture_resource(&app.dir, &p.id, &id);
+            resource["cache_source_id"] = json!(format!("om_{chat}_{index}"));
+            app.db.sync(|c| { c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true'),'$.resources',json(?)) WHERE id=?",params![json!([resource]).to_string(),id])?;Ok(()) }).unwrap();
+            messages.push(id);
+        }
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            let current = public(c,&p.id)?;
+            save(c,&p.id,serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?)?;
+            let turn = claim(c,&p.id)?.unwrap();
+            assert_eq!(turn.checkpoint["images"].as_array().unwrap().len(),2);
+            let ids = turn.checkpoint["images"].as_array().unwrap().iter().map(|image|image["message_id"].as_str().unwrap()).collect::<Vec<_>>();
+            assert!(ids.contains(&messages[1].as_str()) && ids.contains(&messages[2].as_str()) && !ids.contains(&messages[0].as_str()));
+            assert!(turn.checkpoint.to_string().contains("different_discussion_scope"));
+            Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn prepared_image_limits_keep_explicit_reasons_and_regular_file_references() {
+        let (_dir, app, p) = fixture().await;
+        let id = app
+            .db
+            .ingest_bot(
+                &p.id,
+                "cli_fixture",
+                "oc_fixture",
+                "om_limits",
+                "Inspect attachments",
+                &json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p"},"resources":[]}),
+            )
+            .unwrap()
+            .unwrap();
+        let mut resources = Vec::new();
+        for index in 0..7 {
+            let mut resource = crate::multimodal::fixture_resource(&app.dir, &p.id, &id);
+            let original = std::path::PathBuf::from(resource["local_path"].as_str().unwrap());
+            let path = original.with_file_name(format!("{id}-{index}.png"));
+            std::fs::copy(original, &path).unwrap();
+            resource["local_path"] = json!(path);
+            resource["cache_source_id"] = json!("om_limits");
+            if index == 0 {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(crate::multimodal::MAX_IMAGE_BYTES + 1)
+                    .unwrap();
+                resource["bytes"] = json!(crate::multimodal::MAX_IMAGE_BYTES + 1);
+            } else if index == 1 {
+                resource["media_type"] = json!("image/svg+xml");
+            }
+            resources.push(resource);
+        }
+        resources.push(json!({"kind":"file","local_path":"/ordinary/document.txt"}));
+        app.db.sync(|c| {
+            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true'),'$.resources',json(?)) WHERE id=?",params![json!(resources).to_string(),id])?;
+            work::sync_inbound(c)?;
+            let origin: String = c.query_row("SELECT id FROM work_events WHERE message_id=?",[&id],|r|r.get(0))?;
+            let (_,_,scope) = image_source(c,&p.id,&origin)?.unwrap();
+            let mut data = json!({});
+            let refs = prepare_images(c,&p.id,Some(&origin),Some(&scope),true,0,&mut data)?;
+            assert_eq!(refs.len(),crate::multimodal::MAX_IMAGES);
+            let resources = data["user_input"]["resources"].as_array().unwrap();
+            assert_eq!(resources[0]["image_delivery"]["reason"],"image_size_limit");
+            assert_eq!(resources[1]["image_delivery"]["reason"],"unsupported_image_type");
+            assert_eq!(resources[6]["image_delivery"]["reason"],"image_count_limit");
+            assert!(resources[0]["image_delivery"]["note"].as_str().unwrap().contains("2 MiB"));
+            assert!(resources[6]["image_delivery"]["note"].as_str().unwrap().contains("at most 4"));
+            assert_eq!(resources[7]["local_path"],"/ordinary/document.txt");
+            assert!(resources[7]["image_delivery"].is_null());
+            Ok(())
+        }).unwrap();
     }
     fn receipt_args(anchor: &str) -> MessageArgs {
         MessageArgs {
@@ -2992,8 +3334,14 @@ mod tests {
         app.db
             .sync(|c| {
                 work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                let origin = select_origin(c, &turn.context, None)?;
+                assert!(claim(c, &p.id)?.is_none());
+                // A durable delegation created before this readiness gate must still
+                // obey the original resource fence after an upgrade or restart.
+                let origin: Option<String> = Some(c.query_row(
+                    "SELECT id FROM work_events WHERE source_id='om_resource'",
+                    [],
+                    |r| r.get(0),
+                )?);
                 intent(
                     c,
                     &p,
