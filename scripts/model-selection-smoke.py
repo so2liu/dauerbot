@@ -164,6 +164,9 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             assert button == "apply_" + token
             select = next(e for e in form["elements"] if e["name"] == "catalog_model")
             assert card["schema"] == "2.0" and attachment["sent_root_id"] == source
+            content = json.dumps(card)
+            assert "Requested selection:" in content and "Observed running model: unverified" in content
+            assert "Shortcut:" in content and "Send message" in content and "Card action trigger" in content
             return {"command": command, "message_id": attachment["sent_message_id"], "button": button,
                     "options": json.loads(options), "card": card, "select": select}
 
@@ -201,6 +204,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             assert original["native_session"] == native and original["execution"].get("native_confirmed"), original
             catalog = api(f"/projects/{project_id}/models")
             assert "fixture-model-two" in json.dumps(catalog) and "fixture-hidden" not in json.dumps(catalog), catalog
+            assert catalog["effective"] is None and catalog["effective_source"] == "unverified", catalog
             for source in ["om_model_picker", "om_model_stale_picker"]:
                 smoke.FIXTURE.emit(smoke.message(source, "/models"), APP)
             card = smoke.wait_for(lambda: card_for("om_model_picker"), "no topic model picker card")
@@ -261,6 +265,9 @@ runpy.run_path(sys.argv[0],run_name='__main__')
             smoke.wait_for(delivered, "held input did not reach selected model once")
             assert current["generation"] != original["generation"] and current["native_session"] == native
             assert current["execution"]["model_selection"]["model"] == "fixture-model-two"
+            selected_catalog = api(f"/projects/{project_id}/models")
+            assert selected_catalog["configured"] == {"model": "fixture-model-two", "provider": "fixture-provider"}, selected_catalog
+            assert selected_catalog["effective"] is None and selected_catalog["effective_source"] == "unverified", selected_catalog
             assert not current["cli_transition"]["holds_input"]
             emit_action(accepted, "evt_model_accept_retry_after_ready")
             stale_action = callback(stale, "evt_model_stale_generation", "m0")
@@ -272,6 +279,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
 
             smoke.FIXTURE.emit(smoke.message("om_model_default", "/models"), APP)
             default = smoke.wait_for(lambda: card_for("om_model_default"), "no refreshed picker for native default")
+            assert "fixture-provider / fixture-model-two" in json.dumps(default["card"]), default["card"]
             emit_action(callback(default, "evt_model_default", "native"))
             reset = smoke.wait_for(lambda: project() if len(launches()) == 3 and project()["cli_transition"]["phase"] == "ready" else None, "native-default reset did not finish", timeout=50)
             reset_launch = launches()[-1]
