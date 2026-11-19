@@ -4,7 +4,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Selectable, Sizable,
     button::*,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
 };
 use herdr_feishu_bridge::config::Config;
 use serde_json::{Value, json};
@@ -36,6 +36,14 @@ pub fn status(project: &Value) -> &str {
         .unwrap_or("unavailable")
 }
 
+fn image_identity_changed(
+    event: &InputEvent,
+    previous: &(String, String),
+    current: &(String, String),
+) -> bool {
+    matches!(event, InputEvent::Change) && previous != current
+}
+
 pub struct ManagerSettings {
     project: Value,
     config: Value,
@@ -47,6 +55,7 @@ pub struct ManagerSettings {
     open: bool,
     dirty: bool,
     supports_images: bool,
+    image_identity: (String, String),
     message: String,
     tx: mpsc::Sender<Work>,
     endpoint: Entity<InputState>,
@@ -177,14 +186,23 @@ impl ManagerSettings {
         })
         .detach();
         for (index, input) in [&endpoint, &model, &key].into_iter().enumerate() {
-            cx.subscribe(
-                input,
-                move |this, _, _: &gpui_component::input::InputEvent, cx| {
-                    if index < 2 { this.supports_images = false; }
-                    this.dirty = true;
-                    cx.notify();
-                },
-            )
+            cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                if index < 2 {
+                    let identity = (
+                        this.endpoint.read(cx).value().to_string(),
+                        this.model.read(cx).value().to_string(),
+                    );
+                    if image_identity_changed(event, &this.image_identity, &identity) {
+                        this.supports_images = false;
+                    }
+                    this.image_identity = identity;
+                }
+                this.dirty = true;
+                cx.notify();
+            })
             .detach();
         }
         Self {
@@ -198,6 +216,7 @@ impl ManagerSettings {
             open: false,
             dirty: false,
             supports_images: false,
+            image_identity: (String::new(), String::new()),
             message: String::new(),
             tx,
             endpoint,
@@ -295,6 +314,10 @@ impl Render for ManagerSettings {
                     )
                 });
             }
+            self.image_identity = (
+                self.config["base_url"].as_str().unwrap_or("").into(),
+                self.config["model"].as_str().unwrap_or("").into(),
+            );
             self.supports_images = self.config["supports_images"] == true;
             self.dirty = false;
         }
@@ -381,5 +404,42 @@ impl Render for ManagerSettings {
             view=view.child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("The terminal belongs to the coding worker. Model and repair controls remain available if the manager cannot connect.")));
         }
         view
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputEvent, image_identity_changed};
+    #[test]
+    fn declaration_resets_only_for_real_provider_identity_changes() {
+        let saved: (String, String) = ("https://fixture.invalid/v1".into(), "vision".into());
+        let changed = (saved.0.clone(), "another-model".into());
+        for event in [
+            InputEvent::PressEnter { secondary: false },
+            InputEvent::PressEnter { secondary: true },
+            InputEvent::Focus,
+            InputEvent::Blur,
+        ] {
+            assert!(!image_identity_changed(&event, &saved, &saved));
+            assert!(!image_identity_changed(&event, &saved, &changed));
+        }
+        assert!(!image_identity_changed(&InputEvent::Change, &saved, &saved));
+        assert!(image_identity_changed(
+            &InputEvent::Change,
+            &saved,
+            &changed
+        ));
+        assert!(image_identity_changed(
+            &InputEvent::Change,
+            &saved,
+            &("https://another.invalid/v1".into(), saved.1.clone())
+        ));
+        // A freshly populated form or a declaration for edited values is bound
+        // to that identity, even when it differs from the previously saved form.
+        assert!(!image_identity_changed(
+            &InputEvent::Change,
+            &changed,
+            &changed
+        ));
     }
 }
