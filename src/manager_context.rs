@@ -14,6 +14,9 @@ use std::{
 const MAX_REQUESTS: usize = 64;
 const MAX_PROJECT_REQUESTS: usize = 4;
 const MAX_TEXT_BYTES: usize = 48 * 1024;
+// Manager input/tool-result serialization is separately bounded at 256 KiB.
+// Parse that full structured input before applying the smaller display budget.
+const MAX_STRUCTURED_BYTES: usize = 256 * 1024;
 const MAX_BLOCKS: usize = 256;
 const MAX_API_BYTES: usize = 1536 * 1024;
 
@@ -229,7 +232,7 @@ fn redact_text(text: &str) -> (String, bool) {
 fn clean(text: &str) -> (String, bool) {
     // Structured user/tool text frequently contains nested resource metadata.
     // The cap also bounds parsing and redaction work on the diagnostic path.
-    if text.len() <= MAX_TEXT_BYTES
+    if text.len() <= MAX_STRUCTURED_BYTES
         && let Ok(mut value) = serde_json::from_str::<Value>(text)
     {
         let mut changed = false;
@@ -437,6 +440,34 @@ mod tests {
         assert!(changed);
         assert!(!redacted.contains("fixture-password"));
         assert!(!redacted.contains("fixture-token"));
+    }
+    #[test]
+    fn large_structured_context_is_redacted_by_field_before_display_truncation() {
+        let input = json!({"has_api_key":true,"task":"safe task survives","api_key":"fixture-hidden","padding":"x".repeat(MAX_TEXT_BYTES+100)}).to_string();
+        assert!(input.len() > MAX_TEXT_BYTES);
+        let (cleaned, changed) = clean(&input);
+        assert!(changed);
+        let value: Value = serde_json::from_str(&cleaned).unwrap();
+        assert_eq!(value["has_api_key"], true);
+        assert_eq!(value["task"], "safe task survives");
+        assert!(!cleaned.contains("fixture-hidden"));
+        assert_ne!(cleaned, "[redacted credential-bearing line]\n");
+        let mut builder = Builder::new();
+        builder.push("user", "text", &input);
+        assert!(builder.truncated);
+        assert!(builder.redacted);
+        assert!(
+            builder.blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("has_api_key")
+        );
+        assert!(
+            !builder.blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fixture-hidden")
+        );
     }
     #[test]
     fn store_is_read_only_scoped_bounded_and_drop_marks_abandoned() {
