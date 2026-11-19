@@ -3,6 +3,7 @@ mod access;
 mod activation;
 mod agent_tree;
 mod backend;
+mod finder;
 mod locale;
 mod manager_settings;
 #[cfg(target_os = "macos")]
@@ -84,7 +85,8 @@ actions!(
         PreviousProject,
         AddProject,
         ToggleTerminal,
-        ToggleSidebar
+        ToggleSidebar,
+        QuickFind
     ]
 );
 
@@ -132,6 +134,7 @@ struct Desktop {
     picked_path: String,
     name: Entity<InputState>,
     project_search: Entity<InputState>,
+    finder: Entity<finder::QuickFinder>,
     path: Entity<InputState>,
     app_id: Entity<InputState>,
     secret: Entity<InputState>,
@@ -195,6 +198,33 @@ impl Desktop {
                 .placeholder(setup.language.text("Stored only on this Mac"))
                 .masked(true)
         });
+        let finder = cx.new(|cx| finder::QuickFinder::new(window, cx));
+        cx.subscribe_in(
+            &finder,
+            window,
+            |this, _, event: &finder::Navigate, window, cx| {
+                if !this.finder_allowed() || !finder::target_available(&event.0, &this.state) {
+                    return;
+                }
+                match &event.0 {
+                    finder::Target::Project(id) => {
+                        this.select_project(id.clone(), cx);
+                        this.go(6);
+                    }
+                    finder::Target::Session { project, .. } => {
+                        this.go(6);
+                        this.select_project(project.clone(), cx);
+                        this.setup.terminal_hidden = false;
+                        this.sync_terminal(cx);
+                        this.go(6);
+                    }
+                    finder::Target::Page(page) => this.go(*page),
+                }
+                this.focus_handle.focus(window);
+                cx.notify();
+            },
+        )
+        .detach();
         let _ = backend.tx.send(CommandRequest::Environment);
         cx.spawn_in(window, async move |entity, cx| {
             loop {
@@ -229,6 +259,7 @@ impl Desktop {
             picked_path: String::new(),
             name,
             project_search,
+            finder,
             path,
             app_id,
             secret,
@@ -259,6 +290,16 @@ impl Desktop {
             restored: false,
             sidebar_resizing: false,
         }
+    }
+    fn finder_allowed(&self) -> bool {
+        finder::can_open(
+            self.takeover_requested,
+            self.terminal
+                .as_ref()
+                .is_some_and(|bridge| bridge.controlling),
+            self.activation_frozen,
+            self.quitting,
+        )
     }
     fn receive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
@@ -2490,10 +2531,21 @@ impl Render for Desktop {
             7 => self.updates_page(cx).into_any_element(),
             _ => self.settings_page(cx),
         };
+        let finder_allowed = self.finder_allowed();
+        self.finder.update(cx, |finder, cx| {
+            if !finder_allowed { finder.dismiss(window, cx); }
+            finder.sync(&self.state, self.setup.language, cx)
+        });
         div()
             .id("dauerbot-desktop")
+            .relative()
             .track_focus(&self.focus_handle)
             .key_context("Dauerbot")
+            .on_action(cx.listener(|this, _: &QuickFind, window, cx| {
+                if this.finder_allowed() {
+                    this.finder.update(cx, |finder, cx| finder.toggle(this.focus_handle.clone(), window, cx));
+                } else { cx.propagate(); }
+            }))
             .on_action(cx.listener(|this, _: &FocusProjects, window, cx| {
                 if workspace_geometry(window.viewport_size().width, this.setup.page == 6 && !this.setup.terminal_hidden, this.setup.sidebar_hidden, this.setup.sidebar_width).sidebar_hidden {
                     this.toggle_sidebar(window, cx);
@@ -2599,7 +2651,7 @@ impl Render for Desktop {
                             .text_color(rgb(if self.error { palette.error } else { palette.muted }))
                             .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
                     ),
-            ).into_any_element()
+            ).child(self.finder.clone()).into_any_element()
     }
 }
 fn project_status(project: &Value) -> &str {
@@ -2763,6 +2815,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", ShowSettings, None),
+            KeyBinding::new("cmd-k", QuickFind, Some("Dauerbot")),
             KeyBinding::new("cmd-f", FocusProjects, Some("Dauerbot")),
             KeyBinding::new("cmd-b", ToggleSidebar, Some("Dauerbot")),
             KeyBinding::new("cmd-alt-down", NextProject, Some("Dauerbot")),
