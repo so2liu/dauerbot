@@ -38,6 +38,7 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'native',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id),note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_failures(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,incident_id TEXT NOT NULL,attempts INTEGER NOT NULL,diagnostic TEXT NOT NULL,notified INTEGER NOT NULL DEFAULT 0,repair_probe INTEGER NOT NULL DEFAULT 0);")?;
     crate::manager_close::migrate(c, recover)?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_input_claims(input_id TEXT PRIMARY KEY REFERENCES manager_inputs(id) ON DELETE CASCADE,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS manager_claim_run ON manager_input_claims(run_id);")?;
     if recover {
         c.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE status='submitting'",[json!({"status":"uncertain","message":"The host stopped during this effect; do not repeat it without inspecting evidence."}).to_string()])?;
     }
@@ -181,7 +182,7 @@ pub fn set_mode(c: &Connection, project: &str, input: ModeInput) -> Result<Value
     if input.mode == "native" && current["mode"] == "manager" {
         let effects=tx.prepare("SELECT e.id,e.name,e.status,e.result FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=? ORDER BY e.rowid DESC LIMIT 32")?.query_map([project],|r|Ok(json!({"effect_id":r.get::<_,String>(0)?,"tool":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"evidence":r.get::<_,String>(3)?.chars().take(1000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let p = db::project_by_key(&tx, project)?;
-        let mut query=tx.prepare("SELECT id,origin_event_id,payload FROM manager_inputs WHERE project_id=? AND status='queued' ORDER BY rowid")?;
+        let mut query=tx.prepare("SELECT id,origin_event_id,payload FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing') ORDER BY rowid")?;
         let rows = query.query_map([project], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -207,7 +208,7 @@ pub fn set_mode(c: &Connection, project: &str, input: ModeInput) -> Result<Value
         }
         drop(query);
         tx.execute(
-            "UPDATE manager_inputs SET status='transferred' WHERE project_id=? AND status='queued'",
+            "UPDATE manager_inputs SET status='transferred' WHERE project_id=? AND status IN ('queued','processing')",
             [project],
         )?;
     }
@@ -307,7 +308,7 @@ fn input(
     payload: &Value,
 ) -> Result<()> {
     if c.execute("INSERT OR IGNORE INTO manager_inputs(id,project_id,origin_event_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)",params![id,project,origin,kind,payload.to_string(),db::now()])?==1 {
- c.execute("UPDATE manager_config SET input_revision=input_revision+1,next_attempt_at=CASE WHEN ?='user' THEN 0 ELSE next_attempt_at END WHERE project_id=?",params![kind,project])?; }
+ c.execute("UPDATE manager_config SET input_revision=input_revision+CASE WHEN ?='user' THEN 1 ELSE 0 END,next_attempt_at=CASE WHEN ?='user' THEN 0 ELSE next_attempt_at END WHERE project_id=?",params![kind,kind,project])?; }
     Ok(())
 }
 #[derive(Clone)]
@@ -459,6 +460,54 @@ struct WriteArgs {
 struct DelegateArgs {
     instructions: String,
     source_event_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerStatusArgs {
+    input_id: Option<String>,
+    #[serde(default)]
+    after_effect: i64,
+    #[serde(default)]
+    detail_offset: usize,
+}
+/// A bounded read path for the exact input owned by this active batch. Historical
+/// joins identify its effect ancestry, but never grant authority on their own.
+fn input_effect_journal(
+    c: &Connection,
+    ctx: &Context,
+    args: WorkerStatusArgs,
+    current_effect: &str,
+) -> Result<Value> {
+    valid(c, ctx)?;
+    let Some(input) = args.input_id else {
+        ensure!(
+            args.after_effect == 0 && args.detail_offset == 0,
+            "Choose an owned input_id for effect journal paging"
+        );
+        return Ok(Value::Null);
+    };
+    ensure!(
+        args.after_effect >= 0 && args.detail_offset <= 262144,
+        "Effect journal cursor exceeds its bound"
+    );
+    let owned:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.id=? AND i.project_id=? AND i.status='processing' AND own.run_id=?)",params![input,ctx.project,ctx.run],|r|r.get(0))?;
+    ensure!(
+        owned,
+        "Effect evidence requires an input currently owned by this batch"
+    );
+    let records=c.prepare("SELECT DISTINCT e.rowid,e.id,e.run_id,e.name,e.status,e.arguments,e.result FROM manager_effects e JOIN manager_run_inputs ancestry ON ancestry.run_id=e.run_id WHERE ancestry.input_id=? AND e.rowid>? AND e.id!=? ORDER BY e.rowid LIMIT 9")?.query_map(params![input,args.after_effect,current_effect],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let more = records.len() > 8;
+    let mut cursor = args.after_effect;
+    let mut effects = Vec::new();
+    for (row, id, run, name, status, arguments, result) in records.into_iter().take(8) {
+        cursor = row;
+        let argument_chars = arguments.chars().count();
+        let result_chars = result.chars().count();
+        effects.push(json!({"effect_cursor":row,"effect_id":id,"manager_run_id":run,"tool":name,"status":status,"detail_offset":args.detail_offset,"arguments_chunk":arguments.chars().skip(args.detail_offset).take(2000).collect::<String>(),"result_chunk":result.chars().skip(args.detail_offset).take(2000).collect::<String>(),"arguments_chars":argument_chars,"result_chars":result_chars,"more_details":argument_chars>args.detail_offset+2000 || result_chars>args.detail_offset+2000}));
+    }
+    Ok(
+        json!({"input_id":input,"effects":effects,"next_effect_cursor":if more{Some(cursor)}else{None},"instructions":"These are recorded effects, not new requests. Never replay confirmed or uncertain actions. Continue with after_effect for older/later entries; for long arguments/results repeat the preceding cursor with detail_offset advanced by 2000. Delivery or idle is not semantic task success."}),
+    )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -678,7 +727,7 @@ fn enqueue_receipt(
         return Ok((id, false));
     }
     let user_source: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status='queued')",
+        "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status='processing' AND EXISTS(SELECT 1 FROM manager_input_claims own WHERE own.input_id=i.id AND own.run_id=b.run_id))",
         params![ctx.run, origin],
         |r| r.get(0),
     )?;
@@ -725,7 +774,7 @@ fn enqueue_receipt(
 pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
     if let Some(origin) = attachment["manager_receipt_origin"].as_str() {
         let allowed: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_config m ON m.project_id=i.project_id JOIN projects p ON p.id=m.project_id WHERE i.project_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status IN ('queued','consumed') AND m.mode='manager' AND m.revision=? AND p.paused=0)",
+            "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_config m ON m.project_id=i.project_id JOIN projects p ON p.id=m.project_id WHERE i.project_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status IN ('queued','processing','consumed') AND m.mode='manager' AND m.revision=? AND p.paused=0)",
             params![project, origin, attachment["manager_revision"].as_i64()],
             |r| r.get(0),
         )?;
@@ -803,7 +852,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
    },
-   "worker_status"=>{ensure!(call.arguments==json!({}),"worker_status takes no arguments");let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete}))},
+   "worker_status"=>{let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete,"input_effect_journal":journal}))},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
    "send_md"|"send_file"=>{
     let (to,text,anchor,path,receipt)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;ensure!(a.intent.is_some()||a.source_event_id.is_none(),"source_event_id is only used for a receipt");let receipt=a.intent.as_ref().map(|_|MessageArgs{to:a.to.clone(),text:a.text.clone(),reply_to_message_id:a.reply_to_message_id.clone(),intent:Some(MessageIntent::Receipt),source_event_id:a.source_event_id.clone()});(a.to,a.text,a.reply_to_message_id,None,receipt)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),None)};
@@ -985,6 +1034,38 @@ fn prompt_input(raw: &str, event_id: Option<&str>) -> Result<Value> {
     }
     Ok(value)
 }
+/// A durable claim survives process loss; the historical run/input join is not ownership.
+fn own_input(c: &Connection, run: &str, input: &str) -> Result<()> {
+    c.execute("INSERT INTO manager_input_claims(input_id,run_id) VALUES(?,?) ON CONFLICT(input_id) DO UPDATE SET run_id=excluded.run_id", params![input, run])?;
+    ensure!(c.execute("UPDATE manager_inputs SET status='processing' WHERE id=? AND status IN ('queued','processing')", [input])? == 1, "Input is no longer claimable");
+    Ok(())
+}
+fn adopt_legacy_claim(c: &Connection, project: &str) -> Result<()> {
+    let run: Option<String> = c.query_row("SELECT id FROM manager_runs WHERE project_id=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1", [project], |r|r.get(0)).optional()?;
+    if let Some(run) = run {
+        let ids = c.prepare("SELECT i.id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.status='queued' AND NOT EXISTS(SELECT 1 FROM manager_input_claims own WHERE own.input_id=i.id) ORDER BY i.rowid")?.query_map([&run], |r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in ids {
+            own_input(c, &run, &id)?;
+        }
+    }
+    Ok(())
+}
+fn continuation_input(raw: &str, origin: Option<&str>) -> Result<Value> {
+    let value = prompt_input(raw, origin)?;
+    if value.to_string().len() <= 2400 {
+        return Ok(value);
+    }
+    let preview = value["user_input"]["body"]
+        .as_str()
+        .or_else(|| value["instructions"].as_str())
+        .unwrap_or("")
+        .chars()
+        .take(500)
+        .collect::<String>();
+    Ok(
+        json!({"source_event_id":origin,"full_input_retained":true,"preview":preview,"continuation":"Already owned input, not a new request. Its full original payload and attachments remain durable; inspect through the original trusted source before declaring completion. Do not repeat confirmed or uncertain effects."}),
+    )
+}
 fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
     let tx = c.unchecked_transaction()?;
     let p = db::project_by_key(&tx, project)?;
@@ -1000,7 +1081,8 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         [project],
         |r| r.get(0),
     )?;
-    let existing=tx.query_row("SELECT id,origin_event_id,checkpoint,owner FROM manager_runs WHERE project_id=? AND revision=? AND input_revision=? AND status='working' ORDER BY rowid DESC LIMIT 1",params![project,revision,input_revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
+    adopt_legacy_claim(&tx, project)?;
+    let existing=tx.query_row("SELECT id,origin_event_id,checkpoint,owner FROM manager_runs WHERE project_id=? AND revision=? AND input_revision=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1",params![project,revision,input_revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
     let (run, _origin, checkpoint) = if let Some((run, origin, raw, previous_owner)) = existing {
         if previous_owner != owner() {
             tx.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE run_id=? AND status='submitting'",params![json!({"status":"uncertain","message":"The previous host stopped during this effect; inspect evidence, do not replay."}).to_string(),run])?;
@@ -1012,7 +1094,8 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         (run, origin, serde_json::from_str(&raw)?)
     } else {
         let candidates=tx.prepare("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' ORDER BY rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        if candidates.is_empty() {
+        let continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if candidates.is_empty() && continuing.is_empty() {
             tx.commit()?;
             return Ok(None);
         }
@@ -1033,30 +1116,72 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         }
         let notes=tx.prepare("SELECT n.note FROM manager_turn_notes n JOIN manager_runs r ON r.id=n.run_id WHERE r.project_id=? ORDER BY r.rowid DESC LIMIT 8")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let latest=tx.query_row("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
-        let newest_id = latest.as_ref().map(|v| v.0.clone());
-        let latest_context=tx.query_row("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','consumed') ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
-        let latest_steering = if let Some((id, origin, raw, status)) = latest_context {
-            if newest_id.as_ref() == Some(&id) {
-                json!({"source_event_id":origin,"present_in_new_inputs":true})
-            } else {
-                json!({"history_only_not_reply_target":true,"already_consumed":status=="consumed","data":prompt_input(&raw,origin.as_deref())?})
-            }
-        } else {
-            Value::Null
-        };
-        let mut ordered = Vec::new();
-        if let Some(latest) = latest {
-            ordered.push(latest);
-        }
-        for candidate in candidates {
-            if newest_id.as_ref() != Some(&candidate.0) && ordered.len() < 32 {
-                ordered.push(candidate);
-            }
+        let latest_context=tx.query_row("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','processing','consumed') ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
+        // User steering may interrupt an owned batch; observations never do. Reserve
+        // one of the 32 NEW claim slots for that control input, without reordering
+        // ordinary fresh batches or changing their persisted input order.
+        let steering_priority = !continuing.is_empty() && latest.is_some();
+        let mut ordered = candidates;
+        if steering_priority && let Some(latest) = latest {
+            ordered.retain(|item| item.0 != latest.0);
+            ordered.truncate(31);
+            ordered.insert(0, latest);
         }
         let mut inputs = Vec::new();
         let mut origins = HashSet::new();
         let mut current = Vec::new();
+        let mut previous = Vec::new();
         let mut trusted_sources = Vec::new();
+        let latest_steering = match &latest_context {
+            Some((id, origin, raw, status)) => {
+                json!({"input_id":id,"source_event_id":origin,"history_only_not_reply_target":status=="consumed","already_consumed":status=="consumed","context_only_not_batch_member":true,"data":prompt_input(raw,origin.as_deref())?})
+            }
+            None => Value::Null,
+        };
+        let mut selected_continuing = Vec::new();
+        for candidate in continuing {
+            let (id, origin, kind, raw) = &candidate;
+            let item = json!({"input_id":id,"kind":kind,"journal_available":true,"journal_instructions":"Before any external action, call worker_status with this input_id to inspect its paginated original-run effect journal, including confirmed and uncertain effects. Do not treat this input as a new task.","data":continuation_input(raw,origin.as_deref())?});
+            let mut next = previous.clone();
+            next.push(item.clone());
+            let metadata = origin
+                .as_ref()
+                .filter(|id| !origins.contains(*id))
+                .map(|id| trusted_source(&tx, project, id))
+                .transpose()?;
+            let mut sources = trusted_sources.clone();
+            if let Some(ref metadata) = metadata {
+                sources.push(metadata.clone());
+            }
+            // Reserve space for a genuine new steering control before selecting a
+            // bounded continuation page. Unselected inputs keep their OLD owner.
+            let mut reserved = Vec::new();
+            if steering_priority && let Some((_, origin, kind, raw)) = ordered.first() {
+                reserved.push(json!({"kind":kind,"data":prompt_input(raw,origin.as_deref())?}));
+                if let Some(origin) = origin
+                    && !origins.contains(origin)
+                {
+                    sources.push(trusted_source(&tx, project, origin)?);
+                }
+            }
+            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":reserved,"continuing_inputs":next,"latest_user_steering":latest_steering});
+            if required.to_string().len() > 215000 {
+                ensure!(
+                    !selected_continuing.is_empty() || steering_priority,
+                    "Trusted continuation metadata exceeds the management context bound"
+                );
+                break;
+            }
+            previous.push(item);
+            if let Some(metadata) = metadata {
+                trusted_sources.push(metadata);
+            }
+            if let Some(origin) = origin {
+                origins.insert(origin.clone());
+            }
+            selected_continuing.push(candidate);
+        }
+        let continuing = selected_continuing;
         for candidate in ordered {
             let (_, origin, kind, raw) = &candidate;
             let item = json!({"kind":kind,"data":prompt_input(raw,origin.as_deref())?});
@@ -1071,8 +1196,9 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             if let Some(ref metadata) = metadata {
                 sources.push(metadata.clone());
             }
-            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":next,"latest_user_steering":latest_steering});
-            if required.to_string().len() > 215000 && !inputs.is_empty() {
+            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":next,"continuing_inputs":previous,"latest_user_steering":latest_steering});
+            if required.to_string().len() > 215000 && (!inputs.is_empty() || !continuing.is_empty())
+            {
                 break;
             }
             ensure!(
@@ -1088,15 +1214,28 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             }
             inputs.push(candidate);
         }
-        if newest_id.is_some() && current.len() > 1 {
+        if steering_priority && current.len() > 1 {
             current.rotate_left(1);
+        }
+        let mut latest_steering = latest_steering;
+        if let Some((id, _, _, _)) = &latest_context {
+            let present = inputs.iter().any(|item| &item.0 == id);
+            let owned = continuing.iter().any(|item| &item.0 == id);
+            if let Some(object) = latest_steering.as_object_mut() {
+                object.insert("present_in_new_inputs".into(), json!(present));
+                object.insert("present_in_continuing_inputs".into(), json!(owned));
+                object.insert(
+                    "context_only_not_batch_member".into(),
+                    json!(!present && !owned),
+                );
+            }
         }
         let origin = if origins.len() == 1 {
             origins.iter().next().cloned()
         } else {
             None
         };
-        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes});
+        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes});
         if context.to_string().len() > 250000
             && let Some(evidence) = context["effect_evidence"].as_array_mut()
         {
@@ -1128,7 +1267,8 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             [project],
         )?;
         tx.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,origin_event_id,checkpoint,status,owner,created_at) VALUES(?,?,?,?,?,?,'working',?,?)",params![run,project,revision,input_revision,origin,checkpoint.to_string(),owner(),db::now()])?;
-        for (id, _, _, _) in &inputs {
+        for (id, _, _, _) in continuing.iter().chain(inputs.iter()) {
+            own_input(&tx, &run, id)?;
             tx.execute(
                 "INSERT INTO manager_run_inputs(run_id,input_id) VALUES(?,?)",
                 params![run, id],
@@ -1261,7 +1401,7 @@ fn finish_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
         "INSERT OR REPLACE INTO manager_turn_notes(run_id,note) VALUES(?,?)",
         params![context.run, note.chars().take(8000).collect::<String>()],
     )?;
-    tx.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN(SELECT input_id FROM manager_run_inputs WHERE run_id=?) AND status='queued'",[&context.run])?;
+    tx.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN(SELECT input_id FROM manager_input_claims WHERE run_id=?) AND status='processing'",[&context.run])?;
     settle_inputs(&tx, &context.run)?;
     recovered(&tx, context)?;
     tx.commit()?;
@@ -1432,7 +1572,7 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
         "UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=?",
         [project],
     )?;
-    c.execute("UPDATE work_events SET status='cancelled' WHERE id IN(SELECT origin_event_id FROM manager_inputs WHERE project_id=? AND status='queued') AND status='managed'",[project])?;
+    c.execute("UPDATE work_events SET status='cancelled' WHERE id IN(SELECT origin_event_id FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing')) AND status='managed'",[project])?;
     c.execute("UPDATE work_events SET status='cancelled',error='Stopped by the user' WHERE project_id=? AND source='management' AND status='queued'",[project])?;
     c.execute(
         "UPDATE manager_config SET input_revision=input_revision+1 WHERE project_id=?",
@@ -1443,7 +1583,7 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
         [project],
     )?;
     c.execute(
-        "UPDATE manager_inputs SET status='cancelled' WHERE project_id=? AND status='queued'",
+        "UPDATE manager_inputs SET status='cancelled' WHERE project_id=? AND status IN ('queued','processing')",
         [project],
     )?;
     Ok(())
@@ -1455,7 +1595,7 @@ pub async fn run(app: Arc<App>) {
         let Some(_permit) = app.service.gate.enter() else {
             continue;
         };
-        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE m.mode='manager' AND p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status='queued') OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
+        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE m.mode='manager' AND p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status IN ('queued','processing')) OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
         for project in projects {
             if !running.lock().await.insert(project.clone()) {
                 continue;
@@ -1569,6 +1709,363 @@ mod tests {
             source_event_id: None,
         }
     }
+    #[tokio::test]
+    async fn owned_single_and_full_batches_ignore_receipts_and_recover_effects_once() {
+        for count in [1, 3, 32] {
+            let (_dir, app, p) = fixture().await;
+            for n in 0..count {
+                ingest(&app, &p, &format!("om_owned_{n}"), &format!("ordered-{n}"));
+            }
+            let first = app
+                .db
+                .sync(|c| {
+                    work::sync_inbound(c)?;
+                    Ok(claim(c, &p.id)?.unwrap())
+                })
+                .unwrap();
+            let origin=app.db.sync(|c|Ok(c.query_row("SELECT origin_event_id FROM manager_inputs WHERE project_id=? ORDER BY rowid LIMIT 1",[&p.id],|r|r.get::<_,String>(0))?)).unwrap();
+            let call = ToolCall {
+                occurrence: "test:confirmed-delegate".into(),
+                name: "delegate".into(),
+                arguments: json!({"instructions":"one complete assignment","source_event_id":origin}),
+            };
+            let delegated = tool(&app, &first.context, call.clone()).await.unwrap();
+            let saved = first.checkpoint.clone();
+            app.db.sync(|c| {
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",[],|r|r.get::<_,i64>(0))?,count);
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='queued'",[],|r|r.get::<_,i64>(0))?,0);
+                let prompt=prompt_context(&first.checkpoint).unwrap();
+                let bodies=prompt["new_inputs"].as_array().unwrap().iter().map(|v|v["data"]["user_input"]["body"].as_str().unwrap()).collect::<Vec<_>>();
+                assert_eq!(bodies,(0..count).map(|n|format!("ordered-{n}")).collect::<Vec<_>>());
+                db::enqueue_out_request(c,&p.id,"cli_fixture","confirmed-fixture-reply","one result",json!({"to":"oc_fixture","reply_to_message_id":"om_owned_0"}))?;
+                for n in 0..4 {observation(c,&p.id,"worker_run",&format!("receipt-{n}"),"settled",Some(&origin),&json!({"kind":"worker_run","semantic_task_success":"unconfirmed"}))?;}
+                assert!(valid(c,&first.context).is_ok());
+                let same=claim(c,&p.id)?.unwrap();assert_eq!(same.context.run,first.context.run);assert_eq!(same.checkpoint,saved);
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_run_inputs WHERE run_id=?",[&same.context.run],|r|r.get::<_,i64>(0))?,count);
+                // Process loss after a tool was reserved must preserve uncertainty, not replay it.
+                c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('interrupted-tool',?,'test:uncertain','delegate',?,'submitting')",params![first.context.run,json!({"instructions":"uncertain assignment","source_event_id":origin}).to_string()])?;
+                c.execute("UPDATE manager_runs SET owner='previous-host' WHERE id=?",[&first.context.run])?;
+                migrate(c,true)?;
+                let resumed=claim(c,&p.id)?.unwrap();assert_eq!(resumed.context.run,first.context.run);assert_eq!(resumed.checkpoint,saved);
+                assert_eq!(c.query_row("SELECT status FROM manager_effects WHERE id='interrupted-tool'",[],|r|r.get::<_,String>(0))?,"uncertain");
+                Ok(())
+            }).unwrap();
+            assert_eq!(tool(&app, &first.context, call).await.unwrap(), delegated);
+            let uncertain=tool(&app,&first.context,ToolCall{occurrence:"test:uncertain".into(),name:"delegate".into(),arguments:json!({"instructions":"uncertain assignment","source_event_id":origin})}).await.unwrap();
+            assert_eq!(uncertain["status"], "uncertain");
+            app.db
+                .sync(|c| {
+                    assert_eq!(
+                        c.query_row(
+                            "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )?,
+                        1
+                    );
+                    assert_eq!(
+                        c.query_row(
+                            "SELECT COUNT(*) FROM messages WHERE direction='out'",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )?,
+                        1
+                    );
+                    finish_turn(c, &first.context, "original batch complete")?;
+                    assert_eq!(
+                        c.query_row(
+                            "SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )?,
+                        count
+                    );
+                    let receipts = claim(c, &p.id)?.unwrap();
+                    assert_ne!(receipts.context.run, first.context.run);
+                    let prompt = prompt_context(&receipts.checkpoint).unwrap();
+                    assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), 4);
+                    assert!(
+                        prompt["new_inputs"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|v| v["kind"] == "worker"
+                                && v["data"]["semantic_task_success"] == "unconfirmed")
+                    );
+                    finish_turn(c, &receipts.context, "receipt evidence considered")?;
+                    assert!(claim(c, &p.id)?.is_none());
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn legacy_queued_working_members_are_adopted_atomically_without_new_claim() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_legacy_batch", "legacy request");
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let original = claim(c, &p.id)?.unwrap();
+                c.execute("DELETE FROM manager_input_claims", [])?;
+                c.execute("UPDATE manager_inputs SET status='queued'", [])?;
+                c.execute(
+                    "UPDATE manager_runs SET owner='legacy-host' WHERE id=?",
+                    [&original.context.run],
+                )?;
+                let resumed = claim(c, &p.id)?.unwrap();
+                assert_eq!(resumed.context.run, original.context.run);
+                assert_eq!(resumed.checkpoint, original.checkpoint);
+                assert_eq!(
+                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
+                        .get::<_, String>(0))?,
+                    "processing"
+                );
+                assert_eq!(
+                    c.query_row("SELECT run_id FROM manager_input_claims", [], |r| r
+                        .get::<_, String>(0))?,
+                    original.context.run
+                );
+                finish_turn(c, &resumed.context, "legacy work continued")?;
+                assert!(claim(c, &p.id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn full_owned_batch_accepts_urgent_user_steering_without_claiming_it_twice() {
+        let (_dir, app, p) = fixture().await;
+        for n in 0..32 {
+            ingest(&app, &p, &format!("om_full_{n}"), &format!("old goal {n}"));
+        }
+        let first = app
+            .db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                Ok(claim(c, &p.id)?.unwrap())
+            })
+            .unwrap();
+        app.db
+            .sync(|c| {
+                for n in 0..40 {
+                    input(
+                        c,
+                        &p.id,
+                        &format!("worker-pending-{n}"),
+                        None,
+                        "worker",
+                        &json!({"status":"settled","semantic_task_success":"unconfirmed"}),
+                    )?;
+                }
+                assert!(valid(c, &first.context).is_ok());
+                Ok(())
+            })
+            .unwrap();
+        ingest(
+            &app,
+            &p,
+            "om_urgent_correction",
+            "Do not release; preserve the latest correction.",
+        );
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                assert!(valid(c, &first.context).is_err());
+                let next = claim(c, &p.id)?.unwrap();
+                let context = prompt_context(&next.checkpoint).unwrap();
+                assert_ne!(next.context.run, first.context.run);
+                assert_eq!(context["continuing_inputs"].as_array().unwrap().len(), 32);
+                assert_eq!(context["new_inputs"].as_array().unwrap().len(), 32);
+                assert_eq!(context["steering_priority"], true);
+                assert_eq!(
+                    context["new_inputs"].as_array().unwrap().last().unwrap()["data"]["user_input"]
+                        ["body"],
+                    "Do not release; preserve the latest correction."
+                );
+                let correction = context["latest_user_steering"]["source_event_id"]
+                    .as_str()
+                    .unwrap();
+                assert!(select_origin(c, &next.context, Some(correction)).is_ok());
+                let mut receipt = receipt_args("om_urgent_correction");
+                receipt.source_event_id = Some(correction.into());
+                assert!(enqueue_receipt(c, &next.context, "correction-receipt", &receipt)?.1);
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM manager_input_claims WHERE run_id=?",
+                        [&next.context.run],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    64
+                );
+                finish_turn(c, &next.context, "continued goals with latest correction")?;
+                let rest = claim(c, &p.id)?.unwrap();
+                let context = prompt_context(&rest.checkpoint).unwrap();
+                assert_eq!(context["new_inputs"].as_array().unwrap().len(), 9);
+                assert_eq!(context["latest_user_steering"]["already_consumed"], true);
+                assert_eq!(
+                    context["latest_user_steering"]["data"]["user_input"]["body"],
+                    "Do not release; preserve the latest correction."
+                );
+                finish_turn(c, &rest.context, "remaining receipt batch")?;
+                assert!(claim(c, &p.id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn repeated_user_steering_pages_continuations_without_unbounded_context_or_loss() {
+        let (_dir, app, p) = fixture().await;
+        // Large trusted metadata makes unconstrained continuation growth exceed
+        // the real context ceiling after only a few interruptions.
+        for n in 0..32 {
+            app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",&format!("om_page_{n}"),&format!("original-{n}"),&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"extra_metadata":"m".repeat(2800)}})).unwrap();
+        }
+        let mut previous = app
+            .db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                Ok(claim(c, &p.id)?.unwrap())
+            })
+            .unwrap();
+        for round in 0..5 {
+            app.db
+                .sync(|c| {
+                    for n in 0..36 {
+                        input(
+                            c,
+                            &p.id,
+                            &format!("page-worker-{round}-{n}"),
+                            None,
+                            "worker",
+                            &json!({"kind":"worker_run","semantic_task_success":"unconfirmed"}),
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            ingest(
+                &app,
+                &p,
+                &format!("om_page_steer_{round}"),
+                &format!("latest-directive-{round}"),
+            );
+            previous=app.db.sync(|c|{
+                work::sync_inbound(c)?;assert!(valid(c,&previous.context).is_err());let next=claim(c,&p.id)?.unwrap();let context=prompt_context(&next.checkpoint).unwrap();
+                assert!(context["continuing_inputs"].as_array().unwrap().len()<=32);
+                assert!(context["new_inputs"].as_array().unwrap().len()<=32);
+                assert!(context.to_string().len()<=250000);
+                assert_eq!(context["new_inputs"].as_array().unwrap().last().unwrap()["data"]["user_input"]["body"],format!("latest-directive-{round}"));Ok(next)
+            }).unwrap();
+        }
+        app.db.sync(|c| {
+            // Many inputs have durable owners, but only one bounded page moves
+            // to the latest run. Unseen pages are not consumed or re-queued.
+            let owned:i64=c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",[],|r|r.get(0))?;
+            assert!(owned>64);
+            finish_turn(c,&previous.context,"latest steering applied")?;
+            assert!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",[],|r|r.get::<_,i64>(0))?>0);
+            for _ in 0..20 {
+                let Some(next)=claim(c,&p.id)? else {break};let context=prompt_context(&next.checkpoint).unwrap();
+                assert!(context.to_string().len()<=250000);
+                assert!(context["latest_user_steering"].to_string().contains("latest-directive-4"));
+                finish_turn(c,&next.context,"bounded continuation page consumed")?;
+            }
+            assert!(claim(c,&p.id)?.is_none());
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status IN ('queued','processing')",[],|r|r.get::<_,i64>(0))?,0);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",[],|r|r.get::<_,i64>(0))?,32+5*37);Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn continuation_journal_pages_evicted_uncertainty_and_rejects_unowned_inputs() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_journal", "original task");
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;let original=claim(c,&p.id)?.unwrap();
+            let input_id:String=c.query_row("SELECT input_id FROM manager_input_claims WHERE run_id=?",[&original.context.run],|r|r.get(0))?;
+            let args=json!({"instructions":"original uncertain delegation"});
+            c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES('old-uncertain',?,'original','delegate',?,'uncertain',?)",params![original.context.run,args.to_string(),json!({"status":"uncertain","event_id":"not-safe-to-replay"}).to_string()])?;
+            for n in 0..40 {c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES(?,?,?,'read_file','{}','complete','{}')",params![format!("recent-{n}"),original.context.run,format!("read-{n}")])?;}
+            input(c,&p.id,"journal-user-steer",None,"user",&json!({"user_input":{"body":"inspect prior effects before continuing"}}))?;
+            let current=claim(c,&p.id)?.unwrap();let context=prompt_context(&current.checkpoint).unwrap();assert_eq!(context["continuing_inputs"][0]["input_id"],input_id);assert_eq!(context["continuing_inputs"][0]["journal_available"],true);
+            let recent=context["effect_evidence"].as_array().unwrap();assert!(!recent.iter().any(|x|x["effect_id"]=="old-uncertain"),"The regression must actually evict the old receipt from the legacy recent window");
+            let mut cursor=0;let mut found=false;let mut total=0;
+            loop {
+                let page=input_effect_journal(c,&current.context,WorkerStatusArgs{input_id:Some(input_id.clone()),after_effect:cursor,detail_offset:0},"current-inspection")?;
+                let effects=page["effects"].as_array().unwrap();assert!(effects.len()<=8);assert!(page.to_string().len()<100000);
+                for effect in effects {total+=1;if effect["effect_id"]=="old-uncertain" {found=true;assert_eq!(effect["status"],"uncertain");assert!(effect["result_chunk"].as_str().unwrap().contains("not-safe-to-replay"));}}
+                match page["next_effect_cursor"].as_i64(){Some(next)=>{assert!(next>cursor);cursor=next;},None=>break}
+            }
+            assert!(found);assert_eq!(total,41);
+            c.execute("INSERT INTO manager_inputs(id,project_id,kind,payload,status,created_at) VALUES('off-page-input',?,'user','{}','processing',1)",[&p.id])?;
+            c.execute("INSERT INTO manager_input_claims(input_id,run_id) VALUES('off-page-input',?)",[&original.context.run])?;
+            assert!(input_effect_journal(c,&current.context,WorkerStatusArgs{input_id:Some("off-page-input".into()),after_effect:0,detail_offset:0},"inspection").is_err());
+            assert!(input_effect_journal(c,&current.context,WorkerStatusArgs{input_id:Some("other-project-or-invented".into()),after_effect:0,detail_offset:0},"inspection").is_err());
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_effects WHERE name='delegate'",[],|r|r.get::<_,i64>(0))?,1,"Journal inspection must never replay the uncertain delegation");Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn processing_inputs_obey_pause_stop_and_native_mode_handoff() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_processing_stop", "preserve this instruction");
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let first = claim(c, &p.id)?.unwrap();
+                c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
+                assert!(claim(c, &p.id)?.is_none());
+                assert!(valid(c, &first.context).is_err());
+                c.execute("UPDATE projects SET paused=0 WHERE id=?", [&p.id])?;
+                assert_eq!(claim(c, &p.id)?.unwrap().context.run, first.context.run);
+                let tx = c.unchecked_transaction()?;
+                stop(&tx, &p.id)?;
+                tx.commit()?;
+                assert_eq!(
+                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
+                        .get::<_, String>(0))?,
+                    "cancelled"
+                );
+                assert!(claim(c, &p.id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        let (_dir, app, p) = fixture().await;
+        ingest(
+            &app,
+            &p,
+            "om_processing_transfer",
+            "preserve the full original input",
+        );
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let old = claim(c, &p.id)?.unwrap();
+                set_mode(
+                    c,
+                    &p.id,
+                    ModeInput {
+                        mode: "native".into(),
+                        request_id: "processing-handoff".into(),
+                        expected_revision: 2,
+                    },
+                )?;
+                assert_eq!(
+                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
+                        .get::<_, String>(0))?,
+                    "transferred"
+                );
+                assert!(valid(c, &old.context).is_err());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
     #[test]
     fn prompt_keeps_receipt_cohesion_disclosure_exceptions_and_truthful_failures_together() {
         // These are the explicitly requested policy invariants, not an LLM quality test.
@@ -1620,7 +2117,7 @@ mod tests {
                     &p.id,
                     "new-observation",
                     None,
-                    "worker",
+                    "user",
                     &json!({"status":"working"}),
                 )?;
                 let next = claim(c, &p.id)?.unwrap();
@@ -2122,6 +2619,38 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn off_batch_latest_user_control_preserves_its_tail_and_counts_toward_context_budget() {
+        for older_size in [20, 8000] {
+            let (_dir, app, p) = fixture().await;
+            for n in 0..32 {
+                ingest(
+                    &app,
+                    &p,
+                    &format!("om_tail_old_{n}"),
+                    &format!("old instruction {n}: {}", "x".repeat(older_size)),
+                );
+            }
+            let latest = format!(
+                "{}\n不要发布。Do not release or deploy.",
+                "latest control context ".repeat(150)
+            );
+            assert!(latest.len() > 2400);
+            ingest(&app, &p, "om_tail_latest", &latest);
+            app.db.sync(|c|{
+                work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();let context=prompt_context(&turn.checkpoint).unwrap();
+                let batch=context["new_inputs"].as_array().unwrap();assert!(!batch.is_empty()&&batch.len()<=32);
+                for (n,item) in batch.iter().enumerate(){assert!(item["data"]["user_input"]["body"].as_str().unwrap().starts_with(&format!("old instruction {n}: ")));}
+                assert_eq!(context["latest_user_steering"]["data"]["user_input"]["body"],latest);
+                assert_eq!(context["latest_user_steering"]["context_only_not_batch_member"],true);
+                assert_eq!(context["latest_user_steering"]["present_in_new_inputs"],false);
+                assert!(context.to_string().len()<=250000);
+                assert_eq!(c.query_row("SELECT i.status FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id WHERE e.source_id='om_tail_latest'",[],|r|r.get::<_,String>(0))?,"queued");
+                if older_size==20 {assert_eq!(batch.len(),32);}else{assert!(batch.len()<32,"The complete mandatory control must share the same bounded context budget");}
+                Ok(())
+            }).unwrap();
+        }
+    }
+    #[tokio::test]
     async fn exact_batch_completion_keeps_the_33rd_input_and_settles_managed_schedule() {
         let (_dir, app, p) = fixture().await;
         for n in 0..33 {
@@ -2140,7 +2669,7 @@ mod tests {
             .sync(|c| {
                 work::sync_inbound(c)?;
                 let first = claim(c, &p.id)?.unwrap();
-            let prompt=prompt_context(&first.checkpoint).unwrap();assert!(prompt["new_inputs"].as_array().unwrap().iter().any(|v|v["data"]["user_input"]["body"]=="不要发版"),"Newest steering must be mandatory even beyond the oldest 32 rows");
+            let prompt=prompt_context(&first.checkpoint).unwrap();assert_eq!(prompt["new_inputs"][0]["data"]["user_input"]["body"],"bounded instruction 0");assert_eq!(prompt["new_inputs"][31]["data"]["user_input"]["body"],"bounded instruction 31");assert_eq!(prompt["latest_user_steering"]["data"]["user_input"]["body"],"不要发版","Newest boundary remains mandatory even outside the FIFO batch");
                 finish_turn(c, &first.context, "")?;
                 assert_eq!(
                     c.query_row(

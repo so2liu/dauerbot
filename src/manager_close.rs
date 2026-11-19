@@ -53,12 +53,12 @@ fn guard(c: &Connection, p: &Project, generation: &str, terminal: &str) -> Resul
         !crate::cli_switch::latest(c, &p.id)?.is_some_and(|r| r.holds_input),
         "A CLI transition still owns execution delivery"
     );
-    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND status NOT IN ('settled','completed','cancelled')) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR json_extract(payload,'$.target_generation') IS NULL)) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status='queued' AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
+    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND status NOT IN ('settled','completed','cancelled')) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR json_extract(payload,'$.target_generation') IS NULL)) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status IN ('queued','processing') AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
     ensure!(
         !active,
         "Pending or uncertain work still refers to this execution"
     );
-    let pending_messages:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?1 AND ((direction='out' AND status IN ('queued','pending','sending','submitting','uncertain')) OR (direction='in' AND status='queued'))) OR EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=?1 AND i.status='queued' AND NOT EXISTS(SELECT 1 FROM manager_run_inputs ri JOIN manager_runs r ON r.id=ri.run_id WHERE ri.input_id=i.id AND r.status='working'))",[&p.id],|r|r.get(0))?;
+    let pending_messages:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?1 AND ((direction='out' AND status IN ('queued','pending','sending','submitting','uncertain')) OR (direction='in' AND status='queued'))) OR EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=?1 AND i.status IN ('queued','processing') AND NOT EXISTS(SELECT 1 FROM manager_input_claims own JOIN manager_runs r ON r.id=own.run_id WHERE own.input_id=i.id AND r.status='working'))",[&p.id],|r|r.get(0))?;
     ensure!(
         !pending_messages,
         "Unresolved input or message effects prevent a proven-safe close"
@@ -701,6 +701,22 @@ mod tests {
             c.execute("UPDATE work_timers SET enabled=0 WHERE id='timer'",[])?;
             c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('native-out',?,'out','native-send','fixture','uncertain',1,1)",[&p.id])?;
             assert!(guard(c,&p,OLD,"old-terminal").is_err());Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn off_page_processing_input_keeps_its_authoritative_owner_and_blocks_close() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c|{
+            c.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES('old-page',?,1,1,'{}','superseded','fixture',1)",[&p.id])?;
+            c.execute("INSERT INTO manager_inputs(id,project_id,kind,payload,status,created_at) VALUES('off-page',?,'user','{}','processing',1)",[&p.id])?;
+            c.execute("INSERT INTO manager_input_claims(input_id,run_id) VALUES('off-page','old-page')",[])?;
+            assert!(guard(c,&p,OLD,"old-terminal").unwrap_err().to_string().contains("Unresolved input"));
+            // A historical many-to-many join is not sufficient: only the one
+            // durable owner may exempt the current, actively processed page.
+            c.execute("INSERT INTO manager_run_inputs(run_id,input_id) VALUES('close-run','off-page')",[])?;
+            assert!(guard(c,&p,OLD,"old-terminal").is_err());
+            c.execute("UPDATE manager_input_claims SET run_id='close-run' WHERE input_id='off-page'",[])?;
+            assert!(guard(c,&p,OLD,"old-terminal").is_ok());Ok(())
         }).unwrap();
     }
     #[tokio::test]
