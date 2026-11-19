@@ -126,6 +126,26 @@ impl ModelCursor {
     }
 }
 
+/// Plan a native nearest-scroll request from the measured visible interval.
+/// Missing/new-layout geometry is deliberately deferred to GPUI prepaint.
+fn cursor_scroll_target(
+    position: Option<usize>,
+    offset: Pixels,
+    viewport: (Pixels, Pixels),
+    item: Option<(Pixels, Pixels)>,
+) -> Option<usize> {
+    let index = position? + 1; // The explicit native-default button is first.
+    if let Some((top, bottom)) = item
+        && viewport.1 > viewport.0
+        && top + offset >= viewport.0
+        && bottom + offset <= viewport.1
+    {
+        None
+    } else {
+        Some(index)
+    }
+}
+
 /// GPUI applies the wheel delta before this containment step. Clamp that
 /// resulting offset and consume every wheel inside the list, including edges
 /// and lists too short to scroll. Outside events keep their normal behavior.
@@ -369,13 +389,28 @@ impl ModelPicker {
     }
 
     fn move_cursor(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let rendered_items = self.cursor.items.clone();
         self.reconcile_cursor(cx);
         self.cursor.step(forward);
-        if let Some(position) = self.cursor.position() {
-            // The explicit native-default button precedes the filtered model rows.
-            self.options_scroll.scroll_to_item(position + 1);
-        }
+        self.scroll_cursor(self.cursor.items == rendered_items);
         cx.notify();
+    }
+
+    fn scroll_cursor(&self, layout_current: bool) {
+        let viewport = self.options_scroll.bounds();
+        let item = self.cursor.position().and_then(|position| {
+            layout_current
+                .then(|| self.options_scroll.bounds_for_item(position + 1))
+                .flatten()
+        });
+        if let Some(index) = cursor_scroll_target(
+            self.cursor.position(),
+            self.options_scroll.offset().y,
+            (viewport.top(), viewport.bottom()),
+            item.map(|bounds| (bounds.top(), bounds.bottom())),
+        ) {
+            self.options_scroll.scroll_to_item(index);
+        }
     }
 
     fn choose_cursor(&mut self, cx: &mut Context<Self>) {
@@ -614,10 +649,10 @@ impl Render for ModelPicker {
             let previous_cursor = (self.cursor.current, self.cursor.position());
             self.cursor
                 .reconcile(matches.iter().map(|(index, _)| *index).collect());
-            if previous_cursor != (self.cursor.current, self.cursor.position())
-                && let Some(position) = self.cursor.position()
-            {
-                self.options_scroll.scroll_to_item(position + 1);
+            if previous_cursor != (self.cursor.current, self.cursor.position()) {
+                // Filtered row geometry belongs to the preceding frame. GPUI must
+                // measure the new children before choosing their nearest offset.
+                self.scroll_cursor(false);
             }
             let no_matches = !query.trim().is_empty() && matches.is_empty();
             for (index, option) in matches {
@@ -774,9 +809,48 @@ impl Render for ModelPicker {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelCursor, contain_list_wheel, matching_models, selection_enabled};
+    use super::{
+        ModelCursor, contain_list_wheel, cursor_scroll_target, matching_models, selection_enabled,
+    };
     use gpui::px;
     use serde_json::json;
+
+    #[test]
+    fn cursor_visibility_uses_scroll_offset_and_only_requests_hidden_rows() {
+        let viewport = (px(100.), px(200.));
+        // Unscrolled row bounds plus the real list offset give visible bounds.
+        assert_eq!(
+            cursor_scroll_target(Some(2), px(-100.), viewport, Some((px(220.), px(250.)))),
+            None
+        );
+        assert_eq!(
+            cursor_scroll_target(Some(2), px(-100.), viewport, Some((px(190.), px(220.)))),
+            Some(3)
+        );
+        assert_eq!(
+            cursor_scroll_target(Some(2), px(-100.), viewport, Some((px(280.), px(320.)))),
+            Some(3)
+        );
+        assert_eq!(
+            cursor_scroll_target(Some(0), px(0.), viewport, Some((px(100.), px(200.)))),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_visibility_defers_new_geometry_and_has_no_empty_target() {
+        let viewport = (px(100.), px(200.));
+        assert_eq!(cursor_scroll_target(None, px(0.), viewport, None), None);
+        // First model row is child 1 because child 0 is the native-default button.
+        assert_eq!(
+            cursor_scroll_target(Some(0), px(0.), viewport, None),
+            Some(1)
+        );
+        assert_eq!(
+            cursor_scroll_target(Some(4), px(0.), (px(0.), px(0.)), Some((px(0.), px(0.)))),
+            Some(5)
+        );
+    }
 
     #[test]
     fn wheel_containment_clamps_native_offsets_and_consumes_at_both_edges() {
