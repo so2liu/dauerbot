@@ -16,6 +16,7 @@ pub mod handoff;
 pub mod herdr;
 pub mod manager;
 mod manager_close;
+mod manager_terminal;
 pub mod manager_loop;
 pub mod mcp;
 pub mod model_control;

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_CHECKPOINT: usize = 2 * 1024 * 1024;
 const MAX_CONTENT: usize = 256 * 1024;
-const TOOLS: [&str; 8] = [
+const TOOLS: [&str; 10] = [
     "read_file",
     "write_file",
     "delegate",
@@ -27,6 +27,8 @@ const TOOLS: [&str; 8] = [
     "send_md",
     "send_file",
     "close_agent",
+    "cli_send_keys",
+    "cli_view",
 ];
 
 /// Only host-controlled diagnostics cross into durable state or user notices.
@@ -245,6 +247,16 @@ fn definitions() -> Vec<ToolDefinition> {
             "Explicitly close an obsolete owned execution selected from worker_status. Never close automatically: verify task completion, give a reason, and retain unknown/current/live/referenced targets. Returns an audited refusal, verified closure or uncertain receipt.",
             json!({"generation":{"type":"string"},"terminal_id":{"type":"string"},"reason":{"type":"string"},"task_finished":{"type":"boolean"}}),
             vec!["generation", "terminal_id", "reason", "task_finished"],
+        ),
+        (
+            "Send an ordered, compact text/key sequence, with each segment exactly {text: string} or {key: string} to the current project's owned CLI. Use generation from worker_status. Text is UTF-8 with LF unchanged; keys are separate segments. Text never implies a key. Keys: enter, tab, esc, backspace, delete, up/down/left/right, home/end, pageup/pagedown, space; ctrl/alt/shift modifiers and modified letters, for example alt+m. Unknown keys fail before sending. Use cli_view to inspect results; a submitted sequence does not prove task completion. Do not repeat uncertain input.",
+            json!({"generation":{"type":"string"},"segments":{"type":"array","minItems":1,"maxItems":32,"items":{"oneOf":[{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false},{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}]}}}),
+            vec!["generation", "segments"],
+        ),
+        (
+            "Read the current project's owned CLI visible rendered text. This does not send keys, resize, or take over its terminal. Known credential-like lines are redacted. Missing cursor/viewport metadata is explicit; internal execution identifiers are diagnostic, not user-facing task results.",
+            json!({"generation":{"type":"string"}}),
+            vec!["generation"],
         ),
     ];
     TOOLS.into_iter().zip(schemas).map(|(name,(description,properties,required))|ToolDefinition::new(name.try_into().expect("static tool name"),description,json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}))).collect()
