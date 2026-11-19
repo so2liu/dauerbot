@@ -1330,6 +1330,12 @@ impl App {
                 let request = ensure_repair_request(&tx, &p.id)?;
                 record_failure(&tx, &request.id,
                     "Native execution observation is unavailable; supervised recovery is waiting for verified identity before taking any action.")?;
+                // Explicit versioned, internal-only metadata. Older requests
+                // without this marker always retain ordinary recovery semantics.
+                let fence = json!({"schema":1,"agent":p.agent,"generation":p.generation,
+                    "terminal":p.terminal,"native_session":p.native_session,"execution":p.execution});
+                tx.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.observation_fence',json(?)) WHERE id=?",
+                    params![fence.to_string(),request.id])?;
             }
             tx.commit()?;
             Ok(true)
@@ -1413,6 +1419,68 @@ impl App {
         Ok(())
     }
 
+    /// An observation-only hold must not turn a transient RPC loss into a
+    /// replacement of a healthy native conversation. No repair effect or user
+    /// repair instruction may be retired by this shortcut.
+    fn settle_observation_fence(
+        c: &Connection,
+        p: &Project,
+        r: &Request,
+        record: &Value,
+    ) -> Result<bool> {
+        let fence = &r.source["observation_fence"];
+        if fence["schema"] != 1
+            || r.phase != "recovery_pending"
+            || r.generation != p.generation
+            || r.target != p.agent
+            || !r.recovery_generation.is_empty()
+            || !r.nonce.is_empty()
+            || r.attempts != 0
+            || !p.ready
+            || p.execution["mcp_registered"] != true
+            || p.execution["native_confirmed"] != true
+            || p.native_session.is_empty()
+            || crate::repair_lane::descriptor(p).is_some()
+            || record["state"] != "live"
+            || !matches!(
+                record["status"]["state"].as_str(),
+                Some("idle" | "done" | "working")
+            )
+            || !record["native_session"]["value"]
+                .as_str()
+                .is_some_and(|native| {
+                    herdr::same_native_session(&p.agent, &p.native_session, native)
+                })
+            || herdr::check_identity(p, record).is_err()
+            || fence["agent"] != p.agent
+            || fence["generation"] != p.generation
+            || fence["terminal"] != json!(p.terminal)
+            || fence["native_session"] != p.native_session
+            || fence["execution"] != p.execution
+        {
+            return Ok(false);
+        }
+        let tx = c.unchecked_transaction()?;
+        let current: (String,Option<String>,String,String,bool,bool,String) = tx.query_row(
+            "SELECT generation,terminal,native_session,agent,paused,ready,execution FROM projects WHERE id=?",
+            [&p.id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
+        if current.0 != p.generation
+            || current.1 != p.terminal
+            || current.2 != p.native_session
+            || current.3 != p.agent
+            || current.4
+            || !current.5
+            || serde_json::from_str::<Value>(&current.6)? != p.execution
+            || work::has_takeover(&tx, &p.id, &p.generation)?
+        {
+            return Ok(false);
+        }
+        let changed = tx.execute("UPDATE cli_switch_requests SET phase='ready',holds_input=0,error='',next_attempt_at=0 WHERE id=? AND phase='recovery_pending' AND holds_input=1 AND generation=? AND nonce='' AND attempts=0 AND recovery_generation='' AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?) AND source=? AND NOT EXISTS(SELECT 1 FROM cli_repair_prompts WHERE request_id=?) AND NOT EXISTS(SELECT 1 FROM cli_repair_instructions WHERE request_id=?)",
+            params![r.id,p.generation,p.id,r.source.to_string(),r.id,r.id])?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     async fn advance_cli_recovery(
         &self,
         p: &Project,
@@ -1422,6 +1490,18 @@ impl App {
     ) -> Result<bool> {
         self.set_phase(p, "recovering_cli", record.cloned().unwrap_or(Value::Null))
             .await;
+        if let Some(record) = record {
+            let p = p.clone();
+            let request = r.clone();
+            let record = record.clone();
+            if self
+                .db
+                .call(move |c| Self::settle_observation_fence(c, &p, &request, &record))
+                .await?
+            {
+                return Ok(false);
+            }
+        }
         // Readiness wins over an elapsed deadline, including after a service
         // restart or when the previous observation reported a startup failure.
         if p.agent == r.target
@@ -2397,6 +2477,125 @@ mod tests {
             before,
             app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap().id)).unwrap()
         );
+    }
+    async fn healthy_observation_fixture() -> (tempfile::TempDir, Arc<App>, Project, Value) {
+        let (dir, app, p) = fixture().await;
+        let execution = json!({"api_protocol":7,"mcp_contract":1,"backend":"legacy",
+            "workspace_id":"workspace","pane_id":"old-pane","terminal_id":"old-pane",
+            "managed_name":"managed","generation":"old-gen","shell_pid":null,
+            "launch_permit":"/private/fixture/launch","cli_switch_request":"completed",
+            "intended_native_session":"old-native","native_confirmed":true,"mcp_registered":true});
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET execution=? WHERE id=?",params![execution.to_string(),p.id])?;
+            c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source) VALUES('completed',?,'codex','ready','previous-generation',1,0,?)",
+                params![p.id,json!({"agent":"claude","native_session":"previous-claude-native","extra_args":[]}).to_string()])?;
+            queue(c,&p,"pending-observation",1)?;
+            Ok(())
+        }).unwrap();
+        let p = app.db.project(&p.id).await.unwrap();
+        let record = json!({"state":"live","status":{"state":"working"},"foreground":{"name":"codex"},
+            "processes":[{"pid":100,"name":"codex","argv":["codex"]}],"interactive_ready":true,"state_change_seq":22,
+            "native_session":{"value":"old-native"},"execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace",
+            "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
+            "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"active"}});
+        assert!(herdr::check_identity(&p, &record).is_ok());
+        assert!(app.supervise_unobserved_cli(&p).await.unwrap());
+        (dir, app, p, record)
+    }
+    #[tokio::test]
+    async fn healthy_observation_resumes_same_cross_cli_execution_without_repair_or_restart() {
+        let (_dir, app, p, record) = healthy_observation_fixture().await;
+        // Restart migration must retain the explicit internal marker, while
+        // legacy rows without it remain on the normal repair path.
+        app.db.sync(|c| migrate(c, true)).unwrap();
+        let request = app.db.sync(|c| latest(c, &p.id)).unwrap().unwrap();
+        assert_eq!(request.source["observation_fence"]["schema"], 1);
+        assert_eq!(
+            request.source["agent"], "claude",
+            "the historical repair owner is a different CLI"
+        );
+        assert!(
+            !app.advance_cli_switch(&p, None, Some(&record))
+                .await
+                .unwrap()
+        );
+        let current = app.db.project(&p.id).await.unwrap();
+        assert_eq!(current.generation, p.generation);
+        assert_eq!(current.native_session, p.native_session);
+        assert_eq!(current.terminal, p.terminal);
+        assert_eq!(
+            current.execution, p.execution,
+            "do not forge new request ownership"
+        );
+        app.db
+            .sync(|c| {
+                let resumed = latest(c, &p.id)?.unwrap();
+                assert_eq!(resumed.id, request.id);
+                assert_eq!(resumed.phase, "ready");
+                assert!(!resumed.holds_input);
+                assert_eq!(
+                    c.query_row("SELECT count(*) FROM cli_repair_prompts", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                let pending = work::claim_steering(c, &p.id, &p.generation, db::now())?.unwrap();
+                assert_eq!(pending.generation, p.generation);
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn observation_settlement_rejects_stale_authority_and_pending_repair_effects() {
+        for mutation in [
+            "pause",
+            "takeover",
+            "stop",
+            "generation",
+            "execution",
+            "mcp",
+            "native",
+            "error",
+            "repair-prompt",
+            "repair-control",
+            "old-marker",
+        ] {
+            let (_dir, app, p, mut record) = healthy_observation_fixture().await;
+            let request = app.db.sync(|c| latest(c, &p.id)).unwrap().unwrap();
+            app.db.sync(|c| {
+                match mutation {
+                    "pause" => {c.execute("UPDATE projects SET paused=1 WHERE id=?",[&p.id])?;},
+                    "takeover" => {work::set_takeover(c,&p.id,&p.generation,true,db::now())?;},
+                    "stop" => {stopped(c,&p.id,&p.generation)?;},
+                    "generation" => {c.execute("UPDATE projects SET generation='replacement' WHERE id=?",[&p.id])?;},
+                    "execution" => {c.execute("UPDATE projects SET execution=json_set(execution,'$.replacement',1) WHERE id=?",[&p.id])?;},
+                    "mcp" => {c.execute("UPDATE projects SET execution=json_set(execution,'$.mcp_registered',json('false')) WHERE id=?",[&p.id])?;},
+                    "repair-prompt" => {c.execute("INSERT INTO cli_repair_prompts(id,request_id,generation,payload,status,sequence,created_at) VALUES('uncertain',?,'old-gen','do not replay','uncertain',1,1)",[&request.id])?;},
+                    "repair-control" => {journal_repair_instruction(c,&p.id,"control",&json!({"content":"repair explicitly"}))?;},
+                    "old-marker" => {c.execute("UPDATE cli_switch_requests SET source=json_remove(source,'$.observation_fence') WHERE id=?",[&request.id])?;},
+                    _ => {},
+                }
+                Ok(())
+            }).unwrap();
+            if mutation == "native" {
+                record["native_session"]["value"] = json!("another-native");
+            }
+            if mutation == "error" {
+                record["status"]["state"] = json!("error");
+            }
+            let stored = app.db.sync(|c| latest(c, &p.id)).unwrap().unwrap();
+            assert!(
+                !app.db
+                    .sync(|c| App::settle_observation_fence(c, &p, &stored, &record))
+                    .unwrap(),
+                "{mutation}"
+            );
+            if mutation != "stop" {
+                assert!(
+                    app.db.sync(|c| holds_input(c, &p.id)).unwrap(),
+                    "{mutation}"
+                );
+            }
+        }
     }
     #[tokio::test]
     async fn post_ready_observation_loss_preserves_input_and_existing_repair_submission() {
