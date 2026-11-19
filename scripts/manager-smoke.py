@@ -207,8 +207,35 @@ def run_checks(h):
     assert not h.api(route + "/work")["runs"], "raw manager input was also dispatched to native CLI"
     assert "om_manager_write" in json.dumps(MODEL.requests[0]), "manager context omitted the trusted source message ID required for a topic reply"
     advertised = {t["function"]["name"] for t in MODEL.requests[0]["tools"]}
-    assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file", "close_agent"}, advertised
+    assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file", "close_agent", "cli_send_keys", "cli_view"}, advertised
     h.checks.append("scripted model → bounded file write/read → real SDK topic outbox; no raw native delivery or Bash tool")
+
+    context = h.api(route + "/manager/context")
+    assert context["project_id"] == h.key
+    assert context["retention"]["scope"] == "process_memory"
+    assert context["retention"]["lost_on_restart"] is True
+    assert 1 <= len(context["requests"]) <= context["retention"]["max_requests_returned"]
+    encoded_context = json.dumps(context)
+    for secret in ("manager-fixture-secret", "fixture-secret", h.config["token"]):
+        assert secret not in encoded_context, "context inspector exposed fixture authentication"
+    limitations = " ".join(context["limitations"])
+    assert "provider receipt or acceptance" in limitations
+    assert "lost on restart" in limitations
+    assert "Unknown secrets" in limitations
+    for captured in context["requests"]:
+        assert captured["source"] == "logical_request", "live context incorrectly claimed historical reconstruction"
+        assert captured["status"] in {"prepared", "provider_responded", "failed", "abandoned"}
+        assert isinstance(captured["prepared_at_ms"], int)
+        assert captured["finished_at_ms"] is None or isinstance(captured["finished_at_ms"], int)
+        blocks = captured["blocks"]
+        assert blocks and blocks[0]["role"] == "system", "prepared preamble lost its first position"
+        assert [block["index"] for block in blocks] == list(range(len(blocks)))
+        assert any(block["role"] == "user" for block in blocks), "prepared request lost user context"
+        for block in blocks:
+            assert isinstance(block["kind"], str) and block["kind"]
+            assert isinstance(block["text"], str)
+            assert isinstance(block["truncated"], bool)
+    h.checks.append("read-only context API exposes ordered logical requests with explicit limitations and no fixture authentication")
 
     MODEL.script(
         {"tool": "write_file", "arguments": {"path": "../escape.txt", "content": "must stay in workspace"}},
