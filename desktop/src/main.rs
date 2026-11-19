@@ -9,6 +9,7 @@ mod manager_settings;
 mod menubar;
 mod model_picker;
 mod project_tools;
+mod sidebar;
 mod terminal;
 mod updater;
 
@@ -46,20 +47,24 @@ struct WorkspaceGeometry {
     sidebar_hidden: bool,
     available: Pixels,
     center: Pixels,
+    sidebar: Pixels,
 }
 fn workspace_geometry(
     width: Pixels,
     terminal_open: bool,
     sidebar_preference: bool,
+    sidebar_width: sidebar::SidebarWidth,
 ) -> WorkspaceGeometry {
     // Match the reference's compact breakpoint without changing the saved preference.
     let sidebar_hidden = sidebar_preference || terminal_open && width < px(1024.);
-    let available = width - if sidebar_hidden { px(0.) } else { px(224.) };
+    let sidebar = px(sidebar_width.fitted(f32::from(width)));
+    let available = width - if sidebar_hidden { px(0.) } else { sidebar };
     let center = px((f32::from(available) * 0.45).clamp(320., 520.));
     WorkspaceGeometry {
         sidebar_hidden,
         available,
         center,
+        sidebar,
     }
 }
 
@@ -97,6 +102,24 @@ struct Setup {
     language: Language,
     terminal_hidden: bool,
     sidebar_hidden: bool,
+    sidebar_width: sidebar::SidebarWidth,
+}
+impl Setup {
+    fn prepare_startup(&mut self) {
+        self.page = self.page.min(8);
+        // Debugging is opt-in each time the desktop starts.
+        self.terminal_hidden = true;
+    }
+}
+
+#[derive(Clone)]
+struct SidebarDrag {
+    offset: std::rc::Rc<std::cell::Cell<Pixels>>,
+}
+impl Render for SidebarDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -142,6 +165,7 @@ struct Desktop {
     folded_agents: std::collections::HashMap<String, std::collections::HashSet<String>>,
     activation_frozen: bool,
     restored: bool,
+    sidebar_resizing: bool,
 }
 impl Desktop {
     fn tr(&self, text: &str) -> String {
@@ -155,9 +179,7 @@ impl Desktop {
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
-        setup.page = setup.page.min(8);
-        // Debugging is opt-in each time the desktop starts.
-        setup.terminal_hidden = true;
+        setup.prepare_startup();
         let mut input = |placeholder: &'static str, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(setup.language.text(placeholder)))
         };
@@ -240,6 +262,7 @@ impl Desktop {
             folded_agents: std::collections::HashMap::new(),
             activation_frozen: false,
             restored: false,
+            sidebar_resizing: false,
         }
     }
     fn receive(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -512,7 +535,12 @@ impl Desktop {
             })
             .detach();
         } else {
-            cx.quit();
+            let pending = self.backend.flush_preferences_before_exit();
+            cx.spawn(async move |_, cx| {
+                let _ = pending.recv_async().await;
+                let _ = cx.update(|cx| cx.quit());
+            })
+            .detach();
         }
     }
     fn sync_terminal(&mut self, _: &mut Context<Self>) {
@@ -544,11 +572,18 @@ impl Desktop {
             }
         }
     }
+    fn finish_sidebar_resize(&mut self) {
+        if self.sidebar_resizing {
+            self.sidebar_resizing = false;
+            self.go(self.setup.page);
+        }
+    }
     fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
         let geometry = workspace_geometry(
             window.viewport_size().width,
             self.setup.page == 6 && !self.setup.terminal_hidden,
             self.setup.sidebar_hidden,
+            self.setup.sidebar_width,
         );
         if geometry.sidebar_hidden {
             self.setup.sidebar_hidden = false;
@@ -671,10 +706,9 @@ impl Desktop {
         }
         self.setup.page = page.min(8);
         if let Ok(bytes) = serde_json::to_vec(&self.setup) {
-            let _ = herdr_feishu_bridge::config::write_private(
-                &self.backend.dir.join("desktop.json"),
-                &bytes,
-            );
+            let _ = self.backend.tx.send(CommandRequest::DesktopPreferences(
+                backend::DesktopPreferences::Save(bytes),
+            ));
         }
     }
     fn api(&mut self, method: &'static str, path: String, body: Option<Value>, message: &str) {
@@ -1855,6 +1889,7 @@ impl Render for Desktop {
             window.viewport_size().width,
             page == 6 && !self.setup.terminal_hidden,
             self.setup.sidebar_hidden,
+            self.setup.sidebar_width,
         );
         let visible = self.visible_project_ids(cx);
         let mut project_list = div()
@@ -2261,7 +2296,8 @@ impl Render for Desktop {
         }
         let sidebar =
             div()
-                .w(px(224.))
+                .relative()
+                .w(geometry.sidebar)
                 .flex_shrink_0()
                 .h_full()
                 .flex()
@@ -2269,6 +2305,46 @@ impl Render for Desktop {
                 .bg(rgb(CANVAS))
                 .border_r_1()
                 .border_color(rgb(LINE))
+                .child(
+                    div()
+                        .id("sidebar-resize")
+                        .absolute()
+                        .top_0()
+                        .right(px(-4.))
+                        .w(px(8.))
+                        .h_full()
+                        .cursor_col_resize()
+                        .on_drag(
+                            SidebarDrag {
+                                offset: Default::default(),
+                            },
+                            |drag, position, _, cx| {
+                                cx.stop_propagation();
+                                drag.offset.set(px(4.) - position.x);
+                                cx.new(|_| drag.clone())
+                            },
+                        )
+                        .on_drag_move(cx.listener(
+                            |this, event: &DragMoveEvent<SidebarDrag>, window, cx| {
+                                let wanted =
+                                    f32::from(event.event.position.x + event.drag(cx).offset.get());
+                                this.setup.sidebar_width = sidebar::SidebarWidth::from_drag(
+                                    wanted,
+                                    f32::from(window.viewport_size().width),
+                                );
+                                this.sidebar_resizing = true;
+                                cx.notify();
+                            },
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| this.finish_sidebar_resize()),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| this.finish_sidebar_resize()),
+                        ),
+                )
                 .child(
                     div()
                         .h(px(54.))
@@ -2362,7 +2438,7 @@ impl Render for Desktop {
             .track_focus(&self.focus_handle)
             .key_context("Dauerbot")
             .on_action(cx.listener(|this, _: &FocusProjects, window, cx| {
-                if workspace_geometry(window.viewport_size().width, this.setup.page == 6 && !this.setup.terminal_hidden, this.setup.sidebar_hidden).sidebar_hidden {
+                if workspace_geometry(window.viewport_size().width, this.setup.page == 6 && !this.setup.terminal_hidden, this.setup.sidebar_hidden, this.setup.sidebar_width).sidebar_hidden {
                     this.toggle_sidebar(window, cx);
                 }
                 this.project_search.update(cx, |search, cx| search.focus(window, cx));
@@ -2794,6 +2870,45 @@ fn main() {
 #[cfg(test)]
 mod preference_tests {
     use super::{Language, Setup};
+
+    #[test]
+    fn sidebar_preferences_reopen_and_old_readers_ignore_the_new_field() {
+        let old = r#"{"page":6,"language":"zh","terminal_hidden":false,"sidebar_hidden":true,"bots":{"bot":{"published":true}}}"#;
+        let mut setup: Setup = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_value(setup.sidebar_width).unwrap(), 224.);
+        setup.sidebar_width = super::sidebar::SidebarWidth::from_drag(280., 1400.);
+        let bytes = serde_json::to_vec(&setup).unwrap();
+        let mut reopened: Setup = serde_json::from_slice(&bytes).unwrap();
+        reopened.prepare_startup();
+        assert!(reopened.terminal_hidden);
+        assert_eq!(reopened.page, 6);
+        assert_eq!(reopened.language, Language::Zh);
+        assert!(reopened.sidebar_hidden);
+        assert!(reopened.bots["bot"].published);
+        assert_eq!(serde_json::to_value(reopened.sidebar_width).unwrap(), 280.);
+        #[derive(serde::Deserialize)]
+        struct OldSetup {
+            page: usize,
+            sidebar_hidden: bool,
+        }
+        let legacy: OldSetup = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.page, 6);
+        assert!(legacy.sidebar_hidden);
+    }
+
+    #[test]
+    fn malformed_sidebar_width_does_not_discard_other_preferences() {
+        for width in [
+            "null", "false", "\"wide\"", "{}", "[]", "0", "-1", "167", "321", "1e100",
+        ] {
+            let input = format!(r#"{{"page":3,"language":"zh","sidebar_width":{width}}}"#);
+            let mut setup: Setup = serde_json::from_str(&input).unwrap();
+            setup.prepare_startup();
+            assert_eq!(setup.page, 3);
+            assert_eq!(setup.language, Language::Zh);
+            assert_eq!(serde_json::to_value(setup.sidebar_width).unwrap(), 224.);
+        }
+    }
 
     #[test]
     fn existing_preferences_keep_setup_progress_and_language_round_trips() {
