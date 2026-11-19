@@ -455,6 +455,7 @@ mod tests {
             pane["tokens"] = json!({});
         }
         let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -468,8 +469,9 @@ mod tests {
                 Ok(())
             });
         }
-        let shell = command.spawn().unwrap();
+        let mut shell = command.spawn().unwrap();
         let shell_pid = shell.id().unwrap();
+        shell.wait().await.unwrap();
         let acting = app.clone();
         let acting_project = p.id.clone();
         let task = tokio::spawn(async move {
@@ -499,7 +501,7 @@ mod tests {
                         json!({"workspaces":if scenario=="group" {vec![json!({"workspace_id":"w-old","pane_count":1,"worktree":{"repo_key":"group","is_linked_worktree":false}}),json!({"workspace_id":"w-protected","pane_count":1,"worktree":{"repo_key":"group","is_linked_worktree":true}})]}else{vec![json!({"workspace_id":"w-old","pane_count":1,"worktree":null})]}})
                     }
                     "pane.process_info" => {
-                        json!({"process_info":{"shell_pid":shell_pid,"foreground_processes":[{"pid":shell_pid,"name":if scenario=="alive"{"codex"}else{"zsh"}}]}})
+                        json!({"process_info":if scenario=="alive" {json!({"pane_id":"w-old:p1","shell_pid":shell_pid,"foreground_processes":[{"pid":shell_pid,"name":"codex"}]})}else{json!({"pane_id":"w-old:p1","shell_pid":shell_pid})}})
                     }
                     "pane.close" => {
                         count.fetch_add(1, Ordering::SeqCst);
