@@ -1541,6 +1541,11 @@ if model_responded { recovered(&tx,&context)?; }tx.commit()?;Ok(())}).await
 }
 async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
     loop {
+        // A completed iteration has checkpointed both the provider response and
+        // every tool result. Yield only here, never by cancelling live model I/O.
+        if app.service.manager_gate.is_closed() {
+            return Ok(());
+        }
         ensure!(
             current(&app, &turn.context).await,
             "Management turn superseded"
@@ -1791,6 +1796,12 @@ pub async fn run(app: Arc<App>) {
             let app = app.clone();
             let running = running.clone();
             tokio::spawn(async move {
+                // Retain the actor through claim, all step/effect checkpoints,
+                // and failure persistence before service ownership may transfer.
+                let Some(_manager_permit) = app.service.manager_gate.enter() else {
+                    running.lock().await.remove(&project);
+                    return;
+                };
                 let claim_project = project.clone();
                 let turn = {
                     let Some(_permit) = app.service.gate.enter() else {
@@ -1888,6 +1899,32 @@ mod tests {
     }
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
+    }
+    #[tokio::test]
+    async fn upgrade_yield_preserves_run_claims_and_stop_authority() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_upgrade", "Continue this task across upgrade");
+        let turn = app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            Ok(claim(c, &p.id)?.unwrap())
+        }).unwrap();
+        let run = turn.context.run.clone();
+        let checkpoint = turn.checkpoint.clone();
+        app.service.manager_gate.close_for_test().await.unwrap();
+        // The fixture provider is unreachable: yielding must not issue a request
+        // or settle/requeue the claimed input as a new task.
+        drive(app.clone(), turn).await.unwrap();
+        assert!(app.service.gate.enter().is_some());
+        let resumed = app.db.sync(|c| Ok(claim(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(resumed.context.run, run);
+        assert_eq!(resumed.checkpoint, checkpoint);
+        app.db.sync(|c| {
+            assert_eq!(c.query_row("SELECT count(*) FROM manager_input_claims WHERE run_id=?", [&run], |r| r.get::<_, i64>(0))?, 1);
+            stop(c, &p.id)?;
+            assert!(valid(c, &resumed.context).is_err());
+            assert_eq!(c.query_row("SELECT status FROM manager_runs WHERE id=?", [&run], |r| r.get::<_, String>(0))?, "stopped");
+            Ok(())
+        }).unwrap();
     }
     #[tokio::test]
     async fn image_capability_is_explicit_and_resets_when_provider_identity_changes() {

@@ -50,9 +50,12 @@ impl Gate {
         }
         Some(Permit(self.clone()))
     }
-    async fn close(&self) -> Result<()> {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+    async fn close_until(&self, deadline: tokio::time::Instant) -> Result<()> {
         self.closed.store(true, Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(100), async {
+        tokio::time::timeout_at(deadline, async {
             loop {
                 let changed = self.changed.notified();
                 if self.active.load(Ordering::SeqCst) == 0 {
@@ -66,7 +69,7 @@ impl Gate {
     }
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) -> Result<()> {
-        self.close().await
+        self.close_until(tokio::time::Instant::now() + Duration::from_secs(100)).await
     }
     #[cfg(test)]
     pub(crate) fn reopen_for_test(&self) {
@@ -151,6 +154,8 @@ struct Candidate {
 }
 pub struct Service {
     pub gate: Arc<Gate>,
+    /// Quiesce manager actors before fencing their checkpoint and tool writes.
+    pub(crate) manager_gate: Arc<Gate>,
     dir: PathBuf,
     resources: Mutex<Option<Resources>>,
     #[cfg(unix)]
@@ -167,6 +172,7 @@ impl Service {
             .unwrap_or_default();
         Self {
             gate: Arc::new(Gate::default()),
+            manager_gate: Arc::new(Gate::default()),
             dir: dir.into(),
             resources: Mutex::new(None),
             #[cfg(unix)]
@@ -187,7 +193,8 @@ impl Service {
         let mut value = json!(self.receipt.lock().unwrap().clone());
         value["capability"] = json!(CAPABILITY);
         value["owner_pid"] = json!(std::process::id());
-        value["admission_closed"] = json!(self.gate.closed.load(Ordering::SeqCst));
+        value["admission_closed"] = json!(self.gate.is_closed());
+        value["manager_quiescing"] = json!(self.manager_gate.is_closed());
         value
     }
     fn persist(&self, receipt: Receipt) -> Result<Receipt> {
@@ -593,8 +600,32 @@ pub async fn commit(app: &Arc<App>, id: &str) -> Result<Receipt> {
     );
     r.phase = "draining".into();
     app.service.persist(r.clone())?;
-    if let Err(e) = app.service.gate.close().await {
+    // Keep ordinary MCP/control admission open until live manager requests and
+    // their tool results reach a durable boundary. One shared bound stays below
+    // existing 95-second MCP admission timeouts; expiry leaves the old work alive.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let drained = tokio::time::timeout_at(deadline, async {
+        let drain = async {
+            app.service.manager_gate.close_until(deadline).await?;
+            app.service.gate.close_until(deadline).await
+        };
+        tokio::pin!(drain);
+        loop {
+            tokio::select! {
+                result = &mut drain => return result,
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    // Standby control reads expire after 45 seconds. Keep the
+                    // verified candidate warm while the old actor finishes.
+                    send(&mut candidate.control, json!({"command":"ping"})).await?;
+                    ensure!(receive(&mut candidate.control).await?["phase"] == "transport_ready",
+                        "Prepared candidate is no longer ready");
+                }
+            }
+        }
+    }).await.context("Existing operations have not drained").and_then(|result| result);
+    if let Err(e) = drained {
         app.service.gate.reopen();
+        app.service.manager_gate.reopen();
         r.phase = "failed".into();
         r.error = e.to_string();
         return app.service.persist(r);
@@ -612,8 +643,10 @@ pub async fn commit(app: &Arc<App>, id: &str) -> Result<Receipt> {
             fingerprint(&app.dir.join("bridge.sqlite3"), &cfg)? == candidate.fingerprint,
             "Project or bot configuration changed; prepare the upgrade again"
         );
-        send(&mut candidate.control, json!({"command":"validate"})).await?;
-        let valid = receive(&mut candidate.control).await?;
+        let valid = tokio::time::timeout_at(deadline, async {
+            send(&mut candidate.control, json!({"command":"validate"})).await?;
+            receive(&mut candidate.control).await
+        }).await.context("Candidate validation exceeded the drain deadline")??;
         ensure!(
             valid["phase"] == "validated",
             "Candidate is no longer ready"
@@ -643,6 +676,7 @@ pub async fn commit(app: &Arc<App>, id: &str) -> Result<Receipt> {
     if let Err(error) = result {
         if !r.owner_committed {
             app.service.gate.reopen();
+            app.service.manager_gate.reopen();
             r.phase = "failed".into();
             r.error = error.to_string();
             return app.service.persist(r);
@@ -1150,7 +1184,7 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let effect = gate.enter().unwrap();
         let closing = gate.clone();
-        let task = tokio::spawn(async move { closing.close().await });
+        let task = tokio::spawn(async move { closing.close_until(tokio::time::Instant::now() + Duration::from_secs(100)).await });
         tokio::task::yield_now().await;
         assert!(gate.enter().is_none());
         assert!(!task.is_finished());
@@ -1159,6 +1193,26 @@ mod tests {
         assert!(gate.enter().is_none());
         gate.reopen();
         assert!(gate.enter().is_some());
+    }
+    #[tokio::test]
+    async fn manager_drain_timeout_keeps_live_work_and_control_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Service::new(dir.path());
+        let actor = service.manager_gate.enter().unwrap();
+        let drain = service.manager_gate.close_until(
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        );
+        assert!(drain.await.is_err());
+        assert!(service.manager_gate.enter().is_none());
+        // A timeout never drops the actor's permit or closes MCP/Stop admission.
+        assert_eq!(service.manager_gate.active.load(Ordering::SeqCst), 1);
+        assert!(service.gate.enter().is_some());
+        service.manager_gate.reopen();
+        drop(actor);
+        assert!(service.manager_gate.enter().is_some());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        service.manager_gate.close_until(deadline).await.unwrap();
+        service.gate.close_until(deadline).await.unwrap();
     }
     #[test]
     fn clean_handover_and_readonly_preflight_do_not_reclassify_live_effects() {
@@ -1226,7 +1280,7 @@ mod tests {
         started_rx.await.unwrap();
         waiter.abort();
         let closing = gate.clone();
-        let drain = tokio::spawn(async move { closing.close().await });
+        let drain = tokio::spawn(async move { closing.close_until(tokio::time::Instant::now() + Duration::from_secs(100)).await });
         while !gate.closed.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
