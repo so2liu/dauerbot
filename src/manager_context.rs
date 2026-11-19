@@ -17,6 +17,9 @@ const MAX_TEXT_BYTES: usize = 48 * 1024;
 // Manager input/tool-result serialization is separately bounded at 256 KiB.
 // Parse that full structured input before applying the smaller display budget.
 const MAX_STRUCTURED_BYTES: usize = 256 * 1024;
+const MAX_REDACTION_DEPTH: usize = 16;
+const MAX_REDACTION_WORK_BYTES: usize = MAX_STRUCTURED_BYTES * 4;
+const INSPECTION_LIMIT: &str = "[omitted: diagnostic redaction inspection limit]";
 const MAX_BLOCKS: usize = 256;
 const MAX_API_BYTES: usize = 1536 * 1024;
 
@@ -146,27 +149,72 @@ fn sensitive(key: &str) -> bool {
             | "imagebytes"
     )
 }
-fn redact_json(value: &mut Value, changed: &mut bool) {
+struct RedactionBudget {
+    remaining: usize,
+    changed: bool,
+}
+impl RedactionBudget {
+    fn reserve(&mut self, bytes: usize) -> bool {
+        match self.remaining.checked_sub(bytes) {
+            Some(left) => {
+                self.remaining = left;
+                true
+            }
+            None => {
+                self.remaining = 0;
+                self.changed = true;
+                false
+            }
+        }
+    }
+    fn omit(&mut self) -> String {
+        self.changed = true;
+        INSPECTION_LIMIT.into()
+    }
+}
+struct DiagnosticWriter<'a> {
+    bytes: Vec<u8>,
+    budget: &'a mut RedactionBudget,
+}
+impl std::io::Write for DiagnosticWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > MAX_STRUCTURED_BYTES
+            || !self.budget.reserve(bytes.len())
+        {
+            return Err(std::io::Error::other("Diagnostic inspection limit"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn redact_json(value: &mut Value, depth: usize, budget: &mut RedactionBudget) {
+    if depth >= MAX_REDACTION_DEPTH {
+        *value = json!(budget.omit());
+        return;
+    }
     match value {
         Value::Object(fields) => {
             for (key, value) in fields {
                 if sensitive(key) {
                     *value = json!("[redacted sensitive field]");
-                    *changed = true;
+                    budget.changed = true;
                 } else {
-                    redact_json(value, changed);
+                    redact_json(value, depth + 1, budget);
                 }
             }
         }
         Value::Array(values) => {
             for value in values {
-                redact_json(value, changed);
+                redact_json(value, depth + 1, budget);
             }
         }
         Value::String(text) => {
-            let (next, redacted) = redact_text(text);
-            *text = next;
-            *changed |= redacted;
+            // read_file returns file contents as a string inside its JSON result.
+            // Inspect encoded JSON at every string boundary before retention.
+            *text = inspect_text(text, depth + 1, budget);
         }
         _ => {}
     }
@@ -230,16 +278,36 @@ fn redact_text(text: &str) -> (String, bool) {
     (output, changed)
 }
 fn clean(text: &str) -> (String, bool) {
-    // Structured user/tool text frequently contains nested resource metadata.
-    // The cap also bounds parsing and redaction work on the diagnostic path.
+    let mut budget = RedactionBudget {
+        remaining: MAX_REDACTION_WORK_BYTES,
+        changed: false,
+    };
+    let text = inspect_text(text, 0, &mut budget);
+    (text, budget.changed)
+}
+fn inspect_text(text: &str, depth: usize, budget: &mut RedactionBudget) -> String {
+    if depth >= MAX_REDACTION_DEPTH || !budget.reserve(text.len()) {
+        return budget.omit();
+    }
     if text.len() <= MAX_STRUCTURED_BYTES
         && let Ok(mut value) = serde_json::from_str::<Value>(text)
     {
-        let mut changed = false;
-        redact_json(&mut value, &mut changed);
-        return (serde_json::to_string(&value).unwrap_or_default(), changed);
+        redact_json(&mut value, depth + 1, budget);
+        let mut writer = DiagnosticWriter {
+            bytes: Vec::new(),
+            budget,
+        };
+        if serde_json::to_writer(&mut writer, &value).is_err() {
+            return writer.budget.omit();
+        }
+        return String::from_utf8(writer.bytes).unwrap_or_else(|_| budget.omit());
     }
-    redact_text(text)
+    if text.len() > MAX_STRUCTURED_BYTES && text.trim_start().starts_with(['{', '[', '"']) {
+        return budget.omit();
+    }
+    let (text, changed) = redact_text(text);
+    budget.changed |= changed;
+    text
 }
 struct Builder {
     blocks: Vec<Value>,
@@ -375,6 +443,74 @@ pub(crate) fn bounded(mut view: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_file_json_string_content_is_redacted_before_memory_retention() {
+        use rig_core::message::{ToolCall, ToolFunction, ToolName};
+        let call = ToolCall::from_wire(
+            "fixture-read",
+            ToolFunction::new(
+                ToolName::new("read_file").unwrap(),
+                json!({"path":"safe.json"}),
+            ),
+        );
+        let result = call.result(vec![ToolResultContent::json(json!({
+            "path":"safe.json","sha256":"fixture-hash",
+            "content":json!({"password":"fixture-secret","token":"fixture-token","safe":"keep inner field"}).to_string()
+        }))]);
+        let request = CompletionRequest::new(Message::User {
+            content: vec![UserContent::ToolResult(result)],
+        });
+        let store = Arc::new(Store::default());
+        let _guard = store.capture("fixture-project", "fixture-run", 1, &request);
+        let view = store.view("fixture-project");
+        let snapshot = &view["requests"][0];
+        let encoded = snapshot.to_string();
+        assert!(!encoded.contains("fixture-secret"));
+        assert!(!encoded.contains("fixture-token"));
+        assert!(!snapshot["redactions"].as_array().unwrap().is_empty());
+        let outer: Value =
+            serde_json::from_str(snapshot["blocks"][1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(outer["path"], "safe.json");
+        assert_eq!(outer["sha256"], "fixture-hash");
+        let inner: Value = serde_json::from_str(outer["content"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["safe"], "keep inner field");
+        assert_eq!(inner["password"], "[redacted sensitive field]");
+        assert_eq!(inner["token"], "[redacted sensitive field]");
+    }
+    #[test]
+    fn nested_json_inspection_limits_omit_uninspected_content() {
+        let mut encoded = json!({"password":"fixture-deep-secret"}).to_string();
+        for _ in 0..MAX_REDACTION_DEPTH / 3 + 2 {
+            encoded = json!({"content":encoded}).to_string();
+        }
+        assert!(encoded.len() < MAX_STRUCTURED_BYTES);
+        let (cleaned, changed) = clean(&encoded);
+        assert!(changed);
+        assert!(cleaned.contains(INSPECTION_LIMIT));
+        assert!(!cleaned.contains("fixture-deep-secret"));
+        let mut budget = RedactionBudget {
+            remaining: 4,
+            changed: false,
+        };
+        assert_eq!(
+            inspect_text("{\"token\":\"fixture-uninspected\"}", 0, &mut budget),
+            INSPECTION_LIMIT
+        );
+        assert!(budget.changed);
+        assert_eq!(budget.remaining, 0);
+        let mut writer_budget = RedactionBudget {
+            remaining: 2,
+            changed: false,
+        };
+        let mut writer = DiagnosticWriter {
+            bytes: vec![],
+            budget: &mut writer_budget,
+        };
+        assert!(
+            serde_json::to_writer(&mut writer, &json!({"safe":"not inspected fully"})).is_err()
+        );
+        assert!(writer.budget.changed);
+    }
     #[test]
     fn tool_calls_results_and_followup_are_distinct_ordered_blocks() {
         use rig_core::message::{AssistantMessage, ToolCall, ToolFunction, ToolName};
