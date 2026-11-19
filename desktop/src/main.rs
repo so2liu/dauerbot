@@ -2073,6 +2073,8 @@ impl Render for Desktop {
                 .child(
                     div()
                         .flex()
+                        .w_full()
+                        .min_w_0()
                         .items_center()
                         .gap_2()
                         .h_full()
@@ -2110,11 +2112,13 @@ impl Render for Desktop {
                     this.go(6);
                     cx.notify();
                 }));
-            let mut root = div().flex().items_center().w_full().min_w_0();
-            if has_children {
+            let root_layout = agent_tree::row_layout(&[], true, has_children, 32., f32::from(geometry.sidebar) - 16., 0.);
+            let mut root_toggle = agent_tree::disclosure(&root_layout);
+            if root_layout.expandable {
                 let scope = fold_scope.clone();
-                root = root.child(
+                root_toggle = root_toggle.child(
                     Button::new(SharedString::from(format!("fold-project-{id}")))
+                        .w_full()
                         .child(div().text_size(px(12.)).child(if root_folded {
                             "›"
                         } else {
@@ -2134,9 +2138,8 @@ impl Render for Desktop {
                             cx.notify();
                         })),
                 );
-            } else {
-                root = root.child(div().w(px(20.)).flex_shrink_0());
             }
+            let root = div().flex().items_center().w_full().min_w_0().child(root_toggle);
             let mut group = div()
                 .id(SharedString::from(format!("project-tree-{id}")))
                 .flex()
@@ -2148,18 +2151,12 @@ impl Render for Desktop {
                 if manager_enabled {
                     let scope = fold_scope.clone();
                     let terminal_project = id.clone();
-                    let mut worker_row = div()
-                        .id(SharedString::from(format!("coding-worker-{id}")))
-                        .h(px(28.))
-                        .pl(px(28.))
-                        .pr_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .min_w_0();
-                    if !tree.nodes.is_empty() {
-                        worker_row = worker_row.child(
+                    let worker_layout = agent_tree::row_layout(&[], true, !tree.nodes.is_empty(), 28., f32::from(geometry.sidebar) - 16., 28.);
+                    let mut worker_toggle = agent_tree::disclosure(&worker_layout);
+                    if worker_layout.expandable {
+                        worker_toggle = worker_toggle.child(
                             Button::new(SharedString::from(format!("fold-worker-{id}")))
+                                .w_full()
                                 .xsmall()
                                 .child(div().text_size(px(11.)).child(if worker_folded {
                                     "›"
@@ -2172,8 +2169,7 @@ impl Render for Desktop {
                                     "Hide subagents"
                                 }))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let folded =
-                                        this.folded_agents.entry(scope.clone()).or_default();
+                                    let folded = this.folded_agents.entry(scope.clone()).or_default();
                                     if !folded.remove("worker") {
                                         folded.insert("worker".into());
                                     }
@@ -2182,21 +2178,18 @@ impl Render for Desktop {
                                 })),
                         );
                     }
-                    worker_row = worker_row
-                        .child(
-                            div().w(px(12.)).h_full().relative().flex_shrink_0().child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .h(px(14.))
-                                    .w(px(8.))
-                                    .border_l_1()
-                                    .border_b_1()
-                                    .border_color(rgb(palette.line))
-                                    .rounded_bl(px(4.)),
-                            ),
-                        )
+                    let worker_row = div()
+                        .id(SharedString::from(format!("coding-worker-{id}")))
+                        .h(px(28.))
+                        .pl(px(worker_layout.left_padding))
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .min_w_0();
+                    let worker_row = worker_row
+                        .child(agent_tree::branches(&worker_layout, palette))
+                        .child(worker_toggle)
                         .child(agent_tree::cli_icon(
                             project["agent"].as_str().unwrap_or("custom"),
                             format!("worker-cli-{id}"),
@@ -2235,6 +2228,7 @@ impl Render for Desktop {
                 }
                 for row in tree_rows.into_iter().filter(|_| !worker_folded) {
                     let node = row.node;
+                    let layout = agent_tree::row_layout(&row.branches, row.last, row.has_children, 26., f32::from(geometry.sidebar) - 16., if manager_enabled { 48. } else { 28. });
                     let node_id = node.id.clone();
                     let scope = fold_scope.clone();
                     let target = if tree.status == "observed" {
@@ -2257,7 +2251,7 @@ impl Render for Desktop {
                         .id(SharedString::from(format!("agent-{id}-{}", node.id)))
                         .h(px(26.))
                         .min_w_0()
-                        .pl(px(if manager_enabled { 48. } else { 28. }))
+                        .pl(px(layout.left_padding))
                         .pr_2()
                         .flex()
                         .items_center()
@@ -2267,11 +2261,13 @@ impl Render for Desktop {
                         .tooltip(move |window, cx| {
                             gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
                         })
-                        .child(agent_tree::branches(&row, palette));
-                    if row.has_children {
+                        .child(agent_tree::branches(&layout, palette));
+                    let mut disclosure = agent_tree::disclosure(&layout);
+                    if layout.expandable {
                         let fold_id = node_id.clone();
-                        child = child.child(
+                        disclosure = disclosure.child(
                             Button::new(SharedString::from(format!("fold-agent-{id}-{node_id}")))
+                                .w_full()
                                 .child(div().text_size(px(11.)).child(
                                     if folded.contains(&node_id) {
                                         "›"
@@ -2296,7 +2292,7 @@ impl Render for Desktop {
                                 })),
                         );
                     }
-                    child = child.child(agent_tree::cli_icon(
+                    child = child.child(disclosure).child(agent_tree::cli_icon(
                         &node.cli,
                         format!("agent-cli-{id}-{node_id}"),
                             palette,
