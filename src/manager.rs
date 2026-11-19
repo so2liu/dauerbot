@@ -2,7 +2,7 @@
 use crate::{
     App, db,
     db::Project,
-    manager_loop::{self, LoopAction, ProviderConfig, ToolCall},
+    manager_loop::{self, Failure, LoopAction, ProviderConfig, ToolCall},
     work,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -36,6 +36,7 @@ fn installed(c: &Connection) -> Result<bool> {
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'native',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id),note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_failures(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,incident_id TEXT NOT NULL,attempts INTEGER NOT NULL,diagnostic TEXT NOT NULL,notified INTEGER NOT NULL DEFAULT 0,repair_probe INTEGER NOT NULL DEFAULT 0);")?;
     if recover {
         c.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE status='submitting'",[json!({"status":"uncertain","message":"The host stopped during this effect; do not repeat it without inspecting evidence."}).to_string()])?;
     }
@@ -81,8 +82,15 @@ pub fn public(c: &Connection, project: &str) -> Result<Value> {
         [project],
         |r| r.get(0),
     )?;
+    let failure: Option<String> = c
+        .query_row(
+            "SELECT diagnostic FROM manager_failures WHERE project_id=? AND revision=?",
+            params![project, revision],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(
-        json!({"mode":mode,"base_url":base,"model":model,"has_api_key":has_key,"revision":revision,"status":if mode=="native"{"disabled"}else if paused{"paused"}else if !error.is_empty(){"unavailable"}else if active{"working"}else{"ready"},"error":error}),
+        json!({"mode":mode,"base_url":base,"model":model,"has_api_key":has_key,"revision":revision,"status":if mode=="native"{"disabled"}else if paused{"paused"}else if !error.is_empty(){"unavailable"}else if active{"working"}else{"ready"},"error":error,"failure":failure.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?}),
     )
 }
 pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> {
@@ -298,7 +306,7 @@ fn input(
     payload: &Value,
 ) -> Result<()> {
     if c.execute("INSERT OR IGNORE INTO manager_inputs(id,project_id,origin_event_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)",params![id,project,origin,kind,payload.to_string(),db::now()])?==1 {
- c.execute("UPDATE manager_config SET input_revision=input_revision+1,next_attempt_at=0 WHERE project_id=?",[project])?; }
+ c.execute("UPDATE manager_config SET input_revision=input_revision+1,next_attempt_at=CASE WHEN ?='user' THEN 0 ELSE next_attempt_at END WHERE project_id=?",params![kind,project])?; }
     Ok(())
 }
 #[derive(Clone)]
@@ -363,6 +371,17 @@ pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Resu
         return Ok(true);
     }
     let p = db::project_by_key(c, &event.project_id)?;
+    if let Some(incident) = event.payload["repair_incident"].as_str() {
+        let current:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=m.revision AND m.revision=? AND m.mode='manager')",params![p.id,incident,event.payload["repair_revision"].as_i64()],|r|r.get(0))?;
+        if !current {
+            cancel_repair(
+                c,
+                &event.id,
+                "Management recovered or its repair authority changed",
+            )?;
+            return Ok(false);
+        }
+    }
     let same_agent = event.payload["expected_agent"] == p.agent;
     let same_generation = event.payload["target_generation"]
         .as_str()
@@ -629,6 +648,18 @@ fn effect_result(c: &Connection, id: &str, result: &Value, status: &str) -> Resu
     Ok(())
 }
 pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
+    if attachment["manager_notice"] == true {
+        let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN projects p ON p.id=m.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=? AND f.revision=m.revision AND m.mode='manager' AND p.paused=0)",params![project,attachment["manager_incident"].as_str(),attachment["manager_revision"].as_i64()],|r|r.get(0))?;
+        ensure!(
+            allowed,
+            "Management notice no longer belongs to an active incident"
+        );
+        let p = db::project_by_key(c, project)?;
+        ensure!(
+            !work::has_takeover(c, project, &p.generation)?,
+            "Management notice is held by user takeover"
+        );
+    }
     let Some(effect) = attachment["manager_effect"].as_str() else {
         return Ok(());
     };
@@ -725,7 +756,32 @@ pub fn worker_changed(c: &Connection, project: &str) -> Result<()> {
     )?;
     if enabled {
         observe(c, project)?;
+        repair_finished(c, project)?;
     }
+    Ok(())
+}
+fn repair_finished(c: &Connection, project: &str) -> Result<()> {
+    let current:Option<(String,i64)>=c.query_row("SELECT f.incident_id,f.revision FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN work_events e ON e.project_id=f.project_id AND json_extract(e.payload,'$.repair_incident')=f.incident_id AND json_extract(e.payload,'$.repair_revision')=f.revision JOIN work_runs r ON r.event_id=e.id WHERE f.project_id=? AND f.revision=m.revision AND m.mode='manager' AND f.repair_probe=0 AND r.finished_at IS NOT NULL AND r.status IN ('settled','completed') LIMIT 1",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let Some((incident, revision)) = current else {
+        return Ok(());
+    };
+    c.execute(
+        "UPDATE manager_failures SET repair_probe=1 WHERE project_id=? AND incident_id=?",
+        params![project, incident],
+    )?;
+    input(
+        c,
+        project,
+        &format!("repair-probe-{incident}"),
+        None,
+        "worker",
+        &json!({"kind":"repair_finished","incident_id":incident,"semantic_task_success":"unconfirmed","instructions":"Inspect the preserved effect evidence and repair result; make one fresh management request without replaying old effects."}),
+    )?;
+    c.execute("UPDATE manager_runs SET status='superseded' WHERE project_id=? AND revision=? AND status='working'",params![project,revision])?;
+    c.execute(
+        "UPDATE manager_config SET next_attempt_at=0 WHERE project_id=? AND revision=?",
+        params![project, revision],
+    )?;
     Ok(())
 }
 /// Durable observations contain receipts, never invented task-completion signals.
@@ -1003,6 +1059,38 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         checkpoint,
     }))
 }
+fn claim_or_repair(c: &Connection, project: &str) -> Result<Option<Turn>> {
+    match claim(c, project) {
+        Ok(turn) => Ok(turn),
+        Err(_) => {
+            let p = db::project_by_key(c, project)?;
+            if p.paused || work::has_takeover(c, project, &p.generation)? {
+                return Ok(None);
+            }
+            let config:Option<(i64,i64)>=c.query_row("SELECT revision,input_revision FROM manager_config WHERE project_id=? AND mode='manager'",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let Some((revision, input_revision)) = config else {
+                return Ok(None);
+            };
+            // Reserve a failed claim's own generation-bound repair context.
+            // Its inputs stay queued and no ordinary task body reaches a worker.
+            let ctx = Context {
+                project: project.into(),
+                run: db::id(),
+                revision,
+                input_revision,
+            };
+            let tx = c.unchecked_transaction()?;
+            tx.execute("UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",[project])?;
+            tx.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES(?,?,?,?,'null','working',?,?)",params![ctx.run,project,revision,input_revision,owner(),db::now()])?;
+            tx.execute("INSERT INTO manager_run_inputs(run_id,input_id) SELECT ?,id FROM manager_inputs WHERE project_id=? AND status='queued' ORDER BY rowid LIMIT 32",params![ctx.run,project])?;
+            tx.commit()?;
+            let mut error = Failure::internal();
+            error.kind = "context_preparation".into();
+            failure(c, &ctx, &error)?;
+            Ok(None)
+        }
+    }
+}
 async fn current(app: &App, ctx: &Context) -> bool {
     let Some(_permit) = app.service.gate.enter() else {
         return false;
@@ -1013,17 +1101,22 @@ async fn current(app: &App, ctx: &Context) -> bool {
         .await
         .unwrap_or(false)
 }
-async fn checkpoint(app: &App, ctx: &Context, value: &Value) -> Result<()> {
+async fn checkpoint(app: &App, ctx: &Context, value: &Value, model_responded: bool) -> Result<()> {
     let Some(_permit) = app.service.gate.enter() else {
         bail!("Service ownership changed")
     };
     let context = ctx.clone();
+    let correction = value
+        .get("last_correction")
+        .filter(|v| !v.is_null())
+        .map(Value::to_string);
     let value = value.to_string();
     ensure!(
         value.len() <= 2_097_152,
         "Management checkpoint exceeds its bound"
     );
-    app.db.call(move|c|{valid(c,&context)?;ensure!(c.execute("UPDATE manager_runs SET checkpoint=? WHERE id=? AND owner=? AND status='working'",params![value,context.run,owner()])?==1,"Management turn ownership changed");Ok(())}).await
+    app.db.call(move|c|{let tx=c.unchecked_transaction()?;valid(&tx,&context)?;ensure!(tx.execute("UPDATE manager_runs SET checkpoint=? WHERE id=? AND owner=? AND status='working'",params![value,context.run,owner()])?==1,"Management turn ownership changed");if let Some(correction)=correction {tx.execute("UPDATE manager_runs SET error=json_set(CASE WHEN json_valid(error) THEN error ELSE '{}' END,'$.last_correction',json(?)) WHERE id=?",params![correction,context.run])?;}
+if model_responded { recovered(&tx,&context)?; }tx.commit()?;Ok(())}).await
 }
 async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
     loop {
@@ -1037,9 +1130,10 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
         let step = loop {
             tokio::select! {result=&mut model=>break result?,_=tokio::time::sleep(Duration::from_millis(100))=>{if app.shutdown.is_cancelled()||!current(&app,&turn.context).await{cancel.cancel();bail!("Management turn superseded");}}}
         };
-        checkpoint(&app, &turn.context, &step.checkpoint).await?;
+        checkpoint(&app, &turn.context, &step.checkpoint, step.model_responded).await?;
         turn.checkpoint = step.checkpoint;
         match step.action {
+            LoopAction::Continue => continue,
             LoopAction::Tools(calls) => {
                 let mut results = Vec::new();
                 for call in calls {
@@ -1048,7 +1142,7 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
                     results.push((occurrence, value));
                 }
                 turn.checkpoint = manager_loop::supply_tool_results(turn.checkpoint, results)?;
-                checkpoint(&app, &turn.context, &turn.checkpoint).await?;
+                checkpoint(&app, &turn.context, &turn.checkpoint, false).await?;
             }
             LoopAction::Done(note) => {
                 let context = turn.context.clone();
@@ -1076,48 +1170,151 @@ fn finish_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
     )?;
     tx.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN(SELECT input_id FROM manager_run_inputs WHERE run_id=?) AND status='queued'",[&context.run])?;
     settle_inputs(&tx, &context.run)?;
-    tx.execute(
-        "UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=?",
-        [&context.project],
-    )?;
+    recovered(&tx, context)?;
     tx.commit()?;
     Ok(())
 }
-fn failure(c: &Connection, ctx: &Context) -> Result<()> {
-    let tx = c.unchecked_transaction()?;
-    if valid(&tx, ctx).is_err() {
-        return Ok(());
+fn cancel_repair(c: &Connection, id: &str, reason: &str) -> Result<()> {
+    if c.execute("UPDATE work_events SET status='cancelled',error=?,updated_at=? WHERE id=? AND status='queued'",params![reason,db::now(),id])?==1 {
+        c.execute("UPDATE work_tasks SET status='cancelled',updated_at=? WHERE id=(SELECT task_id FROM work_events WHERE id=?)",params![db::now(),id])?;
+        c.execute("UPDATE work_occurrences SET status='cancelled' WHERE event_id=?",[id])?;
     }
-    let message = "The management model is temporarily unavailable. Your input is saved and will retry automatically. Native settings, repair and Agent mode controls remain available.";
+    Ok(())
+}
+fn recovered(c: &Connection, ctx: &Context) -> Result<()> {
+    let repairs=c.prepare("SELECT id FROM work_events WHERE project_id=? AND source='management' AND status='queued' AND json_extract(payload,'$.repair_incident') IN(SELECT incident_id FROM manager_failures WHERE project_id=? AND revision=?)")?.query_map(params![ctx.project,ctx.project,ctx.revision],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in repairs {
+        cancel_repair(c, &id, "Management recovered before repair dispatch")?;
+    }
+    c.execute(
+        "UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=? AND revision=?",
+        params![ctx.project, ctx.revision],
+    )?;
+    c.execute(
+        "DELETE FROM manager_failures WHERE project_id=? AND revision=?",
+        params![ctx.project, ctx.revision],
+    )?;
+    Ok(())
+}
+fn failure_notice(error: &Failure, delay: i64, repair: bool, chinese: bool) -> String {
+    if chinese {
+        let reason = match error.kind.as_str() {
+            "timeout" => "管理模型请求超时",
+            "transport" => "管理模型连接失败",
+            "authorization" => "管理模型接口拒绝了访问",
+            "model_unavailable" => "未找到配置的管理模型",
+            "rate_limited" => "管理模型接口正在限流",
+            "provider_unavailable" => "管理模型接口未能处理请求",
+            "context_rejected" => "管理模型请求超过上下文限制",
+            "request_rejected" => "管理模型接口拒绝了请求",
+            "invalid_response" => "管理模型回复不完整或格式不合法",
+            "context_preparation" => "管理上下文未能准备完成",
+            _ => "管理流程未能继续",
+        };
+        let retry = if error.retryable {
+            format!("将在 {} 秒后自动重试。", delay / 1000)
+        } else {
+            String::new()
+        };
+        let repair = if repair {
+            "已安排原生编程智能体排查修复。"
+        } else {
+            "原生智能体和修复控制仍可使用。"
+        };
+        return format!("{reason}。输入和执行记录均已保留。{retry}{repair}");
+    }
+    let retry = if error.retryable {
+        format!(" Retrying automatically in {} seconds.", delay / 1000)
+    } else {
+        String::new()
+    };
+    let repair = if repair {
+        " A native Agent repair assignment has been prepared."
+    } else {
+        " Native Agent mode and repair controls remain available."
+    };
+    format!(
+        "{}. Input and effect records are saved.{retry}{repair}",
+        error.summary()
+    )
+}
+fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    let Ok(p) = valid(&tx, ctx) else {
+        return Ok(());
+    };
+    let previous:Option<(String,i64,bool)>=tx.query_row("SELECT incident_id,attempts,notified FROM manager_failures WHERE project_id=? AND revision=?",params![ctx.project,ctx.revision],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let (incident, attempts, notified) = previous
+        .map(|(id, n, notified)| (id, n.saturating_add(1), notified))
+        .unwrap_or_else(|| (db::id(), 1, false));
+    let delay = if error.retryable {
+        (30_000_i64 * (1_i64 << attempts.saturating_sub(1).clamp(0, 4))).min(300_000)
+    } else {
+        0
+    };
+    let next_attempt = if error.retryable {
+        db::now() + delay
+    } else {
+        i64::MAX
+    };
+    let diagnostic = json!({"incident_id":incident,"attempt":attempts,"kind":error.kind,"http_status":error.http_status,"retryable":error.retryable,"elapsed_ms":error.elapsed_ms,"output_tokens":error.output_tokens,"output_budget":error.output_budget,"finish_reason":error.finish_reason,"failed_at":db::now(),"next_attempt_at":if error.retryable{Some(next_attempt)}else{None}}).to_string();
+    tx.execute("INSERT INTO manager_failures(project_id,revision,incident_id,attempts,diagnostic,notified) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision,incident_id=excluded.incident_id,attempts=excluded.attempts,diagnostic=excluded.diagnostic,notified=excluded.notified,repair_probe=CASE WHEN manager_failures.incident_id=excluded.incident_id THEN manager_failures.repair_probe ELSE 0 END",params![ctx.project,ctx.revision,incident,attempts,diagnostic,notified])?;
+    tx.execute(
+        "UPDATE manager_runs SET error=json_set(CASE WHEN json_valid(error) THEN error ELSE '{}' END,'$.last_failure',json(?)) WHERE id=?",
+        params![diagnostic, ctx.run],
+    )?;
     tx.execute(
         "UPDATE manager_config SET error=?,next_attempt_at=? WHERE project_id=?",
-        params![message, db::now() + 30_000, ctx.project],
+        params![error.summary(), next_attempt, ctx.project],
     )?;
-    let origins=tx.prepare("SELECT DISTINCT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id IS NOT NULL")?.query_map([&ctx.run],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if !error.retryable || attempts >= 3 {
+        let repair_id = format!("manager-repair-{incident}");
+        let instructions = format!(
+            "<management_repair trust=\"daemon_metadata\" incident_id=\"{incident}\" revision=\"{}\">Repair only this project's management service. Sanitized diagnostic: {}. Verify the current manager failure still has this incident and revision before making changes. Diagnose the configured provider request or management loop; preserve queued user input and all effect receipts. Do not process or forward the user's ordinary tasks, replay uncertain effects, change native CLI login/global settings, or replace the selected provider without explicit authority. Use the existing project control path and report verified recovery or the concrete remaining cause. This is one bounded repair assignment, not authorization for recurring retries.</management_repair>",
+            ctx.revision, error
+        );
+        let event = intent(&tx, &p, &repair_id, &instructions, None, false)?;
+        tx.execute("UPDATE work_events SET payload=json_set(payload,'$.repair_incident',?,'$.repair_revision',?) WHERE id=?",params![incident,ctx.revision,event])?;
+    }
+    if notified {
+        tx.commit()?;
+        return Ok(());
+    }
+    let origins=tx.prepare("SELECT DISTINCT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id IS NOT NULL ORDER BY i.created_at,i.rowid")?.query_map([&ctx.run],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for origin in origins {
         let e = work::event(&tx, &ctx.project, &origin)?;
         if let Some(id) = e.message_id {
-            let (source, raw): (String, String) = tx.query_row(
-                "SELECT source_id,attachment FROM messages WHERE id=?",
+            let (source, raw, content): (String, String, String) = tx.query_row(
+                "SELECT source_id,attachment,content FROM messages WHERE id=?",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
             let a: Value = serde_json::from_str(&raw)?;
             if let (Some(to), Some(binding)) = (
                 a["source"]["chat_id"].as_str(),
                 crate::bot::get(&tx, &ctx.project)?,
             ) {
+                let message = failure_notice(
+                    error,
+                    delay,
+                    !error.retryable || attempts >= 3,
+                    content
+                        .chars()
+                        .any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch)),
+                );
                 db::enqueue_out_request(
                     &tx,
                     &ctx.project,
                     &binding.app_id,
-                    &format!(
-                        "manager-unavailable-{}-{}-{source}",
-                        ctx.project, ctx.revision
-                    ),
-                    message,
-                    json!({"to":to,"reply_to_message_id":source,"manager_notice":true}),
+                    &format!("manager-unavailable-{}-{incident}", ctx.project),
+                    &message,
+                    json!({"to":to,"reply_to_message_id":source,"manager_notice":true,"manager_incident":incident,"manager_revision":ctx.revision}),
                 )?;
+                tx.execute(
+                    "UPDATE manager_failures SET notified=1 WHERE project_id=?",
+                    [&ctx.project],
+                )?;
+                break;
             }
         }
     }
@@ -1127,6 +1324,15 @@ fn failure(c: &Connection, ctx: &Context) -> Result<()> {
 pub fn stop(c: &Connection, project: &str) -> Result<()> {
     crate::cli_control::classify(c)?;
     work::sync_inbound(c)?;
+    let repairs=c.prepare("SELECT id FROM work_events WHERE project_id=? AND source='management' AND status='queued' AND json_extract(payload,'$.repair_incident') IS NOT NULL")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in repairs {
+        cancel_repair(c, &id, "Stopped by the user")?;
+    }
+    c.execute("DELETE FROM manager_failures WHERE project_id=?", [project])?;
+    c.execute(
+        "UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=?",
+        [project],
+    )?;
     c.execute("UPDATE work_events SET status='cancelled' WHERE id IN(SELECT origin_event_id FROM manager_inputs WHERE project_id=? AND status='queued') AND status='managed'",[project])?;
     c.execute("UPDATE work_events SET status='cancelled',error='Stopped by the user' WHERE project_id=? AND source='management' AND status='queued'",[project])?;
     c.execute(
@@ -1159,19 +1365,29 @@ pub async fn run(app: Arc<App>) {
             let running = running.clone();
             tokio::spawn(async move {
                 let claim_project = project.clone();
-                let turn = app.db.call(move |c| claim(c, &claim_project)).await;
-                if turn.is_err() {
-                    let key = project.clone();
-                    let _=app.db.call(move|c|{c.execute("UPDATE manager_config SET error='Management context is unavailable or exceeds the model bound. Input is preserved; native mode handoff remains available.',next_attempt_at=? WHERE project_id=?",params![db::now()+30000,key])?;Ok(())}).await;
-                }
+                let turn = {
+                    let Some(_permit) = app.service.gate.enter() else {
+                        running.lock().await.remove(&project);
+                        return;
+                    };
+                    app.db
+                        .call(move |c| claim_or_repair(c, &claim_project))
+                        .await
+                };
                 if let Ok(Some(turn)) = turn {
                     let context = turn.context.clone();
-                    if drive(app.clone(), turn).await.is_err() {
+                    if let Err(error) = drive(app.clone(), turn).await {
                         let Some(_permit) = app.service.gate.enter() else {
                             running.lock().await.remove(&project);
                             return;
                         };
-                        let _ = app.db.call(move |c| failure(c, &context)).await;
+                        if !app.shutdown.is_cancelled() {
+                            let error = error
+                                .downcast_ref::<Failure>()
+                                .cloned()
+                                .unwrap_or_else(Failure::internal);
+                            let _ = app.db.call(move |c| failure(c, &context, &error)).await;
+                        }
                         app.notify.notify_one();
                     }
                 }
@@ -1244,6 +1460,278 @@ mod tests {
     }
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
+    }
+    #[tokio::test]
+    async fn failures_are_incident_scoped_backoff_survives_observations_and_valid_response_recovers()
+     {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_retry", "请修复问题，保留输入");
+        let turn = app
+            .db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                Ok(claim(c, &p.id)?.unwrap())
+            })
+            .unwrap();
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES('uncertain-effect',?,'old','send_md','{}','uncertain','{}')",[&turn.context.run])?;
+            for attempt in 1..=4 {
+                failure(c,&turn.context,&Failure::timeout())?;
+                let state=public(c,&p.id)?;assert_eq!(state["failure"]["attempt"],attempt);
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM messages WHERE json_extract(attachment,'$.manager_notice')=1",[],|r|r.get::<_,i64>(0))?,1);
+            }
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
+            let retry:i64=c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get(0))?;
+            input(c,&p.id,"observation-new",None,"worker",&json!({"status":"working"}))?;
+            assert_eq!(c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get::<_,i64>(0))?,retry);
+            assert!(claim(c,&p.id)?.is_none());
+            let text:String=c.query_row("SELECT content FROM messages WHERE direction='out'",[],|r|r.get(0))?;
+            assert!(text.contains("请求超时"));assert!(!text.contains("temporarily unavailable"));
+            Ok(())
+        }).unwrap();
+        ingest(&app, &p, "om_retry_new", "补充新的要求");
+        let next = app
+            .db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let next = claim(c, &p.id)?.unwrap();
+                failure(c, &next.context, &Failure::timeout())?;
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE direction='out'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                Ok(next)
+            })
+            .unwrap();
+        let mut corrected = next.checkpoint.clone();
+        corrected["last_correction"] = json!({"kind":"invalid_response","http_status":200,"retryable":false,"elapsed_ms":21000,"output_tokens":4096,"output_budget":4096,"finish_reason":"length"});
+        checkpoint(&app, &next.context, &corrected, false)
+            .await
+            .unwrap();
+        assert!(
+            !app.db
+                .sync(|c| Ok(public(c, &p.id)?["error"].as_str().unwrap().is_empty()))
+                .unwrap()
+        );
+        checkpoint(&app, &next.context, &corrected, true)
+            .await
+            .unwrap();
+        app.db
+            .sync(|c| {
+                let state = public(c, &p.id)?;
+                assert_eq!(state["error"], "");
+                assert!(state["failure"].is_null());
+                let raw: String = c.query_row(
+                    "SELECT error FROM manager_runs WHERE id=?",
+                    [&next.context.run],
+                    |r| r.get(0),
+                )?;
+                let retained: Value = serde_json::from_str(&raw)?;
+                assert_eq!(retained["last_failure"]["kind"], "timeout");
+                assert_eq!(retained["last_correction"]["kind"], "invalid_response");
+                assert_eq!(retained["last_correction"]["output_tokens"], 4096);
+                assert_eq!(
+                    c.query_row(
+                        "SELECT status FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "cancelled"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT status FROM manager_effects WHERE id='uncertain-effect'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "uncertain"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                failure(c, &next.context, &Failure::timeout())?;
+                assert_eq!(public(c, &p.id)?["failure"]["attempt"], 1);
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE direction='out'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    2
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn permanent_failure_prepares_one_scoped_repair_without_forwarding_input_and_honors_controls()
+     {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_permanent", "ordinary-private-task-marker");
+        let turn = app
+            .db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                Ok(claim(c, &p.id)?.unwrap())
+            })
+            .unwrap();
+        app.db
+            .sync(|c| {
+                let mut error = Failure::internal();
+                error.kind = "context_rejected".into();
+                error.http_status = Some(400);
+                failure(c, &turn.context, &error)?;
+                failure(c, &turn.context, &error)?;
+                assert!(claim(c, &p.id)?.is_none());
+                let (id, raw): (String, String) = c.query_row(
+                    "SELECT id,payload FROM work_events WHERE source='management'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let payload: Value = serde_json::from_str(&raw)?;
+                assert!(payload["origin_event_id"].is_null());
+                assert!(payload["repair_incident"].is_string());
+                assert!(!raw.contains("ordinary-private-task-marker"));
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                c.execute(
+                    "UPDATE manager_config SET revision=revision+1 WHERE project_id=?",
+                    [&p.id],
+                )?;
+                let event = work::event(c, &p.id, &id)?;
+                assert!(!bind_event(c, &event, "generation")?);
+                assert_eq!(
+                    c.query_row("SELECT status FROM work_events WHERE id=?", [id], |r| {
+                        r.get::<_, String>(0)
+                    })?,
+                    "cancelled"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_controls", "preserve");
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let turn = claim(c, &p.id)?.unwrap();
+                c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
+                failure(c, &turn.context, &Failure::internal())?;
+                c.execute(
+                    "UPDATE projects SET paused=0,generation='g' WHERE id=?",
+                    [&p.id],
+                )?;
+                work::set_takeover(c, &p.id, "g", true, db::now())?;
+                failure(c, &turn.context, &Failure::internal())?;
+                work::set_takeover(c, &p.id, "g", false, db::now())?;
+                stop(c, &p.id)?;
+                failure(c, &turn.context, &Failure::internal())?;
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM manager_failures", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn oversized_claim_preserves_input_and_schedules_bounded_native_repair_instead_of_forever_retry()
+     {
+        let (_dir, app, p) = fixture().await;
+        app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture","om_large_context","preserve the task",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","extra_metadata":"x".repeat(300000)}})).unwrap();
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                assert!(claim_or_repair(c, &p.id)?.is_none());
+                let state = public(c, &p.id)?;
+                assert_eq!(state["failure"]["kind"], "context_preparation");
+                assert_eq!(state["failure"]["retryable"], false);
+                assert!(claim_or_repair(c, &p.id)?.is_none());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
+                        .get::<_, String>(0))?,
+                    "queued"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn only_current_repair_completion_wakes_one_fresh_probe_and_never_cancels_submitted_work()
+    {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_probe", "ordinary request");
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;let first=claim(c,&p.id)?.unwrap();failure(c,&first.context,&Failure::internal())?;
+            let (id,task):(String,String)=c.query_row("SELECT id,task_id FROM work_events WHERE source='management'",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            c.execute("UPDATE work_events SET status='submitted' WHERE id=?",[&id])?;
+            c.execute("INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at,finished_at) VALUES('repair-run',?,?,?,'generation','settled',?,?,?)",params![p.id,task,id,db::now(),db::now(),db::now()])?;
+            worker_changed(c,&p.id)?;
+            assert_eq!(c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get::<_,i64>(0))?,0);
+            let next=claim(c,&p.id)?.unwrap();assert_ne!(first.context.run,next.context.run);
+            failure(c,&next.context,&Failure::internal())?;
+            worker_changed(c,&p.id)?;
+            assert!(claim(c,&p.id)?.is_none());
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE id LIKE 'repair-probe-%'",[],|r|r.get::<_,i64>(0))?,1);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
+            recovered(c,&next.context)?;
+            assert_eq!(c.query_row("SELECT status FROM work_events WHERE id=?",[id],|r|r.get::<_,String>(0))?,"submitted");
+            assert_ne!(c.query_row("SELECT status FROM work_tasks WHERE id=?",[task],|r|r.get::<_,String>(0))?,"cancelled");
+            Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn queued_incident_notices_are_fenced_by_recovery_pause_takeover_and_stop() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_notice", "request");
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();failure(c,&turn.context,&Failure::timeout())?;
+            let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out'",[],|r|r.get(0))?;
+            let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
+            c.execute("UPDATE projects SET paused=1 WHERE id=?",[&p.id])?;assert!(validate_outbox(c,&p.id,&notice).is_err());
+            c.execute("UPDATE projects SET paused=0,generation='generation' WHERE id=?",[&p.id])?;
+            work::set_takeover(c,&p.id,"generation",true,db::now())?;assert!(validate_outbox(c,&p.id,&notice).is_err());
+            work::set_takeover(c,&p.id,"generation",false,db::now())?;
+            recovered(c,&turn.context)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
+            failure(c,&turn.context,&Failure::internal())?;
+            let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out' ORDER BY rowid DESC LIMIT 1",[],|r|r.get(0))?;
+            let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
+            stop(c,&p.id)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
+            assert_eq!(c.query_row("SELECT status FROM work_tasks WHERE title='Management delegation'",[],|r|r.get::<_,String>(0))?,"cancelled");
+            Ok(())
+        }).unwrap();
     }
     #[tokio::test]
     async fn disabling_and_stop_materialize_stamped_input_without_replay_or_resurrection() {

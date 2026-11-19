@@ -1,15 +1,19 @@
 //! IO-free Rig checkpoints plus one explicitly configured provider call.
 //! The host owns durable admission, revisions, tool effects and uncertainty.
 use anyhow::{Result, bail, ensure};
-use rig_agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome};
+use rig_agent::run::{AgentRun, AgentRunStep, InvalidToolCallAction, ModelTurn, ModelTurnOutcome};
 use rig_core::{
-    completion::{CompletionRequest, ToolDefinition},
+    completion::{CompletionRequest, FinishReason, ToolDefinition},
+    error::{ErrorKind, ProviderError},
     message::{AssistantContent, ToolResultContent, UserContent},
     providers::openai::OpenAIConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 
 const MAX_CHECKPOINT: usize = 2 * 1024 * 1024;
@@ -23,6 +27,115 @@ const TOOLS: [&str; 7] = [
     "send_md",
     "send_file",
 ];
+
+/// Only host-controlled diagnostics cross into durable state or user notices.
+/// Provider bodies and source chains can echo credentials and private input.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Failure {
+    pub kind: String,
+    pub http_status: Option<u16>,
+    pub retryable: bool,
+    pub elapsed_ms: u64,
+    pub output_tokens: Option<u64>,
+    pub output_budget: Option<u64>,
+    pub finish_reason: Option<String>,
+}
+impl Failure {
+    pub fn summary(&self) -> &'static str {
+        match self.kind.as_str() {
+            "timeout" => "The management request timed out",
+            "transport" => "The management provider connection failed",
+            "authorization" => "The management provider rejected access",
+            "model_unavailable" => "The management model was not found",
+            "rate_limited" => "The management provider is rate limited",
+            "provider_unavailable" => "The management provider could not serve the request",
+            "context_rejected" => "The management request exceeded the context limit",
+            "request_rejected" => "The management provider rejected the request",
+            "invalid_response" => "The management response was incomplete or invalid",
+            "context_preparation" => "The management context could not be prepared",
+            _ => "The management run could not continue",
+        }
+    }
+    pub fn timeout() -> Self {
+        Self {
+            kind: "timeout".into(),
+            http_status: None,
+            retryable: true,
+            elapsed_ms: 0,
+            output_tokens: None,
+            output_budget: None,
+            finish_reason: None,
+        }
+    }
+    pub fn internal() -> Self {
+        Self {
+            kind: "execution".into(),
+            http_status: None,
+            retryable: false,
+            elapsed_ms: 0,
+            output_tokens: None,
+            output_budget: None,
+            finish_reason: None,
+        }
+    }
+    fn invalid_response() -> Self {
+        Self {
+            kind: "invalid_response".into(),
+            http_status: Some(200),
+            retryable: false,
+            elapsed_ms: 0,
+            output_tokens: None,
+            output_budget: None,
+            finish_reason: None,
+        }
+    }
+    fn provider(error: ProviderError) -> Self {
+        let report = error.report();
+        let context = report.code.as_deref().is_some_and(|code| {
+            matches!(
+                code,
+                "context_length_exceeded" | "context_window_exceeded" | "max_tokens_exceeded"
+            )
+        });
+        let kind = match report.http_status {
+            _ if context => "context_rejected",
+            Some(401 | 403) => "authorization",
+            Some(404) => "model_unavailable",
+            Some(429) => "rate_limited",
+            Some(408 | 425 | 500..=599) => "provider_unavailable",
+            Some(200..=299) => "invalid_response",
+            Some(_) => "request_rejected",
+            None => match report.kind {
+                ErrorKind::Http | ErrorKind::Timeout => "transport",
+                ErrorKind::Request | ErrorKind::Url => "request_rejected",
+                _ => "invalid_response",
+            },
+        };
+        Self {
+            kind: kind.into(),
+            http_status: report.http_status,
+            retryable: !context && report.retryable,
+            elapsed_ms: 0,
+            output_tokens: None,
+            output_budget: None,
+            finish_reason: None,
+        }
+    }
+    fn elapsed(mut self, started: Instant) -> Self {
+        self.elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        self
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.summary())?;
+        if let Some(status) = self.http_status {
+            write!(f, " (HTTP {status})")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for Failure {}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -65,12 +178,14 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 pub enum LoopAction {
+    Continue,
     Tools(Vec<ToolCall>),
     Done(String),
 }
 pub struct LoopStep {
     pub checkpoint: Value,
     pub action: LoopAction,
+    pub model_responded: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,6 +195,15 @@ struct Checkpoint {
     system: String,
     run: AgentRun,
     pending: AgentRunStep,
+    #[serde(default = "initial_output_budget")]
+    output_budget: u64,
+    #[serde(default)]
+    correction_used: bool,
+    #[serde(default)]
+    last_correction: Option<Failure>,
+}
+fn initial_output_budget() -> u64 {
+    4096
 }
 fn definitions() -> Vec<ToolDefinition> {
     let schemas = [
@@ -134,8 +258,13 @@ fn decode(value: Value) -> Result<Checkpoint> {
         serde_json::to_vec(&value)?.len() <= MAX_CHECKPOINT,
         "Manager checkpoint is too large"
     );
-    let state: Checkpoint = serde_json::from_value(value)?;
+    let mut state: Checkpoint = serde_json::from_value(value)?;
+    state.run = state.run.max_invalid_tool_call_retries(1);
     ensure!(state.format == 1, "Unsupported manager checkpoint version");
+    ensure!(
+        matches!(state.output_budget, 4096 | 8192),
+        "Unsupported manager output budget"
+    );
     Ok(state)
 }
 pub fn begin(input: String, system: String) -> Result<Value> {
@@ -143,7 +272,9 @@ pub fn begin(input: String, system: String) -> Result<Value> {
         input.len() <= MAX_CONTENT && system.len() <= 65536,
         "Manager input is too large"
     );
-    let mut run = AgentRun::new(input).max_turns(32);
+    let mut run = AgentRun::new(input)
+        .max_turns(32)
+        .max_invalid_tool_call_retries(1);
     let pending = run
         .next_step()
         .map_err(|_| anyhow::anyhow!("Cannot initialize manager run"))?;
@@ -152,6 +283,9 @@ pub fn begin(input: String, system: String) -> Result<Value> {
         system,
         run,
         pending,
+        output_budget: initial_output_budget(),
+        correction_used: false,
+        last_correction: None,
     })
 }
 fn calls(state: &Checkpoint) -> Result<Vec<ToolCall>> {
@@ -183,7 +317,7 @@ fn calls(state: &Checkpoint) -> Result<Vec<ToolCall>> {
         })
         .collect()
 }
-fn step(state: Checkpoint) -> Result<LoopStep> {
+fn step(state: Checkpoint, model_responded: bool) -> Result<LoopStep> {
     let action = match &state.pending {
         AgentRunStep::CallTools { .. } => LoopAction::Tools(calls(&state)?),
         AgentRunStep::Done(response) => LoopAction::Done(
@@ -202,6 +336,7 @@ fn step(state: Checkpoint) -> Result<LoopStep> {
     Ok(LoopStep {
         checkpoint: encode(&state)?,
         action,
+        model_responded,
     })
 }
 /// The host must persist the supplied checkpoint and reserve its model attempt
@@ -219,47 +354,103 @@ pub async fn advance(
         turn,
     } = state.pending.clone()
     else {
-        return step(state);
+        return step(state, false);
     };
     config.validate()?;
     let definitions = definitions();
     state.run.advertise_tools(turn, definitions.clone());
     let names: BTreeSet<_> = TOOLS.into_iter().map(str::to_owned).collect();
+    let system = if state.correction_used {
+        format!(
+            "{}\n<management_response_feedback>{{\"previous_response_executed_tools\":0,\"instruction\":\"Return only advertised tool names and complete valid JSON arguments. Keep output concise.\"}}</management_response_feedback>",
+            state.system
+        )
+    } else {
+        state.system.clone()
+    };
     let request = CompletionRequest::new(prompt)
         .messages(history)
-        .preamble(&state.system)
+        .preamble(&system)
         .tools(definitions)
-        .max_tokens(4096);
+        .max_tokens(state.output_budget);
     let client = OpenAIConfig::new(config.api_key.clone())
         .with_base_url(&config.base_url)
         .client();
     let model = client.chat(&config.model);
+    let started = Instant::now();
     let response = tokio::select! {
         biased;
         _=cancellation.cancelled()=>bail!("Manager turn cancelled"),
-        result=tokio::time::timeout(Duration::from_secs(45),model.call(request))=>match result {
+        result=tokio::time::timeout(Duration::from_secs(120),model.call(request))=>match result {
             Ok(Ok(response))=>response,
-            Ok(Err(_))=>bail!("Manager provider request failed; check its endpoint, model and credentials"),
-            Err(_)=>bail!("Manager provider request timed out"),
+            Ok(Err(error))=>{
+                let error=Failure::provider(error).elapsed(started);
+                if error.kind=="invalid_response" && !state.correction_used {
+                    return corrected(&mut state,error);
+                }
+                return Err(error.into());
+            },
+            Err(_)=>return Err(Failure::timeout().elapsed(started).into()),
         }
     };
     ensure!(!cancellation.is_cancelled(), "Manager turn cancelled");
+    if response.finish_reason() == Some(FinishReason::Length) {
+        let mut error = Failure::invalid_response().elapsed(started);
+        error.output_tokens = response.usage.output_tokens;
+        error.output_budget = Some(state.output_budget);
+        error.finish_reason = Some("length".into());
+        if state.correction_used || state.output_budget >= 8192 {
+            return Err(error.into());
+        }
+        // No part of a truncated turn may execute. Retry the same pending
+        // model request once with room for reasoning plus valid tool JSON.
+        return corrected(&mut state, error);
+    }
+    if response.choice.iter().any(|part| matches!(part,AssistantContent::ToolCall(call) if call.function.invalid_arguments.is_some())) {
+        let mut error=Failure::invalid_response().elapsed(started);
+        error.output_tokens=response.usage.output_tokens;error.output_budget=Some(state.output_budget);error.finish_reason=Some("invalid_tool_arguments".into());
+        if state.correction_used { return Err(error.into()); }
+        return corrected(&mut state,error);
+    }
     let mut answer = ModelTurn::from_response_parts(&response, names.clone(), names);
     // Keep the normalized transcript, not an unbounded duplicate provider body.
     answer.raw = Value::Null;
     let outcome = state
         .run
         .model_response(answer)
-        .map_err(|_| anyhow::anyhow!("Manager provider returned an invalid response"))?;
-    ensure!(
-        !matches!(outcome, ModelTurnOutcome::NeedsResolution(_)),
-        "Manager requested an unavailable tool"
-    );
+        .map_err(|_| Failure::invalid_response().elapsed(started))?;
+    if matches!(outcome, ModelTurnOutcome::NeedsResolution(_)) {
+        let mut error = Failure::invalid_response().elapsed(started);
+        error.output_tokens = response.usage.output_tokens;
+        error.output_budget = Some(state.output_budget);
+        error.finish_reason = Some("invalid_tool_call".into());
+        if state.correction_used {
+            return Err(error.into());
+        }
+        state.run.resolve_invalid_tool_call(InvalidToolCallAction::retry("No tool from this response was executed. Return only advertised tool names with complete, valid JSON arguments; keep tool content concise."))
+            .map_err(|_| Failure::invalid_response().elapsed(started))?;
+        state.pending = state
+            .run
+            .next_step()
+            .map_err(|_| Failure::invalid_response().elapsed(started))?;
+        return corrected(&mut state, error);
+    }
+    state.correction_used = false;
     state.pending = state
         .run
         .next_step()
         .map_err(|_| anyhow::anyhow!("Manager run could not advance"))?;
-    step(state)
+    step(state, true)
+}
+fn corrected(state: &mut Checkpoint, error: Failure) -> Result<LoopStep> {
+    state.output_budget = 8192;
+    state.correction_used = true;
+    state.last_correction = Some(error);
+    Ok(LoopStep {
+        checkpoint: encode(state)?,
+        action: LoopAction::Continue,
+        model_responded: false,
+    })
 }
 pub fn supply_tool_results(checkpoint: Value, results: Vec<(String, Value)>) -> Result<Value> {
     let mut state = decode(checkpoint)?;
@@ -354,7 +545,17 @@ mod tests {
             if f.hold {
                 f.release.notified().await;
             }
-            let response = f.script[n].clone();
+            let mut response = f.script[n].clone();
+            if let Some(budget) = response
+                .get("fixture_expected_budget")
+                .and_then(Value::as_u64)
+            {
+                assert_eq!(body["max_tokens"], budget);
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("fixture_expected_budget");
+            }
             if response["fixture_error"] == true {
                 return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -495,7 +696,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await;
-        assert!(result.is_err());
+        assert!(matches!(result.unwrap().action, LoopAction::Continue));
         let mut checkpoint = begin("input".into(), "system".into()).unwrap();
         checkpoint["format"] = json!(99);
         assert!(
@@ -503,6 +704,175 @@ mod tests {
                 .await
                 .is_err()
         );
+        server.abort();
+        let _ = server.await;
+    }
+    #[tokio::test]
+    async fn truncated_response_retries_once_with_more_budget_without_exposing_any_tools() {
+        let mut truncated = answer(
+            Value::Null,
+            json!([
+                {"id":"partial","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}},
+                {"id":"sibling","type":"function","function":{"name":"send_md","arguments":"{}"}}
+            ]),
+        );
+        truncated["choices"][0]["finish_reason"] = json!("length");
+        truncated["usage"]["completion_tokens"] = json!(4096);
+        truncated["fixture_expected_budget"] = json!(4096);
+        let mut complete = answer(json!("recovered"), Value::Null);
+        complete["fixture_expected_budget"] = json!(8192);
+        let (config, f, server) = fixture(vec![truncated.clone(), complete], false).await;
+        let mut old = begin("input".into(), "system".into()).unwrap();
+        for field in ["output_budget", "correction_used", "last_correction"] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        let step = advance(&config, old, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(step.action, LoopAction::Continue));
+        assert!(!step.model_responded);
+        assert_eq!(
+            step.checkpoint["last_correction"]["finish_reason"],
+            "length"
+        );
+        let next = advance(&config, step.checkpoint, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(next.action,LoopAction::Done(ref text) if text=="recovered"));
+        assert!(next.model_responded);
+        assert_eq!(f.requests.load(Ordering::SeqCst), 2);
+        server.abort();
+        let _ = server.await;
+        truncated["fixture_expected_budget"] = json!(8192);
+        let (config, f, server) = fixture(vec![truncated], false).await;
+        let mut checkpoint = begin("input".into(), "system".into()).unwrap();
+        checkpoint["output_budget"] = json!(8192);
+        checkpoint["correction_used"] = json!(true);
+        let error = advance(&config, checkpoint, CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+        let error = error.downcast_ref::<Failure>().unwrap();
+        assert_eq!(error.kind, "invalid_response");
+        assert_eq!(error.http_status, Some(200));
+        assert!(!error.retryable);
+        assert_eq!(f.requests.load(Ordering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
+    }
+    #[tokio::test]
+    async fn malformed_200_and_unknown_tool_receive_only_one_safe_correction() {
+        let invalid = json!({"id":"bad","model":"fixture-model","choices":[]});
+        let (config, f, server) = fixture(vec![invalid.clone(), invalid], false).await;
+        let step = advance(
+            &config,
+            begin("input".into(), "system".into()).unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(step.action, LoopAction::Continue));
+        let error = advance(&config, step.checkpoint, CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<Failure>().unwrap().kind,
+            "invalid_response"
+        );
+        assert_eq!(f.requests.load(Ordering::SeqCst), 2);
+        server.abort();
+        let _ = server.await;
+        let bad = answer(
+            Value::Null,
+            json!([
+                {"id":"unknown","type":"function","function":{"name":"bash","arguments":"{}"}},
+                {"id":"sibling","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"x\",\"content\":\"bad\"}"}}
+            ]),
+        );
+        let (config, f, server) = fixture(vec![bad.clone(), bad], false).await;
+        let step = advance(
+            &config,
+            begin("input".into(), "system".into()).unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(step.action, LoopAction::Continue));
+        assert!(!step.model_responded);
+        assert!(
+            advance(&config, step.checkpoint, CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(f.requests.load(Ordering::SeqCst), 2);
+        server.abort();
+        let _ = server.await;
+    }
+    #[test]
+    fn provider_classification_never_retains_secret_bodies_or_retries_permanent_errors() {
+        for (status, kind, retryable) in [
+            (400, "context_rejected", false),
+            (403, "authorization", false),
+            (429, "rate_limited", true),
+            (503, "provider_unavailable", true),
+            (200, "invalid_response", false),
+        ] {
+            let body = if status == 400 {
+                r#"{"error":{"code":"context_length_exceeded","message":"private-fixture-secret"}}"#
+            } else {
+                r#"{"error":{"message":"private-fixture-secret"}}"#
+            };
+            let error = Failure::provider(ProviderError::from_http_response(
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                body,
+            ));
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.retryable, retryable);
+            assert_eq!(error.http_status, Some(status));
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private-fixture-secret")
+            );
+            assert!(!error.to_string().contains("private-fixture-secret"));
+        }
+    }
+    #[tokio::test]
+    async fn invalid_known_tool_arguments_discard_valid_siblings_even_without_length_finish_reason()
+    {
+        let mut bad = answer(
+            Value::Null,
+            json!([
+                {"id":"sibling","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"x\",\"content\":\"bad\"}"}},
+                {"id":"partial","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}
+            ]),
+        );
+        bad["fixture_expected_budget"] = json!(4096);
+        let mut good = answer(json!("recovered"), Value::Null);
+        good["fixture_expected_budget"] = json!(8192);
+        let (config, f, server) = fixture(vec![bad, good], false).await;
+        let step = advance(
+            &config,
+            begin("input".into(), "system".into()).unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(step.action, LoopAction::Continue));
+        assert!(!step.model_responded);
+        assert_eq!(
+            step.checkpoint["last_correction"]["finish_reason"],
+            "invalid_tool_arguments"
+        );
+        assert!(matches!(
+            advance(&config, step.checkpoint, CancellationToken::new())
+                .await
+                .unwrap()
+                .action,
+            LoopAction::Done(_)
+        ));
+        assert_eq!(f.requests.load(Ordering::SeqCst), 2);
         server.abort();
         let _ = server.await;
     }

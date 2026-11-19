@@ -362,7 +362,7 @@ impl Render for ManagerSettings {
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(0xb44343))
-                        .child(error.to_owned()),
+                        .child(self.language.text(error)),
                 );
             }
         }
