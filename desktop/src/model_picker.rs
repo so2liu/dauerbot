@@ -1,5 +1,9 @@
 //! Native project model controls. HTTP work stays off the GPUI thread.
-use crate::{action_icons::ActionIcon, agent_tree, locale::Language};
+use crate::{
+    action_icons::{ActionIcon, IconButtonExt},
+    agent_tree,
+    locale::Language,
+};
 use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Selectable, Sizable,
@@ -157,15 +161,19 @@ fn contain_list_wheel(offset: Pixels, maximum: Pixels, inside: bool) -> (Pixels,
     }
 }
 
+fn supports_model_selection(project: &Value) -> bool {
+    matches!(
+        project["agent"].as_str(),
+        Some("codex" | "claude" | "pi" | "agy")
+    )
+}
+
 fn selection_enabled(project: &Value, catalog: &Value, busy: bool, catalog_error: bool) -> bool {
     !busy
         && !catalog_error
         && project["paused"] != true
         && project["lifecycle"] != "taken_over"
-        && matches!(
-            project["agent"].as_str(),
-            Some("codex" | "claude" | "pi" | "agy")
-        )
+        && supports_model_selection(project)
         && catalog["agent"] == project["agent"]
         && catalog["generation"] == project["generation"]
         && catalog["options"].is_array()
@@ -455,10 +463,7 @@ impl ModelPicker {
 impl ModelPicker {
     pub fn trigger(&self, cx: &mut Context<Self>) -> Button {
         let palette = crate::ui_theme::palette(cx);
-        let supported = matches!(
-            self.project["agent"].as_str(),
-            Some("codex" | "claude" | "pi" | "agy")
-        );
+        let supported = supports_model_selection(&self.project);
         let configured = &self.catalog["configured"];
         let effective = &self.catalog["effective"];
         let transition = &self.project["cli_transition"];
@@ -466,7 +471,9 @@ impl ModelPicker {
         let requested = &transition["requested_model"];
         let busy = self.ticket.is_some();
         let known = self.catalog.is_object();
-        let label = if pending {
+        let label = if !supported {
+            "Model unsupported"
+        } else if pending {
             requested["model"]
                 .as_str()
                 .unwrap_or("Native CLI/session settings")
@@ -484,7 +491,9 @@ impl ModelPicker {
                 .or(configured["model"].as_str())
                 .unwrap_or("Native CLI/session settings")
         };
-        let caption = if pending {
+        let caption = if !supported {
+            "Model selection is unavailable for this CLI"
+        } else if pending {
             "Requested · switching model"
         } else if self.catalog_error {
             "Native model catalogue could not be loaded"
@@ -504,9 +513,7 @@ impl ModelPicker {
             "pending"
         } else if self.catalog_error {
             "error"
-        } else if busy
-            || (configured["model"].is_string() && !effective["model"].is_string())
-        {
+        } else if busy || (configured["model"].is_string() && !effective["model"].is_string()) {
             "pending"
         } else if effective["model"].is_string() {
             "ready"
@@ -534,16 +541,23 @@ impl ModelPicker {
             .max_w_full()
             .cursor_pointer()
             .child(ActionIcon::Model.draw(palette.accent, 14.))
-            .child(control_label(display).max_w(px(92.)).truncate())
-            .child(agent_tree::status_dot(
-                status,
-                caption.clone(),
-                "model-confirmation".into(),
-                palette,
-            ))
-            .child(ActionIcon::Chevron.draw(palette.muted, 13.))
+            .child(
+                control_label(display)
+                    .max_w(px(if supported { 92. } else { 152. }))
+                    .truncate(),
+            )
             .tooltip(format!("{title} · {label}\n{caption}"))
-            .disabled(!supported)
+            .when(supported, |button| {
+                button
+                    .child(agent_tree::status_dot(
+                        status,
+                        caption,
+                        "model-confirmation".into(),
+                        palette,
+                    ))
+                    .child(ActionIcon::Chevron.draw(palette.muted, 13.))
+            })
+            .icon_disabled(!supported)
             .selected(self.open)
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open = !this.open;
@@ -621,7 +635,7 @@ impl Render for ModelPicker {
                                     self.language.text("Refresh"),
                                     palette.muted,
                                 )
-                                .disabled(busy)
+                                .icon_disabled(busy)
                                 .on_click(cx.listener(|this, _, _, cx| this.request(None, cx))),
                         ),
                 );
@@ -834,6 +848,7 @@ impl Render for ModelPicker {
 mod tests {
     use super::{
         ModelCursor, contain_list_wheel, cursor_scroll_target, matching_models, selection_enabled,
+        supports_model_selection,
     };
     use gpui::px;
     use serde_json::json;
@@ -965,6 +980,10 @@ mod tests {
             assert!(!selection_enabled(&project, &catalog, false, false));
         }
         assert!(!selection_enabled(&project, &json!(null), false, false));
+        let custom = json!({"agent":"custom", "generation":"current"});
+        let custom_catalog = json!({"agent":"custom", "generation":"current", "options":[]});
+        assert!(!supports_model_selection(&custom));
+        assert!(!selection_enabled(&custom, &custom_catalog, false, false));
     }
 
     #[test]

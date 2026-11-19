@@ -1,8 +1,11 @@
 //! Compact project controls and read-only native continuity documents.
 use crate::locale::Language;
-use crate::{action_icons::ActionIcon, agent_tree, control_label};
+use crate::{
+    action_icons::{ActionIcon, IconButtonExt},
+    agent_tree, control_label,
+};
 use gpui::{prelude::*, *};
-use gpui_component::{Disableable, Selectable, Sizable, button::*, text::TextView};
+use gpui_component::{Selectable, Sizable, button::*, text::TextView};
 use herdr_feishu_bridge::{
     config::Config,
     project_documents::{Content, Document},
@@ -330,7 +333,7 @@ impl ProjectTools {
                     palette.muted,
                 )
                 .selected(self.document == Some(document))
-                .disabled(busy)
+                .icon_disabled(busy)
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.request(Some(document), None, cx)),
                 ),
@@ -346,7 +349,7 @@ impl ProjectTools {
                         self.language.text("Reveal folder"),
                         palette.muted,
                     )
-                    .disabled(folder.is_empty())
+                    .icon_disabled(folder.is_empty())
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.reveal_path(std::path::Path::new(&folder))
                     })),
@@ -358,7 +361,7 @@ impl ProjectTools {
                         self.language.text("Copy path"),
                         palette.muted,
                     )
-                    .disabled(copy_folder.is_empty())
+                    .icon_disabled(copy_folder.is_empty())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(copy_folder.clone()));
                         this.message = "Path copied".into();
@@ -429,7 +432,7 @@ impl Render for ProjectTools {
                             palette,
                         ))
                         .selected(agent == key)
-                        .disabled(unavailable || switching || busy || agent == key)
+                        .icon_disabled(unavailable || switching || busy || agent == key)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.cli_open = false;
                             this.request(None, Some(key.into()), cx);
@@ -446,7 +449,7 @@ impl Render for ProjectTools {
                         .h(px(28.))
                         .child(ActionIcon::Repair.draw(palette.warning, 16.))
                         .child(control_label(self.language.text(label)))
-                        .disabled(disabled)
+                        .icon_disabled(disabled)
                         .on_click(cx.listener(|this, _, _, cx| this.request(None, None, cx))),
                 ),
             );

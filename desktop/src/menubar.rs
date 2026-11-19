@@ -7,6 +7,7 @@ use gpui_component::{Root, Sizable, button::*, tooltip::Tooltip};
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{NSView, NSWindow};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use serde_json::Value;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 struct StatusBar {
@@ -241,6 +242,26 @@ fn constrained_popover(panel: [f64; 2], anchor: [f64; 2], visible: [f64; 4]) -> 
     [left, top - height, width, height]
 }
 
+fn menu_project_status(project: &Value) -> &str {
+    if manager_settings::enabled(project) {
+        manager_settings::status(project)
+    } else {
+        project_status(project)
+    }
+}
+
+fn show_status_label(status: &str) -> bool {
+    matches!(
+        status,
+        "needs_attention"
+            | "error"
+            | "offline"
+            | "unavailable"
+            | "update_required"
+            | "switching_cli"
+    )
+}
+
 struct MenuPanel {
     desktop: Entity<Desktop>,
     focus: FocusHandle,
@@ -288,9 +309,17 @@ impl Render for MenuPanel {
             let id = project["id"].as_str().unwrap_or("").to_owned();
             let name = project["name"].as_str().unwrap_or("Project").to_owned();
             let managed = manager_settings::enabled(project);
-            let status = project_status(project);
+            let status = menu_project_status(project);
             let status_label = language.text(status);
-            let detail = format!("{name} · {status_label}");
+            let mut detail = format!("{name} · {status_label}");
+            let worker_status = project_status(project);
+            if managed && show_status_label(worker_status) {
+                detail.push_str(&format!(
+                    "\n{} · {}",
+                    language.text("Coding worker"),
+                    language.text(worker_status)
+                ));
+            }
             rows = rows.child(
                 div()
                     .id(SharedString::from(format!("menu-project-{id}")))
@@ -327,27 +356,16 @@ impl Render for MenuPanel {
                             .truncate()
                             .child(name),
                     )
-                    .when(
-                        matches!(
-                            status,
-                            "needs_attention"
-                                | "error"
-                                | "offline"
-                                | "unavailable"
-                                | "update_required"
-                                | "switching_cli"
-                        ),
-                        |row| {
-                            row.child(
-                                div()
-                                    .max_w(px(106.))
-                                    .truncate()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(palette.muted))
-                                    .child(status_label.clone()),
-                            )
-                        },
-                    )
+                    .when(show_status_label(status), |row| {
+                        row.child(
+                            div()
+                                .max_w(px(106.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(palette.muted))
+                                .child(status_label.clone()),
+                        )
+                    })
                     .child(agent_tree::status_dot(
                         status,
                         status_label,
@@ -521,5 +539,28 @@ mod placement_tests {
         assert!(frame[3] < 628.);
         let frame = constrained_popover([324., 628.], [1400., 920.], [0., 0., 1440., 900.]);
         assert_eq!(frame[3], 628.);
+    }
+}
+
+#[cfg(test)]
+mod project_status_tests {
+    use super::menu_project_status;
+    use serde_json::json;
+
+    #[test]
+    fn menu_status_follows_the_displayed_agent_identity() {
+        let mut project = json!({
+            "agent_mode": "manager",
+            "manager": {"status": "unavailable"},
+            "lifecycle": "ready"
+        });
+        assert_eq!(menu_project_status(&project), "unavailable");
+
+        project["manager"]["status"] = json!("working");
+        project["lifecycle"] = json!("sleeping");
+        assert_eq!(menu_project_status(&project), "working");
+
+        project["agent_mode"] = json!("native");
+        assert_eq!(menu_project_status(&project), "sleeping");
     }
 }

@@ -1,5 +1,5 @@
 use gpui::{prelude::*, *};
-use gpui_component::{Sizable, button::*};
+use gpui_component::{Disableable, Sizable, button::*};
 
 macro_rules! action_icons {
     ($($variant:ident => $name:literal),+ $(,)?) => {
@@ -70,5 +70,17 @@ impl ActionIcon {
             .cursor_pointer()
             .child(self.draw(color, 16.))
             .tooltip(label)
+    }
+}
+
+pub trait IconButtonExt {
+    fn icon_disabled(self, disabled: bool) -> Self;
+}
+
+impl IconButtonExt for Button {
+    fn icon_disabled(self, disabled: bool) -> Self {
+        // The native button's disabled foreground does not tint explicit SVG colors or brand images.
+        self.disabled(disabled)
+            .when(disabled, |button| button.opacity(0.5).cursor_default())
     }
 }

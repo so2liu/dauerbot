@@ -17,7 +17,7 @@ mod terminal;
 mod ui_theme;
 mod updater;
 
-use action_icons::ActionIcon;
+use action_icons::{ActionIcon, IconButtonExt};
 use backend::{Backend, CommandRequest, Reply};
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -1821,7 +1821,7 @@ impl Desktop {
                             self.tr(if enabled { "Pause" } else { "Enable" }),
                             palette.muted,
                         )
-                        .disabled(self.busy)
+                        .icon_disabled(self.busy)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.api(
                                 "POST",
@@ -2662,7 +2662,7 @@ impl Render for Desktop {
                                 &AddProject,
                                 Some("Dauerbot"),
                             )
-                            .disabled(self.busy)
+                            .icon_disabled(self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.go(5);
                                 cx.notify();
@@ -2690,7 +2690,7 @@ impl Render for Desktop {
                     .child(
                         ActionIcon::Settings
                             .button("sidebar-settings", self.tr("Settings"), palette.muted)
-                            .disabled(self.busy)
+                            .icon_disabled(self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.go(8);
                                 cx.notify();

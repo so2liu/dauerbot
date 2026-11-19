@@ -142,6 +142,8 @@ impl Language {
             "Requested · switching model" => "已请求 · 正在切换模型",
             "Invalid or stale model catalogue response" => "模型目录响应无效或已过期，请刷新",
             "Model unavailable" => "模型信息暂不可用",
+            "Model unsupported" => "模型选择不受支持",
+            "Model selection is unavailable for this CLI" => "此 CLI 不支持选择模型",
             "Model unknown" => "模型信息未知",
             "Native model catalogue could not be loaded" => "无法加载 CLI 模型目录",
             "Refreshing model catalogue…" => "正在刷新模型目录…",
