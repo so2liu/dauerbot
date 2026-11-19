@@ -15,10 +15,13 @@ def gh(*args):
     return subprocess.check_output(["gh", *args], text=True)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", required=True)
-    tag = parser.parse_args().tag
+    parser.add_argument("--stage-only", action="store_true",
+                        help="Verify signed assets in an existing private draft without publishing")
+    args = parser.parse_args(argv)
+    tag = args.tag
     manifest = json.loads((ROOT / "dist/release/update.json").read_text())
     if tag != "v" + manifest["version"]:
         raise ValueError("Tag and signed manifest differ")
@@ -29,6 +32,8 @@ def main():
     if existing.returncode == 0:
         if not json.loads(existing.stdout)["isDraft"]:
             raise ValueError("This version is already public; create a new version instead of overwriting it")
+    elif args.stage_only:
+        raise ValueError("Signed staging requires an existing private draft release")
     else:
         gh("release", "create", tag, "-R", REPO, "--draft", "--verify-tag",
            "--title", f"Dauerbot {manifest['version']}", "--notes-file", str(directory / "release-notes.md"))
@@ -42,6 +47,13 @@ def main():
         expected = "sha256:" + hashlib.sha256((directory / name).read_bytes()).hexdigest()
         if name not in assets or assets[name].get("digest") != expected:
             raise ValueError(f"Uploaded asset is incomplete or checksum differs: {name}")
+    if args.stage_only:
+        if not release.get("draft"):
+            raise ValueError("Signed staging requires the release to remain private")
+        gh("release", "edit", tag, "-R", REPO,
+           "--notes-file", str(directory / "release-notes.md"))
+        print(f"Verified signed assets in private draft {tag}; compatibility verification is required before publication.")
+        return
     # Local builds are private staging inputs, not installable release assets.
     for name in ("prebuilt.json", f"Dauerbot-{tag}-macos-arm64-unsigned.zip"):
         if name in assets:

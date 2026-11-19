@@ -109,10 +109,10 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/release-python"
           "$RUNNER_TEMP/release-python/bin/pip" install 'PyNaCl==1.6.0'
           "$RUNNER_TEMP/release-python/bin/python" scripts/prepare-release.py --tag "$RELEASE_TAG"
-      - name: Publish complete release
+      - name: Hold signed draft for local compatibility verification
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/publish-release.py --tag "$RELEASE_TAG"
+        run: python3 scripts/publish-release.py --tag "$RELEASE_TAG" --stage-only
       - name: Remove private signing material
         if: always()
         run: |
