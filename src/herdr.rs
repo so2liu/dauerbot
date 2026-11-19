@@ -20,6 +20,7 @@ use tokio::{
 };
 
 pub mod runtime;
+pub mod terminal_control;
 pub(crate) mod owned_close;
 
 pub use crate::adapter::{launch_args, merge_mcp};
