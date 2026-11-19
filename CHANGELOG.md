@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.4 — 2026-11-19
+
+### Added
+
+- Declared image-capable manager models receive verified image content from Feishu attachments. Enable image support for the exact endpoint and model in manager settings. Unsupported inputs and native-session transports that cannot attach pixels retain explicit file references and an explanation. (#128, #130)
+- Managers can explicitly close verified-exited obsolete owned executions after checking completion, runtime ownership, remaining processes, pending work and uncertain effects. Each decision is audited; no automatic reaper is added. (#125, #127)
+
+### Fixed
+
+- Persist input ownership when a manager claims work. Delivery receipts no longer restart the active batch or replay its input, and interrupted work resumes from its saved checkpoint. (#124, #129)
+- Keep Stop and takeover responsive while historical runtime inspection stalls. Bound the entire inspection and reject stale observations. (#131)
+- Preserve attachment preparation when manager routing acknowledges a message before its download completes. (#130)
+- Preserve an image declaration when pressing Enter or focusing an unchanged provider field. (#130)
+- Allow stopped projects to be removed after management close attempts, preserving audit records and notes throughout schema upgrades. (#132)
+- Allow obsolete executions to become eligible after delivery retries or explicit dismissals are resolved, while keeping pending and uncertain work protected. (#132)
+- Retain every live or ambiguous shell, including builtin-only work, and close only independently verified exited targets with no remaining attributable processes. (#133)
+
+### Changed
+
+- Acknowledge sustained work briefly, keep related tasks together by default, and report results or blockers without volunteering internal execution details. Explicit architecture/model questions remain answerable. (#122, #126)
+- Require review/check closure and automated review evidence for the current PR head. (#131)
+- Advance both application crates to 0.6.4 and bundle build 22; keep API protocol 7 and the native three-tool interface.
+
 ## 0.6.3 — 2026-11-19
 
 ### Fixed
