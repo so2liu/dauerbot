@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.6 — 2026-11-20
+
+### Changed
+
+- Keep manager replies brief and conclusion-first for IM conversations, with detail when requested and honest reporting of blockers. (#149)
+- Express desktop actions through icons and a compact project toolbar, schedule rows, Agent tree and Terminal controls. Retain native CLI brands and explicit input takeover. (#150)
+- Advance both application crates to 0.6.6 and bundle build 24; keep API protocol 7 and the native three-tool interface.
+
+### Fixed
+
+- Bound long Agent names before the fixed sidebar status column, including nested read-only details and navigable child rows. (#150)
+- Match menu status to the displayed manager or native Agent, visibly dim disabled icons, and label unsupported model selection accurately. (#150)
+
 ## 0.6.5 — 2026-11-19
 
 ### Added
