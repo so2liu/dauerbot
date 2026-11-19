@@ -454,6 +454,7 @@ impl ModelPicker {
 
 impl Render for ModelPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = crate::ui_theme::palette(cx);
         if std::mem::take(&mut self.clear_inputs) {
             self.search
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -563,7 +564,7 @@ impl Render for ModelPicker {
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(0x85858d))
+                        .text_color(rgb(palette.muted))
                         .child(self.language.text(caption)),
                 ),
         );
@@ -571,8 +572,8 @@ impl Render for ModelPicker {
             let mut panel = div()
                 .rounded_lg()
                 .border_1()
-                .border_color(rgb(0xe3e3e8))
-                .bg(rgb(0xffffff))
+                .border_color(rgb(palette.line))
+                .bg(rgb(palette.surface))
                 .p_3()
                 .flex()
                 .flex_col()
@@ -597,11 +598,14 @@ impl Render for ModelPicker {
                                 .on_click(cx.listener(|this, _, _, cx| this.request(None, cx))),
                         ),
                 )
-                .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(
-                    self.language.text(
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(palette.muted))
+                        .child(self.language.text(
                         "This project only. Native login and global CLI settings stay in place.",
-                    ),
-                ));
+                    )),
+                );
             let mut options = div()
                 .id("native-model-options")
                 .max_h(px(220.))
@@ -671,7 +675,7 @@ impl Render for ModelPicker {
                         .border_1()
                         .rounded_md()
                         .border_color(if self.cursor.current == Some(index) {
-                            rgb(0x6678cc)
+                            rgb(palette.accent)
                         } else {
                             rgba(0x00000000)
                         })
@@ -789,7 +793,7 @@ impl Render for ModelPicker {
                 panel = panel.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(0x85858d))
+                        .text_color(rgb(palette.muted))
                         .child(self.language.text(warning)),
                 );
             }
@@ -799,7 +803,7 @@ impl Render for ModelPicker {
             view = view.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(0x63636b))
+                    .text_color(rgb(palette.muted))
                     .child(self.language.text(&self.message)),
             );
         }

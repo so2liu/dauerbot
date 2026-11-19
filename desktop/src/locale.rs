@@ -52,6 +52,18 @@ impl Language {
             .to_owned();
         }
         let translated = match source {
+            "Light" => "浅色",
+            "Dark" => "深色",
+            "Appearance" => "外观",
+            "Quick find" => "快速查找",
+            "Search projects, sessions and settings" => "搜索项目、会话和设置",
+            "No matching projects, sessions or settings" => "没有匹配的项目、会话或设置",
+            "Current session" => "当前会话",
+            "Sessions" => "会话",
+            "Language" => "语言",
+            "↑/↓ to move · Enter to open · Esc to close" => {
+                "↑/↓ 移动 · Enter 打开 · Esc 关闭"
+            }
             "disabled" => "未启用",
             "unavailable" => "管理智能体暂不可用",
             "The management request timed out" => "管理模型请求超时",
@@ -71,7 +83,9 @@ impl Language {
             "Built-in manager" => "内置管理智能体",
             "Declare image input support" => "声明支持图片输入",
             "Image input declared supported" => "已声明支持图片输入",
-            "Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references." => "仅在此接口和模型确实支持图片输入时启用；否则仅提供明确的图片文件引用。",
+            "Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references." => {
+                "仅在此接口和模型确实支持图片输入时启用；否则仅提供明确的图片文件引用。"
+            }
             "Manager model settings" => "管理模型设置",
             "Hide manager settings" => "收起管理模型设置",
             "OpenAI-compatible endpoint" => "OpenAI 兼容接口地址",
