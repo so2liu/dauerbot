@@ -18,6 +18,7 @@ pub mod manager;
 mod manager_close;
 pub mod manager_context;
 pub mod manager_loop;
+mod manager_terminal;
 pub mod mcp;
 pub mod model_control;
 pub mod models;

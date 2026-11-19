@@ -501,6 +501,7 @@ struct WriteArgs {
 struct DelegateArgs {
     instructions: String,
     source_event_id: Option<String>,
+    target_cli: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -882,18 +883,24 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
    "write_file"=>{let a:WriteArgs=serde_json::from_value(call.arguments)?;write_file(Path::new(&p.path),a)},
    "delegate"|"steer_worker"=>{
     let a:DelegateArgs=serde_json::from_value(call.arguments)?;let steer=call.name=="steer_worker";
-    ensure!(!steer||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
     let context=ctx.clone();let request=effect.clone();app.db.call(move|c|{
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
-      let held=crate::cli_switch::holds_input(&tx,&p.id)?;
-      ensure!(!steer||!held,"Worker steering is held by a CLI transition");
       let origin=select_origin(&tx,&context,a.source_event_id.as_deref())?;
-      let id=intent(&tx,&p,&request,&a.instructions,origin.as_deref(),steer)?;
+      if let Some(target) = &a.target_cli { crate::cli_switch::request(&tx,&p,target)?; }
+      let held=crate::cli_switch::holds_input(&tx,&p.id)?;
+      // An explicit target participates in the ordinary cooperative handoff.
+      // Its instructions remain held for that successor, never sent to the old CLI.
+      let steer_current = steer && !(a.target_cli.is_some() && held);
+      ensure!(!steer_current||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
+      ensure!(!steer_current||!held,"Worker steering is held by a CLI transition");
+      let id=intent(&tx,&p,&request,&a.instructions,origin.as_deref(),steer_current)?;
       let event=work::event(&tx,&p.id,&id)?;tx.commit()?;
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
    },
-   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();app.db.call(move|c|valid(c,&authority)).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete,"input_effect_journal":journal}))},
+   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let transition_project=p.id.clone();let transition=app.db.call(move|c|crate::cli_switch::latest(c,&transition_project)).await?;let authority=ctx.clone();app.db.call(move|c|valid(c,&authority)).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete,"cli_transition":transition,"input_effect_journal":journal}))},
+   "cli_send_keys"=>{drop(guard);let args:crate::manager_terminal::SendArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::send(app,ctx,args).await},
+   "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args).await},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
    "send_md"|"send_file"=>{
     let (to,text,anchor,path,receipt)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;ensure!(a.intent.is_some()||a.source_event_id.is_none(),"source_event_id is only used for a receipt");let receipt=a.intent.as_ref().map(|_|MessageArgs{to:a.to.clone(),text:a.text.clone(),reply_to_message_id:a.reply_to_message_id.clone(),intent:Some(MessageIntent::Receipt),source_event_id:a.source_event_id.clone()});(a.to,a.text,a.reply_to_message_id,None,receipt)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),None)};
@@ -3484,6 +3491,125 @@ mod tests {
             })
             .unwrap();
     }
+    #[tokio::test]
+    async fn explicit_cli_steer_waits_for_selected_generation_and_preserves_recovery() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_target_cli", "Use agy for this task");
+        let turn = app.db.sync(|c| { work::sync_inbound(c)?; Ok(claim(c, &p.id)?.unwrap()) }).unwrap();
+        let call = ToolCall { occurrence: "targeted-steer".into(), name: "steer_worker".into(),
+            arguments: json!({"instructions":"selected CLI assignment","target_cli":"agy"}) };
+        let receipt = tool(&app, &turn.context, call.clone()).await.unwrap();
+        assert_eq!(receipt["status"], "held");
+        assert_eq!(receipt["worker_agent"], "agy");
+        assert_eq!(receipt["generation"], Value::Null);
+        assert_eq!(tool(&app, &turn.context, call).await.unwrap(), receipt);
+        let transition = receipt["transition_id"].as_str().unwrap().to_owned();
+        let event_id = receipt["event_id"].as_str().unwrap().to_owned();
+        app.db.sync(|c| {
+            assert_eq!(db::project_by_key(c, &p.id)?.agent, "codex");
+            assert!(crate::cli_switch::holds_input(c, &p.id)?);
+            assert!(work::claim_next(c, &p.id, "old-generation", db::now())?.is_none());
+            c.execute("UPDATE cli_switch_requests SET phase='recovery_pending',error='Fixture target is not installed' WHERE id=?", [&transition])?;
+            assert!(work::claim_next(c, &p.id, "wrong-generation", db::now())?.is_none());
+            assert_eq!(work::event(c, &p.id, &event_id)?.status, "queued");
+            // A manager correction remains claimable while ordinary worker input is held.
+            Ok(())
+        }).unwrap();
+        ingest(&app, &p, "om_correct_during_switch", "Keep the input; report the unavailable CLI");
+        let correction = app.db.sync(|c| {work::sync_inbound(c)?;Ok(claim(c,&p.id)?.unwrap())}).unwrap();
+        assert!(prompt_context(&correction.checkpoint).unwrap().to_string().contains("report the unavailable CLI"));
+        assert!(app.db.sync(|c|crate::cli_switch::holds_input(c,&p.id)).unwrap());
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET agent='agy',generation='ready-agy',terminal='fixture-agy',ready=1,execution=? WHERE id=?",
+                params![json!({"mcp_registered":true,"cli_switch_request":transition}).to_string(),p.id])?;
+            c.execute("UPDATE cli_switch_requests SET phase='ready',holds_input=0,error='' WHERE id=?",[&transition])?;
+            let native = work::claim_next(c,&p.id,"ready-agy",db::now())?.unwrap();
+            assert_eq!(native.event_id,event_id);
+            assert_eq!(native.generation,"ready-agy");
+            let event=work::event(c,&p.id,&event_id)?;
+            assert_eq!(event.payload["expected_agent"],"agy");
+            assert_eq!(event.payload["target_generation"],"ready-agy");
+            assert_eq!(event.payload["steer"],false);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM cli_switch_requests",[],|r|r.get::<_,i64>(0))?,1);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_target_validation_and_legacy_steering_are_atomic() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c| {c.execute("UPDATE projects SET generation='current-generation',terminal='current-pane',ready=1,execution=? WHERE id=?",params![json!({"api_protocol":7,"mcp_contract":1}).to_string(),p.id])?;Ok(())}).unwrap();
+        ingest(&app,&p,"om_legacy_cli","Keep current CLI unless explicitly requested");
+        let turn=app.db.sync(|c|{work::sync_inbound(c)?;Ok(claim(c,&p.id)?.unwrap())}).unwrap();
+        let old=tool(&app,&turn.context,ToolCall{occurrence:"legacy-steer".into(),name:"steer_worker".into(),arguments:json!({"instructions":"current CLI input"})}).await.unwrap();
+        assert_eq!(old["status"],"queued");assert_eq!(old["worker_agent"],"codex");assert_eq!(old["generation"],"current-generation");
+        for (n,args) in [json!({"instructions":"never fallback","target_cli":"not-a-cli"}),json!({"instructions":"","target_cli":"claude"})].into_iter().enumerate() {
+            let rejected=tool(&app,&turn.context,ToolCall{occurrence:format!("rejected-target-{n}"),name:"delegate".into(),arguments:args}).await.unwrap();
+            assert!(rejected["error"].is_string());
+        }
+        app.db.sync(|c| {
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM cli_switch_requests",[],|r|r.get::<_,i64>(0))?,0);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
+            let event=work::event(c,&p.id,old["event_id"].as_str().unwrap())?;assert_eq!(event.payload["steer"],true);
+            Ok(())
+        }).unwrap();
+        let selected=tool(&app,&turn.context,ToolCall{occurrence:"select-claude".into(),name:"delegate".into(),arguments:json!({"instructions":"claude work","target_cli":"claude"})}).await.unwrap();
+        assert_eq!(selected["status"],"held");assert_eq!(selected["worker_agent"],"claude");
+        let conflict=tool(&app,&turn.context,ToolCall{occurrence:"conflicting-target".into(),name:"steer_worker".into(),arguments:json!({"instructions":"do not replace active switch","target_cli":"agy"})}).await.unwrap();
+        assert!(conflict["error"].as_str().unwrap().contains("handoff is already in progress"));
+        app.db.sync(|c| {assert_eq!(crate::cli_switch::latest(c,&p.id)?.unwrap().target,"claude");assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,2);Ok(())}).unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_manager_supersedes_blocked_provider_before_its_response() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct Provider {
+            requests: Arc<AtomicUsize>,
+            bodies: tokio::sync::mpsc::UnboundedSender<Value>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        async fn respond(State(p): State<Provider>,Json(body):Json<Value>)->Json<Value> {
+            let index=p.requests.fetch_add(1,Ordering::SeqCst);
+            p.bodies.send(body).unwrap();
+            if index==0 {p.release.notified().await;}
+            let calls=if index==0 {json!([{"id":"stale-write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"stale-provider.txt\",\"content\":\"must not execute\"}"}}])}else{Value::Null};
+            Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager","choices":[{"index":0,"message":{"role":"assistant","content":if index==0{Value::Null}else{json!("Accepted the latest user correction")},"tool_calls":calls},"finish_reason":if index==0{"tool_calls"}else{"stop"}}]}))
+        }
+        let (_dir,app,p)=fixture().await;
+        let (send,mut bodies)=tokio::sync::mpsc::unbounded_channel();
+        let provider=Provider{requests:Arc::new(AtomicUsize::new(0)),bodies:send,release:Arc::new(tokio::sync::Notify::new())};
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
+        let router=Router::new().route("/v1/chat/completions",post(respond)).with_state(provider.clone());
+        let server=tokio::spawn(async move{axum::serve(listener,router).await.unwrap()});
+        app.db.sync(|c| {let current=public(c,&p.id)?;save(c,&p.id,ConfigInput{base_url:format!("http://{addr}/v1"),model:"fixture-manager".into(),api_key:None,clear_api_key:false,expected_revision:current["revision"].as_i64().unwrap(),supports_images:None})?;Ok(())}).unwrap();
+        let binding=crate::bot::Binding{project_id:p.id.clone(),app_id:"cli_fixture".into(),app_secret:"fixture-bot-secret".into()};
+        let input=|id:&str,text:&str|serde_json::to_vec(&json!({"header":{"app_id":"cli_fixture","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_fixture"}},"message":{"message_id":id,"chat_id":"oc_fixture","chat_type":"p2p","message_type":"text","content":json!({"text":text}).to_string()}}})).unwrap();
+        crate::feishu::ingest(&app,&binding,&input("om_first_blocked","Start original task")).unwrap();
+        app.db.sync(|c| {work::sync_inbound(c)?;Ok(())}).unwrap();
+        let acting=app.clone();let host=tokio::spawn(async move{run(acting).await});
+        let first=tokio::time::timeout(Duration::from_secs(3),bodies.recv()).await.unwrap().unwrap();
+        assert!(first.to_string().contains("Start original task"));
+        let started=std::time::Instant::now();
+        crate::feishu::ingest(&app,&binding,&input("om_second_interrupt","Replace direction immediately")).unwrap();
+        app.db.sync(|c| {work::sync_inbound(c)?;Ok(())}).unwrap();
+        let second=tokio::time::timeout(Duration::from_secs(3),bodies.recv()).await.unwrap().unwrap();
+        eprintln!("manager_append_fixture_admission_to_provider_ms={}",started.elapsed().as_millis());
+        assert!(second.to_string().contains("Replace direction immediately"));
+        assert!(!Path::new(&p.path).join("stale-provider.txt").exists());
+        provider.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3),async {
+            loop {
+                if app.db.sync(|c|Ok(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing')",[&p.id],|r|r.get::<_,i64>(0))?)).unwrap()==0 {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        app.shutdown.cancel();host.await.unwrap();server.abort();let _=server.await;
+        assert!(!Path::new(&p.path).join("stale-provider.txt").exists());
+        assert_eq!(app.db.sync(|c|Ok(c.query_row("SELECT COUNT(*) FROM manager_effects WHERE name='write_file'",[],|r|r.get::<_,i64>(0))?)).unwrap(),0);
+    }
+
     #[tokio::test]
     async fn delegate_waits_for_exact_selected_transition_and_abandoned_intents_do_not_block() {
         let (_dir, app, p) = fixture().await;
