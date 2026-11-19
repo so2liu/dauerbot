@@ -214,8 +214,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["instructions"],
         ),
         (
-            "Observe this project's native worker and delegated work receipts.",
-            json!({}),
+            "Observe this project's native worker and delegated work receipts. For an owned continuing input, provide input_id to inspect the full durable effect ancestry, not only recent history. Page using after_effect and detail_offset; recorded confirmed or uncertain effects must not be replayed.",
+            json!({"input_id":{"type":"string"},"after_effect":{"type":"integer","minimum":0},"detail_offset":{"type":"integer","minimum":0,"maximum":262144}}),
             vec![],
         ),
         (

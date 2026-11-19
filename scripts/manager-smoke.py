@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -239,6 +240,59 @@ def run_checks(h):
     generation = h.api(route)["project"]["generation"]
     assert h.api(route)["project"]["ready"]
     h.checks.append("manager delegation wakes isolated native coding worker with real HERDR and exactly three MCP tools")
+
+    # A claimed batch is not fresh work again when native receipts arrive. Crash
+    # after the real delegation and SDK reply while a second model call is held.
+    def rows(sql, params=()):
+        with sqlite3.connect((h.run / "bridge.sqlite3").as_uri() + "?mode=ro", uri=True) as db:
+            db.execute("PRAGMA query_only=ON")
+            return db.execute(sql, params).fetchall()
+
+    def drained():
+        return not rows("SELECT 1 FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing')", (h.key,)) and not rows("SELECT 1 FROM manager_runs WHERE project_id=? AND status='working'", (h.key,))
+
+    fixture.wait_for(drained, "prior manager work did not drain before batch regression", timeout=55)
+    fixture.wait_for(lambda: not rows("SELECT 1 FROM work_runs WHERE project_id=? AND status IN ('submitted','running')", (h.key,)), "prior native work did not settle", timeout=55)
+    delegation_before = rows("SELECT count(*) FROM work_events WHERE project_id=? AND source='management'", (h.key,))[0][0]
+    h.api(route + "/pause", {"paused": True})
+    for number in range(3):
+        fixture.FIXTURE.emit(fixture.message(f"om_manager_batch_{number}", f"Owned FIFO batch instruction {number}"))
+    fixture.wait_for(lambda: len(rows("SELECT id FROM manager_inputs WHERE project_id=? AND status='queued'", (h.key,))) == 3, "three inputs did not queue while paused")
+    origin = rows("SELECT id FROM work_events WHERE project_id=? AND source_id='om_manager_batch_0'", (h.key,))[0][0]
+    MODEL.script(
+        {"tool": "delegate", "arguments": {"source_event_id": origin, "instructions": "Complete batch-native-once and reply in the original topic."}},
+        {"wait": True, "tool": "worker_status", "arguments": {}},
+        {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_batch_0", "text": "manager-batch-recovered-once"}},
+        {"text": ""},
+    )
+    h.api(route + "/pause", {"paused": False})
+    fixture.wait_for(lambda: any("batch-native-once" in m["content"] for m in fixture.FIXTURE.messages), "real native batch delegation did not reply", timeout=55)
+    fixture.wait_for(lambda: rows("SELECT id FROM manager_inputs WHERE project_id=? AND kind='worker' AND status='queued'", (h.key,)), "native receipts did not queue before batch finish", timeout=15)
+    batch_ids = rows("SELECT id FROM manager_inputs WHERE project_id=? AND kind='user' AND json_extract(payload,'$.user_input.body') LIKE 'Owned FIFO batch instruction %' ORDER BY rowid", (h.key,))
+    assert len(batch_ids) == 3
+    owners = [rows("SELECT i.status,own.run_id FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.id=?", (input_id,))[0] for (input_id,) in batch_ids]
+    assert all(status == "processing" for status, _ in owners), owners
+    assert len({run for _, run in owners}) == 1, owners
+    batch_run = owners[0][1]
+    assert rows("SELECT status FROM manager_runs WHERE id=?", (batch_run,))[0][0] == "working"
+    for (input_id,) in batch_ids:
+        assert rows("SELECT count(*) FROM manager_run_inputs WHERE input_id=?", (input_id,))[0][0] == 1
+    # Preserve the pending CallModel checkpoint and complete effect journal.
+    h.daemon.terminate()
+    h.daemon.wait(timeout=15)
+    MODEL.release.set()
+    h.boot()
+    fixture.wait_for(lambda: any("manager-batch-recovered-once" in m["content"] for m in fixture.FIXTURE.messages), "batch checkpoint did not recover after fixture process loss", timeout=30)
+    fixture.wait_for(drained, "owned batch and queued receipts did not drain after recovery", timeout=30)
+    assert rows("SELECT status FROM manager_runs WHERE id=?", (batch_run,))[0][0] == "complete"
+    for (input_id,) in batch_ids:
+        assert rows("SELECT status FROM manager_inputs WHERE id=?", (input_id,))[0][0] == "consumed"
+        assert rows("SELECT count(*) FROM manager_run_inputs WHERE input_id=?", (input_id,))[0][0] == 1
+    assert rows("SELECT count(*) FROM work_events WHERE project_id=? AND source='management'", (h.key,))[0][0] == delegation_before + 1
+    assert len([m for m in fixture.FIXTURE.messages if "batch-native-once" in m["content"]]) == 1
+    assert len([m for m in fixture.FIXTURE.messages if "manager-batch-recovered-once" in m["content"]]) == 1
+    assert rows("SELECT count(*) FROM manager_inputs WHERE project_id=? AND kind='worker' AND status='consumed' AND json_extract(payload,'$.semantic_task_success')='unconfirmed'", (h.key,))[0][0] >= 1
+    h.checks.append("FIFO inputs atomically owned; real native receipts do not preempt; fixture process loss resumes original batch with one delegation/reply and consumes queued receipts")
 
     MODEL.script({"error": True, "repeat": True}, trigger="Exercise a manager provider outage.")
     fixture.FIXTURE.emit(fixture.message("om_manager_unavailable", "Exercise a manager provider outage."))
