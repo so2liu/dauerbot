@@ -1429,6 +1429,20 @@ impl App {
         record: &Value,
     ) -> Result<bool> {
         let fence = &r.source["observation_fence"];
+        // Normal registration (api::register) may add only these two readiness
+        // flags. Preserve every other stored authority/launch field, including
+        // unknown future fields, rather than guessing an identity allowlist.
+        let same_launch = match (fence["execution"].as_object(), p.execution.as_object()) {
+            (Some(before), Some(current)) => {
+                let (mut before, mut current) = (before.clone(), current.clone());
+                for key in ["mcp_registered", "native_confirmed"] {
+                    before.remove(key);
+                    current.remove(key);
+                }
+                before == current
+            }
+            _ => false,
+        };
         if fence["schema"] != 1
             || r.phase != "recovery_pending"
             || r.generation != p.generation
@@ -1455,8 +1469,10 @@ impl App {
             || fence["agent"] != p.agent
             || fence["generation"] != p.generation
             || fence["terminal"] != json!(p.terminal)
-            || fence["native_session"] != p.native_session
-            || fence["execution"] != p.execution
+            || !fence["native_session"].as_str().is_some_and(|native| {
+                native.is_empty() || herdr::same_native_session(&p.agent, native, &p.native_session)
+            })
+            || !same_launch
         {
             return Ok(false);
         }
@@ -2479,19 +2495,42 @@ mod tests {
         );
     }
     async fn healthy_observation_fixture() -> (tempfile::TempDir, Arc<App>, Project, Value) {
+        healthy_observation_fixture_at_startup(false).await
+    }
+    async fn healthy_observation_fixture_at_startup(
+        startup: bool,
+    ) -> (tempfile::TempDir, Arc<App>, Project, Value) {
         let (dir, app, p) = fixture().await;
-        let execution = json!({"api_protocol":7,"mcp_contract":1,"backend":"legacy",
+        let mut execution = json!({"api_protocol":7,"mcp_contract":1,"backend":"legacy",
             "workspace_id":"workspace","pane_id":"old-pane","terminal_id":"old-pane",
             "managed_name":"managed","generation":"old-gen","shell_pid":null,
             "launch_permit":"/private/fixture/launch","cli_switch_request":"completed",
             "intended_native_session":"old-native","native_confirmed":true,"mcp_registered":true});
+        if startup {
+            for key in [
+                "mcp_registered",
+                "native_confirmed",
+                "intended_native_session",
+            ] {
+                execution.as_object_mut().unwrap().remove(key);
+            }
+        }
         app.db.sync(|c| {
-            c.execute("UPDATE projects SET execution=? WHERE id=?",params![execution.to_string(),p.id])?;
+            c.execute("UPDATE projects SET execution=?,ready=?,native_session=? WHERE id=?",params![execution.to_string(),!startup,if startup { "" } else { "old-native" },p.id])?;
             c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source) VALUES('completed',?,'codex','ready','previous-generation',1,0,?)",
                 params![p.id,json!({"agent":"claude","native_session":"previous-claude-native","extra_args":[]}).to_string()])?;
             queue(c,&p,"pending-observation",1)?;
             Ok(())
         }).unwrap();
+        let p = app.db.project(&p.id).await.unwrap();
+        assert!(app.supervise_unobserved_cli(&p).await.unwrap());
+        if startup {
+            // Exact ordinary registration updates, with no launch/identity edit.
+            app.db.sync(|c| {
+                c.execute("UPDATE projects SET ready=1,native_session='old-native',execution=json_set(execution,'$.native_confirmed',json('true'),'$.mcp_registered',json('true')) WHERE id=? AND generation=? AND terminal=?",params![p.id,p.generation,p.terminal])?;
+                Ok(())
+            }).unwrap();
+        }
         let p = app.db.project(&p.id).await.unwrap();
         let record = json!({"state":"live","status":{"state":"working"},"foreground":{"name":"codex"},
             "processes":[{"pid":100,"name":"codex","argv":["codex"]}],"interactive_ready":true,"state_change_seq":22,
@@ -2499,7 +2538,6 @@ mod tests {
             "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
             "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},"children":{"state":"active"}});
         assert!(herdr::check_identity(&p, &record).is_ok());
-        assert!(app.supervise_unobserved_cli(&p).await.unwrap());
         (dir, app, p, record)
     }
     #[tokio::test]
@@ -2543,6 +2581,69 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+    #[tokio::test]
+    async fn startup_observation_fence_accepts_verified_registration_progress() {
+        let (_dir, app, p, record) = healthy_observation_fixture_at_startup(true).await;
+        let request = app.db.sync(|c| latest(c, &p.id)).unwrap().unwrap();
+        let fence = &request.source["observation_fence"];
+        assert_eq!(fence["native_session"], "");
+        assert!(fence["execution"].get("mcp_registered").is_none());
+        assert!(fence["execution"].get("native_confirmed").is_none());
+        assert_eq!(p.execution["mcp_registered"], true);
+        assert_eq!(p.execution["native_confirmed"], true);
+        assert_eq!(p.native_session, "old-native");
+        assert!(
+            !app.advance_cli_switch(&p, None, Some(&record))
+                .await
+                .unwrap()
+        );
+        let current = app.db.project(&p.id).await.unwrap();
+        assert_eq!(current.execution, p.execution);
+        assert_eq!(current.terminal, p.terminal);
+        assert_eq!(current.generation, p.generation);
+        app.db
+            .sync(|c| {
+                assert!(!holds_input(c, &p.id)?);
+                assert_eq!(latest(c, &p.id)?.unwrap().phase, "ready");
+                assert_eq!(
+                    c.query_row("SELECT count(*) FROM cli_repair_prompts", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                assert!(work::claim_steering(c, &p.id, &p.generation, db::now())?.is_some());
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn startup_observation_fence_rejects_changed_launch_authority_after_registration() {
+        for key in ["managed_name", "future_authority"] {
+            let (_dir, app, mut p, mut record) = healthy_observation_fixture_at_startup(true).await;
+            p.execution[key] = json!("replacement");
+            record["execution"] = p.execution.clone();
+            if key == "managed_name" {
+                record["tokens"]["hfb_execution"] = json!("replacement");
+            }
+            app.db
+                .sync(|c| {
+                    c.execute(
+                        "UPDATE projects SET execution=? WHERE id=?",
+                        params![p.execution.to_string(), p.id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(herdr::check_identity(&p, &record).is_ok());
+            let request = app.db.sync(|c| latest(c, &p.id)).unwrap().unwrap();
+            assert!(
+                !app.db
+                    .sync(|c| App::settle_observation_fence(c, &p, &request, &record))
+                    .unwrap(),
+                "{key}"
+            );
+            assert!(app.db.sync(|c| holds_input(c, &p.id)).unwrap());
+        }
     }
     #[tokio::test]
     async fn observation_settlement_rejects_stale_authority_and_pending_repair_effects() {
