@@ -312,7 +312,9 @@ impl Render for ModelPicker {
                         .selected(self.open)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open = !this.open;
-                            if this.open && this.catalog.is_null() && this.ticket.is_none() {
+                            // Native catalogues and Feishu preferences can change without a
+                            // new generation. Reopening must not reuse a stale snapshot.
+                            if this.open && this.ticket.is_none() {
                                 this.request(None, cx);
                             }
                             cx.notify();

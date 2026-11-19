@@ -490,10 +490,13 @@ fn picker_card(command: &Command, catalog: &Catalog) -> Value {
     let configured = catalog
         .configured
         .as_ref()
-        .map(|s| s.model.as_str())
-        .unwrap_or("Native CLI/session settings");
+        .map(|s| match &s.provider {
+            Some(provider) => format!("{provider} / {}", s.model),
+            None => s.model.clone(),
+        })
+        .unwrap_or_else(|| "Native CLI/session settings".into());
     let status = format!(
-        "**Choose a model for this project**\nCLI: {} · Selection: {}\n<font color='grey'>Selection is not proof of the running model. Native login and global settings are preserved.</font>",
+        "**Choose a model for this project**\nCLI: {} · Requested selection: {}\nObserved running model: unverified\n<font color='grey'>Selection is not proof of the running model. Native login and global settings are preserved.</font>",
         command.agent, configured
     );
     let mut guide="Only the requesting user can submit this card. It expires in 30 minutes.\n\n**Shortcut:** Add a Feishu bot-menu item named `/models` with **Send message** behavior. Enable **Card action trigger** in Events & Callbacks → Callback configuration.\n\nSend `/models` again to refresh the catalogue.".to_owned();
