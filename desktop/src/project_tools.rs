@@ -275,6 +275,7 @@ fn recovery_control(project: &Value, busy: bool) -> Option<(&'static str, bool)>
 
 impl Render for ProjectTools {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = crate::ui_theme::palette(cx);
         let transition = &self.project["cli_transition"];
         let switching = self.pending_cli.is_some()
             || matches!(
@@ -323,7 +324,7 @@ impl Render for ProjectTools {
         let mut choices = div().flex().flex_wrap().gap_2().items_center().child(
             div()
                 .text_size(px(11.))
-                .text_color(rgb(0x85858d))
+                .text_color(rgb(palette.muted))
                 .child(
                     self.language
                         .text(if self.project["agent_mode"] == "manager" {
@@ -387,7 +388,7 @@ impl Render for ProjectTools {
         let mut documents = div().flex().flex_wrap().items_center().gap_2().child(
             div()
                 .text_size(px(11.))
-                .text_color(rgb(0x85858d))
+                .text_color(rgb(palette.muted))
                 .child(self.language.text("Project files")),
         );
         for (index, document) in [Document::Handoff, Document::Agents]
@@ -453,7 +454,7 @@ impl Render for ProjectTools {
             .child(choices)
             .child(documents);
         if transition["holds_input"] == true {
-            view = view.child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(
+            view = view.child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(
                 self.language.text("Messages wait for the selected CLI. Stop pauses the project and cancels the switch."),
             ));
         }
@@ -461,11 +462,14 @@ impl Render for ProjectTools {
             view = view.child(div().text_size(px(13.)).child(self.language.text(status)));
         }
         if unavailable {
-            view = view.child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(
-                self.language.text(
+            view = view.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(palette.muted))
+                    .child(self.language.text(
                     "Resume this project and release terminal input before changing its CLI.",
-                ),
-            ));
+                    )),
+            );
         }
         if !self.message.is_empty() {
             view = view.child(
@@ -478,7 +482,7 @@ impl Render for ProjectTools {
             let mut pane = div()
                 .id("project-document-pane")
                 .border_1()
-                .border_color(rgb(0xe3e3e8))
+                .border_color(rgb(palette.line))
                 .rounded_md()
                 .p_4();
             if let Some(content) = &self.content {

@@ -1,5 +1,5 @@
 //! Native menu-bar entry and a GPUI project popover. The daemon outlives all windows.
-use super::{Desktop, INK, LINE, MUTED, Quit, project_status};
+use super::{Desktop, Quit, project_status};
 use crate::control_label;
 use anyhow::{Context as _, Result};
 use gpui::{prelude::*, *};
@@ -266,6 +266,7 @@ impl MenuPanel {
 }
 impl Render for MenuPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = crate::ui_theme::palette(cx);
         let desktop = self.desktop.read(cx);
         let language = desktop.setup.language;
         let projects = desktop.state["projects"]
@@ -291,7 +292,7 @@ impl Render for MenuPanel {
                     .py_2()
                     .rounded_lg()
                     .cursor_pointer()
-                    .hover(|row| row.bg(rgb(0xececf0)))
+                    .hover(|row| row.bg(rgb(palette.hover)))
                     .child(
                         div()
                             .text_size(px(13.))
@@ -302,7 +303,7 @@ impl Render for MenuPanel {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(language.text(project_status(project))),
                     )
                     .on_click(cx.listener(move |_, _, _, cx| {
@@ -317,7 +318,7 @@ impl Render for MenuPanel {
                     .px_3()
                     .py_5()
                     .text_size(px(13.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette.muted))
                     .child(language.text("No projects yet")),
             );
         }
@@ -325,12 +326,12 @@ impl Render for MenuPanel {
             .size_full()
             .p_2()
             .rounded_xl()
-            .bg(rgb(0xf9f9fb))
+            .bg(rgb(palette.surface))
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette.line))
             .font_family(".AppleSystemUIFont")
             .text_size(px(13.))
-            .text_color(rgb(INK))
+            .text_color(rgb(palette.foreground))
             .flex()
             .flex_col()
             .track_focus(&self.focus)
@@ -355,7 +356,7 @@ impl Render for MenuPanel {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(language.text(if connection_error {
                                 "Disconnected"
                             } else {
@@ -369,7 +370,7 @@ impl Render for MenuPanel {
                         .px_3()
                         .pb_2()
                         .text_size(px(11.))
-                        .text_color(rgb(0x9a762c))
+                        .text_color(rgb(palette.warning))
                         .child(language.text("Independent instance")),
                 )
             })
@@ -379,7 +380,7 @@ impl Render for MenuPanel {
                     .mt_2()
                     .pt_2()
                     .border_t_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette.line))
                     .flex()
                     .flex_col()
                     .gap_1()

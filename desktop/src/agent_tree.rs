@@ -33,7 +33,7 @@ pub fn cli_label(agent: &str) -> &'static str {
     }
 }
 
-pub fn cli_icon(agent: &str, id: String) -> Stateful<Div> {
+pub fn cli_icon(agent: &str, id: String, palette: crate::ui_theme::Palette) -> Stateful<Div> {
     let path = match agent {
         "codex" => "cli/codex.svg",
         "claude" => "cli/claude.svg",
@@ -45,6 +45,10 @@ pub fn cli_icon(agent: &str, id: String) -> Stateful<Div> {
     div()
         .id(SharedString::from(id))
         .size(px(18.))
+        .when(!matches!(agent, "codex" | "claude" | "pi" | "agy" | "antigravity"), |icon| {
+            // Rasterized currentColor SVGs do not inherit surrounding text color.
+            icon.rounded(px(4.)).bg(rgb(palette.asset_surface))
+        })
         .when(agent == "pi", |icon| icon.rounded(px(4.)).bg(rgb(0x343440)))
         .flex_shrink_0()
         .flex()
@@ -54,14 +58,19 @@ pub fn cli_icon(agent: &str, id: String) -> Stateful<Div> {
         .child(img(path).size(px(if agent == "pi" { 14. } else { 16. })))
 }
 
-pub fn status_dot(status: &str, label: String, id: String) -> Stateful<Div> {
+pub fn status_dot(
+    status: &str,
+    label: String,
+    id: String,
+    palette: crate::ui_theme::Palette,
+) -> Stateful<Div> {
     let color = match status {
-        "busy" | "running" | "working" => 0x4f46e5,
-        "error" | "offline" | "needs_attention" | "failed" | "unavailable" => 0xc44e4e,
-        "blocked" | "paused" | "taken_over" | "pending" | "held" => 0xb88a36,
-        "done" | "ready" | "completed" => 0x4f8870,
-        "aborted" => 0x70707c,
-        _ => 0x96969e,
+        "busy" | "running" | "working" => palette.accent,
+        "error" | "offline" | "needs_attention" | "failed" | "unavailable" => palette.error,
+        "blocked" | "paused" | "taken_over" | "pending" | "held" => palette.warning,
+        "done" | "ready" | "completed" => palette.success,
+        "aborted" => palette.muted,
+        _ => palette.muted,
     };
     let ring = matches!(
         status,
@@ -261,7 +270,7 @@ pub fn project_target(node: &Node, projects: &Value) -> Option<String> {
 
 /// Continuation lines follow the reference's depth-first rows. Geometry is
 /// native GPUI borders, so indentation does not depend on font box glyphs.
-pub fn branches(row: &Row<'_>) -> Div {
+pub fn branches(row: &Row<'_>, palette: crate::ui_theme::Palette) -> Div {
     let mut lines = div().flex().h_full().items_center().flex_shrink_0();
     if row.branches.len() > 3 {
         lines = lines.child(div().w(px(12.)).text_size(px(10.)).child("…"));
@@ -272,7 +281,7 @@ pub fn branches(row: &Row<'_>) -> Div {
         .skip(row.branches.len().saturating_sub(3))
     {
         lines = lines.child(div().w(px(12.)).h_full().when(*continuing, |line| {
-            line.border_l_1().border_color(rgb(0xd7d7df))
+            line.border_l_1().border_color(rgb(palette.line))
         }));
     }
     lines.child(
@@ -289,7 +298,7 @@ pub fn branches(row: &Row<'_>) -> Div {
                     .w(px(8.))
                     .border_l_1()
                     .border_b_1()
-                    .border_color(rgb(0xd7d7df))
+                    .border_color(rgb(palette.line))
                     .rounded_bl(px(4.)),
             )
             .when(!row.last, |line| {
@@ -300,7 +309,7 @@ pub fn branches(row: &Row<'_>) -> Div {
                         .top(px(13.))
                         .bottom_0()
                         .border_l_1()
-                        .border_color(rgb(0xd7d7df)),
+                        .border_color(rgb(palette.line)),
                 )
             }),
     )

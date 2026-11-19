@@ -11,6 +11,7 @@ mod model_picker;
 mod project_tools;
 mod sidebar;
 mod terminal;
+mod ui_theme;
 mod updater;
 
 use backend::{Backend, CommandRequest, Reply};
@@ -35,13 +36,6 @@ fn control_label(text: impl Into<SharedString>) -> Div {
         .child(text)
 }
 
-const INK: u32 = 0x1c1c21;
-const MUTED: u32 = 0x85858d;
-const LINE: u32 = 0xe3e3e8;
-const ACCENT: u32 = 0x4f46e5;
-const CANVAS: u32 = 0xf4f4f6;
-const SURFACE: u32 = 0xffffff;
-const PILL: u32 = 0xf1f1f4;
 #[derive(Clone, Copy, Debug)]
 struct WorkspaceGeometry {
     sidebar_hidden: bool,
@@ -103,6 +97,7 @@ struct Setup {
     terminal_hidden: bool,
     sidebar_hidden: bool,
     sidebar_width: sidebar::SidebarWidth,
+    appearance: ui_theme::Appearance,
 }
 impl Setup {
     fn prepare_startup(&mut self) {
@@ -477,6 +472,7 @@ impl Desktop {
 
         if let Ok(setup) = serde_json::from_value(snapshot["setup"].clone()) {
             self.setup = setup;
+            ui_theme::apply(self.setup.appearance, cx);
         }
         self.selected = snapshot["selected"].as_str().unwrap_or("").into();
         self.picked_path = snapshot["picked_path"].as_str().unwrap_or("").into();
@@ -787,6 +783,7 @@ impl Desktop {
             }))
     }
     fn title(&self, _kicker: &str, title: &str, description: &str) -> Div {
+        let palette = self.setup.appearance.palette();
         div()
             .flex()
             .flex_col()
@@ -801,7 +798,7 @@ impl Desktop {
             .child(
                 div()
                     .text_size(px(13.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette.muted))
                     .line_height(relative(1.5))
                     .child(self.tr(description)),
             )
@@ -810,13 +807,14 @@ impl Desktop {
         self.card_detail(title, &self.tr(text))
     }
     fn card_detail(&self, title: &str, text: &str) -> Div {
+        let palette = self.setup.appearance.palette();
         div()
             .min_w_0()
             .p_5()
             .rounded_xl()
-            .bg(rgb(0xffffff))
+            .bg(rgb(palette.surface))
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(palette.line))
             .flex()
             .flex_col()
             .gap_2()
@@ -829,7 +827,7 @@ impl Desktop {
             .child(
                 div()
                     .text_size(px(13.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette.muted))
                     .line_height(relative(1.6))
                     .child(text.to_owned()),
             )
@@ -870,6 +868,7 @@ impl Desktop {
             .child(self.btn("bot-next", "Bot enabled. Add credentials →", |this, _, _| this.go(2), cx).primary()).into_any_element()
     }
     fn credentials(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.setup.appearance.palette();
         let projects = self.state["projects"]
             .as_array()
             .cloned()
@@ -901,7 +900,7 @@ impl Desktop {
             .child(choices)
             .child(self.field("App ID", &self.app_id))
             .child(self.field("App Secret", &self.secret))
-            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(self.tr("The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac.")))
+            .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.tr("The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac.")))
             .child(self.btn("save-credentials", "Save and connect", |this, _, cx| {
                 let id = this.app_id.read(cx).value().to_string();
                 if !id.starts_with("cli_") { this.notice = "Enter an App ID starting with cli_".into(); this.error = true; return; }
@@ -961,6 +960,7 @@ impl Desktop {
             .into_any_element()
     }
     fn project_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.setup.appearance.palette();
         let picked = self.picked_path.clone();
         let agents = ["Codex", "Claude Code", "Pi", "Antigravity"];
         let mut choices = div().flex().gap_2();
@@ -980,7 +980,7 @@ impl Desktop {
             .child(self.field("Project name", &self.name))
             .child(self.card("Private workspace", "By default, Dauerbot creates a folder in ~/.dauerbot/agents with project instructions. You can also choose an existing folder."))
             .child(self.field("Project folder (optional existing folder)", &self.path))
-            .when(!picked.is_empty(), |v| v.child(div().text_size(px(13.)).text_color(rgb(ACCENT)).child(format!("{} {picked}", self.tr("Selected:")))))
+            .when(!picked.is_empty(), |v| v.child(div().text_size(px(13.)).text_color(rgb(palette.accent)).child(format!("{} {picked}", self.tr("Selected:")))))
             .child(self.btn("pick-project", "Choose a folder...", |this, window, cx| this.pick(false, window, cx), cx))
             .child(choices)
             .child(self.card("Connect a dedicated bot", "After creating this project, connect its own Feishu bot or continue locally. You never need to enter chat IDs."))
@@ -996,6 +996,7 @@ impl Desktop {
             .into_any_element()
     }
     fn project_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.setup.appearance.palette();
         let projects = self.state["projects"]
             .as_array()
             .cloned()
@@ -1019,7 +1020,7 @@ impl Desktop {
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette.muted))
                         .child(project["path"].as_str().unwrap_or("").to_owned()),
                 );
             let bound = project["bot"]["has_secret"] == true;
@@ -1032,7 +1033,7 @@ impl Desktop {
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(if bound { ACCENT } else { MUTED }))
+                            .text_color(rgb(if bound { palette.accent } else { palette.muted }))
                             .child(self.tr(if bound {
                                 "Bot connected"
                             } else {
@@ -1047,7 +1048,7 @@ impl Desktop {
                     )),
             );
             if !bound {
-                body = body.child(div().text_size(px(11.)).text_color(rgb(MUTED))
+                body = body.child(div().text_size(px(11.)).text_color(rgb(palette.muted))
                     .child(self.tr("This project is local only. Connect a dedicated Feishu bot to receive messages.")));
             }
             if let Some(error) = self.state["runtime"]["bots"][&id]["error"]
@@ -1149,7 +1150,7 @@ impl Desktop {
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(0x667782))
+                            .text_color(rgb(palette.muted))
                             .child(self.tr(if paused {
                             "Automatic activity is paused. Messages stay saved until you resume."
                         } else {
@@ -1201,14 +1202,14 @@ impl Desktop {
                 body = body.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette.muted))
                         .child(format!("{}: {model}", self.tr("Model"))),
                 );
             } else {
                 body = body.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette.muted))
                         .child(self.tr("Model follows the CLI's own settings")),
                 );
             }
@@ -1391,6 +1392,7 @@ impl Desktop {
             .into_any_element()
     }
     fn workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.setup.appearance.palette();
         let project = self.state["projects"].as_array().and_then(|projects| {
             projects
                 .iter()
@@ -1414,7 +1416,7 @@ impl Desktop {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette.muted))
                         .child(self.tr("Add a project, then send instructions in Feishu.")),
                 )
                 .child(
@@ -1460,7 +1462,7 @@ impl Desktop {
                             .child(
                                 div()
                                     .text_size(px(13.))
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette.muted))
                                     .child(self.tr("Your instructions, one message away.")),
                             ),
                     )
@@ -1470,9 +1472,9 @@ impl Desktop {
                             .px_3()
                             .py_1()
                             .rounded_full()
-                            .bg(rgb(PILL))
+                            .bg(rgb(palette.pill))
                             .text_size(px(11.))
-                            .text_color(rgb(0x63636b))
+                            .text_color(rgb(palette.muted))
                             .child(self.tr(project_status(project))),
                     ),
             )
@@ -1480,8 +1482,8 @@ impl Desktop {
                 div()
                     .rounded_xl()
                     .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette.line))
+                    .bg(rgb(palette.surface))
                     .p_4()
                     .flex()
                     .flex_col()
@@ -1491,13 +1493,13 @@ impl Desktop {
                         div()
                             .pt_3()
                             .border_t_1()
-                            .border_color(rgb(0xececf0))
+                            .border_color(rgb(palette.hover))
                             .when(manager_enabled, |view| {
                                 view.child(
                                     div()
                                         .mb_2()
                                         .text_size(px(11.))
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette.muted))
                                         .child(self.tr("Coding worker model")),
                                 )
                             })
@@ -1507,8 +1509,8 @@ impl Desktop {
         let mut schedules = div()
             .rounded_xl()
             .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(SURFACE))
+            .border_color(rgb(palette.line))
+            .bg(rgb(palette.surface))
             .overflow_hidden()
             .child(
                 div()
@@ -1534,16 +1536,16 @@ impl Desktop {
                                     .px_2()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(rgb(PILL))
+                                    .bg(rgb(palette.pill))
                                     .text_size(px(11.))
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette.muted))
                                     .child(timers.len().to_string()),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(self.tr("Managed in Feishu")),
                     ),
             );
@@ -1553,7 +1555,7 @@ impl Desktop {
                     .px_6()
                     .py_8()
                     .border_t_1()
-                    .border_color(rgb(0xececf0))
+                    .border_color(rgb(palette.hover))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -1562,12 +1564,12 @@ impl Desktop {
                         div()
                             .size(px(40.))
                             .rounded_full()
-                            .bg(rgb(PILL))
+                            .bg(rgb(palette.pill))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_xl()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child("◷"),
                     )
                     .child(
@@ -1576,9 +1578,14 @@ impl Desktop {
                             .font_weight(FontWeight::MEDIUM)
                             .child(self.tr("Nothing scheduled yet")),
                     )
-                    .child(div().text_size(px(13.)).text_color(rgb(MUTED)).child(
-                        self.tr("Ask the Agent in Feishu to schedule something when you need it."),
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(palette.muted))
+                            .child(self.tr(
+                                "Ask the Agent in Feishu to schedule something when you need it.",
                     )),
+                    ),
             );
         }
         for timer in timers {
@@ -1604,14 +1611,14 @@ impl Desktop {
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette.muted))
                         .child(timer_description(&timer, self.setup.language)),
                 );
             if !next.is_empty() && enabled {
                 details = details.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(palette.muted))
                         .child(format!("{} · {next}", self.tr("Next run"))),
                 );
             }
@@ -1620,7 +1627,7 @@ impl Desktop {
                     .px_4()
                     .py_4()
                     .border_t_1()
-                    .border_color(rgb(0xececf0))
+                    .border_color(rgb(palette.hover))
                     .flex()
                     .items_center()
                     .gap_3()
@@ -1628,11 +1635,19 @@ impl Desktop {
                         div()
                             .size(px(30.))
                             .rounded_lg()
-                            .bg(rgb(if enabled { 0xeeedfd } else { PILL }))
+                            .bg(rgb(if enabled {
+                                palette.selected
+                            } else {
+                                palette.pill
+                            }))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(rgb(if enabled { ACCENT } else { MUTED }))
+                            .text_color(rgb(if enabled {
+                                palette.accent
+                            } else {
+                                palette.muted
+                            }))
                             .child("◷"),
                     )
                     .child(details)
@@ -1660,7 +1675,7 @@ impl Desktop {
                     ),
             );
         }
-        content = content.child(schedules).child(div().text_size(px(11.)).text_color(rgb(MUTED))
+        content = content.child(schedules).child(div().text_size(px(11.)).text_color(rgb(palette.muted))
             .child(self.tr("Send instructions in Feishu. New messages immediately steer the Agent, even while it is working.")));
         content.into_any_element()
     }
@@ -1670,12 +1685,13 @@ impl Desktop {
         geometry: WorkspaceGeometry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let palette = self.setup.appearance.palette();
         let center = div()
             .id("scheduled-work")
             .size_full()
             .overflow_y_scroll()
             .p_6()
-            .bg(rgb(CANVAS))
+            .bg(rgb(palette.canvas))
             .child(content);
         if self.setup.terminal_hidden {
             return div()
@@ -1688,8 +1704,8 @@ impl Desktop {
                         .h_full()
                         .flex_shrink_0()
                         .border_l_1()
-                        .border_color(rgb(LINE))
-                        .bg(rgb(0xf9f9fb))
+                        .border_color(rgb(palette.line))
+                        .bg(rgb(palette.surface))
                         .pt_5()
                         .flex()
                         .flex_col()
@@ -1708,7 +1724,7 @@ impl Desktop {
                             div()
                                 .mt_3()
                                 .text_size(px(11.))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette.muted))
                                 .child(self.tr("Terminal")),
                         ),
                 )
@@ -1730,6 +1746,7 @@ impl Desktop {
             .into_any_element()
     }
     fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.setup.appearance.palette();
         let mut links = div().flex().flex_wrap().gap_2();
         for (index, label) in [
             (1, "Feishu bot setup"),
@@ -1743,6 +1760,34 @@ impl Desktop {
                 cx,
             ));
         }
+        let appearance = self.setup.appearance;
+        let theme_controls = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(self.tr("Appearance"))
+            .child(
+                Button::new("appearance-light")
+                    .child(self.tr("Light"))
+                    .selected(appearance == ui_theme::Appearance::Light)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.setup.appearance = ui_theme::Appearance::Light;
+                        ui_theme::apply(this.setup.appearance, cx);
+                        this.go(this.setup.page);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("appearance-dark")
+                    .child(self.tr("Dark"))
+                    .selected(appearance == ui_theme::Appearance::Dark)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.setup.appearance = ui_theme::Appearance::Dark;
+                        ui_theme::apply(this.setup.appearance, cx);
+                        this.go(this.setup.page);
+                        cx.notify();
+                    })),
+            );
         let project = self.project_settings(cx);
         div()
             .flex()
@@ -1754,13 +1799,14 @@ impl Desktop {
                 "Connections and occasional project controls.",
             ))
             .child(links)
+            .child(theme_controls)
             .child(
                 div()
                     .p_5()
                     .rounded_xl()
                     .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette.line))
+                    .bg(rgb(palette.surface))
                     .child(project),
             )
             .child(
@@ -1768,13 +1814,14 @@ impl Desktop {
                     .p_5()
                     .rounded_xl()
                     .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(SURFACE))
+                    .border_color(rgb(palette.line))
+                    .bg(rgb(palette.surface))
                     .child(self.environment_page(cx)),
             )
             .into_any_element()
     }
     fn environment_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.setup.appearance.palette();
         div()
             .flex()
             .flex_col()
@@ -1791,7 +1838,7 @@ impl Desktop {
                     .gap_1()
                     .text_size(px(13.))
                     .child(self.tr(name))
-                    .child(div().text_color(rgb(MUTED)).child(self.tr(status)))
+                    .child(div().text_color(rgb(palette.muted)).child(self.tr(status)))
             }))
             .child(self.btn(
                 "rescan",
@@ -1868,13 +1915,14 @@ impl Desktop {
 }
 impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.setup.appearance.palette();
         if self.activation_frozen {
             return div()
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgb(CANVAS))
+                .bg(rgb(palette.canvas))
                 .child(self.tr("Finishing the update. Your projects keep running."))
                 .into_any_element();
         }
@@ -1929,8 +1977,8 @@ impl Render for Desktop {
                 .focusable()
                 .tab_index(0)
                 .border_1()
-                .border_color(rgb(CANVAS))
-                .focus(|style| style.border_color(rgb(ACCENT)))
+                .border_color(rgb(palette.canvas))
+                .focus(|style| style.border_color(rgb(palette.accent)))
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                     if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                         this.select_project(keyboard_id.clone(), cx);
@@ -1942,8 +1990,12 @@ impl Render for Desktop {
                 .h(px(32.))
                 .rounded_md()
                 .cursor_pointer()
-                .bg(rgb(if selected { 0xe6e6eb } else { CANVAS }))
-                .hover(|style| style.bg(rgb(0xececf0)))
+                .bg(rgb(if selected {
+                    palette.selected
+                } else {
+                    palette.canvas
+                }))
+                .hover(|style| style.bg(rgb(palette.hover)))
                 .child(
                     div()
                         .flex()
@@ -1957,6 +2009,7 @@ impl Render for Desktop {
                                 project["agent"].as_str().unwrap_or("custom")
                             },
                             format!("project-cli-{id}"),
+                            palette,
                         ))
                         .child(
                             div()
@@ -1975,6 +2028,7 @@ impl Render for Desktop {
                             status,
                             self.tr(status),
                             format!("project-status-{id}"),
+                            palette,
                         )),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2065,13 +2119,14 @@ impl Render for Desktop {
                                     .w(px(8.))
                                     .border_l_1()
                                     .border_b_1()
-                                    .border_color(rgb(0xd7d7df))
+                                    .border_color(rgb(palette.line))
                                     .rounded_bl(px(4.)),
                             ),
                         )
                         .child(agent_tree::cli_icon(
                             project["agent"].as_str().unwrap_or("custom"),
                             format!("worker-cli-{id}"),
+                            palette,
                         ))
                         .child(
                             div().flex_1().min_w_0().child(
@@ -2100,6 +2155,7 @@ impl Render for Desktop {
                             project_status(project),
                             self.tr(project_status(project)),
                             format!("worker-state-{id}"),
+                            palette,
                         ));
                     group = group.child(worker_row);
                 }
@@ -2133,11 +2189,11 @@ impl Render for Desktop {
                         .items_center()
                         .gap_1()
                         .rounded_md()
-                        .hover(|style| style.bg(rgb(0xececf0)))
+                        .hover(|style| style.bg(rgb(palette.hover)))
                         .tooltip(move |window, cx| {
                             gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
                         })
-                        .child(agent_tree::branches(&row));
+                        .child(agent_tree::branches(&row, palette));
                     if row.has_children {
                         let fold_id = node_id.clone();
                         child = child.child(
@@ -2169,6 +2225,7 @@ impl Render for Desktop {
                     child = child.child(agent_tree::cli_icon(
                         &node.cli,
                         format!("agent-cli-{id}-{node_id}"),
+                            palette,
                     ));
                     if target.is_none() {
                         let name = node.name.clone();
@@ -2200,7 +2257,7 @@ impl Render for Desktop {
                                             .min_w_0()
                                             .truncate()
                                             .text_size(px(12.))
-                                            .text_color(rgb(0x65656f))
+                                            .text_color(rgb(palette.muted))
                                             .child(node.name.clone()),
                                     ),
                                 )
@@ -2219,12 +2276,14 @@ impl Render for Desktop {
                                         )
                                         .child(summary.clone())
                                         .child(
-                                            div().text_color(rgb(MUTED)).child(observation.clone()),
+                                            div()
+                                                .text_color(rgb(palette.muted))
+                                                .child(observation.clone()),
                                         )
                                         .child(
                                             div()
                                                 .text_size(px(11.))
-                                                .text_color(rgb(MUTED))
+                                                .text_color(rgb(palette.muted))
                                                 .child(read_only.clone()),
                                         )
                                 }),
@@ -2237,7 +2296,7 @@ impl Render for Desktop {
                                 .min_w_0()
                                 .truncate()
                                 .text_size(px(12.))
-                                .text_color(rgb(0x65656f))
+                                .text_color(rgb(palette.muted))
                                 .child(node.name.clone()),
                         );
                     }
@@ -2245,6 +2304,7 @@ impl Render for Desktop {
                         &node.state,
                         self.tr(&node.state),
                         format!("agent-state-{id}-{node_id}"),
+                        palette,
                     ));
                     if let Some(target) = target {
                         let key_target = target.clone();
@@ -2277,7 +2337,7 @@ impl Render for Desktop {
                             .pr_2()
                             .py_1()
                             .text_size(px(10.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(self.tr(if tree.status == "stale" {
                                 "Agent details may be out of date"
                             } else {
@@ -2288,17 +2348,16 @@ impl Render for Desktop {
             }
             project_list = project_list.child(group);
         }
-        let sidebar =
-            div()
+        let sidebar = div()
                 .relative()
                 .w(geometry.sidebar)
                 .flex_shrink_0()
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(rgb(CANVAS))
+            .bg(rgb(palette.canvas))
                 .border_r_1()
-                .border_color(rgb(LINE))
+            .border_color(rgb(palette.line))
                 .child(
                     div()
                         .id("sidebar-resize")
@@ -2350,13 +2409,13 @@ impl Render for Desktop {
                             div()
                                 .size(px(24.))
                                 .rounded_md()
-                                .bg(rgb(INK))
+                            .bg(rgb(palette.accent))
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .text_size(px(13.))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(SURFACE))
+                            .text_color(rgb(palette.on_accent))
                                 .child("D"),
                         )
                         .child(
@@ -2372,7 +2431,7 @@ impl Render for Desktop {
                         .pt_3()
                         .pb_2()
                         .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                    .text_color(rgb(palette.muted))
                         .child(self.tr("Projects")),
                 )
                 .child(
@@ -2388,7 +2447,7 @@ impl Render for Desktop {
                             .px_4()
                             .py_3()
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                        .text_color(rgb(palette.muted))
                             .child(self.tr("No matching projects")),
                     )
                 })
@@ -2399,20 +2458,24 @@ impl Render for Desktop {
                         .flex()
                         .flex_col()
                         .gap_2()
+                    .child(self.btn("sidebar-add", "+ Add project", |this, _, _| this.go(5), cx))
+                    .child(
+                        div()
+                            .pt_3()
+                            .border_t_1()
+                            .border_color(rgb(palette.hover))
                         .child(self.btn(
-                            "sidebar-add",
-                            "+ Add project",
-                            |this, _, _| this.go(5),
+                                "sidebar-settings",
+                                "Settings",
+                                |this, _, _| this.go(8),
                             cx,
-                        ))
-                        .child(div().pt_3().border_t_1().border_color(rgb(0xececf0)).child(
-                            self.btn("sidebar-settings", "Settings", |this, _, _| this.go(8), cx),
-                        ))
+                            )),
+                    )
                         .child(
                             div()
                                 .px_2()
                                 .text_size(px(11.))
-                                .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                                 .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                         ),
                 );
@@ -2453,8 +2516,8 @@ impl Render for Desktop {
             .flex()
             .font_family(".AppleSystemUIFont")
             .text_size(px(13.))
-            .text_color(rgb(INK))
-            .bg(rgb(CANVAS))
+            .text_color(rgb(palette.foreground))
+            .bg(rgb(palette.canvas))
             .when(!geometry.sidebar_hidden, |view| view.child(sidebar))
             .child(
                 div()
@@ -2471,9 +2534,9 @@ impl Render for Desktop {
                             .items_center()
                             .justify_between()
                             .border_b_1()
-                            .border_color(rgb(LINE))
+                            .border_color(rgb(palette.line))
                             .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(div().flex().items_center().gap_3()
                                 .child(Button::new("toggle-sidebar").small().text_size(px(13.)).child(control_label(self.tr(if geometry.sidebar_hidden { "Show sidebar" } else { "Hide sidebar" })))
                                     .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx))))
@@ -2507,7 +2570,7 @@ impl Render for Desktop {
                                                 .mb_6()
                                                 .p_4()
                                                 .rounded_lg()
-                                                .bg(rgb(0xfff1ce))
+                                                .bg(rgb(palette.warning_surface))
                                                 .text_size(px(13.))
                                                 .child(self.tr("Independent instance · This window uses separate data from your everyday workspace."))
                                                 .child(div().mt_2().text_size(px(11.)).child(
@@ -2531,9 +2594,9 @@ impl Render for Desktop {
                             .px_6()
                             .py_2()
                             .border_t_1()
-                            .border_color(rgb(LINE))
+                            .border_color(rgb(palette.line))
                             .text_size(px(11.))
-                            .text_color(rgb(if self.error { 0xb44343 } else { MUTED }))
+                            .text_color(rgb(if self.error { palette.error } else { palette.muted }))
                             .child(if let Some(reason) = &self.connection_error { format!("{}: {reason}", self.tr("Local service connection failed")) } else { self.tr(&self.notice) }),
                     ),
             ).into_any_element()
@@ -2697,11 +2760,6 @@ fn main() {
     });
     app.run(move |cx| {
         gpui_component::init(cx);
-        Theme::change(ThemeMode::Light, None, cx);
-        Theme::global_mut(cx).font_family = ".AppleSystemUIFont".into();
-        Theme::global_mut(cx).font_size = px(16.); // Keep REM geometry stable; UI text uses explicit pixels.
-        Theme::global_mut(cx).colors.primary = rgb(ACCENT).into();
-        Theme::global_mut(cx).colors.primary_hover = rgb(0x4338ca).into();
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", ShowSettings, None),
@@ -2712,11 +2770,12 @@ fn main() {
             KeyBinding::new("cmd-n", AddProject, Some("Dauerbot")),
             KeyBinding::new("cmd-alt-t", ToggleTerminal, Some("Dauerbot")),
         ]);
-        let language = std::fs::read(backend.dir.join("desktop.json"))
+        let saved_setup = std::fs::read(backend.dir.join("desktop.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Setup>(&bytes).ok())
-            .map(|setup| setup.language)
             .unwrap_or_default();
+        let language = saved_setup.language;
+        ui_theme::apply(saved_setup.appearance, cx);
         if candidate.is_none() {
             set_menus(language, cx);
         }
@@ -2864,6 +2923,31 @@ fn main() {
 #[cfg(test)]
 mod preference_tests {
     use super::{Language, Setup};
+
+    #[test]
+    fn appearance_round_trips_and_bad_fields_preserve_other_preferences() {
+        for value in ["null", "false", "42", "{}", "[]", "\"unknown\""] {
+            let source =
+                format!(r#"{{"page":6,"language":"zh","sidebar_width":280,"appearance":{value}}}"#);
+            let setup: Setup = serde_json::from_str(&source).unwrap();
+            assert_eq!(setup.appearance, super::ui_theme::Appearance::Light);
+            assert_eq!(setup.page, 6);
+            assert_eq!(setup.language, Language::Zh);
+            assert_eq!(serde_json::to_value(setup.sidebar_width).unwrap(), 280.);
+        }
+        let mut setup: Setup = serde_json::from_str(r#"{"page":6,"language":"zh"}"#).unwrap();
+        assert_eq!(setup.appearance, super::ui_theme::Appearance::Light);
+        setup.appearance = super::ui_theme::Appearance::Dark;
+        let bytes = serde_json::to_vec(&setup).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Setup>(&bytes).unwrap().appearance,
+            super::ui_theme::Appearance::Dark
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["appearance"],
+            "dark"
+        );
+    }
 
     #[test]
     fn sidebar_preferences_reopen_and_old_readers_ignore_the_new_field() {

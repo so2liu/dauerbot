@@ -278,7 +278,12 @@ impl ManagerSettings {
         }
         cx.notify();
     }
-    fn field(&self, title: &str, input: &Entity<InputState>) -> Div {
+    fn field(
+        &self,
+        title: &str,
+        input: &Entity<InputState>,
+        palette: crate::ui_theme::Palette,
+    ) -> Div {
         div()
             .flex()
             .flex_col()
@@ -286,7 +291,7 @@ impl ManagerSettings {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(0x85858d))
+                    .text_color(rgb(palette.muted))
                     .child(self.language.text(title)),
             )
             .child(
@@ -299,6 +304,7 @@ impl ManagerSettings {
 }
 impl Render for ManagerSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = crate::ui_theme::palette(cx);
         if std::mem::take(&mut self.clear_inputs) {
             for input in [&self.endpoint, &self.model, &self.key] {
                 input.update(cx, |input, cx| input.set_value("", window, cx));
@@ -348,16 +354,16 @@ impl Render for ManagerSettings {
                 })));
         }
         let mut view=div().flex().flex_col().gap_3().child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(self.language.text("Project Agent")))
-            .child(modes).child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("The manager uses its own model and delegates coding to your native CLI. CLI login and model settings stay separate.")))
+            .child(modes).child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("The manager uses its own model and delegates coding to your native CLI. CLI login and model settings stay separate.")))
             .child(Button::new("manager-config-toggle").small().child(control_label(self.language.text(if self.open {"Hide manager settings"}else{"Manager model settings"})))
                 .on_click(cx.listener(|this,_,_,cx|{this.open = !this.open;cx.notify();})));
         if self.open {
-            view=view.child(self.field("OpenAI-compatible endpoint",&self.endpoint)).child(self.field("Manager model",&self.model)).child(self.field("Manager API key",&self.key))
+            view=view.child(self.field("OpenAI-compatible endpoint", &self.endpoint, palette)).child(self.field("Manager model", &self.model, palette)).child(self.field("Manager API key", &self.key, palette))
                 .child(Button::new("manager-image-capability").small().selected(self.supports_images).disabled(busy||!self.config["supports_images"].is_boolean())
                     .child(control_label(self.language.text(if self.supports_images {"Image input declared supported"}else{"Declare image input support"})))
                     .on_click(cx.listener(|this,_,_,cx| { this.supports_images = !this.supports_images; cx.notify(); })))
-                .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references.")))
-                .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text(if self.config["has_api_key"]==true {"API key saved. Leave blank to keep it."}else{"No manager API key saved"})))
+                .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references.")))
+                .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text(if self.config["has_api_key"]==true {"API key saved. Leave blank to keep it."}else{"No manager API key saved"})))
                 .child(div().flex().flex_wrap().gap_2()
                     .child(Button::new("save-manager-config").small().primary().child(control_label(self.language.text("Save manager settings")))
                         .disabled(busy||revision.is_none())
@@ -395,13 +401,13 @@ impl Render for ManagerSettings {
                 view = view.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(0xb44343))
+                        .text_color(rgb(palette.error))
                         .child(self.language.text(error)),
                 );
             }
         }
         if mode == "manager" {
-            view=view.child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("The terminal belongs to the coding worker. Model and repair controls remain available if the manager cannot connect.")));
+            view=view.child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("The terminal belongs to the coding worker. Model and repair controls remain available if the manager cannot connect.")));
         }
         view
     }
