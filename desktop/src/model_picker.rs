@@ -560,7 +560,8 @@ impl Render for ModelPicker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::matching_models;
+    use serde_json::json;
 
     #[test]
     fn model_search_ranks_names_before_provider_matches_and_preserves_catalogue_order() {
