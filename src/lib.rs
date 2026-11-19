@@ -769,12 +769,9 @@ impl App {
         let record = match observation {
             Ok(record) => record,
             Err(error) => {
-                let id = p.id.clone();
-                let generation = p.generation.clone();
-                self.db
-                    .call(move |c| work::touch_execution(c, &id, &generation, db::now()))
-                    .await?;
-                self.set_phase(&p, "offline", Value::Null).await;
+                if self.supervise_unobserved_cli(&p).await? {
+                    self.set_phase(&p, "recovering_cli", Value::Null).await;
+                }
                 return Err(error);
             }
         };

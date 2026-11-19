@@ -1309,6 +1309,33 @@ impl App {
         Ok(())
     }
 
+    /// Losing observation is not proof of native exit. Elect recovery once,
+    /// retaining any in-flight repair phase and uncertain effects until a fresh
+    /// observation can authorize an action on this exact execution.
+    pub(crate) async fn supervise_unobserved_cli(&self, p: &Project) -> Result<bool> {
+        let p = p.clone();
+        self.db.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            let current: (String, Option<String>, String, bool) = tx.query_row(
+                "SELECT generation,terminal,execution,paused FROM projects WHERE id=?",
+                [&p.id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )?;
+            if current.0 != p.generation || current.1 != p.terminal
+                || serde_json::from_str::<Value>(&current.2)? != p.execution
+                || current.3 || work::has_takeover(&tx, &p.id, &p.generation)? {
+                return Ok(false);
+            }
+            work::touch_execution(&tx, &p.id, &p.generation, db::now())?;
+            if !latest(&tx, &p.id)?.is_some_and(|request| active(&request)) {
+                let request = ensure_repair_request(&tx, &p.id)?;
+                record_failure(&tx, &request.id,
+                    "Native execution observation is unavailable; supervised recovery is waiting for verified identity before taking any action.")?;
+            }
+            tx.commit()?;
+            Ok(true)
+        }).await
+    }
+
     /// Nudge the same durable transition. This neither abandons the selected
     /// target nor releases ordinary input or repeats an uncertain prompt.
     pub async fn request_cli_repair(&self, key: &str) -> Result<Project> {
@@ -2372,6 +2399,82 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn post_ready_observation_loss_preserves_input_and_existing_repair_submission() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c| {
+            c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source) VALUES('completed',?,'codex','ready','old-gen',1,0,?)",
+                params![p.id,json!({"agent":"codex","native_session":"old-native","extra_args":p.extra_args}).to_string()])?;
+            queue(c, &p, "pending-after-ready", 1)?;
+            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('uncertain-effect',?,'out','effect','preserve','uncertain',1,1)",[&p.id])?;
+            Ok(())
+        }).unwrap();
+        assert!(app.supervise_unobserved_cli(&p).await.unwrap());
+        let repair = app.db.sync(|c| {
+            let repair = latest(c, &p.id)?.unwrap();
+            assert_ne!(repair.id, "completed");
+            assert_eq!(repair.phase, "recovery_pending");
+            assert!(repair.holds_input);
+            assert!(work::claim_steering(c, &p.id, &p.generation, 2)?.is_none());
+            assert_eq!(work::event(c, &p.id, "pending-after-ready")?.status, "queued");
+            assert_eq!(c.query_row("SELECT status FROM messages WHERE id='uncertain-effect'",[],|r|r.get::<_,String>(0))?, "uncertain");
+            c.execute("UPDATE cli_switch_requests SET phase='requested',nonce='preserved-nonce',next_attempt_at=12345 WHERE id=?",[&repair.id])?;
+            c.execute("INSERT INTO cli_repair_prompts(id,request_id,generation,payload,status,sequence,created_at) VALUES('uncertain-prompt',?,'old-gen','preserved prompt','uncertain',1,1)",[&repair.id])?;
+            Ok(repair)
+        }).unwrap();
+        assert!(app.supervise_unobserved_cli(&p).await.unwrap());
+        app.db
+            .sync(|c| {
+                let current = latest(c, &p.id)?.unwrap();
+                assert_eq!(current.id, repair.id);
+                assert_eq!(current.phase, "requested");
+                assert_eq!(current.nonce, "preserved-nonce");
+                assert_eq!(current.next_attempt_at, 12345);
+                assert_eq!(
+                    c.query_row("SELECT count(*) FROM cli_switch_requests", [], |r| r
+                        .get::<_, i64>(0))?,
+                    2
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT status FROM cli_repair_prompts WHERE id='uncertain-prompt'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "uncertain"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let current = app.db.project(&p.id).await.unwrap();
+        assert_eq!(current.generation, p.generation);
+        assert_eq!(current.terminal, p.terminal);
+        assert_eq!(current.native_session, p.native_session);
+    }
+    #[tokio::test]
+    async fn unobserved_cli_election_respects_pause_takeover_and_exact_execution() {
+        for mutation in ["pause", "takeover", "generation", "terminal", "execution"] {
+            let (_dir, app, p) = fixture().await;
+            app.db.sync(|c| {
+                match mutation {
+                    "pause" => {c.execute("UPDATE projects SET paused=1 WHERE id=?",[&p.id])?;},
+                    "takeover" => {work::set_takeover(c,&p.id,&p.generation,true,db::now())?;},
+                    "generation" => {c.execute("UPDATE projects SET generation='replacement' WHERE id=?",[&p.id])?;},
+                    "terminal" => {c.execute("UPDATE projects SET terminal='replacement' WHERE id=?",[&p.id])?;},
+                    _ => {c.execute("UPDATE projects SET execution=json_set(execution,'$.replacement',1) WHERE id=?",[&p.id])?;},
+                }
+                Ok(())
+            }).unwrap();
+            assert!(
+                !app.supervise_unobserved_cli(&p).await.unwrap(),
+                "{mutation}"
+            );
+            assert!(
+                app.db.sync(|c| latest(c, &p.id)).unwrap().is_none(),
+                "{mutation}"
+            );
+        }
+    }
+    #[tokio::test]
     async fn runtime_fault_without_any_queued_message_journals_supervised_native_repair() {
         let (_dir, app, p) = fixture().await;
         app.journal_cli_fault(&p.id, "post-ready native error")
@@ -2395,14 +2498,14 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
-    async fn errored_owned_source_schedules_one_supervised_restart_without_killing_children() {
+    async fn observation_loss_then_errored_source_supervises_restart_without_killing_children() {
         let (_dir, app, p) = fixture().await;
         app.db.sync(|c|{
             c.execute("UPDATE projects SET execution=json_object('api_protocol',7,'mcp_contract',1,'backend','legacy','workspace_id','workspace','pane_id','old-pane','terminal_id','old-pane','managed_name','managed','generation','old-gen','shell_pid',NULL,'launch_permit','/private/fixture/launch') WHERE id=?",[&p.id])?;
             Ok(())
         }).unwrap();
         let p = app.db.project(&p.id).await.unwrap();
-        app.journal_cli_fault(&p.id, "native error").await.unwrap();
+        assert!(app.supervise_unobserved_cli(&p).await.unwrap());
         let mut record = json!({"state":"live","status":{"state":"error"},"foreground":{"name":"codex"},"processes":[{"pid":100,"name":"codex","argv":["codex"]}],"interactive_ready":true,"state_change_seq":22,
             "execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace",
             "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
