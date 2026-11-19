@@ -200,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
             if "img_fixture_slow" in self.path:
                 FIXTURE.resource_started.set()
                 assert FIXTURE.resource_release.wait(20), "slow resource fixture was not released"
-            data = b"downloaded fixture attachment"
+            data = (ROOT / "tests/fixtures/input.png").read_bytes() if "type=image" in self.path else b"downloaded fixture attachment"
             self.send_response(200); self.send_header("Content-Length", str(len(data)))
             self.send_header("Content-Type", "application/octet-stream")
             self.end_headers(); self.wfile.write(data); return
@@ -618,7 +618,7 @@ def main():
         FIXTURE.emit(message("om_second", "second message"))
         FIXTURE.emit(message("om_third", "", kind="file", content={"file_key": "fixture-inbound", "file_name": "incoming.txt"}))
         wait_for(lambda: all(any(m["source_id"] == key and m["status"] == "submitted" for m in api(f"/projects/{project['id']}")["messages"]) for key in ["om_second", "om_third"]), "queued messages failed")
-        assert list((run / "files").glob("*incoming.txt"))
+        assert list((run / "files" / project["id"]).glob("*incoming.txt"))
         checks.append("ordered follow-up turns and streamed inbound attachment")
         rich_doc = {"title":"Screenshot", "content":[[{"tag":"text","text":"fixture-post-caption"},{"tag":"img","image_key":"img_fixture_post"},{"tag":"img","image_key":"img_fixture_post"}]]}
         FIXTURE.emit(message("om_rich_post", "", kind="post", content={"zh_cn":rich_doc,"en_us":rich_doc}))

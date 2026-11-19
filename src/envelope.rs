@@ -135,6 +135,20 @@ pub fn render_resources(message: &Message, context: &Value, resources: &[Value])
         refs.push_str(&format!("\n<attachment trust=\"user_input\" kind=\"{}\" resource_key=\"{}\" name=\"{}\" local_path=\"{}\" status=\"{}\" error=\"{}\"/>",
             attr(resource,"kind"),attr(resource,"file_key"),attr(resource,"file_name"),attr(resource,"local_path"),
             if resource["local_path"].is_string() { "downloaded" } else { "unavailable" },attr(resource,"error")));
+        if resource["kind"] == "image"
+            || resource["media_type"]
+                .as_str()
+                .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            if let Some(path) = resource["local_path"].as_str() {
+                refs.push_str(&format!(
+                    "\n<image_delivery mode=\"path_only\">{}</image_delivery>",
+                    escape(&crate::multimodal::fallback_note(Path::new(path)))
+                ));
+            } else {
+                refs.push_str("\n<image_delivery mode=\"unavailable\">Image pixels were not delivered. Do not claim to have viewed this image.</image_delivery>");
+            }
+        }
     }
     xml.insert_str(end, &refs);
     xml

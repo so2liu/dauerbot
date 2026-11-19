@@ -4,7 +4,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Disableable, Selectable, Sizable,
     button::*,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
 };
 use herdr_feishu_bridge::config::Config;
 use serde_json::{Value, json};
@@ -36,6 +36,14 @@ pub fn status(project: &Value) -> &str {
         .unwrap_or("unavailable")
 }
 
+fn image_identity_changed(
+    event: &InputEvent,
+    previous: &(String, String),
+    current: &(String, String),
+) -> bool {
+    matches!(event, InputEvent::Change) && previous != current
+}
+
 pub struct ManagerSettings {
     project: Value,
     config: Value,
@@ -46,6 +54,8 @@ pub struct ManagerSettings {
     fill_inputs: bool,
     open: bool,
     dirty: bool,
+    supports_images: bool,
+    image_identity: (String, String),
     message: String,
     tx: mpsc::Sender<Work>,
     endpoint: Entity<InputState>,
@@ -175,14 +185,24 @@ impl ManagerSettings {
             }
         })
         .detach();
-        for input in [&endpoint, &model, &key] {
-            cx.subscribe(
-                input,
-                |this, _, _: &gpui_component::input::InputEvent, cx| {
-                    this.dirty = true;
-                    cx.notify();
-                },
-            )
+        for (index, input) in [&endpoint, &model, &key].into_iter().enumerate() {
+            cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                if index < 2 {
+                    let identity = (
+                        this.endpoint.read(cx).value().to_string(),
+                        this.model.read(cx).value().to_string(),
+                    );
+                    if image_identity_changed(event, &this.image_identity, &identity) {
+                        this.supports_images = false;
+                    }
+                    this.image_identity = identity;
+                }
+                this.dirty = true;
+                cx.notify();
+            })
             .detach();
         }
         Self {
@@ -195,6 +215,8 @@ impl ManagerSettings {
             fill_inputs: false,
             open: false,
             dirty: false,
+            supports_images: false,
+            image_identity: (String::new(), String::new()),
             message: String::new(),
             tx,
             endpoint,
@@ -212,6 +234,7 @@ impl ManagerSettings {
             self.fill_inputs = false;
             self.open = false;
             self.dirty = false;
+            self.supports_images = false;
             self.message.clear();
             self.request("GET", "manager", None, cx);
         } else if self.ticket.is_none()
@@ -291,6 +314,11 @@ impl Render for ManagerSettings {
                     )
                 });
             }
+            self.image_identity = (
+                self.config["base_url"].as_str().unwrap_or("").into(),
+                self.config["model"].as_str().unwrap_or("").into(),
+            );
+            self.supports_images = self.config["supports_images"] == true;
             self.dirty = false;
         }
         self.dirty = !self.config.is_null()
@@ -298,7 +326,8 @@ impl Render for ManagerSettings {
                 != self.config["base_url"].as_str().unwrap_or("")
                 || self.model.read(cx).value().as_ref()
                     != self.config["model"].as_str().unwrap_or("")
-                || !self.key.read(cx).value().is_empty());
+                || !self.key.read(cx).value().is_empty()
+                || self.supports_images != (self.config["supports_images"] == true));
         let busy = self.ticket.is_some();
         let mode = self.config["mode"]
             .as_str()
@@ -324,12 +353,17 @@ impl Render for ManagerSettings {
                 .on_click(cx.listener(|this,_,_,cx|{this.open = !this.open;cx.notify();})));
         if self.open {
             view=view.child(self.field("OpenAI-compatible endpoint",&self.endpoint)).child(self.field("Manager model",&self.model)).child(self.field("Manager API key",&self.key))
+                .child(Button::new("manager-image-capability").small().selected(self.supports_images).disabled(busy||!self.config["supports_images"].is_boolean())
+                    .child(control_label(self.language.text(if self.supports_images {"Image input declared supported"}else{"Declare image input support"})))
+                    .on_click(cx.listener(|this,_,_,cx| { this.supports_images = !this.supports_images; cx.notify(); })))
+                .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references.")))
                 .child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text(if self.config["has_api_key"]==true {"API key saved. Leave blank to keep it."}else{"No manager API key saved"})))
                 .child(div().flex().flex_wrap().gap_2()
                     .child(Button::new("save-manager-config").small().primary().child(control_label(self.language.text("Save manager settings")))
                         .disabled(busy||revision.is_none())
                         .on_click(cx.listener(|this,_,_,cx| {
                             let mut body=json!({"base_url":this.endpoint.read(cx).value().to_string(),"model":this.model.read(cx).value().to_string(),"expected_revision":this.config["revision"]});
+                            if this.config["supports_images"].is_boolean() { body["supports_images"] = json!(this.supports_images); }
                             let key=this.key.read(cx).value().to_string();if !key.is_empty(){body["api_key"]=json!(key);}
                             this.request("PUT","manager",Some(body),cx);
                         })))
@@ -370,5 +404,42 @@ impl Render for ManagerSettings {
             view=view.child(div().text_size(px(11.)).text_color(rgb(0x85858d)).child(self.language.text("The terminal belongs to the coding worker. Model and repair controls remain available if the manager cannot connect.")));
         }
         view
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputEvent, image_identity_changed};
+    #[test]
+    fn declaration_resets_only_for_real_provider_identity_changes() {
+        let saved: (String, String) = ("https://fixture.invalid/v1".into(), "vision".into());
+        let changed = (saved.0.clone(), "another-model".into());
+        for event in [
+            InputEvent::PressEnter { secondary: false },
+            InputEvent::PressEnter { secondary: true },
+            InputEvent::Focus,
+            InputEvent::Blur,
+        ] {
+            assert!(!image_identity_changed(&event, &saved, &saved));
+            assert!(!image_identity_changed(&event, &saved, &changed));
+        }
+        assert!(!image_identity_changed(&InputEvent::Change, &saved, &saved));
+        assert!(image_identity_changed(
+            &InputEvent::Change,
+            &saved,
+            &changed
+        ));
+        assert!(image_identity_changed(
+            &InputEvent::Change,
+            &saved,
+            &("https://another.invalid/v1".into(), saved.1.clone())
+        ));
+        // A freshly populated form or a declaration for edited values is bound
+        // to that identity, even when it differs from the previously saved form.
+        assert!(!image_identity_changed(
+            &InputEvent::Change,
+            &changed,
+            &changed
+        ));
     }
 }

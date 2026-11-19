@@ -65,7 +65,15 @@ async fn resource(
     if key == "img_missing" {
         return (StatusCode::FORBIDDEN, "fixture unavailable").into_response();
     }
-    (StatusCode::OK, format!("bytes:{key}")).into_response()
+    if key == "img_not_image" {
+        return (StatusCode::OK, "not image pixels").into_response();
+    }
+    if query["type"] == "file" {
+        return (StatusCode::OK, "document bytes").into_response();
+    }
+    let mut bytes = include_bytes!("fixtures/input.png").to_vec();
+    bytes.extend_from_slice(key.as_bytes());
+    (StatusCode::OK, bytes).into_response()
 }
 
 #[tokio::test]
@@ -150,11 +158,27 @@ async fn multiple_resources_are_bounded_cached_and_delivered_with_durable_failur
         .filter(|(i, _)| *i != 1 && *i != 2)
     {
         let path = std::path::Path::new(r["local_path"].as_str().unwrap());
-        assert!(path.starts_with(dir.path().join("files")));
+        assert!(path.starts_with(dir.path().canonicalize().unwrap().join("files")));
         assert_eq!(
-            std::fs::read_to_string(path).unwrap(),
-            format!("bytes:img_{i}")
+            std::fs::read(path).unwrap(),
+            [
+                include_bytes!("fixtures/input.png").as_slice(),
+                format!("img_{i}").as_bytes()
+            ]
+            .concat()
         );
+        assert!(
+            path.starts_with(
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("files")
+                    .join(&project.id)
+            )
+        );
+        assert_eq!(r["cache_project_id"], project.id);
+        assert_eq!(r["cache_message_id"], message.id);
+        assert_eq!(r["media_type"], "image/png");
     }
     assert_ne!(resources[0]["local_path"], resources[2]["local_path"]);
     assert_eq!(
@@ -189,6 +213,76 @@ async fn multiple_resources_are_bounded_cached_and_delivered_with_durable_failur
             .unwrap()
             .len(),
         1
+    );
+
+    let (_, _, _, bad_attachment) =
+        feishu::normalize(&event("image", json!({"image_key":"img_not_image"})))
+            .unwrap()
+            .unwrap();
+    let bad_id = app
+        .db
+        .ingest_bot(
+            &project.id,
+            "cli_fixture",
+            "oc_real",
+            "om_bad_type",
+            "bad image",
+            &bad_attachment,
+        )
+        .unwrap()
+        .unwrap();
+    let bad = app.db.message(&bad_id).await.unwrap();
+    let rejected = feishu::download_resources(&app, &bad).await.unwrap();
+    assert!(rejected[0]["local_path"].is_null());
+    assert!(
+        rejected[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported media type")
+    );
+    assert!(
+        std::fs::read_dir(dir.path().join("files").join(&project.id))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".part"))
+    );
+    let (_, _, _, file_attachment) = feishu::normalize(&event(
+        "file",
+        json!({"file_key":"doc_fixture","file_name":"note.txt"}),
+    ))
+    .unwrap()
+    .unwrap();
+    let file_id = app
+        .db
+        .ingest_bot(
+            &project.id,
+            "cli_fixture",
+            "oc_real",
+            "om_document",
+            "document",
+            &file_attachment,
+        )
+        .unwrap()
+        .unwrap();
+    let document = app.db.message(&file_id).await.unwrap();
+    let documents = feishu::download_resources(&app, &document).await.unwrap();
+    assert_eq!(documents[0]["kind"], "file");
+    assert!(documents[0]["media_type"].is_null());
+    assert_eq!(
+        std::fs::read(documents[0]["local_path"].as_str().unwrap()).unwrap(),
+        b"document bytes"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(message, key, kind)| message == "om_document"
+                && key == "doc_fixture"
+                && kind == "file")
     );
 
     // A warm handover preserves ownership; only cold recovery abandons an attempt.
@@ -265,5 +359,226 @@ async fn multiple_resources_are_bounded_cached_and_delivered_with_durable_failur
             .unwrap()
             .contains("binding changed")
     );
+    server.abort();
+}
+
+#[derive(Clone, Default)]
+struct PreparationRace {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    downloads: Arc<Mutex<Vec<String>>>,
+    model_requests: Arc<Mutex<Vec<Value>>>,
+}
+
+#[tokio::test]
+async fn manager_routing_before_or_during_real_download_does_not_strand_images() {
+    use herdr_feishu_bridge::{manager, work};
+    use std::time::Duration;
+    async fn image(
+        State(state): State<PreparationRace>,
+        Path((message, _)): Path<(String, String)>,
+    ) -> Response {
+        state.downloads.lock().unwrap().push(message);
+        state.started.notify_one();
+        state.release.notified().await;
+        (
+            StatusCode::OK,
+            include_bytes!("fixtures/input.png").as_slice(),
+        )
+            .into_response()
+    }
+    async fn model(State(state): State<PreparationRace>, Json(body): Json<Value>) -> Json<Value> {
+        let image_count = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "image_url")
+            .count();
+        assert_eq!(
+            image_count, 1,
+            "The real manager request must contain downloaded pixels"
+        );
+        state.model_requests.lock().unwrap().push(body);
+        Json(
+            json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":"Image inspected in the fixture."},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+        )
+    }
+    let state = PreparationRace::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route(
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            post(|| async {
+                Json(json!({"code":0,"tenant_access_token":"fixture","expire":3600}))
+            }),
+        )
+        .route(
+            "/open-apis/im/v1/messages/{message}/resources/{key}",
+            get(image),
+        )
+        .route("/v1/chat/completions", post(model))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let app = App::new(
+        directory.path().into(),
+        Config {
+            feishu_base: base.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let project = app
+        .db
+        .create(db::ProjectInput {
+            name: "Manager image race".into(),
+            path: directory.path().to_string_lossy().into(),
+            agent: "codex".into(),
+            chat_id: "oc_real".into(),
+            native_session: String::new(),
+            extra_args: vec![],
+        })
+        .await
+        .unwrap();
+    app.db
+        .sync(|c| {
+            bot::save(c, &project.id, "cli_fixture", "fixture", false)?;
+            let config = manager::save(
+                c,
+                &project.id,
+                manager::ConfigInput {
+                    base_url: format!("{base}/v1"),
+                    model: "fixture".into(),
+                    api_key: Some("fixture".into()),
+                    clear_api_key: false,
+                    expected_revision: 0,
+                    supports_images: Some(true),
+                },
+            )?;
+            manager::set_mode(
+                c,
+                &project.id,
+                manager::ModeInput {
+                    mode: "manager".into(),
+                    request_id: "race-mode".into(),
+                    expected_revision: config["revision"].as_i64().unwrap(),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (_, _, caption, attachment) =
+        feishu::normalize(&event("image", json!({"image_key":"img_race"})))
+            .unwrap()
+            .unwrap();
+    let first = app
+        .db
+        .ingest_bot(
+            &project.id,
+            "cli_fixture",
+            "oc_real",
+            "om_before_begin",
+            &caption,
+            &attachment,
+        )
+        .unwrap()
+        .unwrap();
+    app.db.sync(|c| work::sync_inbound(c).map(|_| ())).unwrap();
+    assert_eq!(app.db.message(&first).await.unwrap().status, "acknowledged");
+    let resources = tokio::spawn(feishu::resource_worker(app.clone()));
+    let management = tokio::spawn(manager::run(app.clone()));
+    for (index, id) in [first.clone(), String::new()].into_iter().enumerate() {
+        let id = if index == 0 {
+            id
+        } else {
+            app.db
+                .ingest_bot(
+                    &project.id,
+                    "cli_fixture",
+                    "oc_real",
+                    "om_during_download",
+                    &caption,
+                    &attachment,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(5), state.started.notified())
+            .await
+            .unwrap();
+        if index == 1 {
+            // Preparation owns a real blocked HTTP download before routing takes ownership.
+            assert!(
+                app.db.message(&id).await.unwrap().attachment["resource_preparation"].is_string()
+            );
+            app.db.sync(|c| work::sync_inbound(c).map(|_| ())).unwrap();
+        }
+        assert_eq!(app.db.message(&id).await.unwrap().status, "acknowledged");
+        assert_ne!(
+            app.db.message(&id).await.unwrap().attachment["resources_ready"],
+            true
+        );
+        state.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                let done=app.db.sync(|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id WHERE e.message_id=? AND i.status='consumed')",[&id],|r|r.get::<_,bool>(0))?)).unwrap();
+                if done {break;}
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        let message = app.db.message(&id).await.unwrap();
+        assert_eq!(message.attachment["resources_ready"], true);
+        assert_eq!(
+            std::fs::read(
+                message.attachment["resources"][0]["local_path"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            include_bytes!("fixtures/input.png")
+        );
+        app.db.sync(|c|{
+            assert_eq!(c.query_row("SELECT count(*) FROM work_events WHERE message_id=?",[&id],|r|r.get::<_,i64>(0))?,1);
+            assert_eq!(c.query_row("SELECT count(*) FROM work_runs WHERE event_id IN(SELECT id FROM work_events WHERE message_id=?)",[&id],|r|r.get::<_,i64>(0))?,0);
+            Ok(())
+        }).unwrap();
+    }
+    app.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), resources)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), management)
+        .await
+        .unwrap()
+        .unwrap();
+    // Stop cancels the authoritative owner before the worker can discover it.
+    let stopped = app
+        .db
+        .ingest_bot(
+            &project.id,
+            "cli_fixture",
+            "oc_real",
+            "om_stopped_image",
+            &caption,
+            &attachment,
+        )
+        .unwrap()
+        .unwrap();
+    app.db.sync(|c| manager::stop(c, &project.id)).unwrap();
+    let stopped = app.db.message(&stopped).await.unwrap();
+    assert!(
+        app.db
+            .sync(|c| feishu::begin_resource_preparation(c, &stopped))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        *state.downloads.lock().unwrap(),
+        vec!["om_before_begin", "om_during_download"]
+    );
+    assert_eq!(state.model_requests.lock().unwrap().len(), 2);
     server.abort();
 }

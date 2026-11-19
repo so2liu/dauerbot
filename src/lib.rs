@@ -20,6 +20,7 @@ pub mod manager_loop;
 pub mod mcp;
 pub mod model_control;
 pub mod models;
+pub mod multimodal;
 pub mod native_children;
 pub mod project_documents;
 pub mod project_instructions;

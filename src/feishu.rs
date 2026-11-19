@@ -5,6 +5,7 @@ use open_lark::ws_client::{
     EventDispatcherHandler, EventHandler, LarkWsClient,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -260,6 +261,11 @@ pub struct ResourcePreparation {
     pub bot_app_id: String,
 }
 
+// Manager routing acknowledges a message before asynchronous preparation. Only
+// its live authoritative owner (or an explicit, still-live native transfer) may
+// keep that source eligible; historical acknowledgements and Stop stay fenced.
+const RESOURCE_ELIGIBLE: &str = "(m.status IN ('pending','queued') OR (m.status='acknowledged' AND EXISTS(SELECT 1 FROM work_events e JOIN manager_inputs i ON i.origin_event_id=e.id AND i.project_id=e.project_id WHERE e.message_id=m.id AND e.project_id=m.project_id AND e.source='feishu' AND e.status='managed' AND (i.status IN ('queued','processing') OR (i.status='transferred' AND EXISTS(SELECT 1 FROM work_events d WHERE d.project_id=e.project_id AND d.source='management' AND json_extract(d.payload,'$.origin_event_id')=e.id AND d.status IN ('queued','submitting','submitted','uncertain')))))))";
+
 pub fn begin_resource_preparation(
     c: &rusqlite::Connection,
     message: &db::Message,
@@ -273,7 +279,7 @@ pub fn begin_resource_preparation(
             .unwrap_or("")
             .to_owned(),
     };
-    let changed = c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resource_preparation',?) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND json_extract(attachment,'$.resource_preparation') IS NULL AND status IN ('pending','queued')",rusqlite::params![preparation.token,preparation.message_id,preparation.source_id,preparation.bot_app_id])?;
+    let changed = c.execute(&format!("UPDATE messages AS m SET attachment=json_set(attachment,'$.resource_preparation',?) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND json_extract(attachment,'$.resource_preparation') IS NULL AND {RESOURCE_ELIGIBLE}"),rusqlite::params![preparation.token,preparation.message_id,preparation.source_id,preparation.bot_app_id])?;
     Ok((changed == 1).then_some(preparation))
 }
 
@@ -298,7 +304,7 @@ pub fn finish_resource_preparation(
     } else {
         json!({"members_status":"unavailable"})
     };
-    let changed=c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND status IN ('pending','queued')",rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
+    let changed=c.execute(&format!("UPDATE messages AS m SET attachment=json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND {RESOURCE_ELIGIBLE}"),rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
     Ok(changed == 1)
 }
 
@@ -340,7 +346,13 @@ pub async fn download_resources(app: &App, m: &db::Message) -> Result<Vec<Value>
         )
         .await;
         match downloaded {
-            Ok(Ok(Some(path))) => resource["local_path"] = json!(path),
+            Ok(Ok(Some(metadata))) => {
+                if let (Some(resource), Some(metadata)) =
+                    (resource.as_object_mut(), metadata.as_object())
+                {
+                    resource.extend(metadata.clone());
+                }
+            }
             Ok(Ok(None)) => resource["error"] = json!("Resource key is missing"),
             Ok(Err(error)) => resource["error"] = json!(error.to_string()),
             Err(_) => {
@@ -381,7 +393,7 @@ pub async fn resource_worker(app: Arc<App>) {
         };
         let next = app.db.call(|c| {
             use rusqlite::OptionalExtension;
-            Ok(c.query_row("SELECT id FROM messages WHERE direction='in' AND status IN ('pending','queued') AND (json_extract(attachment,'$.file_key') IS NOT NULL OR json_array_length(attachment,'$.resources')>0) AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND json_extract(attachment,'$.resource_preparation') IS NULL ORDER BY rowid LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?)
+            Ok(c.query_row(&format!("SELECT m.id FROM messages m WHERE m.direction='in' AND {RESOURCE_ELIGIBLE} AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1 AND json_extract(m.attachment,'$.resource_preparation') IS NULL ORDER BY m.rowid LIMIT 1"),[],|r|r.get::<_,String>(0)).optional()?)
         }).await;
         match next {
             Ok(Some(id)) => {
@@ -404,13 +416,6 @@ pub async fn resource_worker(app: Arc<App>) {
     }
 }
 
-struct PartialResource(PathBuf);
-impl Drop for PartialResource {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 async fn download_resource(
     app: &App,
     m: &db::Message,
@@ -418,7 +423,7 @@ async fn download_resource(
     index: usize,
     attempt: &str,
     remaining: &mut u64,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<Value>> {
     let Some(key) = resource["file_key"].as_str() else {
         return Ok(None);
     };
@@ -457,13 +462,15 @@ async fn download_resource(
         } else {
             "attachment"
         });
-    let target = app
-        .dir
-        .join("files")
-        .join(format!("{}-{attempt}-{index}-{name}", m.id));
-    let temp = target.with_extension("part");
-    let _cleanup = PartialResource(temp.clone());
-    let mut file = tokio::fs::File::create(&temp).await?;
+    let key_hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+    let name = format!("{}-{index}-{}-{name}", m.id, &key_hash[..16]);
+    let temporary = format!(".{}-{attempt}-{index}.part", m.id);
+    let (mut cache, file) =
+        crate::multimodal::CacheWrite::create(&app.dir, &m.project_id, &name, &temporary)?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut hasher = Sha256::new();
+    let mut head = Vec::new();
+    let mut total = 0_u64;
     let result = async {
         while let Some(chunk) = response.chunk().await? {
             let bytes = chunk.len() as u64;
@@ -472,18 +479,26 @@ async fn download_resource(
                 bail!("Incoming resources exceed the 100 MB message limit");
             }
             *remaining -= bytes;
+            total += bytes;
+            hasher.update(&chunk);
+            let head_bytes = (32_usize.saturating_sub(head.len())).min(chunk.len());
+            head.extend_from_slice(&chunk[..head_bytes]);
             file.write_all(&chunk).await?;
         }
+        anyhow::ensure!(kind != "image" || total > 0, "Incoming image is empty");
+        anyhow::ensure!(
+            kind != "image" || crate::multimodal::image_type(&head).is_some(),
+            "Incoming image has an unsupported media type"
+        );
         file.sync_all().await?;
-        tokio::fs::rename(&temp, &target).await?;
+        cache.publish()?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&temp).await;
-    }
     result?;
-    Ok(Some(target))
+    Ok(Some(
+        json!({"local_path":cache.path,"cache_root":cache.root,"cache_project_id":m.project_id,"cache_message_id":m.id,"cache_source_id":m.source_id,"sha256":format!("{:x}",hasher.finalize()),"bytes":total,"media_type":crate::multimodal::image_type(&head)}),
+    ))
 }
 
 pub struct Inbound {

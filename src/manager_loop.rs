@@ -137,6 +137,8 @@ impl std::error::Error for Failure {}
 pub struct ProviderConfig {
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub supports_images: bool,
     #[serde(skip_serializing)]
     pub api_key: String,
 }
@@ -195,6 +197,12 @@ struct Checkpoint {
     correction_used: bool,
     #[serde(default)]
     last_correction: Option<Failure>,
+    #[serde(default)]
+    images: Vec<crate::multimodal::ImageRef>,
+    #[serde(default)]
+    image_delivery: Vec<Value>,
+    #[serde(default)]
+    image_input_digest: Option<String>,
 }
 fn definitions() -> Vec<ToolDefinition> {
     let schemas = [
@@ -265,10 +273,22 @@ fn decode(mut value: Value) -> Result<Checkpoint> {
     Ok(state)
 }
 pub fn begin(input: String, system: String) -> Result<Value> {
+    begin_with_images(input, system, vec![])
+}
+pub fn begin_with_images(
+    input: String,
+    system: String,
+    images: Vec<crate::multimodal::ImageRef>,
+) -> Result<Value> {
+    ensure!(
+        images.len() <= crate::multimodal::MAX_IMAGES,
+        "Too many manager images"
+    );
     ensure!(
         input.len() <= MAX_CONTENT && system.len() <= 65536,
         "Manager input is too large"
     );
+    let image_input_digest = (!images.is_empty()).then(|| crate::multimodal::input_digest(&input));
     let mut run = AgentRun::new(input)
         .max_turns(32)
         .max_invalid_tool_call_retries(1);
@@ -282,6 +302,9 @@ pub fn begin(input: String, system: String) -> Result<Value> {
         pending,
         correction_used: false,
         last_correction: None,
+        images,
+        image_delivery: vec![],
+        image_input_digest,
     })
 }
 fn calls(state: &Checkpoint) -> Result<Vec<ToolCall>> {
@@ -364,6 +387,18 @@ pub async fn advance(
     } else {
         state.system.clone()
     };
+    let mut prompt = prompt;
+    let mut history = history;
+    if !state.images.is_empty() {
+        state.image_delivery = crate::multimodal::hydrate(
+            &mut prompt,
+            &mut history,
+            &state.images,
+            state.image_input_digest.as_deref(),
+            config.supports_images,
+        )
+        .await;
+    }
     let request = CompletionRequest::new(prompt)
         .messages(history)
         .preamble(&system)
@@ -500,6 +535,7 @@ mod tests {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
         hold: bool,
+        bodies: Arc<std::sync::Mutex<Vec<Value>>>,
     }
     async fn fixture(
         script: Vec<Value>,
@@ -512,6 +548,7 @@ mod tests {
             started: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
             hold,
+            bodies: Arc::new(std::sync::Mutex::new(vec![])),
         };
         async fn handler(
             State(f): State<Fixture>,
@@ -539,6 +576,7 @@ mod tests {
             }) {
                 f.corrective_requests.fetch_add(1, Ordering::SeqCst);
             }
+            f.bodies.lock().unwrap().push(body.clone());
             let n = f.requests.fetch_add(1, Ordering::SeqCst);
             f.started.notify_one();
             if f.hold {
@@ -569,6 +607,7 @@ mod tests {
             ProviderConfig {
                 base_url: format!("http://{addr}/v1"),
                 model: "fixture-model".into(),
+                supports_images: false,
                 api_key: "private-fixture-secret".into(),
             },
             fixture,
@@ -577,6 +616,120 @@ mod tests {
     }
     fn answer(content: Value, calls: Value) -> Value {
         json!({"id":"fixture-response","object":"chat.completion","created":1,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":content,"tool_calls":calls},"finish_reason":if calls.is_array(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})
+    }
+    #[tokio::test]
+    async fn declared_images_reach_initial_and_followup_wire_without_checkpoint_pixels() {
+        use crate::multimodal::{ImageRef, fixture_resource};
+        use base64::Engine;
+        let directory = tempfile::tempdir().unwrap();
+        let resource = fixture_resource(directory.path(), "project", "message");
+        let image = ImageRef::from_resource(
+            "project",
+            "message",
+            &resource,
+            std::path::Path::new(resource["cache_root"].as_str().unwrap()),
+        )
+        .unwrap();
+        let mut other_resource = fixture_resource(directory.path(), "project", "message-b");
+        let other_bytes = include_bytes!("../tests/fixtures/input-green.png");
+        std::fs::write(other_resource["local_path"].as_str().unwrap(), other_bytes).unwrap();
+        use sha2::Digest;
+        other_resource["sha256"] = json!(format!("{:x}", sha2::Sha256::digest(other_bytes)));
+        other_resource["bytes"] = json!(other_bytes.len());
+        let other_image = ImageRef::from_resource(
+            "project",
+            "message-b",
+            &other_resource,
+            std::path::Path::new(other_resource["cache_root"].as_str().unwrap()),
+        )
+        .unwrap();
+        let calls = json!([{"id":"read","type":"function","function":{"name":"worker_status","arguments":"{}"}}]);
+        let (mut config, f, server) = fixture(
+            vec![
+                answer(Value::Null, calls),
+                answer(json!("complete"), Value::Null),
+                answer(json!("text-only"), Value::Null),
+            ],
+            false,
+        )
+        .await;
+        config.supports_images = true;
+        let initial = begin_with_images(
+            "Inspect source pixels".into(),
+            "Manager".into(),
+            vec![other_image, image],
+        )
+        .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../tests/fixtures/input.png"));
+        assert!(!initial.to_string().contains(&encoded));
+        let first = advance(&config, initial.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let LoopAction::Tools(calls) = first.action else {
+            panic!("tools")
+        };
+        let continuation = supply_tool_results(
+            first.checkpoint,
+            vec![(calls[0].occurrence.clone(), json!({"ready":true}))],
+        )
+        .unwrap();
+        let restored = serde_json::from_str(&continuation.to_string()).unwrap();
+        let last = advance(&config, restored, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!last.checkpoint.to_string().contains(&encoded));
+        assert_eq!(last.checkpoint["image_delivery"][0]["mode"], "image_part");
+        config.supports_images = false;
+        let fallback = advance(&config, initial, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback.checkpoint["image_delivery"][0]["reason"],
+            "image_capability_not_declared"
+        );
+        let bodies = f.bodies.lock().unwrap();
+        let mut counts = vec![];
+        for body in bodies.iter() {
+            let images = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|m| m["content"].as_array().into_iter().flatten())
+                .filter(|p| p["type"] == "image_url")
+                .collect::<Vec<_>>();
+            let green = base64::engine::general_purpose::STANDARD
+                .encode(include_bytes!("../tests/fixtures/input-green.png"));
+            for message in body["messages"].as_array().unwrap() {
+                if let Some(parts) = message["content"].as_array() {
+                    for (index, part) in parts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p["type"] == "image_url")
+                    {
+                        let caption = parts[index - 1]["text"].as_str().unwrap();
+                        if part["image_url"]["url"] == format!("data:image/png;base64,{green}") {
+                            assert!(
+                                caption.contains("source_message_id=om_message-b")
+                                    && caption.contains("cache_message_id=message-b")
+                            );
+                        } else {
+                            assert_eq!(
+                                part["image_url"]["url"],
+                                format!("data:image/png;base64,{encoded}")
+                            );
+                            assert!(
+                                caption.contains("source_message_id=om_message,")
+                                    && caption.contains("cache_message_id=message,")
+                            );
+                        }
+                    }
+                }
+            }
+            counts.push(images.len());
+        }
+        assert_eq!(counts, vec![2, 2, 0]);
+        server.abort();
     }
     #[tokio::test]
     async fn checkpointed_tool_occurrences_survive_restart_without_replaying_provider_or_tools() {
