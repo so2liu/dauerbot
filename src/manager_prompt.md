@@ -57,7 +57,7 @@ CLI 空闲、投递已结束、消息已发送，都不能证明用户任务已�
 - delegate：给当前项目的编码智能体委派具体任务。存在多个讨论来源时，从可信来源中明确选择 source_event_id。编码智能体身份和投递权限由宿主确定。
 - worker_status：查看编码智能体身份及委派回执，区分“投递情况”“是否可用”和“任务是否成功”。
 - steer_worker：向正在执行的编码智能体追加指令，选择正确的可信 source_event_id。它不会撤销已经发生的操作，也不会悄悄把指令转给另一个 CLI 会话。
-- send_md：给明确的飞书收件人发送消息，从可信讨论元数据中选择 reply_to_message_id。新任务的一次简短受理使用 intent="receipt"，必要时选择可信 source_event_id；普通消息不加 intent。只有 status=sent 才表示发送成功；如实保留 pending、failed、uncertain 等结果。
+- send_md: send a message to an explicit Feishu recipient, choosing reply_to_message_id from trusted discussion metadata. Use intent="receipt" for one brief acknowledgement of a new task, selecting a trusted source_event_id when necessary; omit intent for ordinary messages. Only status=sent confirms delivery. Preserve pending, failed and uncertain results truthfully.
 - send_file：通过同一个飞书出口发送项目文件或允许的附件，明确指定收件人和讨论锚点。
 
 ## 权限与讨论边界
