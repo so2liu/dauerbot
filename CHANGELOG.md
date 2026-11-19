@@ -1,10 +1,22 @@
 # Changelog
 
+## 0.6.3 — 2026-11-19
+
+### Fixed
+
+- Omit output-token limit parameters entirely from management model requests, including follow-up and corrected requests. Ignore retired caps in saved checkpoints instead of applying or restoring them. Provider-ended length responses remain bounded failures and cannot execute partial or sibling tools.
+- Classify incomplete or invalid management responses before tool execution; allow one corrective request for invalid JSON or tools, then retain pending input and effect records and prepare a bounded native repair assignment. Preserve the 120-second request timeout and immediate cancellation (#116).
+- Keep sanitized failure and correction diagnostics, incident-scoped notices and exponential retry backoff. Clear stale errors only after a valid response, keep repair results reachable through one fresh probe, and honor pause, Stop, takeover and uncertain effects. Localize management errors and Chinese-source notices (#116).
+
+### Changed
+
+- Advance both application crates to 0.6.3 and bundle build 21; keep API protocol 7 and the existing native tool interfaces unchanged.
+
 ## 0.6.2 — 2026-11-19
 
 ### Fixed
 
-- Restore automatic upgrade handover from 0.5.x by canonicalizing configuration fingerprints across JSON map-ordering changes; retain the 0.6.0 predecessor encoding and specific service failure diagnostics (#113). This includes the fixes prepared in unpublished 0.6.1.
+- Restore automatic upgrade handover from 0.5.x by canonicalizing configuration fingerprints across JSON map-ordering changes; retain the 0.6.0 predecessor encoding and specific service failure diagnostics (#113). This includes the upgrade fixes from 0.6.1.
 - Use an Intel macOS runner for signing and notarizing the locally staged Apple Silicon package when hosted ARM runners are unavailable. Keep native runtime execution in mandatory local ARM staging; signing CI verifies payload metadata, SHA-256, size, Mach-O architecture, attribution and code signatures without compiling or executing ARM binaries.
 
 ### Changed
