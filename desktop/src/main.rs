@@ -2961,8 +2961,7 @@ fn main() {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(herdr_feishu_bridge::config::default_dir);
-    let independent_data = independent_data_dir(&dir);
-    let title = if independent_data {
+    let title = if independent_data_dir(&dir) {
         "Dauerbot · Independent instance"
     } else {
         "Dauerbot"
@@ -2971,7 +2970,6 @@ fn main() {
     let candidate = activation_id.as_deref().map(|id| {
         activation::Candidate::connect(&dir, id).expect("Cannot prepare the updated app")
     });
-    let open_independent = independent_data && candidate.is_none();
     let backend = if let Some(candidate) = &candidate {
         Backend::start_mode(
             dir,
@@ -3028,8 +3026,8 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(800.), px(600.))),
-                    show: !cfg!(target_os = "macos") || open_independent,
-                    focus: !cfg!(target_os = "macos") || open_independent,
+                    show: !cfg!(target_os = "macos"),
+                    focus: !cfg!(target_os = "macos"),
                     titlebar: Some(TitlebarOptions {
                         title: Some(title.into()),
                         ..Default::default()
@@ -3151,18 +3149,10 @@ fn main() {
             .detach();
         } else {
             #[cfg(target_os = "macos")]
-            {
-                let activate_window = match menubar::install(desktop_view, main_window, cx) {
-                    Ok(()) => open_independent,
-                    Err(error) => {
-                        eprintln!("{error:#}");
-                        true
-                    }
-                };
-                if activate_window {
-                    cx.activate(true);
-                    let _ = main_window.update(cx, |_, window, _| window.activate_window());
-                }
+            if let Err(error) = menubar::install(desktop_view, main_window, cx) {
+                eprintln!("{error:#}");
+                cx.activate(true);
+                let _ = main_window.update(cx, |_, window, _| window.activate_window());
             }
             #[cfg(not(target_os = "macos"))]
             cx.activate(true);
