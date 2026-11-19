@@ -219,8 +219,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["path", "content"],
         ),
         (
-            "Delegate coding to this project's native CLI worker; returns a durable receipt. Select source_event_id from trusted_sources when multiple discussions are present.",
-            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"}}),
+            "Delegate coding to this project's native CLI worker; returns a durable receipt. Optional target_cli selects a supported CLI through the ordinary cooperative handoff; held is not delivery and readiness failures remain visible in worker_status. Omit it to keep the current selection. Select source_event_id from trusted_sources when multiple discussions are present.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy"]}}),
             vec!["instructions"],
         ),
         (
@@ -229,8 +229,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec![],
         ),
         (
-            "Steer this project's current native coding worker. Select source_event_id from trusted_sources when multiple discussions are present.",
-            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"}}),
+            "Steer this project's native coding worker. Optional target_cli selects a supported CLI; if it differs, instructions wait behind the cooperative handoff for the selected successor instead of reaching the old worker. Omit it for current-worker steering. Select source_event_id from trusted_sources when multiple discussions are present.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy"]}}),
             vec!["instructions"],
         ),
         (
