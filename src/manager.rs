@@ -465,6 +465,13 @@ struct MessageArgs {
     to: String,
     text: String,
     reply_to_message_id: Option<String>,
+    intent: Option<MessageIntent>,
+    source_event_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MessageIntent {
+    Receipt,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -647,7 +654,91 @@ fn effect_result(c: &Connection, id: &str, result: &Value, status: &str) -> Resu
     )?;
     Ok(())
 }
+/// A receipt belongs to an explicit user source, not a transient model turn.
+/// Reuse its immutable outbox entry; a new model occurrence is not a new send.
+fn enqueue_receipt(
+    c: &Connection,
+    ctx: &Context,
+    effect: &str,
+    args: &MessageArgs,
+) -> Result<(String, bool)> {
+    valid(c, ctx)?;
+    let origin = select_origin(c, ctx, args.source_event_id.as_deref())?
+        .context("A receipt requires a trusted user source")?;
+    let request = format!("manager-receipt-{}-{origin}", ctx.project);
+    if let Some(id) = c
+        .query_row(
+            "SELECT id FROM messages WHERE project_id=? AND direction='out' AND source_id=?",
+            params![ctx.project, request],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok((id, false));
+    }
+    let user_source: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status='queued')",
+        params![ctx.run, origin],
+        |r| r.get(0),
+    )?;
+    ensure!(user_source, "Only new user input can receive a receipt");
+    let (source, raw): (String, String) = c.query_row(
+        "SELECT m.source_id,m.attachment FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.id=? AND e.project_id=? AND m.direction='in'",
+        params![origin, ctx.project],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let attachment: Value = serde_json::from_str(&raw)?;
+    let binding = crate::bot::get(c, &ctx.project)?.context("Connect this project's bot first")?;
+    ensure!(
+        attachment["bot_app_id"] == binding.app_id,
+        "A receipt requires this project's trusted Feishu source"
+    );
+    let source_meta = &attachment["source"];
+    ensure!(
+        source_meta["chat_id"].as_str() == Some(args.to.as_str())
+            || (source_meta["chat_type"] == "p2p"
+                && source_meta["sender"]["open_id"].as_str() == Some(args.to.as_str())),
+        "A receipt must address its original user conversation"
+    );
+    let anchor = args
+        .reply_to_message_id
+        .as_deref()
+        .context("A receipt requires an explicit trusted discussion anchor")?;
+    ensure!(
+        anchor == source
+            || source_meta["root_id"].as_str() == Some(anchor)
+            || source_meta["parent_id"].as_str() == Some(anchor),
+        "A receipt must use its original trusted discussion"
+    );
+    let id = db::enqueue_out_request(
+        c,
+        &ctx.project,
+        &binding.app_id,
+        &request,
+        &args.text,
+        json!({"to":args.to,"reply_to_message_id":anchor,"manager_effect":effect,
+            "manager_receipt_origin":origin,"manager_revision":ctx.revision}),
+    )?;
+    Ok((id, true))
+}
 pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
+    if let Some(origin) = attachment["manager_receipt_origin"].as_str() {
+        let allowed: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_config m ON m.project_id=i.project_id JOIN projects p ON p.id=m.project_id WHERE i.project_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status IN ('queued','consumed') AND m.mode='manager' AND m.revision=? AND p.paused=0)",
+            params![project, origin, attachment["manager_revision"].as_i64()],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            allowed,
+            "The receipt's user source was stopped or superseded"
+        );
+        let p = db::project_by_key(c, project)?;
+        ensure!(
+            !work::has_takeover(c, project, &p.generation)?,
+            "Management reply is held by user takeover"
+        );
+        return Ok(());
+    }
     if attachment["manager_notice"] == true {
         let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN projects p ON p.id=m.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=? AND f.revision=m.revision AND m.mode='manager' AND p.paused=0)",params![project,attachment["manager_incident"].as_str(),attachment["manager_revision"].as_i64()],|r|r.get(0))?;
         ensure!(
@@ -713,13 +804,13 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
    },
    "worker_status"=>{ensure!(call.arguments==json!({}),"worker_status takes no arguments");let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs}))},
    "send_md"|"send_file"=>{
-    let (to,text,anchor,path)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;(a.to,a.text,a.reply_to_message_id,None)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path))};
+    let (to,text,anchor,path,receipt)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;ensure!(a.intent.is_some()||a.source_event_id.is_none(),"source_event_id is only used for a receipt");let receipt=a.intent.as_ref().map(|_|MessageArgs{to:a.to.clone(),text:a.text.clone(),reply_to_message_id:a.reply_to_message_id.clone(),intent:Some(MessageIntent::Receipt),source_event_id:a.source_event_id.clone()});(a.to,a.text,a.reply_to_message_id,None,receipt)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),None)};
     crate::feishu::recipient_type(&to)?;ensure!(!text.trim().is_empty()||path.is_some(),"Message content is empty");ensure!(text.len()<=131072,"Message is too large");
-    let context=ctx.clone();let request=effect.clone();let message=app.db.call(move|c|{let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;let mut attachment=json!({"to":to,"manager_effect":request});if let Some(anchor)=anchor {attachment["reply_to_message_id"]=json!(anchor);}
-    if let Some(path)=path {attachment["path"]=json!(path);}let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;tx.commit()?;Ok(id)}).await?;
+    let context=ctx.clone();let request=effect.clone();let (message,dispatch)=app.db.call(move|c|{let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;if let Some(receipt)=receipt {let queued=enqueue_receipt(&tx,&context,&request,&receipt)?;tx.commit()?;return Ok(queued);}let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;let mut attachment=json!({"to":to,"manager_effect":request});if let Some(anchor)=anchor {attachment["reply_to_message_id"]=json!(anchor);}
+    if let Some(path)=path {attachment["path"]=json!(path);}let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;tx.commit()?;Ok((id,true))}).await?;
     // The journal is committed before remote IO. Do not hold the project lock
     // across Feishu: fresh input and deterministic controls remain immediate.
-    drop(guard);let send_error=app.send_out(&message).await.err().map(|e|e.to_string());let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
+    drop(guard);let send_error=if dispatch {app.send_out(&message).await.err().map(|e|e.to_string())}else{None};let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
    },
    _=>bail!("This management tool is not available"),
   }
@@ -1217,9 +1308,9 @@ fn failure_notice(error: &Failure, delay: i64, repair: bool, chinese: bool) -> S
             String::new()
         };
         let repair = if repair {
-            "已安排原生编程智能体排查修复。"
+            "已安排排查恢复。"
         } else {
-            "原生智能体和修复控制仍可使用。"
+            "设置和修复入口仍可使用。"
         };
         return format!("{reason}。输入和执行记录均已保留。{retry}{repair}");
     }
@@ -1229,9 +1320,9 @@ fn failure_notice(error: &Failure, delay: i64, repair: bool, chinese: bool) -> S
         String::new()
     };
     let repair = if repair {
-        " A native Agent repair assignment has been prepared."
+        " Recovery has been scheduled for investigation."
     } else {
-        " Native Agent mode and repair controls remain available."
+        " Settings and repair controls remain available."
     };
     format!(
         "{}. Input and effect records are saved.{retry}{repair}",
@@ -1324,6 +1415,12 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
 pub fn stop(c: &Connection, project: &str) -> Result<()> {
     crate::cli_control::classify(c)?;
     work::sync_inbound(c)?;
+    // Do not resurrect a queued acknowledgement after Stop followed by resume.
+    // Sending/uncertain effects may already have happened and remain untouched.
+    c.execute(
+        "UPDATE messages SET status='failed',error='Stopped by the user',updated_at=? WHERE project_id=? AND direction='out' AND status='pending' AND json_extract(attachment,'$.manager_receipt_origin') IS NOT NULL",
+        params![db::now(), project],
+    )?;
     let repairs=c.prepare("SELECT id FROM work_events WHERE project_id=? AND source='management' AND status='queued' AND json_extract(payload,'$.repair_incident') IS NOT NULL")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for id in repairs {
         cancel_repair(c, &id, "Stopped by the user")?;
@@ -1460,6 +1557,230 @@ mod tests {
     }
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
+    }
+    fn receipt_args(anchor: &str) -> MessageArgs {
+        MessageArgs {
+            to: "oc_fixture".into(),
+            text: "收到，我先核对现状再给你结论。".into(),
+            reply_to_message_id: Some(anchor.into()),
+            intent: Some(MessageIntent::Receipt),
+            source_event_id: None,
+        }
+    }
+    #[test]
+    fn prompt_keeps_receipt_cohesion_disclosure_exceptions_and_truthful_failures_together() {
+        // These are the explicitly requested policy invariants, not an LLM quality test.
+        for policy in [
+            "优先用 send_md",
+            "intent=\"receipt\"",
+            "简单问题能直接完整回答时直接回答",
+            "同一任务的补充、纠正",
+            "默认保持任务整体",
+            "调研 A 和 B",
+            "并行开发互不依赖的 feature A、B、C",
+            "用户自然语言指定的组织方式优先",
+            "内部执行机制默认不对用户展示",
+            "唯一例外是用户明确询问架构",
+            "这些名称属于任务内容",
+            "不能因隐藏内部机制而隐瞒失败",
+        ] {
+            assert!(SYSTEM.contains(policy), "Missing policy: {policy}");
+        }
+        let mut failure = Failure::timeout();
+        failure.kind = "rate_limited".into();
+        for chinese in [false, true] {
+            let notice = failure_notice(&failure, 30_000, true, chinese);
+            assert!(!notice.contains("原生编程智能体"));
+            assert!(!notice.contains("native Agent"));
+            assert!(notice.contains("限流") || notice.contains("rate limited"));
+            assert!(notice.contains("保留") || notice.contains("saved"));
+        }
+    }
+    #[tokio::test]
+    async fn receipt_is_immutable_across_turns_and_does_not_redispatch_existing_states() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_receipt", "Please research A and B together.");
+        let (next, id, attachment) = app
+            .db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let first = claim(c, &p.id)?.unwrap();
+                let args = receipt_args("om_receipt");
+                let (id, fresh) = enqueue_receipt(c, &first.context, "original-effect", &args)?;
+                assert!(fresh);
+                let raw: String =
+                    c.query_row("SELECT attachment FROM messages WHERE id=?", [&id], |r| {
+                        r.get(0)
+                    })?;
+                let attachment: Value = serde_json::from_str(&raw)?;
+                input(
+                    c,
+                    &p.id,
+                    "new-observation",
+                    None,
+                    "worker",
+                    &json!({"status":"working"}),
+                )?;
+                let next = claim(c, &p.id)?.unwrap();
+                assert_ne!(first.context.run, next.context.run);
+                // The original receipt retains authority when its model checkpoint is superseded.
+                validate_outbox(c, &p.id, &attachment)?;
+                Ok((next, id, attachment))
+            })
+            .unwrap();
+        for status in ["pending", "sent", "uncertain", "failed"] {
+            app.db
+                .sync(|c| {
+                    c.execute(
+                        "UPDATE messages SET status=? WHERE id=?",
+                        params![status, id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let result = tool(&app, &next.context, ToolCall {
+                occurrence: format!("regenerated-{status}"), name: "send_md".into(),
+                arguments: json!({"to":"oc_fixture","text":"Different regenerated wording", "reply_to_message_id":"om_different", "intent":"receipt"}),
+            }).await.unwrap();
+            assert_eq!(result["outbox_id"], id);
+            assert_eq!(result["status"], status);
+        }
+        app.db
+            .sync(|c| {
+                let (text, raw): (String, String) = c.query_row(
+                    "SELECT content,attachment FROM messages WHERE id=?",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                assert_eq!(text, receipt_args("om_receipt").text);
+                assert_eq!(serde_json::from_str::<Value>(&raw)?, attachment);
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM messages WHERE direction='out'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn receipts_are_source_scoped_and_reject_worker_local_or_foreign_targets() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_scope", "Task");
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let turn = claim(c, &p.id)?.unwrap();
+                let mut args = receipt_args("om_scope");
+                args.to = "oc_foreign".into();
+                assert!(enqueue_receipt(c, &turn.context, "bad-target", &args).is_err());
+                args.to = "oc_fixture".into();
+                args.reply_to_message_id = Some("om_foreign".into());
+                assert!(enqueue_receipt(c, &turn.context, "bad-anchor", &args).is_err());
+                args.reply_to_message_id = Some("om_scope".into());
+                args.source_event_id = Some("invented-event".into());
+                assert!(enqueue_receipt(c, &turn.context, "bad-origin", &args).is_err());
+                args.source_event_id = None;
+                for kind in ["worker", "schedule"] {
+                    c.execute(
+                        "UPDATE manager_inputs SET kind=? WHERE project_id=?",
+                        params![kind, p.id],
+                    )?;
+                    assert!(enqueue_receipt(c, &turn.context, "non-user-ack", &args).is_err());
+                }
+                c.execute(
+                    "UPDATE manager_inputs SET kind='user' WHERE project_id=?",
+                    [&p.id],
+                )?;
+                c.execute(
+                    "UPDATE messages SET attachment='{}' WHERE direction='in' AND project_id=?",
+                    [&p.id],
+                )?;
+                assert!(enqueue_receipt(c, &turn.context, "local-ack", &args).is_err());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM messages WHERE direction='out'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn receipt_pause_takeover_and_stop_cannot_resurrect_a_consumed_inputs_pending_ack() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_stop_receipt", "Task");
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let first = claim(c, &p.id)?.unwrap();
+                let (id, _) = enqueue_receipt(
+                    c,
+                    &first.context,
+                    "receipt-effect",
+                    &receipt_args("om_stop_receipt"),
+                )?;
+                let raw: String =
+                    c.query_row("SELECT attachment FROM messages WHERE id=?", [&id], |r| {
+                        r.get(0)
+                    })?;
+                let attachment: Value = serde_json::from_str(&raw)?;
+                c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
+                assert!(validate_outbox(c, &p.id, &attachment).is_err());
+                c.execute(
+                    "UPDATE projects SET paused=0,generation='g' WHERE id=?",
+                    [&p.id],
+                )?;
+                work::set_takeover(c, &p.id, "g", true, db::now())?;
+                assert!(validate_outbox(c, &p.id, &attachment).is_err());
+                work::set_takeover(c, &p.id, "g", false, db::now())?;
+                finish_turn(c, &first.context, "done")?;
+                validate_outbox(c, &p.id, &attachment)?;
+                let tx = c.unchecked_transaction()?;
+                stop(&tx, &p.id)?;
+                tx.commit()?;
+                c.execute("UPDATE projects SET paused=0 WHERE id=?", [&p.id])?;
+                input(
+                    c,
+                    &p.id,
+                    "worker-after-stop",
+                    attachment["manager_receipt_origin"].as_str(),
+                    "worker",
+                    &json!({"status":"done"}),
+                )?;
+                let after_stop = claim(c, &p.id)?.unwrap();
+                let (same, dispatch) = enqueue_receipt(
+                    c,
+                    &after_stop.context,
+                    "late-receipt",
+                    &receipt_args("om_stop_receipt"),
+                )?;
+                assert_eq!(same, id);
+                assert!(!dispatch);
+                // Even if a later turn still references the original source, the stable failed
+                // outbox entry is never requeued and send_out will never dispatch it again.
+                assert_eq!(
+                    c.query_row("SELECT status FROM messages WHERE id=?", [&id], |r| r
+                        .get::<_, String>(0))?,
+                    "failed"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM messages WHERE direction='out'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
     }
     #[tokio::test]
     async fn failures_are_incident_scoped_backoff_survives_observations_and_valid_response_recovers()
