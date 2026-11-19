@@ -16,7 +16,16 @@ pub(crate) struct CloseArgs {
 }
 
 pub(crate) fn migrate(c: &Connection, recover: bool) -> Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_close_audit(effect_id TEXT PRIMARY KEY REFERENCES manager_effects(id), project_id TEXT NOT NULL, manager_run TEXT NOT NULL, target_generation TEXT NOT NULL, terminal_id TEXT NOT NULL, reason TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_close_audit(effect_id TEXT PRIMARY KEY REFERENCES manager_effects(id) ON DELETE CASCADE, project_id TEXT NOT NULL, manager_run TEXT NOT NULL, target_generation TEXT NOT NULL, terminal_id TEXT NOT NULL, reason TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);")?;
+    // Existing stores predate the project-lifetime cascade. Rebuild inside the
+    // caller's migration transaction, retaining every audit field verbatim.
+    let cascade: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('manager_close_audit') WHERE [table]='manager_effects' AND [from]='effect_id' AND on_delete='CASCADE')", [], |r|r.get(0))?;
+    if !cascade {
+        c.execute_batch("CREATE TABLE manager_close_audit_cascade(effect_id TEXT PRIMARY KEY REFERENCES manager_effects(id) ON DELETE CASCADE, project_id TEXT NOT NULL, manager_run TEXT NOT NULL, target_generation TEXT NOT NULL, terminal_id TEXT NOT NULL, reason TEXT NOT NULL, evidence TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+            INSERT INTO manager_close_audit_cascade SELECT * FROM manager_close_audit;
+            DROP TABLE manager_close_audit;
+            ALTER TABLE manager_close_audit_cascade RENAME TO manager_close_audit;")?;
+    }
     if recover {
         c.execute("UPDATE manager_close_audit SET status='uncertain' WHERE status IN ('checking','submitting')", [])?;
     }
@@ -53,7 +62,7 @@ fn guard(c: &Connection, p: &Project, generation: &str, terminal: &str) -> Resul
         !crate::cli_switch::latest(c, &p.id)?.is_some_and(|r| r.holds_input),
         "A CLI transition still owns execution delivery"
     );
-    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND status NOT IN ('settled','completed','cancelled')) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR json_extract(payload,'$.target_generation') IS NULL)) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status IN ('queued','processing') AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
+    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND (finished_at IS NULL OR status NOT IN ('settled','completed','cancelled','interrupted','failed'))) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR json_extract(payload,'$.target_generation') IS NULL)) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status IN ('queued','processing') AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
     ensure!(
         !active,
         "Pending or uncertain work still refers to this execution"
@@ -260,6 +269,156 @@ mod tests {
         }).unwrap();
         let p = app.db.project(&p.id).await.unwrap();
         (dir, app, p)
+    }
+    fn audit_rows(c: &Connection) -> Result<Vec<Vec<rusqlite::types::Value>>> {
+        Ok(
+            c.prepare("SELECT * FROM manager_close_audit ORDER BY effect_id")?
+                .query_map([], |r| (0..10).map(|index| r.get(index)).collect())?
+                .collect::<rusqlite::Result<_>>()?,
+        )
+    }
+    #[tokio::test]
+    async fn project_removal_cascades_audits_and_notes_after_fresh_and_legacy_migration() {
+        for legacy in [false, true] {
+            let (_dir, app, p) = fixture().await;
+            let path = app.dir.join("bridge.sqlite3");
+            let before=app.db.sync(|c| {
+                if legacy {
+                    // Reconstruct the actually shipped constraints in a private
+                    // production store, then reopen through Db's outer transaction.
+                    for table in ["manager_close_audit","manager_turn_notes"] {
+                        let sql:String=c.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",[table],|r|r.get(0))?;
+                        c.execute_batch(&format!("DROP TABLE {table}; {}",sql.replace(" ON DELETE CASCADE","")))?;
+                    }
+                }
+                c.execute("UPDATE projects SET terminal=NULL WHERE id=?",[&p.id])?;
+                c.execute("INSERT INTO manager_turn_notes(run_id,note) VALUES('close-run','preserve this decision verbatim')",[])?;
+                for status in ["refused","uncertain","checking"] {
+                    let effect=format!("audit-{status}");
+                    c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES(?,'close-run',?,'close_agent','{}','complete')",params![effect,status])?;
+                    c.execute("INSERT INTO manager_close_audit(effect_id,project_id,manager_run,target_generation,terminal_id,reason,evidence,status,created_at,updated_at) VALUES(?,?,'close-run',?,'old-terminal','retain reason','{\"proof\":\"unchanged\"}',?,17,23)",params![effect,p.id,OLD,status])?;
+                }
+                audit_rows(c)
+            }).unwrap();
+            drop(app);
+            let db = db::Db::open_handover(&path).unwrap();
+            db.sync(|c| {
+                assert_eq!(audit_rows(c)?, before);
+                assert_eq!(
+                    c.query_row("SELECT note FROM manager_turn_notes", [], |r| r
+                        .get::<_, String>(0))?,
+                    "preserve this decision verbatim"
+                );
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+            drop(db);
+            let db = db::Db::open(&path).unwrap();
+            db.sync(|c| {
+                assert_eq!(c.query_row("SELECT status FROM manager_close_audit WHERE effect_id='audit-checking'",[],|r|r.get::<_,String>(0))?,"uncertain");
+                assert_eq!(c.query_row("SELECT evidence FROM manager_close_audit WHERE effect_id='audit-uncertain'",[],|r|r.get::<_,String>(0))?,r#"{"proof":"unchanged"}"#);
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_close_audit",[],|r|r.get::<_,i64>(0))?,3);
+                Ok(())
+            }).unwrap();
+            db.remove_project(&p.id).await.unwrap();
+            db.sync(|c| {
+                for table in [
+                    "projects",
+                    "manager_runs",
+                    "manager_effects",
+                    "manager_close_audit",
+                    "manager_turn_notes",
+                ] {
+                    assert_eq!(
+                        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+    fn delivery_input(c: &Connection, p: &Project) -> Result<work::Event> {
+        c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('delivery-input',?,'in','om_delivery','fixture','queued',1,1)",[&p.id])?;
+        work::sync_inbound(c)?;
+        work::events(c, &p.id)?
+            .into_iter()
+            .find(|event| event.message_id.as_deref() == Some("delivery-input"))
+            .context("Missing delivery event")
+    }
+    #[tokio::test]
+    async fn resolved_delivery_attempts_allow_close_but_active_and_uncertain_work_do_not() {
+        for resolution in ["retry", "dismiss", "failed"] {
+            let (_dir, app, p) = fixture().await;
+            app.db
+                .sync(|c| {
+                    let event = delivery_input(c, &p)?;
+                    let first = work::claim_next(c, &p.id, OLD, 2)?.unwrap();
+                    assert!(guard(c, &p, OLD, "old-terminal").is_err());
+                    work::delivery(c, &first.id, "queued", "Definitely not submitted", 3)?;
+                    assert_eq!(work::run(c, &p.id, &first.id)?.status, "interrupted");
+                    assert!(work::run(c, &p.id, &first.id)?.finished_at.is_some());
+                    assert!(
+                        guard(c, &p, OLD, "old-terminal").is_err(),
+                        "Queued retry still protects the target"
+                    );
+                    let next = work::claim_next(c, &p.id, OLD, 4)?.unwrap();
+                    match resolution {
+                        "retry" => {
+                            work::delivery(c, &next.id, "submitted", "", 5)?;
+                            assert!(guard(c, &p, OLD, "old-terminal").is_err());
+                            work::observe_idle(c, &p.id, OLD, None, 3006)?;
+                            assert_eq!(work::run(c, &p.id, &next.id)?.status, "settled");
+                        }
+                        "dismiss" => {
+                            work::delivery(c, &next.id, "uncertain", "Ambiguous submission", 5)?;
+                            assert!(guard(c, &p, OLD, "old-terminal").is_err());
+                            work::resolve_event(c, &p.id, &event.id, false, 6)?;
+                            assert_eq!(work::run(c, &p.id, &next.id)?.status, "interrupted");
+                        }
+                        "failed" => {
+                            work::delivery(
+                                c,
+                                &next.id,
+                                "failed",
+                                "Definitely failed before submission",
+                                5,
+                            )?;
+                            assert_eq!(work::run(c, &p.id, &next.id)?.status, "failed");
+                            work::resolve_event(c, &p.id, &event.id, false, 6)?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        guard(c, &p, OLD, "old-terminal").is_ok(),
+                        "Finished historical attempts must not pin the execution forever"
+                    );
+                    // Unknown/unfinished terminal records and explicit uncertainty
+                    // remain blockers, even if an inconsistent timestamp is present.
+                    c.execute(
+                        "UPDATE work_runs SET status='interrupted',finished_at=NULL WHERE id=?",
+                        [&first.id],
+                    )?;
+                    assert!(guard(c, &p, OLD, "old-terminal").is_err());
+                    c.execute(
+                        "UPDATE work_runs SET status='uncertain',finished_at=7 WHERE id=?",
+                        [&first.id],
+                    )?;
+                    assert!(guard(c, &p, OLD, "old-terminal").is_err());
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
     fn authority(p: &Project) -> crate::manager::Context {
         crate::manager::Context {
