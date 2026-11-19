@@ -274,23 +274,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cli = dir.path().join("codex-fixture");
         let script = format!(
-            r##"#!/usr/bin/env python3
-import sys,json,os
-from pathlib import Path
-base=Path(__file__).parent
-if '--version' in sys.argv:
- print('codex-cli '+('0.1.0' if (base/'unsupported').exists() else '0.169.1'));sys.exit(0)
-with (base/'starts').open('a') as f:f.write(str(os.getpid())+'\n')
-for line in sys.stdin:
- q=json.loads(line)
- with (base/'requests').open('a') as f:f.write(json.dumps(q)+'\n')
- if 'id' not in q:continue
- if q['method']=='initialize':result={{}}
- elif q['method']=='thread/list':
-  assert q['params']=={{'ancestorThreadId':'{ROOT}','useStateDbOnly':True,'limit':127,'sourceKinds':['subAgentThreadSpawn'],'archived':False}}
-  result={{'data':[{{'id':'{CHILD}','parentThreadId':'{ROOT}','agentNickname':'fixture reviewer','preview':'NEVER EXPORT PRIVATE CONTENT'}}],'nextCursor':None}}
- else:raise AssertionError(q['method'])
- print(json.dumps({{'id':q['id'],'result':result}}),flush=True)
+            r##"#!/bin/sh
+# No interpreter or external command may be resolved through the caller's PATH.
+PATH=''
+export PATH
+base=${{0%/*}}
+if [ "${{1-}}" = '--version' ]; then
+    if [ -f "$base/unsupported" ]; then
+        printf '%s\n' 'codex-cli 0.1.0'
+    else
+        printf '%s\n' 'codex-cli 0.169.1'
+    fi
+    exit 0
+fi
+printf '%s\n' "$$" >> "$base/starts"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$base/requests"
+    case "$line" in
+        *'"id":'*)
+            id=${{line#*'"id":'}}
+            id=${{id%%[!0-9]*}}
+            [ -n "$id" ] || exit 1
+            ;;
+        *) continue ;;
+    esac
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{{"id":%s,"result":{{}}}}\n' "$id"
+            ;;
+        *'"method":"thread/list"'*)
+            printf '{{"id":%s,"result":{{"data":[{{"id":"{CHILD}","parentThreadId":"{ROOT}","agentNickname":"fixture reviewer","preview":"NEVER EXPORT PRIVATE CONTENT"}}],"nextCursor":null}}}}\n' "$id"
+            ;;
+        *) exit 1 ;;
+    esac
+done
 "##
         );
         std::fs::write(&cli, script).unwrap();
@@ -315,13 +332,28 @@ for line in sys.stdin:
         let starts = std::fs::read_to_string(dir.path().join("starts")).unwrap();
         assert_eq!(starts.lines().count(), 1, "UI polls reuse one owned helper");
         let requests = std::fs::read_to_string(dir.path().join("requests")).unwrap();
+        let requests: Vec<Value> = requests
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(
             requests
-                .lines()
-                .filter(|line| line.contains("thread/list"))
-                .count(),
-            2
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "initialized", "thread/list", "thread/list"]
         );
+        let lists: Vec<_> = requests
+            .iter()
+            .filter(|request| request["method"] == "thread/list")
+            .collect();
+        assert_eq!(lists.len(), 2);
+        for request in lists {
+            assert_eq!(
+                request["params"],
+                json!({"ancestorThreadId":ROOT,"useStateDbOnly":true,"limit":127,"sourceKinds":["subAgentThreadSpawn"],"archived":false})
+            );
+        }
         let key = format!(
             "{}:{}:{}",
             cli.display(),
