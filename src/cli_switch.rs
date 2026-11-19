@@ -556,6 +556,35 @@ async fn artifact(p: &Project) -> Result<Option<String>> {
         _ => anyhow::bail!("{}", content.message),
     }
 }
+/// Accept a native CLI selection while the caller owns the project lock and
+/// transaction. This shares the ordinary UI handoff and delivery-lock path.
+pub(crate) fn request(c: &Connection, p: &Project, target: &str) -> Result<Option<Request>> {
+    ensure!(["codex", "claude", "pi", "agy"].contains(&target),
+        "Unsupported target CLI; choose codex, claude, pi, or agy");
+    ensure!(!p.paused, "Resume this project before changing its CLI");
+    ensure!(!App::update_required(p),
+        "Recover this project after its service update before changing the CLI");
+    ensure!(!work::has_takeover(c, &p.id, &p.generation)?,
+        "Release terminal input before changing the CLI");
+    let previous = latest(c, &p.id)?;
+    if let Some(r) = previous.as_ref().filter(|r| active(r)) {
+        ensure!(r.target == target,
+            "A CLI handoff is already in progress; review its result before starting another");
+        c.execute("UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?", [&r.id])?;
+        return latest(c, &p.id);
+    }
+    let retry = p.agent == target && p.terminal.is_none()
+        && previous.as_ref().is_some_and(|r| r.phase == "startup_failed" && r.target == target);
+    if p.agent == target && !retry { return Ok(None); }
+    let initial_phase = if retry { "starting" } else { "preparing" };
+    let mut source = json!({"agent":p.agent,"native_session":p.native_session,
+        "extra_args":p.extra_args,"generation":p.generation});
+    source["selection"] = json!(crate::models::load(c, &p.id, &p.agent)?);
+    c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,?,?,?,1,?,?)",
+        params![db::id(),p.id,target,initial_phase,p.generation,db::now(),source.to_string(),db::now()])?;
+    latest(c, &p.id)
+}
+
 impl App {
     pub(crate) async fn cli_switch_bootstrap(&self, project: &str) -> Result<String> {
         let id = project.to_owned();
@@ -726,64 +755,18 @@ impl App {
     }
 
     pub async fn request_cli_switch(self: &Arc<Self>, key: &str, target: &str) -> Result<Project> {
-        ensure!(
-            ["codex", "claude", "pi", "agy"].contains(&target),
-            "Choose Codex, Claude Code, Pi, or Antigravity"
-        );
         let p = self.db.project(key).await?;
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
         let p = self.db.project(&p.id).await?;
-        ensure!(!p.paused, "Resume this project before changing its CLI");
-        ensure!(
-            !Self::update_required(&p),
-            "Recover this project after its service update before changing the CLI"
-        );
-        let id = p.id.clone();
-        let generation = p.generation.clone();
-        self.db
-            .call(move |c| {
-                ensure!(
-                    !work::has_takeover(c, &id, &generation)?,
-                    "Release terminal input before changing the CLI"
-                );
-                Ok(())
-            })
-            .await?;
-        let id = p.id.clone();
-        let previous = self.db.call(move |c| latest(c, &id)).await?;
-        if let Some(r) = previous.as_ref().filter(|r| active(r)) {
-            ensure!(
-                r.target == target,
-                "A CLI handoff is already in progress; review its result before starting another"
-            );
-            let id = r.id.clone();
-            self.db
-                .call(move |c| {
-                    c.execute(
-                        "UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?",
-                        [id],
-                    )?;
-                    Ok(())
-                })
-                .await?;
-            self.notify.notify_one();
-            return Ok(p);
-        }
-        let retry = p.agent == target
-            && p.terminal.is_none()
-            && previous
-                .as_ref()
-                .is_some_and(|r| r.phase == "startup_failed" && r.target == target);
-        if p.agent == target && !retry {
-            return Ok(p);
-        }
-        let initial_phase = if retry { "starting" } else { "preparing" };
-        let id = p.id.clone();
+        let current = p.clone();
         let target = target.to_owned();
-        let generation = p.generation.clone();
-        let mut source = json!({"agent":p.agent,"native_session":p.native_session,"extra_args":p.extra_args,"generation":p.generation});
-        self.db.call(move|c|{let tx=c.unchecked_transaction()?;source["selection"]=json!(crate::models::load(&tx,&id,source["agent"].as_str().unwrap_or(""))?);tx.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source,phase_started_at) VALUES(?,?,?,?,?,?,1,?,?)",params![db::id(),id,target,initial_phase,generation,db::now(),source.to_string(),db::now()])?;tx.commit()?;Ok(())}).await?;
+        self.db.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            request(&tx, &current, &target)?;
+            tx.commit()?;
+            Ok(())
+        }).await?;
         self.notify.notify_one();
         Ok(p)
     }
