@@ -5,6 +5,7 @@ mod agent_tree;
 mod backend;
 mod finder;
 mod locale;
+mod manager_context;
 mod manager_settings;
 #[cfg(target_os = "macos")]
 mod menubar;
