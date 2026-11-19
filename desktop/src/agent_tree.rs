@@ -268,25 +268,87 @@ pub fn project_target(node: &Node, projects: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Continuation lines follow the reference's depth-first rows. Geometry is
-/// native GPUI borders, so indentation does not depend on font box glyphs.
-pub fn branches(row: &Row<'_>, palette: crate::ui_theme::Palette) -> Div {
-    let mut lines = div().flex().h_full().items_center().flex_shrink_0();
-    if row.branches.len() > 3 {
-        lines = lines.child(div().w(px(12.)).text_size(px(10.)).child("…"));
+/// One prefix plan is shared by leaves and expandable rows. Reserving the
+/// disclosure column prevents a leaf's icon/name from moving left at the same depth.
+#[derive(Debug, PartialEq)]
+pub struct RowLayout {
+    pub expandable: bool,
+    pub continuations: Vec<bool>,
+    pub compressed: bool,
+    pub elbow: bool,
+    pub left_padding: f32,
+    pub extends_below: bool,
+    pub elbow_y: f32,
+    pub branch_column: f32,
+    pub disclosure_width: f32,
+}
+
+pub fn row_layout(
+    ancestors: &[bool],
+    last: bool,
+    expandable: bool,
+    height: f32,
+    row_width: f32,
+    preferred_padding: f32,
+) -> RowLayout {
+    // Disclosure (20), CLI icon (18), status (16), four gaps (16), right
+    // padding (8) and up to 24 pixels of name take precedence over ancestry.
+    let width = if row_width.is_finite() { row_width.max(0.) } else { 0. };
+    let prefix_budget = (width - 78. - 24.).max(0.);
+    let left_padding = preferred_padding.max(0.).min((prefix_budget - 12.).max(0.));
+    let capacity = ((prefix_budget - left_padding) / 12.).floor().min(5.) as usize;
+    let compressed = ancestors.len() + 1 > capacity && !ancestors.is_empty();
+    let elbow = capacity > usize::from(compressed);
+    let visible = capacity.saturating_sub(usize::from(compressed) + usize::from(elbow));
+    RowLayout {
+        expandable,
+        continuations: ancestors[ancestors.len().saturating_sub(visible)..].to_vec(),
+        compressed: compressed && capacity > 0,
+        elbow,
+        left_padding,
+        extends_below: !last,
+        elbow_y: height / 2.,
+        branch_column: 12.,
+        disclosure_width: 20.,
     }
-    for continuing in row
-        .branches
-        .iter()
-        .skip(row.branches.len().saturating_sub(3))
-    {
-        lines = lines.child(div().w(px(12.)).h_full().when(*continuing, |line| {
+}
+
+impl RowLayout {
+    pub fn connector_width(&self) -> f32 {
+        (self.continuations.len() + usize::from(self.compressed) + usize::from(self.elbow)) as f32 * self.branch_column
+    }
+}
+
+pub fn disclosure(layout: &RowLayout) -> Div {
+    div()
+        .w(px(layout.disclosure_width))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+}
+
+/// Continuation lines follow depth-first rows. Geometry is native GPUI borders,
+/// so indentation does not depend on font box glyphs or disclosure availability.
+pub fn branches(layout: &RowLayout, palette: crate::ui_theme::Palette) -> Div {
+    let mut lines = div()
+        .w(px(layout.connector_width()))
+        .flex()
+        .h_full()
+        .items_center()
+        .flex_shrink_0();
+    if layout.compressed {
+        lines = lines.child(div().w(px(layout.branch_column)).text_size(px(10.)).child("…"));
+    }
+    for continuing in &layout.continuations {
+        lines = lines.child(div().w(px(layout.branch_column)).h_full().when(*continuing, |line| {
             line.border_l_1().border_color(rgb(palette.line))
         }));
     }
-    lines.child(
+    lines.when(layout.elbow, |lines| lines.child(
         div()
-            .w(px(12.))
+            .w(px(layout.branch_column))
             .h_full()
             .relative()
             .child(
@@ -294,32 +356,84 @@ pub fn branches(row: &Row<'_>, palette: crate::ui_theme::Palette) -> Div {
                     .absolute()
                     .top_0()
                     .left_0()
-                    .h(px(13.))
+                    .h(px(layout.elbow_y))
                     .w(px(8.))
                     .border_l_1()
                     .border_b_1()
                     .border_color(rgb(palette.line))
                     .rounded_bl(px(4.)),
             )
-            .when(!row.last, |line| {
+            .when(layout.extends_below, |line| {
                 line.child(
                     div()
                         .absolute()
                         .left_0()
-                        .top(px(13.))
+                        .top(px(layout.elbow_y))
                         .bottom_0()
                         .border_l_1()
                         .border_color(rgb(palette.line)),
                 )
             }),
-    )
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, Tree, project_target};
+    use super::{Node, Tree, project_target, row_layout};
     use serde_json::{Value, json};
     use std::collections::HashSet;
+
+    #[test]
+    fn leaves_and_expandable_siblings_reserve_the_same_disclosure_column() {
+        let leaf = row_layout(&[true, false], false, false, 26., 304., 28.);
+        let branch = row_layout(&[true, false], false, true, 26., 304., 28.);
+        assert!(!leaf.expandable && branch.expandable);
+        assert_eq!(leaf.connector_width(), branch.connector_width());
+        assert_eq!(leaf.disclosure_width, branch.disclosure_width);
+        // Neither icon nor name positioning may depend on the presence of a toggle.
+        assert_eq!(
+            leaf.connector_width() + leaf.disclosure_width,
+            branch.connector_width() + branch.disclosure_width
+        );
+    }
+
+    #[test]
+    fn compressed_branch_geometry_preserves_recent_continuations_and_row_midpoint() {
+        let deep = row_layout(&[true, false, true, false, true], true, false, 26., 304., 48.);
+        assert!(deep.compressed);
+        assert_eq!(deep.continuations, [true, false, true]);
+        assert!(!deep.extends_below);
+        assert_eq!(deep.elbow_y, 13.);
+        assert_eq!(deep.connector_width(), 60.);
+        let worker = row_layout(&[], true, true, 28., 304., 28.);
+        assert_eq!(worker.elbow_y, 14.);
+        assert!(!worker.compressed && worker.continuations.is_empty());
+        let sibling = row_layout(&[false], false, true, 26., 304., 28.);
+        assert!(sibling.extends_below);
+        assert_eq!(sibling.continuations, [false]);
+    }
+
+    #[test]
+    fn narrow_rows_compress_ancestry_before_displacing_names_and_status() {
+        for width in [100., 152., 208., 304.] {
+            for padding in [28., 48.] {
+                for depth in [0, 1, 3, 8, 64] {
+                    let layout = row_layout(&vec![true; depth], false, true, 26., width, padding);
+                    // The production row reserves the same disclosure/icon/status/gaps
+                    // whether or not a disclosure toggle exists.
+                    let occupied = layout.left_padding + layout.connector_width() + 78.;
+                    assert!(occupied <= width);
+                    assert!(layout.left_padding <= padding);
+                    if width >= 102. {
+                        assert!(width - occupied >= 24.);
+                    }
+                }
+            }
+        }
+        let minimum = row_layout(&[true; 8], true, false, 26., 152., 48.);
+        assert!(minimum.compressed && minimum.continuations.is_empty());
+        assert!(!minimum.elbow);
+    }
 
     #[test]
     fn preserves_nested_identity_and_folded_sibling_branches() {
