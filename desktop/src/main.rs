@@ -1195,6 +1195,33 @@ impl Desktop {
             if project["lifecycle"] == "update_required" {
                 body = body.child(self.card("Update pending", "This project is waiting for a compatible update. Its conversation and saved messages are preserved."));
             }
+            let debug_project = id.clone();
+            let debug_mode = project["debug_mode"] == true;
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new("project-debug")
+                            .child(control_label(self.tr("Manager prompt debug")))
+                            .selected(debug_mode)
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.api(
+                                    "POST",
+                                    format!("/projects/{debug_project}/debug"),
+                                    Some(json!({"debug_mode":!debug_mode})),
+                                    "Debug setting saved",
+                                )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(palette.muted))
+                            .child(self.tr("When enabled, the full manager prompt is visible to participants in its Feishu discussion.")),
+                    ),
+            );
             let pause = id.clone();
             let paused = project["paused"].as_bool().unwrap_or(false);
             body = body.child(

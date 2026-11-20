@@ -88,6 +88,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/projects/{id}/documents/{document}", get(project_document))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
+        .route("/projects/{id}/debug", post(project_debug))
         .route("/projects/{id}/show", post(show))
         .route("/projects/{id}/screen", get(screen))
         .route("/projects/{id}/terminal", get(show))
@@ -688,6 +689,18 @@ async fn pause(
     app.notify.notify_one();
 
     Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+struct ProjectDebug {
+    debug_mode: bool,
+}
+async fn project_debug(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<ProjectDebug>,
+) -> ApiResult {
+    app.db.set_debug_mode(&id, input.debug_mode).await?;
+    Ok(Json(json!({"debug_mode":input.debug_mode})))
 }
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     Ok(Json(app.show(&id).await?))

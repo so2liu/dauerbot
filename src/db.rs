@@ -133,6 +133,8 @@ pub struct Project {
     pub agent: String,
     pub chat_id: String,
     pub paused: bool,
+    #[serde(default)]
+    pub debug_mode: bool,
     pub terminal: Option<String>,
     pub terminal_pid: Option<i64>,
     pub generation: String,
@@ -203,9 +205,10 @@ fn project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(12)?,
         mcp_token: row.get(13)?,
         execution: serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
+        debug_mode: row.get(15)?,
     })
 }
-const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token,execution";
+const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token,execution,debug_mode";
 fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: row.get(0)?,
@@ -356,7 +359,7 @@ impl Db {
               terminal TEXT, terminal_pid INTEGER, generation TEXT NOT NULL DEFAULT '',
               ready INTEGER NOT NULL DEFAULT 0, native_session TEXT NOT NULL DEFAULT '',
               extra_args TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, mcp_token TEXT NOT NULL,
-              execution TEXT NOT NULL DEFAULT 'null');
+              execution TEXT NOT NULL DEFAULT 'null', debug_mode INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS messages (
               id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
               direction TEXT NOT NULL, source_id TEXT NOT NULL, content TEXT NOT NULL,
@@ -378,6 +381,16 @@ impl Db {
         )?;
         if has_enabled {
             migration.execute_batch("ALTER TABLE projects DROP COLUMN enabled;")?;
+        }
+        let has_debug_mode: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name='debug_mode')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_debug_mode {
+            migration.execute_batch(
+                "ALTER TABLE projects ADD COLUMN debug_mode INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         crate::conversation::migrate(&migration)?;
         crate::discussion::migrate(&migration, recover)?;
@@ -490,6 +503,17 @@ impl Db {
             c.execute(
                 "UPDATE projects SET paused=? WHERE id=?",
                 params![value, key],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn set_debug_mode(&self, key: &str, value: bool) -> Result<()> {
+        let id = self.project(key).await?.id;
+        self.call(move |c| {
+            c.execute(
+                "UPDATE projects SET debug_mode=? WHERE id=?",
+                params![value, id],
             )?;
             Ok(())
         })

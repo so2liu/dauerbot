@@ -616,6 +616,11 @@ impl Language {
             "Add a project, choose an agent, and start your main session." => {
                 "添加项目，选择 Agent，然后启动主会话。"
             }
+            "Manager prompt debug" => "调试 Manager 提示词",
+            "Debug setting saved" => "调试设置已保存",
+            "When enabled, the full manager prompt is visible to participants in its Feishu discussion." => {
+                "开启后，飞书讨论的参与者可看到完整的 Manager 提示词。"
+            }
             "Delivery paused" => "已暂停接收",
             "Exited" => "已退出",
             "Needs input" => "等待操作",

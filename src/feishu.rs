@@ -236,6 +236,115 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
     Ok(receipt)
 }
 
+fn debug_reply_body(text: &str) -> Value {
+    json!({"msg_type":"text","content":json!({"text":text}).to_string(),"reply_in_thread":true})
+}
+
+fn debug_reply_parts(prompt: &str) -> Vec<Value> {
+    const BODY_LIMIT: usize = 60_000;
+    // Leave room for both JSON wrappers and the part number.
+    const TEXT_BUDGET: usize = BODY_LIMIT - 256;
+    let single = debug_reply_body(prompt);
+    if single.to_string().len() <= BODY_LIMIT {
+        return vec![single];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = prompt;
+    while !remaining.is_empty() {
+        let mut bytes = 0;
+        let mut end = remaining.len();
+        let mut newline = 0;
+        for (index, ch) in remaining.char_indices() {
+            bytes += match ch {
+                '"' | '\\' => 4,
+                ch if ch.is_ascii_control() => 7,
+                ch => ch.len_utf8(),
+            };
+            if bytes > TEXT_BUDGET {
+                end = if newline > 0 { newline } else { index };
+                break;
+            }
+            if ch == '\n' {
+                newline = index + 1;
+            }
+        }
+        chunks.push(&remaining[..end]);
+        remaining = &remaining[end..];
+    }
+    let total = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| debug_reply_body(&format!("[debug {}/{}]\n{text}", index + 1, total)))
+        .collect()
+}
+
+/// Echo a prompt without writing its message, outbox or worker observation to the store.
+/// Feishu clients may still render markup present in the original plain text.
+pub async fn send_debug_reply(
+    app: &App,
+    project: &str,
+    bot_app_id: &str,
+    to: &str,
+    anchor: &str,
+    prompt: &str,
+) -> Result<()> {
+    recipient_type(to)?;
+    anyhow::ensure!(
+        anchor.starts_with("om_")
+            && anchor.len() <= 200
+            && anchor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Invalid debug reply anchor"
+    );
+    let parts = debug_reply_parts(prompt);
+    let total = parts.len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let authorization = tokio::time::timeout_at(deadline, async {
+        let binding = app.db.bot(project).await?;
+        anyhow::ensure!(binding.app_id == bot_app_id, "Feishu bot changed");
+        let base = app.config.read().await.feishu_base.clone();
+        let token = token(app, &binding).await?;
+        Ok::<_, anyhow::Error>((base, token))
+    })
+    .await;
+    let Ok(Ok((base, token))) = authorization else {
+        bail!("Debug reply stopped after 0/{total} parts: Feishu authorization unavailable");
+    };
+
+    for (sent, body) in parts.into_iter().enumerate() {
+        let response = tokio::time::timeout_at(deadline, async {
+            let response = app
+                .http
+                .post(format!("{base}/open-apis/im/v1/messages/{anchor}/reply"))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|_| anyhow::anyhow!("Feishu transport failed"))?;
+            let status = response.status();
+            let data = api_json(response)
+                .await
+                .map_err(|_| anyhow::anyhow!("Feishu API rejected the reply (HTTP {status})"))?;
+            let receipt = SendReceipt::from_response(&data)?;
+            anyhow::ensure!(
+                !receipt.thread_id.is_empty(),
+                "Feishu did not confirm a topic reply"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        match response {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("Debug reply stopped after {sent}/{total} parts: {error}"),
+            Err(_) => bail!("Debug reply stopped after {sent}/{total} parts: timed out"),
+        }
+    }
+    Ok(())
+}
+
 pub fn allowed_file(p: &db::Project, path: &Path, data_dir: &Path) -> Result<PathBuf> {
     let absolute = std::fs::canonicalize(if path.is_absolute() {
         path.to_owned()
@@ -1138,4 +1247,32 @@ pub(crate) async fn progress_message(
         "Feishu progress reply has no topic receipt"
     );
     Ok(ProgressDelivery::Sent(receipt.message_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_parts_preserve_utf8_and_escaped_bytes_under_wire_budget() {
+        let payload = "行\u{0001} \\ \" <at user_id=\"example\">text</at> &\n".repeat(4500);
+        assert!(payload.len() > 150_000);
+        let parts = debug_reply_parts(&payload);
+        assert!(parts.len() > 1);
+        let mut reconstructed = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            assert!(serde_json::to_vec(part).unwrap().len() <= 60_000);
+            let content: Value = serde_json::from_str(part["content"].as_str().unwrap()).unwrap();
+            let header = format!("[debug {}/{}]\n", index + 1, parts.len());
+            // This verifies API payload bytes. Feishu clients may render supported markup.
+            reconstructed.push_str(
+                content["text"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix(&header)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(reconstructed, payload);
+    }
 }

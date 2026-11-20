@@ -1113,6 +1113,46 @@ struct Turn {
     context: Context,
     config: ProviderConfig,
     checkpoint: Value,
+    debug_dispatch: Option<DebugDispatch>,
+}
+struct DebugDispatch {
+    bot_app_id: String,
+    to: String,
+    anchor: String,
+    payload: String,
+}
+
+fn debug_dispatch(
+    c: &Connection,
+    project: &str,
+    origins: impl Iterator<Item = impl AsRef<str>>,
+    payload: &str,
+) -> Result<Option<DebugDispatch>> {
+    let mut source = c.prepare(
+        "SELECT b.app_id, json_extract(m.attachment,'$.source.chat_id'), m.source_id
+         FROM work_events e JOIN messages m ON m.id=e.message_id
+         JOIN project_bots b ON b.project_id=e.project_id
+         WHERE e.id=? AND e.project_id=? AND e.source='feishu' AND m.direction='in'
+           AND json_extract(m.attachment,'$.bot_app_id')=b.app_id
+           AND json_extract(m.attachment,'$.source.chat_id') GLOB 'oc_*'
+           AND m.source_id GLOB 'om_*'",
+    )?;
+    for origin in origins {
+        let target = source
+            .query_row(params![origin.as_ref(), project], |row| {
+                Ok(DebugDispatch {
+                    bot_app_id: row.get(0)?,
+                    to: row.get(1)?,
+                    anchor: row.get(2)?,
+                    payload: payload.to_owned(),
+                })
+            })
+            .optional()?;
+        if target.is_some() {
+            return Ok(target);
+        }
+    }
+    Ok(None)
 }
 fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
     let e = work::event(c, project, id)?;
@@ -1305,8 +1345,8 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         |r| r.get(0),
     )?;
     adopt_legacy_claim(&tx, project)?;
-    let existing=tx.query_row("SELECT id,origin_event_id,checkpoint,owner FROM manager_runs WHERE project_id=? AND revision=? AND input_revision=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1",params![project,revision,input_revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
-    let (run, _origin, checkpoint) = if let Some((run, origin, raw, previous_owner)) = existing {
+    let existing=tx.query_row("SELECT id,checkpoint,owner FROM manager_runs WHERE project_id=? AND revision=? AND input_revision=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1",params![project,revision,input_revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
+    let (run, checkpoint, debug_dispatch) = if let Some((run, raw, previous_owner)) = existing {
         if previous_owner != owner() {
             tx.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE run_id=? AND status='submitting'",params![json!({"status":"uncertain","message":"The previous host stopped during this effect; inspect evidence, do not replay."}).to_string(),run])?;
             tx.execute(
@@ -1314,7 +1354,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 params![owner(), run],
             )?;
         }
-        (run, origin, serde_json::from_str(&raw)?)
+        (run, serde_json::from_str(&raw)?, None)
     } else {
         let candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {PREPARED_INPUT} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1524,6 +1564,36 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             prompt.len() <= 250000,
             "Management context exceeds its bound"
         );
+        let debug_dispatch = if p.debug_mode {
+            let admitted_steering = latest_context.as_ref().and_then(|(id, origin, _, _)| {
+                origin
+                    .as_ref()
+                    .filter(|_| inputs.iter().any(|input| &input.0 == id))
+            });
+            let origins = admitted_steering.into_iter().chain(
+                inputs
+                    .iter()
+                    .rev()
+                    .chain(continuing.iter().rev())
+                    .filter_map(|input| input.1.as_ref()),
+            );
+            match debug_dispatch(&tx, project, origins, &prompt) {
+                Ok(Some(dispatch)) => Some(dispatch),
+                Ok(None) => {
+                    tracing::debug!(
+                        project,
+                        "Manager prompt debug has no trusted Feishu discussion"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(project, "Manager prompt debug discussion lookup failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let checkpoint = manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?;
         let run = db::id();
         tx.execute(
@@ -1538,7 +1608,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 params![run, id],
             )?;
         }
-        (run, origin, checkpoint)
+        (run, checkpoint, debug_dispatch)
     };
     tx.commit()?;
     Ok(Some(Turn {
@@ -1555,6 +1625,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             supports_images,
         },
         checkpoint,
+        debug_dispatch,
     }))
 }
 fn claim_or_repair(c: &Connection, project: &str) -> Result<Option<Turn>> {
@@ -1627,10 +1698,56 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
             current(&app, &turn.context).await,
             "Management turn superseded"
         );
+        if let Some(dispatch) = turn.debug_dispatch.take() {
+            let echo = crate::feishu::send_debug_reply(
+                &app,
+                &turn.context.project,
+                &dispatch.bot_app_id,
+                &dispatch.to,
+                &dispatch.anchor,
+                &dispatch.payload,
+            );
+            tokio::pin!(echo);
+            loop {
+                tokio::select! {
+                    result = &mut echo => {
+                        if let Err(error) = result {
+                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, %error, "Debug echo failed; continuing manager dispatch");
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if app.shutdown.is_cancelled() || !current(&app, &turn.context).await {
+                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, "Debug echo interrupted by management turn supersession");
+                            bail!("Management turn superseded");
+                        }
+                        if app.service.manager_gate.is_closed() {
+                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, "Debug echo interrupted by service handover");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            // Revalidate after Feishu I/O, which may overlap new steering.
+            if app.service.manager_gate.is_closed() {
+                return Ok(());
+            }
+            ensure!(
+                current(&app, &turn.context).await,
+                "Management turn superseded"
+            );
+        }
         let cancel = CancellationToken::new();
-        let model = manager_loop::advance_observed(&turn.config, turn.checkpoint.clone(), cancel.clone(), Some(crate::manager_context::Observer {
-            store: app.manager_context.clone(), project: turn.context.project.clone(), run: turn.context.run.clone(),
-        }));
+        let model = manager_loop::advance_observed(
+            &turn.config,
+            turn.checkpoint.clone(),
+            cancel.clone(),
+            Some(crate::manager_context::Observer {
+                store: app.manager_context.clone(),
+                project: turn.context.project.clone(),
+                run: turn.context.run.clone(),
+            }),
+        );
         tokio::pin!(model);
         let step = loop {
             tokio::select! {result=&mut model=>break result?,_=tokio::time::sleep(Duration::from_millis(100))=>{if app.shutdown.is_cancelled()||!current(&app,&turn.context).await{cancel.cancel();bail!("Management turn superseded");}}}
@@ -1996,6 +2113,157 @@ mod tests {
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
     }
+    #[tokio::test]
+    async fn debug_replies_echo_first_prompt_before_provider_without_outbox_records() {
+        use axum::{
+            Json, Router,
+            extract::{Path as RoutePath, State},
+            http::StatusCode,
+            routing::post,
+        };
+
+        type Journal = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+        async fn auth() -> Json<Value> {
+            Json(json!({"code":0,"tenant_access_token":"fixture-token","expire":3600}))
+        }
+        async fn echo(
+            State(journal): State<Journal>,
+            RoutePath(anchor): RoutePath<String>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let status = if anchor == "om_debug_rate_limit" {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            };
+            journal.lock().unwrap().push((anchor, body));
+            (
+                status,
+                Json(json!({"code":0,"data":{"thread_id":"omt_fixture","message_id":"om_debug_sent"}})),
+            )
+        }
+        async fn complete(State(journal): State<Journal>, Json(body): Json<Value>) -> Json<Value> {
+            journal.lock().unwrap().push(("provider".into(), body));
+            Json(
+                json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager","choices":[{"index":0,"message":{"role":"assistant","content":"Done"},"finish_reason":"stop"}]}),
+            )
+        }
+
+        let (_dir, app, p) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        app.config.write().await.feishu_base = base.clone();
+        let journal = Journal::default();
+        let router = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(auth),
+            )
+            .route("/open-apis/im/v1/messages/{anchor}/reply", post(echo))
+            .route("/v1/chat/completions", post(complete))
+            .with_state(journal.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        for (anchor, enabled, resume) in [
+            ("om_debug_off", false, false),
+            ("om_debug_on", true, false),
+            ("om_debug_rate_limit", true, false),
+            ("om_debug_resume", true, true),
+        ] {
+            app.db.set_debug_mode(&p.id, enabled).await.unwrap();
+            ingest(&app, &p, anchor, "保留 \"引号\" 和 <event>\\&\n");
+            let mut turn = app
+                .db
+                .sync(|c| {
+                    work::sync_inbound(c)?;
+                    let turn = claim(c, &p.id)?.unwrap();
+                    assert_eq!(turn.debug_dispatch.is_some(), enabled);
+                    if resume {
+                        let saved = claim(c, &p.id)?.unwrap();
+                        assert_eq!(saved.context.run, turn.context.run);
+                        assert!(saved.debug_dispatch.is_none());
+                        return Ok(saved);
+                    }
+                    Ok(turn)
+                })
+                .unwrap();
+            turn.config.base_url = format!("{base}/v1");
+            tokio::time::timeout(Duration::from_secs(4), drive(app.clone(), turn))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let events = std::mem::take(&mut *journal.lock().unwrap());
+            assert_eq!(events.last().unwrap().0, "provider");
+            if enabled && !resume {
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].0, anchor);
+                assert_eq!(events[0].1["msg_type"], "text");
+                assert_eq!(events[0].1["reply_in_thread"], true);
+                let content: Value =
+                    serde_json::from_str(events[0].1["content"].as_str().unwrap()).unwrap();
+                let sent_to_model = events[1].1["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| message["role"] == "user")
+                    .unwrap();
+                let model_text = sent_to_model["content"]
+                    .as_str()
+                    .or_else(|| sent_to_model["content"][0]["text"].as_str())
+                    .unwrap();
+                assert_eq!(content["text"].as_str(), Some(model_text));
+            } else {
+                assert_eq!(events.len(), 1);
+            }
+        }
+        let mut scheduled = app
+            .db
+            .sync(|c| {
+                let now = db::now();
+                work::create_timer(
+                    c,
+                    &p.id,
+                    serde_json::from_value(json!({
+                        "name":"Debug timer fixture", "kind":"once", "at":now,
+                        "prompt":"Produce the requested result", "to":"oc_fixture", "purpose":"user"
+                    }))?,
+                    now,
+                )?;
+                assert_eq!(work::fire_due(c, now)?.len(), 1);
+                let turn = claim(c, &p.id)?.unwrap();
+                assert!(turn.debug_dispatch.is_none());
+                Ok(turn)
+            })
+            .unwrap();
+        scheduled.config.base_url = format!("{base}/v1");
+        tokio::time::timeout(Duration::from_secs(4), drive(app.clone(), scheduled))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.lock().unwrap()[0].0, "provider");
+        assert_eq!(journal.lock().unwrap().len(), 1);
+        app.db
+            .sync(|c| {
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE direction='out'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM manager_failures", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn upgrade_yield_preserves_run_claims_and_stop_authority() {
         let (_dir, app, p) = fixture().await;
