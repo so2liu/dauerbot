@@ -11,6 +11,7 @@ mod manager_settings;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod model_picker;
+mod panel;
 mod project_tools;
 mod sidebar;
 mod terminal;
@@ -66,7 +67,7 @@ fn workspace_geometry(
     }
 }
 
-const STEPS: [&str; 9] = [
+const STEPS: [&str; 10] = [
     "Welcome",
     "Create a Feishu bot",
     "Connect your bot",
@@ -76,6 +77,7 @@ const STEPS: [&str; 9] = [
     "Workspace",
     "App Updates",
     "Settings",
+    "Activity",
 ];
 actions!(
     bridge,
@@ -106,7 +108,7 @@ struct Setup {
 }
 impl Setup {
     fn prepare_startup(&mut self) {
-        self.page = self.page.min(8);
+        self.page = self.page.min(9);
         // Debugging is opt-in each time the desktop starts.
         self.terminal_hidden = true;
     }
@@ -161,6 +163,7 @@ struct Desktop {
     model_picker: Entity<model_picker::ModelPicker>,
     manager_settings: Entity<manager_settings::ManagerSettings>,
     manager_context: Entity<manager_context::ManagerContext>,
+    observation: Entity<panel::ObservationPanel>,
     work_checked: std::time::Instant,
     quitting: bool,
     takeover_requested: bool,
@@ -275,6 +278,33 @@ impl Desktop {
         let manager_settings =
             cx.new(|cx| manager_settings::ManagerSettings::new(backend.dir.clone(), window, cx));
         let manager_context = cx.new(|cx| manager_context::ManagerContext::new(backend.dir.clone(), cx));
+        let observation = cx.new(|cx| panel::ObservationPanel::new(backend.dir.clone(), window, cx));
+        let desktop = cx.weak_entity();
+        observation.update(cx, |panel, _| {
+            panel.set_navigation(move |project, model_context, window, cx| {
+                let _ = desktop.update(cx, |this, cx| {
+                    let selected = this.state["projects"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|candidate| candidate["id"] == project)
+                        .cloned();
+                    let Some(selected) = selected else {
+                        return;
+                    };
+                    this.select_project(project, cx);
+                    this.go(if model_context { 8 } else { 6 });
+                    if model_context {
+                        this.manager_context.update(cx, |context, cx| {
+                            context.select(&selected, this.setup.language, cx);
+                            context.open(cx);
+                        });
+                    }
+                    this.focus_handle.focus(window);
+                    cx.notify();
+                });
+            });
+        });
         Self {
             focus_handle,
             backend,
@@ -309,6 +339,7 @@ impl Desktop {
             model_picker,
             manager_settings,
             manager_context,
+            observation,
             work_checked: std::time::Instant::now() - Duration::from_secs(30),
             quitting: false,
             takeover_requested: false,
@@ -766,7 +797,7 @@ impl Desktop {
             self.release_terminal();
             self.terminal_key.clear();
         }
-        self.setup.page = page.min(8);
+        self.setup.page = page.min(9);
         if let Ok(bytes) = serde_json::to_vec(&self.setup) {
             self.backend.save_preferences(bytes);
         }
@@ -2721,6 +2752,22 @@ impl Render for Desktop {
                     .items_center()
                     .gap_1()
                     .child(
+                        Button::new("sidebar-activity")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .selected(page == 9)
+                            .child(ActionIcon::ChartBar.draw(palette.accent, 16.))
+                            .tooltip(self.tr("Activity"))
+                            .when(geometry.sidebar >= px(200.), |button| {
+                                button.child(control_label(self.tr("Activity")))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.go(9);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         ActionIcon::Settings
                             .button("sidebar-settings", self.tr("Settings"), palette.muted)
                             .icon_disabled(self.busy)
@@ -2749,6 +2796,12 @@ impl Render for Desktop {
             5 => self.project_form(cx),
             6 => self.workspace(geometry.sidebar_hidden, cx),
             7 => self.updates_page(cx).into_any_element(),
+            9 => {
+                self.observation.update(cx, |panel, cx| {
+                    panel.activate(&self.state["projects"], self.setup.language, cx);
+                });
+                self.observation.clone().into_any_element()
+            }
             _ => self.settings_page(cx),
         };
         let finder_allowed = self.finder_allowed();
@@ -2812,11 +2865,17 @@ impl Render for Desktop {
                                 .border_color(rgb(palette.line))
                                 .child(self.sidebar_toggle(geometry.sidebar_hidden, cx))
                                 .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(self.tr(STEPS[page])))
+                                .when(page == 9 && self.independent_data, |row| {
+                                    row.child(div().text_size(px(11.)).text_color(rgb(palette.warning))
+                                        .child(self.tr("Independent instance")))
+                                })
                                 .when(geometry.sidebar_hidden, |row| row.child(self.language_toggle(cx))),
                         )
                     })
                     .child(if page == 6 {
                         div().flex_1().min_h_0().child(self.workspace_layout(content, geometry, cx)).into_any_element()
+                    } else if page == 9 {
+                        div().flex_1().min_h_0().min_w_0().child(content).into_any_element()
                     } else {
                         div()
                             .id(("content-scroll", page))
@@ -2853,7 +2912,7 @@ impl Render for Desktop {
                             .into_any_element()
                     })
                     .when(
-                        page != 6
+                        !matches!(page, 6 | 9)
                             || self.connection_error.is_some()
                             || self.error
                             || !matches!(self.notice.as_str(), ""

@@ -27,6 +27,7 @@ pub mod model_control;
 pub mod models;
 pub mod multimodal;
 pub mod native_children;
+mod panel;
 pub mod project_documents;
 pub mod project_instructions;
 mod repair_lane;

@@ -1196,6 +1196,36 @@ mod tests {
         assert_eq!(fingerprint(&path, &cfg).unwrap(), previous);
     }
     #[test]
+    fn activity_index_preserves_version_and_activation_fingerprints() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("bridge.sqlite3");
+        let cfg = Config::default();
+        let db = Db::open(&path)?;
+        db.sync(|c| {
+            c.execute("DROP INDEX message_project_time", [])?;
+            Ok(())
+        })?;
+        drop(db);
+        let previous = fingerprint(&path, &cfg)?;
+        let previous_ordered = fingerprint_with_order(&path, &cfg, true)?;
+        let reopened = Db::open(&path)?;
+        reopened.sync(|c| {
+            let schema = c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+            let columns = c
+                .prepare("SELECT name,desc FROM pragma_index_xinfo('message_project_time') WHERE key=1 ORDER BY seqno")?
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(schema, 7);
+            assert_eq!(columns, [("project_id".into(), false), ("created_at".into(), true)]);
+            Ok(())
+        })?;
+        assert_eq!(api::PROTOCOL, 7);
+        assert_eq!(fingerprint(&path, &cfg)?, previous);
+        assert_eq!(fingerprint_with_order(&path, &cfg, true)?, previous_ordered);
+        Ok(())
+    }
+
+    #[test]
     fn insertion_order_compatibility_requires_the_actual_060_parent() {
         let mut owner = Owner {
             activation_id: "previous-activation".into(),

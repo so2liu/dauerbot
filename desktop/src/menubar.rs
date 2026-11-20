@@ -265,6 +265,7 @@ fn show_status_label(status: &str) -> bool {
 struct MenuPanel {
     desktop: Entity<Desktop>,
     focus: FocusHandle,
+    needs_action: Value,
     _subscriptions: Vec<Subscription>,
 }
 impl MenuPanel {
@@ -279,9 +280,39 @@ impl MenuPanel {
                 }
             }),
         ];
+        let data = desktop.read(cx).backend.dir.clone();
+        let (tx, reply) = flume::bounded(1);
+        std::thread::spawn(move || {
+            let query = || -> anyhow::Result<Value> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let http = reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build()?;
+                    crate::panel::load_overview(&data, &http).await
+                        .map(|overview| overview["project_needs_action"].clone())
+                })
+            };
+            if let Ok(counts) = query() {
+                let _ = tx.send(counts);
+            }
+        });
+        cx.spawn(async move |entity, cx| {
+            if let Ok(counts) = reply.recv_async().await {
+                let _ = entity.update(cx, |this, cx| {
+                    this.needs_action = counts;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         Self {
             desktop,
             focus,
+            needs_action: Value::Null,
             _subscriptions: subscriptions,
         }
     }
@@ -311,6 +342,10 @@ impl Render for MenuPanel {
             let status = menu_project_status(project);
             let status_label = language.text(status);
             let mut detail = format!("{name} · {status_label}");
+            let needs_action = self.needs_action[&id].as_u64().unwrap_or(0);
+            if needs_action > 0 {
+                detail.push_str(&format!("\n{} · {needs_action}", language.text("Needs action")));
+            }
             let worker_status = project_status(project);
             if show_status_label(worker_status) {
                 detail.push_str(&format!(
@@ -360,6 +395,15 @@ impl Render for MenuPanel {
                                 .text_color(rgb(palette.muted))
                                 .child(status_label.clone()),
                         )
+                    })
+                    .when(needs_action > 0, |row| {
+                        row.child(div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(rgb(palette.warning_surface))
+                            .text_color(rgb(palette.warning))
+                            .text_size(px(11.))
+                            .child(needs_action.to_string()))
                     })
                     .child(agent_tree::status_dot(
                         status,
@@ -474,6 +518,13 @@ impl Render for MenuPanel {
                                     }),
                                 ),
                         ),
+                    )
+                    .child(
+                        ActionIcon::ChartBar
+                            .button("menu-activity", language.text("Activity"), palette.muted)
+                            .on_click(
+                                cx.listener(|_, _, _, cx| cx.defer(|cx| open_main(None, 9, cx))),
+                            ),
                     )
                     .child(
                         ActionIcon::Settings
