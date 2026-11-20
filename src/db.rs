@@ -300,7 +300,6 @@ fn ingest_message(
             });
         }
     }
-    crate::manager::stamp(&tx, project, &mut attachment)?;
     let key = id();
     let inserted=tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",params![key,project,source,content,attachment.to_string(),now(),now()])?;
     if inserted == 1 && attachment["daemon_control"] == "model" {
@@ -401,6 +400,7 @@ impl Db {
         }
         crate::manager::migrate(&migration, recover)?;
         crate::work::migrate(&migration)?;
+        crate::manager::migrate_queued(&migration)?;
         crate::handoff::migrate(&migration)?;
         crate::cli_switch::migrate(&migration, recover)?;
         crate::models::migrate(&migration)?;
@@ -467,6 +467,7 @@ impl Db {
             let tx = c.unchecked_transaction()?;
             tx.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
             params![key,input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,now(),id()])?;
+            tx.execute("INSERT INTO manager_config(project_id,mode) VALUES(?,'manager')", [&key])?;
             crate::conversation::primary(&tx, &key, input.chat_id.trim(), "")?;
             tx.commit()?;
             Ok(())

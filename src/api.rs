@@ -81,6 +81,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/projects/{id}/manager",
             get(manager_config).put(manager_save),
         )
+        .route("/manager/provider", get(manager_provider).put(manager_save_provider))
         .route("/projects/{id}/agent/mode", post(manager_mode))
         .route("/projects/{id}/manager/context", get(manager_context))
         .route("/projects/{id}/models", get(project_models))
@@ -379,6 +380,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
     let mut records = Vec::new();
     let mut work_states = serde_json::Map::new();
     let bindings = app.db.bots().await?;
+    let manager_provider = app.db.call(crate::manager::public_provider).await?;
     for p in projects {
         let id = p.id.clone();
         let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
@@ -419,7 +421,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         records.push(record);
     }
     Ok(Json(
-        json!({"projects":records,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL,"mcp_contracts":[crate::mcp::CONTRACT],"service_activation":app.service.state()}),
+        json!({"projects":records,"manager_provider":manager_provider,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL,"mcp_contracts":[crate::mcp::CONTRACT],"service_activation":app.service.state()}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {
@@ -738,20 +740,27 @@ async fn manager_context(State(app): State<Arc<App>>, Path(id): Path<String>) ->
     }
     Ok(Json(crate::manager_context::bounded(view)))
 }
-async fn manager_save(
+async fn manager_provider(State(app): State<Arc<App>>) -> ApiResult {
+    Ok(Json(app.db.call(crate::manager::public_provider).await?))
+}
+async fn manager_save_provider(
     State(app): State<Arc<App>>,
-    Path(id): Path<String>,
     Json(input): Json<crate::manager::ConfigInput>,
 ) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let lock = app.project_lock(&p.id).await;
-    let _guard = lock.lock().await;
-    let value = app
-        .db
-        .call(move |c| crate::manager::save(c, &p.id, input))
-        .await?;
+    // The same project locks fence individual manager effects while a shared
+    // update invalidates their provider revisions.
+    let mut projects = app.db.projects().await?;
+    projects.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    let mut guards = Vec::with_capacity(projects.len());
+    for project in projects {
+        guards.push(app.project_lock(&project.id).await.lock_owned().await);
+    }
+    let value = app.db.call(move |c| crate::manager::save_provider(c,input)).await?;
     app.notify.notify_one();
     Ok(Json(value))
+}
+async fn manager_save() -> ApiResult {
+    Err(anyhow::anyhow!("Manager credentials are shared. Update them at /api/manager/provider.").into())
 }
 async fn manager_mode(
     State(app): State<Arc<App>>,
@@ -780,7 +789,7 @@ async fn inject(
     let key = db::id();
     let source = format!("local-{}", db::id());
     let out = key.clone();
-    app.db.call(move|c|{let tx=c.unchecked_transaction()?;let mut attachment=json!({});crate::manager::stamp(&tx,&p.id,&mut attachment)?;tx.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
+    app.db.call(move|c|{let tx=c.unchecked_transaction()?;let attachment=json!({});tx.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
         rusqlite::params![key,p.id,source,input.content,attachment.to_string(),db::now(),db::now()])?;tx.commit()?;Ok(())}).await?;
     app.notify.notify_one();
 

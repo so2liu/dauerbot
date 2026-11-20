@@ -103,13 +103,15 @@ impl Language {
             "The management run could not continue" => "管理流程未能继续",
             "held" => "等待中",
             "Project Agent" => "项目主智能体",
-            "Native CLI" => "原生 CLI",
-            "Built-in manager" => "内置管理智能体",
             "Declare image input support" => "声明支持图片输入",
             "Image input declared supported" => "已声明支持图片输入",
             "Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references." => {
                 "仅在此接口和模型确实支持图片输入时启用；否则仅提供明确的图片文件引用。"
             }
+            "Shared manager provider" => "全局管理智能体配置",
+            "Every project uses this manager endpoint, model, and API key. Coding CLI login and settings stay separate." => "所有项目共用此管理智能体的服务地址、模型和 API 密钥。编码 CLI 的登录与设置保持独立。",
+            "The previous projects used different managers. Review and save the shared provider." => "旧项目的管理智能体配置不同，请检查并保存全局配置。",
+            "Configure the shared manager in Settings" => "前往设置配置全局管理智能体",
             "Manager model settings" => "管理模型设置",
             "Hide manager settings" => "收起管理模型设置",
             "OpenAI-compatible endpoint" => "OpenAI 兼容接口地址",

@@ -397,6 +397,7 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
                       params![if status=="dismissed"{"Dismissed by the user"}else{"Explicit delivery retry"},updated,updated,id])?;
                     c.execute("UPDATE work_tasks SET status=?,updated_at=? WHERE id=(SELECT task_id FROM work_events WHERE id=?)",
                       params![if status=="queued"{"queued"}else{"cancelled"},updated,id])?;
+                    if status == "queued" { crate::manager::route_event(c, &id)?; }
                 }
                 "acknowledged" => {
                     c.execute("UPDATE work_runs SET status='running',error='',updated_at=? WHERE event_id=? AND status IN ('submitting','submitted','uncertain') AND finished_at IS NULL",params![updated,id])?;
@@ -573,8 +574,15 @@ fn claim(
         // Resource preparation runs independently of project reconciliation.
         // Skip only those messages; later steering must not wait for a download.
         let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=COALESCE(work_events.message_id,(SELECT origin.message_id FROM work_events origin WHERE work_events.source='management' AND origin.id=json_extract(work_events.payload,'$.origin_event_id'))) AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
+        // A minimal delivery-journal fixture can omit the manager schema.
+        // Production stores always install it before reconciling work.
+        let source = if crate::manager::installed(c)? {
+            "source='management'"
+        } else {
+            "1=1"
+        };
         let message = c.query_row(
-            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND (message_id IS NOT NULL OR source='management') AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
+            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND (message_id IS NOT NULL OR source='management') AND {source} AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
             [project], event_row,
         ).optional()?;
         let next = if message.is_some() {
@@ -583,7 +591,7 @@ fn claim(
             if steering_only {
                 return Ok(None);
             }
-            c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
+            c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND {source} AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
               [project],event_row).optional()?
         };
         let Some(event) = next else { return Ok(None) };
@@ -855,15 +863,24 @@ pub fn create_timer(c: &Connection, project: &str, input: TimerInput, now: i64) 
     })
 }
 fn cancel_timer_queue(c: &Connection, id: &str, revision: i64, now: i64) -> Result<()> {
+    let managed = if crate::manager::installed(c)? {
+        " OR (e.status='managed' AND EXISTS(SELECT 1 FROM manager_inputs
+            WHERE origin_event_id=e.id AND status='queued'))"
+    } else {
+        ""
+    };
     let ids = c
-        .prepare(
+        .prepare(&format!(
             "SELECT e.id FROM work_events e JOIN work_occurrences o ON o.event_id=e.id
-      WHERE o.timer_id=? AND o.revision<=? AND e.status='queued'",
-        )?
+             WHERE o.timer_id=? AND o.revision<=? AND (e.status='queued'{managed})"
+        ))?
         .query_map(params![id, revision], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for event in ids {
-        c.execute("UPDATE work_events SET status='cancelled',error='Schedule changed before dispatch',updated_at=? WHERE id=? AND status='queued'",params![now,event])?;
+        if !managed.is_empty() {
+            c.execute("UPDATE manager_inputs SET status='cancelled' WHERE origin_event_id=? AND status='queued'", [&event])?;
+        }
+        c.execute("UPDATE work_events SET status='cancelled',error='Schedule changed before dispatch',updated_at=? WHERE id=? AND status IN ('queued','managed')",params![now,event])?;
         c.execute(
             "UPDATE work_occurrences SET status='cancelled' WHERE event_id=?",
             [event],
@@ -1337,6 +1354,9 @@ pub fn resolve_event(
                 "UPDATE messages SET status=?,error='',updated_at=? WHERE id=?",
                 params![status, now, message],
             )?;
+        }
+        if retry {
+            crate::manager::route_event(c, id)?;
         }
         resolve_recovery_attention(c, project, now)?;
         event(c, project, id)

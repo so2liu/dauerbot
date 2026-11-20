@@ -288,13 +288,7 @@ impl ProjectTools {
         let palette = crate::ui_theme::palette(cx);
         let agent = self.current_cli();
         let name = agent_tree::cli_label(agent);
-        let label = self
-            .language
-            .text(if self.project["agent_mode"] == "manager" {
-                "Coding CLI"
-            } else {
-                "CLI"
-            });
+        let label = self.language.text("Coding CLI");
         Button::new("project-cli-menu")
             .small()
             .compact()

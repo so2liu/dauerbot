@@ -243,11 +243,7 @@ fn constrained_popover(panel: [f64; 2], anchor: [f64; 2], visible: [f64; 4]) -> 
 }
 
 fn menu_project_status(project: &Value) -> &str {
-    if manager_settings::enabled(project) {
-        manager_settings::status(project)
-    } else {
-        project_status(project)
-    }
+    manager_settings::status(project)
 }
 
 fn show_status_label(status: &str) -> bool {
@@ -308,12 +304,11 @@ impl Render for MenuPanel {
         for project in &projects {
             let id = project["id"].as_str().unwrap_or("").to_owned();
             let name = project["name"].as_str().unwrap_or("Project").to_owned();
-            let managed = manager_settings::enabled(project);
             let status = menu_project_status(project);
             let status_label = language.text(status);
             let mut detail = format!("{name} · {status_label}");
             let worker_status = project_status(project);
-            if managed && show_status_label(worker_status) {
+            if show_status_label(worker_status) {
                 detail.push_str(&format!(
                     "\n{} · {}",
                     language.text("Coding worker"),
@@ -339,11 +334,7 @@ impl Render for MenuPanel {
                     .hover(|row| row.bg(rgb(palette.hover)))
                     .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
                     .child(agent_tree::cli_icon(
-                        if managed {
-                            "manager"
-                        } else {
-                            project["agent"].as_str().unwrap_or("custom")
-                        },
+                        "manager",
                         format!("menu-cli-{id}"),
                         palette,
                     ))
@@ -560,7 +551,5 @@ mod project_status_tests {
         project["lifecycle"] = json!("sleeping");
         assert_eq!(menu_project_status(&project), "working");
 
-        project["agent_mode"] = json!("native");
-        assert_eq!(menu_project_status(&project), "sleeping");
     }
 }

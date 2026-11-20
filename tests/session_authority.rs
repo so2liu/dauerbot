@@ -275,11 +275,13 @@ async fn three_tool_upgrade_preserves_messages_and_schedules_without_replaying_i
         assert!(work::claim_next(c,&id,"new",70_002)?.is_none());
         work::set_timer_enabled(c,&id,&saved.id,true,200_000)?;
         assert_eq!(work::fire_due(c,200_001)?.len(),1);
-        let run=work::claim_next(c,&id,"new",200_002)?.unwrap();
-        work::delivery(c,&run.id,"submitted","",200_003)?;
+        assert!(work::claim_next(c,&id,"new",200_002)?.is_none());
+        let status: String = c.query_row("SELECT status FROM manager_inputs WHERE project_id=? AND kind='schedule' ORDER BY rowid DESC LIMIT 1", [&id], |r| r.get(0))?;
+        assert_eq!(status, "queued");
         work::delete_timer(c,&id,&saved.id,200_004)?;
         assert!(work::fire_due(c,1_000_000)?.is_empty());
-        assert_eq!(work::run(c,&id,&run.id)?.status,"submitted");
+        let left: i64 = c.query_row("SELECT count(*) FROM manager_inputs WHERE project_id=? AND kind='schedule' AND status='queued'", [&id], |r| r.get(0))?;
+        assert_eq!(left, 0);
         assert!(c.prepare("PRAGMA foreign_key_check")?.query([])?.next()?.is_none());
         Ok(())
     }).await.unwrap();

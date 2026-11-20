@@ -1046,7 +1046,10 @@ impl Desktop {
             );
         }
         div().flex().flex_col().gap_4()
-            .child(self.title("ADD PROJECT", "Add project", "One bot belongs to one project. Direct and group messages reach its active agent, which you can switch in the workspace."))
+            .child(self.title("ADD PROJECT", "Add project", "One bot belongs to one project. The manager receives direct and group messages and delegates coding to the CLI you select."))
+            .when(self.state["manager_provider"]["configured"] == false, |view| {
+                view.child(self.btn("project-provider-setup", "Configure the shared manager in Settings", |this, _, _| this.go(8), cx))
+            })
             .child(self.field("Project name", &self.name))
             .child(self.card("Private workspace", "By default, Dauerbot creates a folder in ~/.dauerbot/agents with project instructions. You can also choose an existing folder."))
             .child(self.field("Project folder (optional existing folder)", &self.path))
@@ -1075,10 +1078,6 @@ impl Desktop {
         let mut body = div().flex().flex_col().gap_4();
         if let Some(project) = selected {
             let id = self.selected.clone();
-            self.manager_settings.update(cx, |settings, cx| {
-                settings.select(&project, self.setup.language, cx)
-            });
-            body = body.child(self.manager_settings.clone());
             self.manager_context.update(cx, |context, cx| context.select(&project, self.setup.language, cx));
             body = body.child(self.manager_context.clone());
             body = body
@@ -1261,11 +1260,7 @@ impl Desktop {
                 div()
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr(if manager_settings::enabled(&project) {
-                        "Coding CLI"
-                    } else {
-                        "Project CLI"
-                    })),
+                    .child(self.tr("Coding CLI")),
             );
             let mut agents = div().flex().flex_wrap().gap_2();
             for (index, agent) in ["codex", "claude", "pi", "agy"].into_iter().enumerate() {
@@ -1352,18 +1347,7 @@ impl Desktop {
             .is_some_and(|bridge| bridge.controlling);
         let foreground = 0xe8eeeb;
         let muted = 0xa7b5c2;
-        let title = self.tr(
-            if self.state["projects"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|project| project["id"] == self.selected && manager_settings::enabled(project))
-            {
-                "Coding worker terminal"
-            } else {
-                "Terminal"
-            },
-        );
+        let title = self.tr("Coding worker terminal");
         let mut actions = div().flex().items_center().gap_1();
         if let Some(bridge) = &self.terminal {
             let project = bridge.descriptor.project_id.clone();
@@ -1637,9 +1621,13 @@ impl Desktop {
             picker.select(project, self.setup.language, cx);
             picker.trigger(cx)
         });
-        let status = project_status(project);
+        let status = manager_settings::status(project);
         let timers = visible_timers(&self.timers);
-        let content = div().flex().flex_col().gap_4().child(
+        let content = div().flex().flex_col().gap_4()
+            .when(self.state["manager_provider"]["configured"] == false, |view| {
+                view.child(self.btn("workspace-provider-setup", "Configure the shared manager in Settings", |this, _, _| this.go(8), cx))
+            })
+            .child(
             div()
                 .min_w_0()
                 .flex()
@@ -1945,6 +1933,9 @@ impl Desktop {
     }
     fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette();
+        self.manager_settings.update(cx, |settings, cx| {
+            settings.refresh(&self.state["manager_provider"], self.setup.language, cx);
+        });
         let mut links = div().flex().flex_wrap().gap_2();
         for (index, label) in [
             (1, "Feishu bot setup"),
@@ -2010,6 +2001,7 @@ impl Desktop {
             ))
             .child(links)
             .child(theme_controls)
+            .child(self.manager_settings.clone())
             .child(
                 div()
                     .p_5()
@@ -2161,12 +2153,7 @@ impl Render for Desktop {
             }
             let keyboard_id = id.clone();
             let selected = id == self.selected && page == 6;
-            let manager_enabled = manager_settings::enabled(project);
-            let status = if manager_enabled {
-                manager_settings::status(project)
-            } else {
-                project_status(project)
-            };
+            let status = manager_settings::status(project);
             let tree = agent_tree::Tree::from_project(project);
             let fold_scope = format!(
                 "{}:{}:{}",
@@ -2180,7 +2167,6 @@ impl Render for Desktop {
                 .cloned()
                 .unwrap_or_default();
             let tree_rows = tree.rows(&folded);
-            let has_children = manager_enabled || !tree.nodes.is_empty();
             let root_folded = folded.contains("");
             let click_project = id.clone();
             let root_row = div()
@@ -2212,11 +2198,7 @@ impl Render for Desktop {
                         .gap_1p5()
                         .h_full()
                         .child(agent_tree::cli_icon(
-                            if manager_enabled {
-                                "manager"
-                            } else {
-                                project["agent"].as_str().unwrap_or("custom")
-                            },
+                            "manager",
                             format!("project-cli-{id}"),
                             palette,
                         ))
@@ -2248,7 +2230,7 @@ impl Render for Desktop {
             let root_layout = agent_tree::row_layout(
                 &[],
                 true,
-                has_children,
+                true,
                 32.,
                 f32::from(geometry.sidebar) - 16.,
                 0.,
@@ -2309,8 +2291,8 @@ impl Render for Desktop {
                 .min_w_0()
                 .child(root);
             if !root_folded {
-                let worker_folded = manager_enabled && folded.contains("worker");
-                if manager_enabled {
+                let worker_folded = folded.contains("worker");
+                {
                     let scope = fold_scope.clone();
                     let terminal_project = id.clone();
                     let worker_layout = agent_tree::row_layout(
@@ -2405,7 +2387,7 @@ impl Render for Desktop {
                         row.has_children,
                         26.,
                         f32::from(geometry.sidebar) - 16.,
-                        if manager_enabled { 48. } else { 28. },
+                        48.,
                     );
                     let node_id = node.id.clone();
                     let scope = fold_scope.clone();

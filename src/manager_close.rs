@@ -263,7 +263,7 @@ mod tests {
             c.execute("UPDATE projects SET generation=?,terminal='current-terminal' WHERE id=?",params![CURRENT,p.id])?;
             c.execute("INSERT INTO work_executions(generation,project_id,agent,terminal,status,last_activity,created_at,updated_at) VALUES(?,?,'codex','old-terminal','exited',1,1,1)",params![OLD,p.id])?;
             c.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES('close-run',?,1,1,'{}','working',?,1)",params![p.id,crate::manager::owner()])?;
-            c.execute("INSERT INTO manager_config(project_id,mode,revision,input_revision) VALUES(?,'manager',1,1)",[&p.id])?;
+            c.execute("UPDATE manager_config SET revision=1,input_revision=1 WHERE project_id=?",[&p.id])?;
             c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('close-effect','close-run','one','close_agent','{}','submitting')",[])?;
             Ok(())
         }).unwrap();
@@ -349,12 +349,9 @@ mod tests {
         }
     }
     fn delivery_input(c: &Connection, p: &Project) -> Result<work::Event> {
-        c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('delivery-input',?,'in','om_delivery','fixture','queued',1,1)",[&p.id])?;
-        work::sync_inbound(c)?;
-        work::events(c, &p.id)?
-            .into_iter()
-            .find(|event| event.message_id.as_deref() == Some("delivery-input"))
-            .context("Missing delivery event")
+        let event = crate::manager::test_delegate(c, &p.id, "delivery-fixture", None)?;
+        c.execute("UPDATE work_events SET payload=json_set(payload,'$.target_generation',?) WHERE id=?", params![OLD,event])?;
+        work::event(c, &p.id, &event)
     }
     #[tokio::test]
     async fn resolved_delivery_attempts_allow_close_but_active_and_uncertain_work_do_not() {
@@ -399,10 +396,9 @@ mod tests {
                         }
                         _ => unreachable!(),
                     }
-                    assert!(
-                        guard(c, &p, OLD, "old-terminal").is_ok(),
-                        "Finished historical attempts must not pin the execution forever"
-                    );
+                    // The manager has already inspected these delivery receipts.
+                    c.execute("UPDATE manager_inputs SET status='consumed' WHERE project_id=? AND kind='worker'", [&p.id])?;
+                    guard(c, &p, OLD, "old-terminal").context("Finished historical attempts must not pin the execution forever")?;
                     // Unknown/unfinished terminal records and explicit uncertainty
                     // remain blockers, even if an inconsistent timestamp is present.
                     c.execute(

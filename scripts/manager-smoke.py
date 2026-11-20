@@ -171,18 +171,18 @@ def main():
 
 def run_checks(h):
     route = f"/projects/{h.key}"
-    initial = h.api(route + "/manager")
-    assert initial["mode"] == "native", initial
+    initial = h.api("/manager/provider")
+    assert initial["configured"] is False, initial
+    assert h.api(route + "/manager")["status"] == "unavailable"
+    try:
+        h.api(route + "/agent/mode", {"mode": "native"})
+    except RuntimeError as error:
+        assert "HTTP 400" in str(error) and "Single-agent mode has been removed" in str(error)
+    else:
+        raise AssertionError("legacy mode route accepted single-agent mode")
+    assert h.api(route + "/agent/mode", {"mode": "manager"})["mode"] == "manager"
     provider = {"base_url": f"http://127.0.0.1:{h.model.server_port}/v1", "model": "fixture-manager", "api_key": "manager-fixture-secret", "expected_revision": initial["revision"]}
-    configured = h.api(route + "/manager", provider, "PUT")
-    assert configured["mode"] == "native" and configured["has_api_key"] is True
-    assert "manager-fixture-secret" not in json.dumps(configured)
-    assert "manager-fixture-secret" not in json.dumps(h.api("/state"))
-    mode = {"mode": "manager", "request_id": "fixture-manager-enable", "expected_revision": configured["revision"]}
-    enabled = h.api(route + "/agent/mode", mode)
-    assert h.api(route + "/agent/mode", mode) == enabled, "mode request retry changed its result"
-    assert h.api(route + "/manager")["mode"] == "manager"
-    h.checks.append("opt-in mode, native default, private separate API credential and idempotent mode request")
+    h.checks.append("default manager projects report missing shared configuration; legacy native mode is rejected with HTTP 400")
 
     MODEL.script(
         {"tool": "write_file", "id": "same-provider-call-id", "arguments": {"path": "manager-note.txt", "content": "restricted manager fixture\n"}},
@@ -192,6 +192,14 @@ def run_checks(h):
         {"text": ""},
     )
     fixture.FIXTURE.emit(fixture.message("om_manager_write", "Write and read a project note, then reply in this topic."))
+    fixture.wait_for(lambda: any("Your message is saved" in m["content"] and m.get("fixture_reply_to") == "om_manager_write" for m in fixture.FIXTURE.messages), "missing configuration notice did not use the source topic")
+    assert not MODEL.requests and not h.api(route + "/work")["runs"], "unconfigured input escaped its manager inbox"
+    configured = h.api("/manager/provider", provider, "PUT")
+    assert configured["configured"] is True and configured["has_api_key"] is True
+    assert "manager-fixture-secret" not in json.dumps(configured)
+    assert "manager-fixture-secret" not in json.dumps(h.api("/state"))
+    assert h.api(route + "/manager")["model"] == "fixture-manager"
+    h.checks.append("one anchored missing-config notice; preserved input resumes after saving the redacted global provider")
     fixture.wait_for(lambda: any("manager-file-roundtrip-ok" in m["content"] for m in fixture.FIXTURE.messages), "manager file/message loop did not finish")
     assert (h.workspace / "manager-note.txt").read_text() == "restricted manager fixture\n"
     sent = [m for m in fixture.FIXTURE.messages if "manager-file-roundtrip-ok" in m["content"]]
@@ -334,14 +342,6 @@ def run_checks(h):
     assert "manager-fixture-secret" not in (h.run / "daemon.log").read_text()
     h.checks.append("private daemon restart retains mode and sent effects without credential leakage or message replay")
 
-    current = h.api(route + "/manager")
-    native_request = {"mode": "native", "request_id": "fixture-native-enable", "expected_revision": current["revision"]}
-    h.api(route + "/agent/mode", native_request)
-    assert h.api(route + "/manager")["mode"] == "native"
-    fixture.FIXTURE.emit(fixture.message("om_after_manager", "native-mode-after-manager"))
-    fixture.wait_for(lambda: any("native-mode-after-manager" in m["content"] for m in fixture.FIXTURE.messages), "native mode failed to resume after manager provider outage", timeout=55)
-    assert len([m for m in fixture.FIXTURE.messages if "manager-file-roundtrip-ok" in m["content"] and m.get("fixture_reply_to") == "om_manager_write"]) == before, "mode handoff replayed an already completed manager reply"
-    h.checks.append("provider-independent switch to native hands off preserved manager state and resumes new input without replaying its completed effects")
 
 
 if __name__ == "__main__":

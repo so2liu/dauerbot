@@ -2059,13 +2059,13 @@ mod tests {
     #[tokio::test]
     async fn vanished_execution_retirement_preserves_native_pending_and_uncertain_effects() {
         let (_dir, app, p) = fixture().await;
-        app.db
+        let submitted = app.db
             .sync(|c| {
-                queue(c, &p, "already-submitted", 1)?;
+                let submitted = crate::manager::test_delegate(c, &p.id, "already-submitted", None)?;
                 let run = work::claim_steering(c, &p.id, &p.generation, 2)?.unwrap();
                 work::delivery(c, &run.id, "submitted", "", 2)?;
                 queue(c, &p, "still-pending", 3)?;
-                Ok(())
+                Ok(submitted)
             })
             .unwrap();
         app.request_cli_switch(&p.id, "agy").await.unwrap();
@@ -2074,10 +2074,10 @@ mod tests {
                 let r = latest(c, &p.id)?.unwrap();
                 assert!(retire_vanished(c, &p, &r)?);
                 assert_eq!(
-                    work::event(c, &p.id, "already-submitted")?.status,
+                    work::event(c, &p.id, &submitted)?.status,
                     "uncertain"
                 );
-                assert_eq!(work::event(c, &p.id, "still-pending")?.status, "queued");
+                assert_eq!(work::event(c, &p.id, "still-pending")?.status, "managed");
                 assert!(holds_input(c, &p.id)?);
                 assert!(work::claim_steering(c, &p.id, "repair-generation", 4)?.is_none());
                 let retired = latest(c, &p.id)?.unwrap();
@@ -2126,18 +2126,20 @@ mod tests {
     #[tokio::test]
     async fn accepted_switch_holds_all_unclaimed_input_without_invalidating_handoff() {
         let (_dir, app, p) = fixture().await;
-        app.db
+        let submitted = app.db
             .sync(|c| {
-                queue(c, &p, "already-submitted", 1)?;
+                let submitted = crate::manager::test_delegate(c, &p.id, "already-submitted", None)?;
                 let run = work::claim_steering(c, &p.id, &p.generation, 2)?.unwrap();
                 work::delivery(c, &run.id, "submitted", "", 2)?;
-                queue(c, &p, "pending-before", 3)
+                queue(c, &p, "pending-before", 3)?;
+                Ok(submitted)
             })
             .unwrap();
         app.request_cli_switch(&p.id, "pi").await.unwrap();
         app.db.sync(|c|{
             let r=requested(c,&p)?;
             queue(c,&p,"pending-after",4)?;
+            let held = crate::manager::test_delegate(c,&p.id,"held-delegation",Some("pending-after"))?;
             let timer=work::create_timer(c,&p.id,serde_json::from_value(serde_json::json!({"name":"While switching","prompt":"scheduled input","kind":"once","at":5}))?,0)?;
             assert_eq!(work::fire_due(c,6)?.len(),1);
             assert!(work::claim_steering(c,&p.id,&p.generation,7)?.is_none());
@@ -2146,21 +2148,22 @@ mod tests {
             assert!(claim(c,&p.id,&r,"accepted")?,"queued input cannot invalidate the handoff");
             complete(c,&p.id,&r)?;
             assert!(holds_input(c,&p.id)?);
-            assert_eq!(work::event(c,&p.id,"already-submitted")?.status,"uncertain");
+            assert_eq!(work::event(c,&p.id,&submitted)?.status,"uncertain");
             // Old registration and a wrong observed generation cannot unlock input.
             assert!(!ready(c,&p.id,&p.generation,&r)?);
             c.execute("UPDATE projects SET generation='new-gen',terminal='new-pane',ready=1,execution=json_object('cli_switch_request',?,'mcp_registered',json('true')) WHERE id=?",params![r.id,p.id])?;
             assert!(!ready(c,&p.id,"stale-generation",&r)?);
             assert!(ready(c,&p.id,"new-gen",&r)?);
             assert!(!holds_input(c,&p.id)?);
-            for expected in ["pending-before","pending-after"] {
-                let run=work::claim_steering(c,&p.id,"new-gen",8)?.unwrap();
-                assert_eq!(work::event(c,&p.id,&run.event_id)?.source_id,expected);
-                work::delivery(c,&run.id,"submitted","",8)?;
+            let delegation=work::claim_steering(c,&p.id,"new-gen",8)?.unwrap();
+            assert_eq!(delegation.event_id,held);
+            work::delivery(c,&delegation.id,"submitted","",8)?;
+            for source in ["pending-before","pending-after"] {
+                assert_eq!(work::event(c,&p.id,source)?.status,"managed");
+                assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE origin_event_id=?",[source],|v|v.get::<_,String>(0))?,"queued");
             }
-            let scheduled=work::claim_next(c,&p.id,"new-gen",9)?.unwrap();
-            assert_eq!(c.query_row("SELECT count(*) FROM work_occurrences WHERE timer_id=?",[timer.id],|v|v.get::<_,i64>(0))?,1);
-            work::delivery(c,&scheduled.id,"submitted","",9)?;
+            let status: String = c.query_row("SELECT e.status FROM work_events e JOIN work_occurrences o ON o.event_id=e.id WHERE o.timer_id=?", [timer.id], |v|v.get(0))?;
+            assert_eq!(status,"managed");
             assert!(work::claim_next(c,&p.id,"new-gen",10)?.is_none());
             Ok(())
         }).unwrap();
@@ -2206,7 +2209,7 @@ mod tests {
                 c.query_row("SELECT paused FROM projects WHERE id=?", [&p.id], |v| v
                     .get::<_, bool>(0))?
             );
-            assert_eq!(work::event(c, &p.id, "held")?.status, "queued");
+            assert_eq!(work::event(c, &p.id, "held")?.status, "cancelled");
             Ok(())
         })
         .unwrap();
@@ -2502,7 +2505,7 @@ mod tests {
             c.execute("UPDATE projects SET execution=?,ready=?,native_session=? WHERE id=?",params![execution.to_string(),!startup,if startup { "" } else { "old-native" },p.id])?;
             c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source) VALUES('completed',?,'codex','ready','previous-generation',1,0,?)",
                 params![p.id,json!({"agent":"claude","native_session":"previous-claude-native","extra_args":[]}).to_string()])?;
-            queue(c,&p,"pending-observation",1)?;
+            crate::manager::test_delegate(c,&p.id,"pending-observation",None)?;
             Ok(())
         }).unwrap();
         let p = app.db.project(&p.id).await.unwrap();
@@ -2698,7 +2701,7 @@ mod tests {
             assert_eq!(repair.phase, "recovery_pending");
             assert!(repair.holds_input);
             assert!(work::claim_steering(c, &p.id, &p.generation, 2)?.is_none());
-            assert_eq!(work::event(c, &p.id, "pending-after-ready")?.status, "queued");
+            assert_eq!(work::event(c, &p.id, "pending-after-ready")?.status, "managed");
             assert_eq!(c.query_row("SELECT status FROM messages WHERE id='uncertain-effect'",[],|r|r.get::<_,String>(0))?, "uncertain");
             c.execute("UPDATE cli_switch_requests SET phase='requested',nonce='preserved-nonce',next_attempt_at=12345 WHERE id=?",[&repair.id])?;
             c.execute("INSERT INTO cli_repair_prompts(id,request_id,generation,payload,status,sequence,created_at) VALUES('uncertain-prompt',?,'old-gen','preserved prompt','uncertain',1,1)",[&repair.id])?;

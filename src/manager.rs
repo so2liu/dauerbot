@@ -1,4 +1,4 @@
-//! Optional restricted management actor. Native CLI authority stays in the worker.
+//! Restricted management actor. Native CLI authority stays in the worker.
 use crate::{
     App, db,
     db::Project,
@@ -27,7 +27,7 @@ pub(crate) fn owner() -> &'static str {
     OWNER.get_or_init(db::id)
 }
 
-fn installed(c: &Connection) -> Result<bool> {
+pub(crate) fn installed(c: &Connection) -> Result<bool> {
     Ok(c.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_config')",
         [],
@@ -35,7 +35,7 @@ fn installed(c: &Connection) -> Result<bool> {
     )?)
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'native',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id) ON DELETE CASCADE,note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'manager',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id) ON DELETE CASCADE,note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_failures(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,incident_id TEXT NOT NULL,attempts INTEGER NOT NULL,diagnostic TEXT NOT NULL,notified INTEGER NOT NULL DEFAULT 0,repair_probe INTEGER NOT NULL DEFAULT 0);")?;
     if !c
         .prepare("PRAGMA table_info(manager_config)")?
@@ -49,6 +49,37 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
             [],
         )?;
     }
+    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_provider_config(
+        id INTEGER PRIMARY KEY CHECK(id=1), base_url TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
+        supports_images INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0, migration_conflict INTEGER NOT NULL DEFAULT 0
+    );")?;
+    // A blank singleton also marks a completed migration, including after a key is cleared.
+    let migrated = c.execute("INSERT OR IGNORE INTO manager_provider_config(id,base_url,model,api_key,supports_images,migration_conflict)
+        SELECT 1,old.base_url,old.model,old.api_key,old.supports_images,
+            EXISTS(SELECT 1 FROM manager_config other WHERE
+                trim(other.base_url)!='' AND trim(other.model)!='' AND trim(other.api_key)!=''
+                AND (other.base_url,other.model,other.api_key,other.supports_images) !=
+                    (old.base_url,old.model,old.api_key,old.supports_images))
+        FROM manager_config old WHERE trim(old.base_url)!='' AND trim(old.model)!='' AND trim(old.api_key)!=''
+        ORDER BY old.revision DESC,old.project_id LIMIT 1", [])?;
+    let empty = c.execute("INSERT OR IGNORE INTO manager_provider_config(id) VALUES(1)", [])?;
+    if migrated == 1 || empty == 1 {
+        // An existing checkpoint belongs to its original provider identity.
+        c.execute("UPDATE manager_config AS old SET revision=revision+1,input_revision=input_revision+1,error='',next_attempt_at=0
+            WHERE old.mode='manager' AND EXISTS(SELECT 1 FROM manager_provider_config current WHERE
+                (old.base_url,old.model,old.api_key,old.supports_images) !=
+                (current.base_url,current.model,current.api_key,current.supports_images))", [])?;
+        if empty == 1 {
+            c.execute("UPDATE manager_config SET error='',next_attempt_at=0", [])?;
+        }
+        c.execute("UPDATE manager_runs SET status='superseded' WHERE status='working' AND
+            revision!=(SELECT revision FROM manager_config WHERE project_id=manager_runs.project_id)", [])?;
+    }
+    c.execute("INSERT OR IGNORE INTO manager_config(project_id,mode) SELECT id,'manager' FROM projects", [])?;
+    c.execute("UPDATE manager_config SET mode='manager',base_url='',model='',api_key='',supports_images=0
+        WHERE mode!='manager' OR base_url!='' OR model!='' OR api_key!='' OR supports_images!=0", [])?;
     // Turn notes share the owning project's lifetime, just like their runs.
     let notes_cascade: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('manager_turn_notes') WHERE [table]='manager_runs' AND [from]='run_id' AND on_delete='CASCADE')", [], |r|r.get(0))?;
     if !notes_cascade {
@@ -80,54 +111,51 @@ pub struct ConfigInput {
 #[serde(deny_unknown_fields)]
 pub struct ModeInput {
     pub mode: String,
+    #[serde(default)]
     pub request_id: String,
+    #[serde(default)]
     pub expected_revision: i64,
 }
-pub fn public(c: &Connection, project: &str) -> Result<Value> {
-    let row=c.query_row("SELECT mode,base_url,model,api_key!='',revision,error FROM manager_config WHERE project_id=?",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?))).optional()?;
-    let (mode, base, model, has_key, revision, error) = row.unwrap_or((
-        "native".into(),
-        String::new(),
-        String::new(),
-        false,
-        0,
-        String::new(),
-    ));
-    let error = if mode == "manager" && (!has_key || model.trim().is_empty()) {
-        "Configure a management endpoint, model and API key".to_owned()
-    } else {
-        error
-    };
-    let supports_images: bool = c
-        .query_row(
-            "SELECT supports_images FROM manager_config WHERE project_id=?",
-            [project],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(false);
-    let paused: bool = c.query_row("SELECT paused FROM projects WHERE id=?", [project], |r| {
-        r.get(0)
-    })?;
-    let active: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_runs WHERE project_id=? AND status='working')",
-        [project],
-        |r| r.get(0),
-    )?;
-    let failure: Option<String> = c
-        .query_row(
-            "SELECT diagnostic FROM manager_failures WHERE project_id=? AND revision=?",
-            params![project, revision],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(
-        json!({"mode":mode,"base_url":base,"model":model,"supports_images":supports_images,"has_api_key":has_key,"revision":revision,"status":if mode=="native"{"disabled"}else if paused{"paused"}else if !error.is_empty(){"unavailable"}else if active{"working"}else{"ready"},"error":error,"failure":failure.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?}),
-    )
+const PROVIDER_REQUIRED: &str = "Global manager credentials are not configured. Open Settings to configure the manager endpoint, model, and API key.";
+const PROVIDER_CONFIGURED: &str = "trim(base_url)!='' AND trim(model)!='' AND trim(api_key)!=''";
+
+pub fn public_provider(c: &Connection) -> Result<Value> {
+    Ok(c.query_row(
+        &format!("SELECT base_url,model,trim(api_key)!='',supports_images,revision,migration_conflict,
+            ({PROVIDER_CONFIGURED}) FROM manager_provider_config WHERE id=1"),
+        [],
+        |row| Ok(json!({
+            "base_url":row.get::<_,String>(0)?,"model":row.get::<_,String>(1)?,
+            "has_api_key":row.get::<_,bool>(2)?,"supports_images":row.get::<_,bool>(3)?,
+            "revision":row.get::<_,i64>(4)?,"migration_conflict":row.get::<_,bool>(5)?,
+            "configured":row.get::<_,bool>(6)?
+        })),
+    )?)
 }
-pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> {
+pub fn public(c: &Connection, project: &str) -> Result<Value> {
+    let mut public = public_provider(c)?;
+    public["mode"] = json!("manager");
+    let (paused, revision, error, active): (bool, i64, String, bool) = c.query_row(
+        "SELECT p.paused, m.revision, m.error,
+          EXISTS(SELECT 1 FROM manager_runs WHERE project_id=p.id AND status='working')
+         FROM projects p JOIN manager_config m ON m.project_id=p.id WHERE p.id=?",
+        [project], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let failure: Option<String> = c.query_row(
+        "SELECT diagnostic FROM manager_failures WHERE project_id=? AND revision=?",
+        params![project, revision], |row| row.get(0),
+    ).optional()?;
+    let error = if public["configured"] == true { error } else { PROVIDER_REQUIRED.into() };
+    public["status"] = json!(if paused { "paused" } else if !error.is_empty() {
+        "unavailable"
+    } else if active { "working" } else { "ready" });
+    public["error"] = json!(error);
+    public["failure"] = failure.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?.unwrap_or(Value::Null);
+    Ok(public)
+}
+pub fn save_provider(c: &Connection, input: ConfigInput) -> Result<Value> {
     let tx = c.unchecked_transaction()?;
-    let current = public(&tx, project)?;
+    let current = public_provider(&tx)?;
     ensure!(
         current["revision"] == input.expected_revision,
         "Manager settings changed; refresh before saving"
@@ -136,14 +164,9 @@ pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> 
         !(input.clear_api_key && input.api_key.is_some()),
         "Choose either a new key or clear key"
     );
-    let previous: String = tx
-        .query_row(
-            "SELECT api_key FROM manager_config WHERE project_id=?",
-            [project],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or_default();
+    let previous: String = tx.query_row(
+        "SELECT api_key FROM manager_provider_config WHERE id=1", [], |row| row.get(0),
+    )?;
     let key = if input.clear_api_key {
         String::new()
     } else {
@@ -153,130 +176,36 @@ pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> 
         base_url: input.base_url.clone(),
         model: input.model.clone(),
         supports_images: false,
-        api_key: if key.is_empty() {
-            "configuration-placeholder".into()
-        } else {
-            key.clone()
-        },
+        api_key: if key.is_empty() { "configuration-placeholder".into() } else { key.clone() },
     };
     config.validate()?;
-    // An omitted declaration survives only for the exact configured provider/model.
     let supports_images = input.supports_images.unwrap_or_else(|| {
         current["base_url"] == input.base_url
             && current["model"] == input.model
             && current["supports_images"] == true
     });
-    tx.execute("INSERT INTO manager_config(project_id,base_url,model,api_key,revision) VALUES(?,?,?,?,1) ON CONFLICT(project_id) DO UPDATE SET base_url=excluded.base_url,model=excluded.model,api_key=excluded.api_key,revision=manager_config.revision+1,input_revision=manager_config.input_revision+1,error='',next_attempt_at=0",params![project,input.base_url,input.model,key])?;
-    tx.execute(
-        "UPDATE manager_config SET supports_images=? WHERE project_id=?",
-        params![supports_images, project],
-    )?;
-    tx.execute(
-        "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
-        [project],
-    )?;
-    let result = public(&tx, project)?;
+    tx.execute("UPDATE manager_provider_config SET base_url=?,model=?,api_key=?,supports_images=?,
+        revision=revision+1,updated_at=?,migration_conflict=0 WHERE id=1",
+        params![input.base_url,input.model,key,supports_images,db::now()])?;
+    tx.execute("UPDATE manager_config SET revision=revision+1,input_revision=input_revision+1,error='',next_attempt_at=0", [])?;
+    tx.execute("UPDATE manager_runs SET status='superseded' WHERE status='working'", [])?;
+    let result = public_provider(&tx)?;
     tx.commit()?;
     Ok(result)
 }
 pub fn set_mode(c: &Connection, project: &str, input: ModeInput) -> Result<Value> {
-    ensure!(
-        ["native", "manager"].contains(&input.mode.as_str()),
-        "Invalid Agent mode"
-    );
-    ensure!(
-        !input.request_id.is_empty() && input.request_id.len() <= 200,
-        "Invalid mode request ID"
-    );
-    let tx = c.unchecked_transaction()?;
-    let payload =
-        json!({"mode":input.mode,"expected_revision":input.expected_revision}).to_string();
-    if let Some(previous) = tx
-        .query_row(
-            "SELECT payload FROM manager_mode_requests WHERE project_id=? AND request_id=?",
-            params![project, input.request_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        ensure!(
-            previous == payload,
-            "Mode request ID refers to different content"
-        );
-        return public(&tx, project);
+    if input.mode == "native" {
+        bail!("Single-agent mode has been removed; all projects use manager/worker mode.");
     }
-    crate::cli_control::classify(&tx)?;
-    work::sync_inbound(&tx)?;
-    let current = public(&tx, project)?;
-    ensure!(
-        current["revision"] == input.expected_revision,
-        "Manager settings changed; refresh before switching"
-    );
-    if input.mode == "manager" {
-        ensure!(
-            current["has_api_key"] == true
-                && !current["model"].as_str().unwrap_or_default().is_empty(),
-            "Configure the management model first"
-        );
-    }
-    tx.execute("INSERT INTO manager_config(project_id,mode,revision) VALUES(?,?,1) ON CONFLICT(project_id) DO UPDATE SET mode=excluded.mode,revision=manager_config.revision+1,input_revision=manager_config.input_revision+1,error='',next_attempt_at=0",params![project,input.mode])?;
-    if input.mode == "native" && current["mode"] == "manager" {
-        let effects=tx.prepare("SELECT e.id,e.name,e.status,e.result FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=? ORDER BY e.rowid DESC LIMIT 32")?.query_map([project],|r|Ok(json!({"effect_id":r.get::<_,String>(0)?,"tool":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"evidence":r.get::<_,String>(3)?.chars().take(1000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let p = db::project_by_key(&tx, project)?;
-        let mut query=tx.prepare("SELECT id,origin_event_id,payload FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing') ORDER BY rowid")?;
-        let rows = query.query_map([project], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, origin, raw) = row?;
-            let chars: Vec<char> = raw.chars().collect();
-            let total = chars.len().div_ceil(16000).max(1);
-            for (part, chunk) in chars.chunks(16000).enumerate() {
-                let handoff=json!({"instruction":"Explicit Agent-mode handoff. These ordered data chunks preserve unresolved user input. Assemble all parts for this input before acting. Do not repeat completed, committed or uncertain effects; inspect evidence first. Worker messages already sent must not be resent.","input_id":id,"part":part+1,"parts":total,"input_data_chunk":chunk.iter().collect::<String>(),"effect_evidence":effects}).to_string();
-                intent(
-                    &tx,
-                    &p,
-                    &format!("manager-mode-{}-{id}-{part}", input.request_id),
-                    &handoff,
-                    origin.as_deref(),
-                    false,
-                )?;
-            }
-        }
-        drop(query);
-        tx.execute(
-            "UPDATE manager_inputs SET status='transferred' WHERE project_id=? AND status IN ('queued','processing')",
-            [project],
-        )?;
-    }
-    tx.execute(
-        "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
-        [project],
-    )?;
-    tx.execute(
-        "INSERT INTO manager_mode_requests(project_id,request_id,payload) VALUES(?,?,?)",
-        params![project, input.request_id, payload],
-    )?;
-    let result = public(&tx, project)?;
-    tx.commit()?;
-    Ok(result)
+    ensure!(input.mode == "manager", "Invalid Agent mode");
+    public(c, project)
 }
-/// Stamp ownership at actual insertion; enabling never reclassifies an old inbox.
-pub fn stamp(c: &Connection, project: &str, attachment: &mut Value) -> Result<()> {
-    let enabled: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager')",
-        [project],
-        |r| r.get(0),
-    )?;
-    if enabled {
-        if !attachment.is_object() {
-            *attachment = json!({});
-        }
-        attachment["manager_owned"] = json!(true);
+pub fn migrate_queued(c: &Connection) -> Result<()> {
+    let events = c.prepare("SELECT id FROM work_events WHERE status='queued' AND source!='management' ORDER BY rowid")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for event in events {
+        route_event(c, &event)?;
     }
     Ok(())
 }
@@ -298,18 +227,6 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
         return Ok(());
     }
     let payload: Value = serde_json::from_str(&raw)?;
-    let enabled = if source == "timer" {
-        c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager')",
-            [&project],
-            |r| r.get::<_, bool>(0),
-        )?
-    } else {
-        payload["attachment"]["manager_owned"] == true
-    };
-    if !enabled {
-        return Ok(());
-    }
     let native_event = work::event(c, &project, event)?;
     let trusted_source = if source == "feishu" || source == "local" {
         json!({"message_id":if source=="feishu"{Some(&native_event.source_id)}else{None},"local_source_id":if source=="local"{Some(&native_event.source_id)}else{None},"source":payload["attachment"]["source"],"bot_app_id":payload["attachment"]["bot_app_id"]})
@@ -348,6 +265,7 @@ fn input(
     kind: &str,
     payload: &Value,
 ) -> Result<()> {
+    c.execute("INSERT OR IGNORE INTO manager_config(project_id,mode) VALUES(?,'manager')", [project])?;
     if c.execute("INSERT OR IGNORE INTO manager_inputs(id,project_id,origin_event_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)",params![id,project,origin,kind,payload.to_string(),db::now()])?==1 {
  c.execute("UPDATE manager_config SET input_revision=input_revision+CASE WHEN ?='user' THEN 1 ELSE 0 END,next_attempt_at=CASE WHEN ?='user' THEN 0 ELSE next_attempt_at END WHERE project_id=?",params![kind,kind,project])?; }
     Ok(())
@@ -361,7 +279,7 @@ pub(crate) struct Context {
 }
 pub(crate) fn valid(c: &Connection, ctx: &Context) -> Result<Project> {
     let p = crate::db::project_by_key(c, &ctx.project)?;
-    let matches:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager' AND revision=? AND input_revision=?)",params![ctx.project,ctx.revision,ctx.input_revision],|r|r.get(0))?;
+    let matches:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND revision=? AND input_revision=?)",params![ctx.project,ctx.revision,ctx.input_revision],|r|r.get(0))?;
     ensure!(
         matches && !p.paused,
         "Management input or policy changed; effect cancelled"
@@ -408,14 +326,21 @@ fn intent(
     c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at) VALUES(?,?,?,'management',?,?,'queued',?,?)",params![event,p.id,task,id,payload.to_string(),db::now(),db::now()])?;
     Ok(event)
 }
+#[cfg(test)]
+pub(crate) fn test_delegate(c: &Connection, project: &str, key: &str, origin: Option<&str>) -> Result<String> {
+    let p = db::project_by_key(c, project)?;
+    intent(c, &p, key, "Fixture delegation", origin, false)
+}
 /// Called inside the ordinary native claim transaction, after readiness checks.
 pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Result<bool> {
     if event.source != "management" {
-        return Ok(true);
+        return Ok(!installed(c)?);
     }
     let p = db::project_by_key(c, &event.project_id)?;
     if let Some(incident) = event.payload["repair_incident"].as_str() {
-        let current:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=m.revision AND m.revision=? AND m.mode='manager')",params![p.id,incident,event.payload["repair_revision"].as_i64()],|r|r.get(0))?;
+        let current:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id
+            CROSS JOIN manager_provider_config g WHERE f.project_id=? AND f.incident_id=? AND f.revision=m.revision AND m.revision=?
+            AND trim(g.base_url)!='' AND trim(g.model)!='' AND trim(g.api_key)!='')",params![p.id,incident,event.payload["repair_revision"].as_i64()],|r|r.get(0))?;
         if !current {
             cancel_repair(
                 c,
@@ -450,6 +375,7 @@ pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Resu
     Ok(true)
 }
 pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String> {
+    ensure!(event.source == "management", "Only manager delegations may reach the coding worker");
     ensure!(
         event.payload["expected_agent"] == p.agent
             && event.payload["target_generation"] == p.generation,
@@ -829,9 +755,19 @@ fn enqueue_receipt(
     Ok((id, true))
 }
 pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
+    if let Some(revision) = attachment["manager_provider_revision"].as_i64() {
+        let allowed: bool = c.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM manager_provider_config g JOIN projects p ON p.id=?
+                WHERE g.revision=? AND p.paused=0 AND NOT ({PROVIDER_CONFIGURED}))"),
+            params![project, revision], |row| row.get(0),
+        )?;
+        let p = db::project_by_key(c, project)?;
+        ensure!(allowed && !work::has_takeover(c, project, &p.generation)?,
+            "The manager configuration notice is no longer active");
+    }
     if let Some(origin) = attachment["manager_receipt_origin"].as_str() {
         let allowed: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_config m ON m.project_id=i.project_id JOIN projects p ON p.id=m.project_id WHERE i.project_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status IN ('queued','processing','consumed') AND m.mode='manager' AND m.revision=? AND p.paused=0)",
+            "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_config m ON m.project_id=i.project_id JOIN projects p ON p.id=m.project_id WHERE i.project_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status IN ('queued','processing','consumed') AND m.revision=? AND p.paused=0)",
             params![project, origin, attachment["manager_revision"].as_i64()],
             |r| r.get(0),
         )?;
@@ -847,7 +783,7 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
         return Ok(());
     }
     if attachment["manager_notice"] == true {
-        let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN projects p ON p.id=m.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=? AND f.revision=m.revision AND m.mode='manager' AND p.paused=0)",params![project,attachment["manager_incident"].as_str(),attachment["manager_revision"].as_i64()],|r|r.get(0))?;
+        let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN projects p ON p.id=m.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=? AND f.revision=m.revision AND p.paused=0)",params![project,attachment["manager_incident"].as_str(),attachment["manager_revision"].as_i64()],|r|r.get(0))?;
         ensure!(
             allowed,
             "Management notice no longer belongs to an active incident"
@@ -861,7 +797,7 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
     let Some(effect) = attachment["manager_effect"].as_str() else {
         return Ok(());
     };
-    let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id JOIN manager_config m ON m.project_id=r.project_id JOIN projects p ON p.id=m.project_id WHERE e.id=? AND r.project_id=? AND r.status IN ('working','complete') AND r.revision=m.revision AND r.input_revision=m.input_revision AND m.mode='manager' AND p.paused=0)",params![effect,project],|r|r.get(0))?;
+    let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id JOIN manager_config m ON m.project_id=r.project_id JOIN projects p ON p.id=m.project_id WHERE e.id=? AND r.project_id=? AND r.status IN ('working','complete') AND r.revision=m.revision AND r.input_revision=m.input_revision AND p.paused=0)",params![effect,project],|r|r.get(0))?;
     ensure!(allowed, "Management reply was superseded or stopped");
     let p = db::project_by_key(c, project)?;
     ensure!(
@@ -1003,19 +939,12 @@ pub fn worker_changed(c: &Connection, project: &str) -> Result<()> {
     if !installed(c)? {
         return Ok(());
     }
-    let enabled: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager')",
-        [project],
-        |r| r.get(0),
-    )?;
-    if enabled {
-        observe(c, project)?;
-        repair_finished(c, project)?;
-    }
+    observe(c, project)?;
+    repair_finished(c, project)?;
     Ok(())
 }
 fn repair_finished(c: &Connection, project: &str) -> Result<()> {
-    let current:Option<(String,i64)>=c.query_row("SELECT f.incident_id,f.revision FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN work_events e ON e.project_id=f.project_id AND json_extract(e.payload,'$.repair_incident')=f.incident_id AND json_extract(e.payload,'$.repair_revision')=f.revision JOIN work_runs r ON r.event_id=e.id WHERE f.project_id=? AND f.revision=m.revision AND m.mode='manager' AND f.repair_probe=0 AND r.finished_at IS NOT NULL AND r.status IN ('settled','completed') LIMIT 1",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let current:Option<(String,i64)>=c.query_row("SELECT f.incident_id,f.revision FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN work_events e ON e.project_id=f.project_id AND json_extract(e.payload,'$.repair_incident')=f.incident_id AND json_extract(e.payload,'$.repair_revision')=f.revision JOIN work_runs r ON r.event_id=e.id WHERE f.project_id=? AND f.revision=m.revision AND f.repair_probe=0 AND r.finished_at IS NOT NULL AND r.status IN ('settled','completed') LIMIT 1",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((incident, revision)) = current else {
         return Ok(());
     };
@@ -1332,7 +1261,7 @@ fn prepare_images(
 fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
     let tx = c.unchecked_transaction()?;
     let p = db::project_by_key(&tx, project)?;
-    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row("SELECT base_url,model,api_key,revision,input_revision,supports_images FROM manager_config WHERE project_id=? AND mode='manager' AND next_attempt_at<=?",params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row("SELECT g.base_url,g.model,g.api_key,m.revision,m.input_revision,g.supports_images FROM manager_config m CROSS JOIN manager_provider_config g WHERE m.project_id=? AND m.next_attempt_at<=? AND trim(g.base_url)!='' AND trim(g.model)!='' AND trim(g.api_key)!=''",params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
     let Some((base_url, model, api_key, revision, _, supports_images)) = config else {
         return Ok(None);
     };
@@ -1628,7 +1557,47 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         debug_dispatch,
     }))
 }
+fn provider_unavailable(c: &Connection, project: &str) -> Result<bool> {
+    let (configured, revision): (bool, i64) = c.query_row(
+        &format!("SELECT ({PROVIDER_CONFIGURED}),revision FROM manager_provider_config WHERE id=1"),
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if configured {
+        return Ok(false);
+    }
+    let p = db::project_by_key(c, project)?;
+    if p.paused || work::has_takeover(c, project, &p.generation)? {
+        return Ok(true);
+    }
+    let Some(binding) = crate::bot::get(c, project)? else {
+        return Ok(true);
+    };
+    let request = format!("manager-provider-required-{project}-{revision}");
+    let source: Option<(String, String, String)> = c.query_row(
+        "SELECT m.source_id,json_extract(m.attachment,'$.source.chat_id'),m.content
+         FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id
+         JOIN messages m ON m.id=e.message_id
+         WHERE i.project_id=? AND i.status IN ('queued','processing') AND e.source='feishu'
+         AND json_extract(m.attachment,'$.bot_app_id')=?
+         AND json_type(m.attachment,'$.source.chat_id')='text'
+         AND m.source_id GLOB 'om_*'
+         AND NOT EXISTS(SELECT 1 FROM messages WHERE project_id=i.project_id AND direction='out' AND source_id=?)
+         ORDER BY i.rowid LIMIT 1",
+        params![project,binding.app_id,request], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).optional()?;
+    if let Some((anchor, to, body)) = source {
+        let content = if body.chars().any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch)) {
+            "尚未配置全局管理智能体凭据。消息已保留，请在 Dauerbot 的设置中配置服务地址、模型和 API 密钥。"
+        } else {
+            "Your message is saved. Configure the shared manager endpoint, model, and API key in Dauerbot Settings to continue."
+        };
+        db::enqueue_out_request(c, project, &binding.app_id, &request, content,
+            json!({"to":to,"reply_to_message_id":anchor,"manager_provider_revision":revision}))?;
+    }
+    Ok(true)
+}
 fn claim_or_repair(c: &Connection, project: &str) -> Result<Option<Turn>> {
+    if provider_unavailable(c, project)? { return Ok(None); }
     match claim(c, project) {
         Ok(turn) => Ok(turn),
         Err(_) => {
@@ -1636,7 +1605,7 @@ fn claim_or_repair(c: &Connection, project: &str) -> Result<Option<Turn>> {
             if p.paused || work::has_takeover(c, project, &p.generation)? {
                 return Ok(None);
             }
-            let config:Option<(i64,i64)>=c.query_row("SELECT revision,input_revision FROM manager_config WHERE project_id=? AND mode='manager'",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let config:Option<(i64,i64)>=c.query_row("SELECT revision,input_revision FROM manager_config WHERE project_id=?",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let Some((revision, input_revision)) = config else {
                 return Ok(None);
             };
@@ -2001,7 +1970,7 @@ pub async fn run(app: Arc<App>) {
         let Some(_permit) = app.service.gate.enter() else {
             continue;
         };
-        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE m.mode='manager' AND p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status IN ('queued','processing')) OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
+        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status IN ('queued','processing')) OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
         for project in projects {
             if !running.lock().await.insert(project.clone()) {
                 continue;
@@ -2084,9 +2053,8 @@ mod tests {
         app.db
             .sync(|c| {
                 crate::bot::save(c, &p.id, "cli_fixture", "private-fixture-key", false)?;
-                save(
+                save_provider(
                     c,
-                    &p.id,
                     ConfigInput {
                         base_url: "http://127.0.0.1:9/v1".into(),
                         model: "fixture-manager".into(),
@@ -2096,19 +2064,140 @@ mod tests {
                         supports_images: None,
                     },
                 )?;
-                set_mode(
-                    c,
-                    &p.id,
-                    ModeInput {
-                        mode: "manager".into(),
-                        request_id: "enable".into(),
-                        expected_revision: 1,
-                    },
-                )?;
                 Ok(())
             })
             .unwrap();
         (dir, app, p)
+    }
+    #[tokio::test]
+    async fn unconfigured_projects_hold_input_without_delegating_and_share_the_saved_provider() {
+        let (_dir, app, first) = fixture().await;
+        let second = app.db.create(ProjectInput {
+            name: "Second fixture".into(),
+            path: first.path.clone(),
+            agent: "codex".into(),
+            chat_id: String::new(),
+            native_session: String::new(),
+            extra_args: vec![],
+        }).await.unwrap();
+        // A nonempty model/key still requires an endpoint.
+        app.db.sync(|c| {
+            c.execute("UPDATE manager_provider_config SET base_url='' WHERE id=1", [])?;
+            Ok(())
+        }).unwrap();
+        ingest(&app, &first, "om_provider_required", "Hold this request");
+        ingest(&app, &first, "om_provider_required_again", "Also keep this request");
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            for project in [&first.id, &second.id] {
+                let state = public(c, project)?;
+                assert_eq!(state["mode"], "manager");
+                assert_eq!(state["status"], "unavailable");
+                assert_eq!(state["error"], PROVIDER_REQUIRED);
+                assert!(state.get("api_key").is_none());
+                assert!(claim(c, project)?.is_none());
+                assert!(claim_or_repair(c, project)?.is_none());
+                assert!(work::claim_next(c, project, "fixture", db::now())?.is_none());
+            }
+            // Repeated actor polling retains the original topic and at most one notice.
+            assert!(claim_or_repair(c, &first.id)?.is_none());
+            for table in ["manager_failures", "manager_runs", "work_runs"] {
+                let count: u32 = c.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))?;
+                assert_eq!(count, 0, "{table}");
+            }
+            let pending: u32 = c.query_row("SELECT count(*) FROM manager_inputs WHERE status='queued'", [], |row| row.get(0))?;
+            assert_eq!(pending, 2);
+            let notices = c.prepare("SELECT attachment FROM messages WHERE direction='out'")?
+                .query_map([], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(notices.len(), 1);
+            let notice: Value = serde_json::from_str(&notices[0])?;
+            assert_eq!(notice["reply_to_message_id"], "om_provider_required");
+            validate_outbox(c, &first.id, &notice)?;
+            assert!(set_mode(c, &first.id, ModeInput {
+                mode:"native".into(), request_id:String::new(), expected_revision:0
+            }).is_err());
+
+            let current = public_provider(c)?;
+            save_provider(c, ConfigInput {
+                base_url:"https://provider.example/v1".into(), model:"shared-fixture".into(), api_key:None,
+                clear_api_key:false, expected_revision:current["revision"].as_i64().unwrap(),
+                supports_images:Some(true),
+            })?;
+            assert!(validate_outbox(c, &first.id, &notice).is_err());
+            for project in [&first.id, &second.id] {
+                let state = public(c, project)?;
+                assert_eq!(state["model"], "shared-fixture");
+                assert_eq!(state["status"], "ready");
+                assert_eq!(state["supports_images"], true);
+            }
+            assert!(claim_or_repair(c, &first.id)?.is_some());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_provider_migration_is_single_shot_and_preserves_unclaimed_and_uncertain_work() {
+        let (_dir, app, first) = fixture().await;
+        let new_project = |name: &str| ProjectInput {
+            name:name.into(), path:first.path.clone(), agent:"codex".into(),
+            chat_id:String::new(), native_session:String::new(), extra_args:vec![],
+        };
+        let different = app.db.create(new_project("Compared legacy fixture")).await.unwrap();
+        let native = app.db.create(new_project("Legacy native fixture")).await.unwrap();
+        let absent = app.db.create(new_project("Legacy fixture without configuration")).await.unwrap();
+        app.db.sync(|c| {
+            c.execute_batch("DROP TABLE manager_provider_config;")?;
+            c.execute("UPDATE manager_config SET base_url='https://fixture.example',model='old-fixture',
+                api_key='fixture-key-a',mode='manager',revision=3 WHERE project_id=?", [&first.id])?;
+            c.execute("UPDATE manager_config SET base_url='https://fixture.example/v1',model='chosen-fixture',
+                api_key='fixture-key-b',supports_images=1,mode='manager',revision=4 WHERE project_id=?", [&different.id])?;
+            c.execute("UPDATE manager_config SET mode='native' WHERE project_id=?", [&native.id])?;
+            c.execute("DELETE FROM manager_config WHERE project_id=?", [&absent.id])?;
+            for (id, state) in [("legacy-queued", "queued"), ("legacy-uncertain", "uncertain")] {
+                c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at)
+                    VALUES(?,?,'Legacy task','Legacy payload',?,1,1)", params![id,native.id,state])?;
+                c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
+                    VALUES(?,?,?,'local',?,?,?,1,1)",
+                    params![id,native.id,id,id,json!({"content":"preserve this"}).to_string(),state])?;
+            }
+            c.execute("INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at)
+                VALUES('legacy-run',?,'legacy-uncertain','legacy-uncertain','legacy-generation','uncertain',1,1)", [&native.id])?;
+            Ok(())
+        }).unwrap();
+        let path = app.dir.join("bridge.sqlite3");
+        // Handover opens the real migration pipeline on a private fixture store.
+        let db = db::Db::open_handover(&path).unwrap();
+        db.sync(|c| {
+            let schema: i64 = c.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            assert_eq!(schema, 7);
+            assert_eq!(crate::api::PROTOCOL, 7);
+            let selected = public_provider(c)?;
+            assert_eq!(selected["model"], "chosen-fixture");
+            assert_eq!(selected["migration_conflict"], true);
+            assert_eq!(selected["supports_images"], true);
+            for project in [&first.id,&different.id,&native.id,&absent.id] {
+                assert_eq!(public(c, project)?["model"], "chosen-fixture");
+            }
+            assert_eq!(work::event(c, &native.id, "legacy-queued")?.status, "managed");
+            assert_eq!(work::event(c, &native.id, "legacy-uncertain")?.status, "uncertain");
+            assert_eq!(work::run(c, &native.id, "legacy-run")?.status, "uncertain");
+            let moved: u32 = c.query_row("SELECT count(*) FROM manager_inputs WHERE origin_event_id='legacy-queued'", [], |row| row.get(0))?;
+            assert_eq!(moved, 1);
+            save_provider(c, ConfigInput {
+                base_url:"https://fixture.example/v1".into(),model:"chosen-fixture".into(),api_key:None,
+                clear_api_key:true,expected_revision:selected["revision"].as_i64().unwrap(),supports_images:None,
+            })?;
+            Ok(())
+        }).unwrap();
+        drop(db);
+        db::Db::open_handover(&path).unwrap().sync(|c| {
+            let provider = public_provider(c)?;
+            assert_eq!(provider["has_api_key"], false);
+            assert_eq!(provider["migration_conflict"], false);
+            let stale: u32 = c.query_row("SELECT count(*) FROM manager_config WHERE api_key!=''", [], |row| row.get(0))?;
+            assert_eq!(stale, 0);
+            Ok(())
+        }).unwrap();
     }
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
@@ -2298,7 +2387,7 @@ mod tests {
             assert_eq!(original["supports_images"], false);
             let configure = |model: &str, declared: Option<bool>| -> Result<Value> {
                 let current = public(c, &p.id)?;
-                save(c, &p.id, ConfigInput { base_url: current["base_url"].as_str().unwrap().into(), model: model.into(), api_key: None, clear_api_key: false, expected_revision: current["revision"].as_i64().unwrap(), supports_images: declared })
+                save_provider(c, ConfigInput { base_url: current["base_url"].as_str().unwrap().into(), model: model.into(), api_key: None, clear_api_key: false, expected_revision: current["revision"].as_i64().unwrap(), supports_images: declared })
             };
             assert_eq!(configure("fixture-vision-name-is-not-proof", None)?["supports_images"], false);
             assert_eq!(configure("fixture-vision-name-is-not-proof", Some(true))?["supports_images"], true);
@@ -2307,7 +2396,7 @@ mod tests {
             assert_eq!(configure("different-model", Some(true))?["supports_images"], true);
             let current = public(c, &p.id)?;
             let changed: ConfigInput = serde_json::from_value(json!({"base_url":"http://127.0.0.1:8/v1","model":"different-model","expected_revision":current["revision"]}))?;
-            assert_eq!(save(c, &p.id, changed)?["supports_images"], false);
+            assert_eq!(save_provider(c, changed)?["supports_images"], false);
             Ok(())
         }).unwrap();
     }
@@ -2338,7 +2427,7 @@ mod tests {
             assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE id=?", [&image_input], |r|r.get::<_,String>(0))?, "processing");
             let current = public(c,&p.id)?;
             let config: ConfigInput = serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?;
-            save(c,&p.id,config)?;
+            save_provider(c,config)?;
             let inline = claim(c,&p.id)?.unwrap();
             assert_eq!(inline.checkpoint["images"].as_array().unwrap().len(),1);
             assert_eq!(inline.checkpoint["images"][0]["message_id"],id);
@@ -2386,7 +2475,7 @@ mod tests {
         app.db.sync(|c| {
             work::sync_inbound(c)?;
             let current = public(c,&p.id)?;
-            save(c,&p.id,serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?)?;
+            save_provider(c,serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?)?;
             let turn = claim(c,&p.id)?.unwrap();
             assert_eq!(turn.checkpoint["images"].as_array().unwrap().len(),2);
             let ids = turn.checkpoint["images"].as_array().unwrap().iter().map(|image|image["message_id"].as_str().unwrap()).collect::<Vec<_>>();
@@ -2755,7 +2844,7 @@ mod tests {
         }).unwrap();
     }
     #[tokio::test]
-    async fn processing_inputs_obey_pause_stop_and_native_mode_handoff() {
+    async fn processing_inputs_obey_pause_and_stop() {
         let (_dir, app, p) = fixture().await;
         ingest(&app, &p, "om_processing_stop", "preserve this instruction");
         app.db
@@ -2776,43 +2865,6 @@ mod tests {
                     "cancelled"
                 );
                 assert!(claim(c, &p.id)?.is_none());
-                Ok(())
-            })
-            .unwrap();
-        let (_dir, app, p) = fixture().await;
-        ingest(
-            &app,
-            &p,
-            "om_processing_transfer",
-            "preserve the full original input",
-        );
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let old = claim(c, &p.id)?.unwrap();
-                set_mode(
-                    c,
-                    &p.id,
-                    ModeInput {
-                        mode: "native".into(),
-                        request_id: "processing-handoff".into(),
-                        expected_revision: 2,
-                    },
-                )?;
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "transferred"
-                );
-                assert!(valid(c, &old.context).is_err());
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
                 Ok(())
             })
             .unwrap();
@@ -3455,52 +3507,7 @@ mod tests {
         }).unwrap();
     }
     #[tokio::test]
-    async fn disabling_and_stop_materialize_stamped_input_without_replay_or_resurrection() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_before_mode", "preserve this input");
-        app.db
-            .sync(|c| {
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM manager_inputs", [], |r| r
-                        .get::<_, i64>(0))?,
-                    0
-                );
-                let request = || ModeInput {
-                    mode: "native".into(),
-                    request_id: "native-mode".into(),
-                    expected_revision: 2,
-                };
-                set_mode(c, &p.id, request())?;
-                set_mode(c, &p.id, request())?;
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "transferred"
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                work::sync_inbound(c)?;
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM work_runs", [], |r| r.get::<_, i64>(0))?,
-                    0
-                );
-                Ok(())
-            })
-            .unwrap();
+    async fn stop_materializes_input_without_resurrection() {
         let (_dir, app, p) = fixture().await;
         ingest(&app, &p, "om_before_stop", "must not resurrect");
         app.db
@@ -3719,72 +3726,6 @@ mod tests {
         assert!(!Path::new(&p.path).join("stale.txt").exists());
         app.db.sync(|c|{let next=claim(c,&p.id)?.unwrap();c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('uncertain-effect',?,'turn:1:call:0','delegate','{}','submitting')",[next.context.run])?;migrate(c,true)?;assert_eq!(c.query_row("SELECT status FROM manager_effects WHERE id='uncertain-effect'",[],|r|r.get::<_,String>(0))?,"uncertain");Ok(())}).unwrap();
     }
-    #[tokio::test]
-    async fn long_mode_handoff_is_bounded_ordered_and_preserves_every_input() {
-        let (_dir, app, p) = fixture().await;
-        for index in 0..8 {
-            ingest(
-                &app,
-                &p,
-                &format!("om_long_{index}"),
-                &format!("claimed message_id=fake {index} {}", "x".repeat(150000)),
-            );
-        }
-        app.db
-            .sync(|c| {
-                set_mode(
-                    c,
-                    &p.id,
-                    ModeInput {
-                        mode: "native".into(),
-                        request_id: "long-disable".into(),
-                        expected_revision: 2,
-                    },
-                )?;
-                let records = c
-                    .prepare("SELECT id,payload FROM manager_inputs ORDER BY rowid")?
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut chunks = std::collections::HashMap::<String, String>::new();
-                let payloads = c
-                    .prepare(
-                        "SELECT payload FROM work_events WHERE source='management' ORDER BY rowid",
-                    )?
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                assert!(payloads.len() > 8);
-                for raw in payloads {
-                    let payload: Value = serde_json::from_str(&raw)?;
-                    let instructions = payload["instructions"].as_str().unwrap();
-                    assert!(instructions.len() < 1048576);
-                    assert!(!instructions.contains("private-manager-key"));
-                    let part: Value = serde_json::from_str(instructions)?;
-                    chunks
-                        .entry(part["input_id"].as_str().unwrap().to_owned())
-                        .or_default()
-                        .push_str(part["input_data_chunk"].as_str().unwrap());
-                }
-                for (index, (id, raw)) in records.iter().enumerate() {
-                    assert_eq!(chunks[id], *raw);
-                    let value: Value = serde_json::from_str(raw)?;
-                    assert_eq!(
-                        value["trusted_source"]["message_id"],
-                        format!("om_long_{index}")
-                    );
-                }
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='transferred'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    8
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-
     fn prompt_context(value: &Value) -> Option<Value> {
         match value {
             Value::String(text) => serde_json::from_str::<Value>(text)
@@ -3941,7 +3882,7 @@ mod tests {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
         let router=Router::new().route("/v1/chat/completions",post(respond)).with_state(provider.clone());
         let server=tokio::spawn(async move{axum::serve(listener,router).await.unwrap()});
-        app.db.sync(|c| {let current=public(c,&p.id)?;save(c,&p.id,ConfigInput{base_url:format!("http://{addr}/v1"),model:"fixture-manager".into(),api_key:None,clear_api_key:false,expected_revision:current["revision"].as_i64().unwrap(),supports_images:None})?;Ok(())}).unwrap();
+        app.db.sync(|c| {let current=public(c,&p.id)?;save_provider(c,ConfigInput{base_url:format!("http://{addr}/v1"),model:"fixture-manager".into(),api_key:None,clear_api_key:false,expected_revision:current["revision"].as_i64().unwrap(),supports_images:None})?;Ok(())}).unwrap();
         let binding=crate::bot::Binding{project_id:p.id.clone(),app_id:"cli_fixture".into(),app_secret:"fixture-bot-secret".into()};
         let input=|id:&str,text:&str|serde_json::to_vec(&json!({"header":{"app_id":"cli_fixture","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_fixture"}},"message":{"message_id":id,"chat_id":"oc_fixture","chat_type":"p2p","message_type":"text","content":json!({"text":text}).to_string()}}})).unwrap();
         crate::feishu::ingest(&app,&binding,&input("om_first_blocked","Start original task")).unwrap();

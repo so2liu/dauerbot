@@ -445,9 +445,8 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
     app.db
         .sync(|c| {
             bot::save(c, &project.id, "cli_fixture", "fixture", false)?;
-            let config = manager::save(
+            manager::save_provider(
                 c,
-                &project.id,
                 manager::ConfigInput {
                     base_url: format!("{base}/v1"),
                     model: "fixture".into(),
@@ -455,15 +454,6 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
                     clear_api_key: false,
                     expected_revision: 0,
                     supports_images: Some(true),
-                },
-            )?;
-            manager::set_mode(
-                c,
-                &project.id,
-                manager::ModeInput {
-                    mode: "manager".into(),
-                    request_id: "race-mode".into(),
-                    expected_revision: config["revision"].as_i64().unwrap(),
                 },
             )?;
             Ok(())

@@ -224,7 +224,6 @@ mod tests {
                 input_revision: 0,
             };
             app.db.sync(|c| {
-                c.execute("INSERT INTO manager_config(project_id,mode) VALUES(?,'manager')", [&p.id])?;
                 c.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES('run',?,0,0,'{}','working',?,0)", rusqlite::params![p.id,manager::owner()])?;
                 c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&p.id])?;
                 Ok(())
@@ -319,7 +318,6 @@ mod tests {
             input_revision: 0,
         };
         app.db.sync(|c| {
-            c.execute("INSERT INTO manager_config(project_id,mode) VALUES(?,'manager')", [&project.id])?;
             c.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES('run',?,0,0,'{}','working',?,0)", rusqlite::params![project.id,manager::owner()])?;
             c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&project.id])?;
             assert!(current(c,&ctx,"g").is_ok());
