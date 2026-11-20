@@ -88,7 +88,7 @@ pub(crate) fn native_home() -> Result<PathBuf> {
 }
 
 enum Observer {
-    Protocol(Server),
+    Protocol(Box<Server>),
     Lifecycle {
         home: PathBuf,
         version: String,
@@ -112,7 +112,7 @@ impl Observer {
                 cwd: cwd.to_owned(),
             })
         } else {
-            Ok(Self::Protocol(Server::start(cli, cwd).await?))
+            Ok(Self::Protocol(Box::new(Server::start(cli, cwd).await?)))
         }
     }
 

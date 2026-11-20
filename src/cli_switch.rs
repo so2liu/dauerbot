@@ -616,9 +616,9 @@ pub(crate) fn request(c: &Connection, p: &Project, target: &str) -> Result<Optio
     );
     let previous = latest(c, &p.id)?;
     ensure!(
-        !previous
+        previous
             .as_ref()
-            .is_some_and(|r| r.phase == "recovery_exhausted"),
+            .is_none_or(|r| r.phase != "recovery_exhausted"),
         "Retry recovery or stop the unresolved execution before changing the target CLI"
     );
     if let Some(r) = previous.as_ref().filter(|r| active(r)) {
