@@ -131,6 +131,40 @@ fn classifications_use_durable_evidence_and_keep_full_detail() -> Result<()> {
 }
 
 #[test]
+fn dismissed_delegation_keeps_failed_history_without_requiring_action() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = db::Db::open(&dir.path().join("panel.sqlite"))?;
+    let now = db::now();
+    db.sync(|c| {
+        seed_project(c, "atlas")?;
+        incoming(c, "atlas", "original", "Fixture request", now - 5_000, json!({}))?;
+        work::sync_inbound(c)?;
+        c.execute("UPDATE manager_inputs SET status='consumed' WHERE origin_event_id='original'", [])?;
+        let delegate = crate::manager::test_delegate(c, "atlas", "fixture-effect", Some("original"))?;
+        c.execute("UPDATE work_events SET status='failed' WHERE id=?", [&delegate])?;
+        c.execute(
+            "INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at,finished_at)
+             SELECT 'failed-run',project_id,task_id,id,'fixture-generation','failed',?2,?2,?2
+             FROM work_events WHERE id=?1",
+            params![delegate,now-1000],
+        )?;
+        let before = message_detail(c, "original", now)?.unwrap();
+        assert_eq!(before["closure_reason"], "worker_failure");
+        assert_eq!(before["needs_action"], true);
+
+        work::resolve_event(c, "atlas", &delegate, false, now)?;
+        let after = message_detail(c, "original", now)?.unwrap();
+        assert_eq!(after["closure_reason"], "dismissed");
+        assert_eq!(after["needs_action"], false);
+        assert!(after["timeline"].as_array().unwrap().iter()
+            .any(|row| row["id"] == "failed-run" && row["status"] == "failed"));
+        let panel = overview(c, &HashMap::new(), &Query::default(), now)?;
+        assert_eq!(panel["kpis"]["needs_action"], 0);
+        Ok(())
+    })
+}
+
+#[test]
 fn chats_merge_project_history_and_buckets_follow_local_boundaries() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = db::Db::open(&dir.path().join("panel.sqlite"))?;

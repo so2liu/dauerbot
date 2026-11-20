@@ -66,8 +66,11 @@ WITH source AS (
     FROM work_runs r JOIN (SELECT DISTINCT id FROM event_links) e ON e.id=r.event_id
 ), worker_evidence AS (
     SELECT e.item_id,
-        MAX(e.status IN ('failed','uncertain') OR COALESCE(r.status IN ('failed','uncertain'),0)) AS failed,
-        MAX(e.status IN ('submitting','submitted') OR COALESCE(r.status IN ('submitting','submitted','running'),0)) AS active,
+        MAX(e.status!='dismissed' AND
+            (e.status IN ('failed','uncertain') OR COALESCE(r.status IN ('failed','uncertain'),0))) AS failed,
+        MAX(e.status!='dismissed' AND
+            (e.status IN ('submitting','submitted') OR COALESCE(r.status IN ('submitting','submitted','running'),0))) AS active,
+        MAX(e.status='dismissed') AS dismissed,
         MAX(e.status='queued' AND e.created_at<:now-120000) AS stale_queue,
         MAX(e.status='queued') AS queued,
         MAX(e.status IN ('delivered','completed','consumed','transferred','cancelled','dismissed') OR
@@ -164,7 +167,7 @@ WITH source AS (
 ), active_projects AS MATERIALIZED (
     SELECT DISTINCT project_id FROM manager_runs WHERE status='working'
 ), evidence AS (
-    SELECT c.*,COALESCE(w.failed,0) AS worker_failed,
+    SELECT c.*,COALESCE(w.failed,0) AS worker_failed, COALESCE(w.dismissed,0) AS worker_dismissed,
         COALESCE(r.uncertain,0) AS manager_uncertain, COALESCE(w.active,0) AS worker_active,
         COALESCE(w.queued,0) AS worker_queued, COALESCE(w.stale_queue,0) AS worker_stale,
         COALESCE(i.active,0) AS input_active,COALESCE(i.processing,0) AS manager_processing,
@@ -200,6 +203,7 @@ WITH source AS (
         WHEN NOT ended AND NOT is_control AND takeover THEN 'takeover'
         WHEN is_control AND (command_phase='done' OR reply_count>0) THEN 'control'
         WHEN reply_count>0 THEN 'replied'
+        WHEN ended AND worker_dismissed THEN 'dismissed'
         WHEN ended AND receipt_count>0 THEN 'receipt_only'
         WHEN ended THEN 'no_reply'
         WHEN routing THEN 'routing_pending'
