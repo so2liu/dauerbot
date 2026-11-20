@@ -1,6 +1,8 @@
 pub mod adapter;
 mod agent_tree;
 pub mod api;
+pub(crate) mod autonomy;
+mod autonomy_feishu;
 pub mod bot;
 pub mod child_thread_gc;
 mod child_threads;
@@ -552,7 +554,9 @@ impl App {
         let message = m.clone();
         let admitted=self.db.call(move|c|{
             let tx=c.unchecked_transaction()?;
-            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment).and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment)) {
+            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment)
+                .and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment))
+                .and_then(|_|autonomy_feishu::validate_publication(&tx,&message.project_id,&message.attachment)) {
                 tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;tx.commit()?;return Ok(false);
             }
             let changed=tx.execute(
@@ -573,9 +577,16 @@ impl App {
                     .as_str()
                     .map(str::to_owned);
                 self.db.call(move|c|{
-                    c.execute("UPDATE messages SET status='sent',error='',attachment=json_set(attachment,
+                    let tx = c.unchecked_transaction()?;
+                    tx.execute("UPDATE messages SET status='sent',error='',attachment=json_set(attachment,
                       '$.sent_message_id',?,'$.sent_chat_id',?,'$.sent_thread_id',?,'$.sent_root_id',?,'$.resolved_reply_to_message_id',?),updated_at=? WHERE id=?",
                       rusqlite::params![receipt.message_id,receipt.chat_id,receipt.thread_id,receipt.root_id,anchor,db::now(),id])?;
+                    tx.execute(
+                        "UPDATE proposals SET source_message_id=? WHERE outbox_id=? AND source_message_id IS NULL
+                         AND EXISTS(SELECT 1 FROM autonomy_settings s WHERE s.project_id=proposals.project_id AND s.chat_id=?)",
+                        rusqlite::params![receipt.message_id,id,receipt.chat_id],
+                    )?;
+                    tx.commit()?;
                     Ok(())
                 }).await?;
             }

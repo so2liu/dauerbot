@@ -671,6 +671,9 @@ impl CardActionTriggerHandler for Inbound {
         let Some(_permit) = self.app.service.gate.enter() else {
             return Ok(Some(updating_card_response()));
         };
+        if let Some(response) = crate::autonomy_feishu::callback(&self.app, &self.binding, &event) {
+            return Ok(Some(response));
+        }
         Ok(Some(crate::model_control::ingest_callback(
             &self.app,
             &self.binding,
@@ -715,6 +718,14 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
             return Err(anyhow::anyhow!(
                 "The Feishu event belongs to a different bot"
             ));
+        }
+        if v["header"]["app_id"].as_str() == Some(binding.app_id.as_str())
+            && app.db.sync(|c| {
+                crate::autonomy_feishu::text(c, binding, &source, &text, &attachment["source"], db::now())
+            })?
+        {
+            app.notify.notify_one();
+            return Ok(());
         }
         let model_command = attachment["source"]["message_type"] == "text"
             && crate::model_control::is_command(crate::cli_control::command_text(&text, &attachment["source"]));
