@@ -392,14 +392,14 @@ impl ObservationPanel {
         self.language.text(key)
     }
 
-    fn time(&self, at: &Value) -> String {
+    fn time(&self, at: &Value, format: &str) -> String {
         let Some(time) = at.as_i64().and_then(DateTime::<Utc>::from_timestamp_millis) else {
             return "—".into();
         };
         if let Some(zone) = self.dashboard.as_ref().and_then(|d| d.zone) {
-            time.with_timezone(&zone).format("%m/%d %H:%M").to_string()
+            time.with_timezone(&zone).format(format).to_string()
         } else {
-            time.format("%m/%d %H:%M UTC").to_string()
+            format!("{} UTC", time.format(format))
         }
     }
 
@@ -620,6 +620,14 @@ fn muted(p: Palette, value: impl Into<SharedString>) -> Div {
 
 fn small_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id).small().compact().label(label)
+}
+
+fn chat_kind(chat: &Value) -> &'static str {
+    match text(chat, "kind") {
+        "group" => "Group",
+        "p2p" => "Direct",
+        _ => "Unknown chat",
+    }
 }
 
 fn state_color(state: &str, p: Palette) -> u32 {
@@ -1074,11 +1082,7 @@ impl ObservationPanel {
         }
         let id = text(chat, "chat_id");
         let tail = id.char_indices().rev().nth(3).map_or(id, |(i, _)| &id[i..]);
-        let kind = self.tr(if chat["kind"] == "p2p" {
-            "Direct"
-        } else {
-            "Group"
-        });
+        let kind = self.tr(chat_kind(chat));
         format!("{kind} · …{tail}")
     }
 
@@ -1152,16 +1156,11 @@ impl ObservationPanel {
                     .tooltip(move |window, cx| Tooltip::new(more.clone()).build(window, cx)),
             );
         }
-        let known_chat = if chat["kind"] == "p2p" {
-            "Direct"
-        } else {
-            "Group"
-        };
         let activity = format!(
             "{} · {} · {}",
-            self.tr(known_chat),
+            self.tr(chat_kind(chat)),
             count(chat, "message_count_in_range"),
-            self.time(&chat["last_seen_at"])
+            self.time(&chat["last_seen_at"], "%m/%d %H:%M")
         );
         div()
             .id(SharedString::from(key))
@@ -1357,7 +1356,7 @@ impl ObservationPanel {
         let source = [
             text(row, "project_name"),
             text(row, "chat_name"),
-            &self.time(&row["created_at"]),
+            &self.time(&row["created_at"], "%m/%d %H:%M"),
         ]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -1678,7 +1677,7 @@ impl ObservationPanel {
         if !timeline.is_empty() {
             let items = timeline.iter().map(|item| {
                 let kind = self.tr(label_key(text(item, "kind"), TIMELINE_KEYS));
-                let at = self.time(&item["at_ms"]);
+                let at = self.time(&item["at_ms"], "%m/%d %H:%M:%S%.3f");
                 let state = self.tr(evidence_status(text(item, "status")));
                 div()
                     .flex()
@@ -1691,7 +1690,7 @@ impl ObservationPanel {
                             .flex_shrink_0()
                             .bg(rgb(p.accent)),
                     )
-                    .child(muted(p, at).w(px(95.)).flex_shrink_0())
+                    .child(muted(p, at).w(px(154.)).flex_shrink_0())
                     .child(div().flex_1().min_w_0().child(kind))
                     .child(muted(p, state))
             });
