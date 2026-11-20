@@ -16,7 +16,7 @@ const CAN_REQUEST: &str = "p.paused=0
     AND NOT EXISTS(SELECT 1 FROM work_leases l WHERE l.project_id=p.id AND l.generation=p.generation AND l.active=1)
     AND NOT EXISTS(SELECT 1 FROM cli_switch_requests s WHERE s.project_id=p.id AND s.holds_input=1)
     AND b.app_id=a.app_id AND a.owner_open_id!='' AND a.chat_id!=''
-    AND EXISTS(SELECT 1 FROM manager_provider_config m WHERE trim(m.base_url)!='' AND trim(m.model)!='' AND trim(m.api_key)!='')
+    AND EXISTS(SELECT 1 FROM manager_provider_config m WHERE m.migration_conflict=0 AND trim(m.base_url)!='' AND trim(m.model)!='' AND trim(m.api_key)!='')
     AND NOT EXISTS(SELECT 1 FROM proposals r WHERE r.project_id=p.id AND r.status='rejected'
                     AND r.decided_at>:now-a.cooldown_seconds*1000)
     AND (SELECT count(*) FROM proposals q WHERE q.project_id=p.id AND q.status='pending')<a.pending_limit";

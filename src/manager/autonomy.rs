@@ -33,7 +33,7 @@ fn claim(c: &Connection, now: i64) -> Result<Option<Request>> {
         return Ok(None);
     };
     let (base_url, model, api_key, provider_revision, configured) = c.query_row(
-        &format!("SELECT base_url,model,api_key,revision,({PROVIDER_CONFIGURED}) FROM manager_provider_config WHERE id=1"),
+        &format!("SELECT base_url,model,api_key,revision,({PROVIDER_CONFIGURED}) FROM manager_provider_config g WHERE id=1"),
         [],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,bool>(4)?)),
     )?;
