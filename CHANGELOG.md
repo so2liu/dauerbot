@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.7 — 2026-11-20
+
+### Added
+
+- View observed Feishu conversations, message closure and activity trends in the desktop Activity panel. (#153)
+- Let the manager propose scoped project improvements for owner approval. Proposals are disabled by default and enabled per project. Approve or reject in the proposal discussion. (#154)
+
+### Fixed
+
+- Keep accepted inputs through Stop, resume attachment preparation explicitly, and scope manager replies to their work and destination. Preserve group context and hold queued work when shared provider migration requires confirmation. (#152)
+
 ## 0.6.6 — 2026-11-20
 
 ### Changed
