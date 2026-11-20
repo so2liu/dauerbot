@@ -221,6 +221,29 @@ pub(crate) fn expire(c: &Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
+/// Called at send admission for exactly one proposal outbox record.
+pub(crate) fn dismiss_expired_publication(
+    c: &Connection,
+    project: &str,
+    outbox: &str,
+    now: i64,
+) -> Result<bool> {
+    c.execute(
+        "UPDATE proposals SET status='expired',decided_at=?
+         WHERE project_id=? AND outbox_id=? AND status='pending' AND created_at<=?
+           AND EXISTS(SELECT 1 FROM messages WHERE id=proposals.outbox_id AND status='pending')",
+        params![now, project, outbox, now - TTL],
+    )?;
+    let dismissed = c.execute(
+        "UPDATE messages SET status='dismissed',error='No pending proposals remain',updated_at=?
+         WHERE id=? AND project_id=? AND direction='out' AND status='pending'
+           AND NOT EXISTS(SELECT 1 FROM proposals WHERE project_id=messages.project_id
+                          AND outbox_id=messages.id AND status='pending')",
+        params![now, outbox, project],
+    )?;
+    Ok(dismissed != 0)
+}
+
 pub(crate) fn claim_due(c: &Connection, now: i64) -> Result<Option<Settings>> {
     let tx = c.unchecked_transaction()?;
     expire(&tx, now)?;

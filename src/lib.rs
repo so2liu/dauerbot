@@ -553,6 +553,12 @@ impl App {
         let message = m.clone();
         let admitted=self.db.call(move|c|{
             let tx=c.unchecked_transaction()?;
+            if message.attachment.get("autonomy_publication_revision").is_some()
+                && autonomy::dismiss_expired_publication(&tx,&message.project_id,&message.id,db::now())?
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
             let publication=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment)
                 .and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment))
                 .and_then(|_|autonomy_feishu::validate_publication(&tx,&message.project_id,&message.attachment));
@@ -1547,6 +1553,12 @@ mod supervisor_tests {
                 json!({"to":"oc_fixture","discussion_intent":"decision","discussion_scope":"proposal",
                     "autonomy_publication_revision":0}),
             )?;
+            c.execute(
+                "INSERT INTO proposals(id,project_id,number,title,why_now,scope,not_doing,acceptance,risk,effort,category,dedupe_hash,status,created_at,outbox_id)
+                 VALUES('live-proposal','project',1,'Fixture','Reason','Scope','No other changes',
+                        'Verify','Low','Small','documentation','fixture','pending',?,?)",
+                rusqlite::params![db::now(), proposal],
+            )?;
             let ordinary = db::enqueue_out_request(
                 c, "project", "cli_fixture", "ordinary", "Pending ordinary message",
                 json!({"to":"oc_fixture","discussion_intent":"result","discussion_scope":"ordinary"}),
@@ -1598,6 +1610,63 @@ mod supervisor_tests {
             &attachment
         ))?);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn autonomy_send_admission_dismisses_only_the_expired_pending_card() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = App::new(
+            dir.path().join("store"),
+            Config {
+                feishu_base: "http://127.0.0.1:1".into(),
+                ..Config::default()
+            },
+        )?;
+        app.db.sync(|c| {
+            c.execute_batch("INSERT INTO projects(id,name,path,agent,created_at,mcp_token,paused)
+                  VALUES('project','Fixture','/isolated','codex',0,'local-fixture',1);
+                INSERT INTO autonomy_settings(project_id,enabled,owner_open_id,app_id,chat_id)
+                  VALUES('project',1,'ou_owner','cli_fixture','oc_fixture');")?;
+            crate::bot::save(c, "project", "cli_fixture", "local-fixture", false)?;
+            for (id, status, at) in [
+                ("expired-card", "pending", db::now() - 8 * 86_400_000),
+                ("fresh-card", "pending", db::now()),
+                ("sent-card", "sent", db::now() - 8 * 86_400_000),
+                ("uncertain-card", "uncertain", db::now() - 8 * 86_400_000),
+            ] {
+                let attachment = json!({"to":"oc_fixture","bot_app_id":"cli_fixture",
+                    "discussion_intent":"decision","discussion_scope":id,
+                    "autonomy_publication_revision":0});
+                c.execute(
+                    "INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
+                     VALUES(?1,'project','out',?1,'Fixture',?2,?3,?4,?4)",
+                    rusqlite::params![id, status, attachment.to_string(), at],
+                )?;
+                c.execute(
+                    "INSERT INTO proposals(id,project_id,number,title,why_now,scope,not_doing,acceptance,risk,effort,category,dedupe_hash,status,created_at,outbox_id)
+                     VALUES(?1,'project',1,'Fixture','Reason','Scope','No other changes',
+                            'Verify','Low','Small','documentation',?1,'pending',?2,?1)",
+                    rusqlite::params![id, at],
+                )?;
+            }
+            Ok(())
+        })?;
+        app.db.pause("project", false).await?;
+        for id in ["expired-card", "sent-card", "uncertain-card"] {
+            app.send_out(id).await?;
+        }
+        assert_eq!(app.db.message("expired-card").await?.status, "dismissed");
+        assert_eq!(app.db.message("fresh-card").await?.status, "pending");
+        assert_eq!(app.db.message("sent-card").await?.status, "sent");
+        assert_eq!(app.db.message("uncertain-card").await?.status, "uncertain");
+        app.db.sync(|c| {
+            let states = c
+                .prepare("SELECT status FROM proposals ORDER BY id")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(states, ["expired", "pending", "pending", "pending"]);
+            Ok(())
+        })
     }
 
     #[tokio::test]
