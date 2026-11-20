@@ -886,10 +886,10 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
         if let Some(intent)=intent {
             attachment["discussion_intent"]=json!(intent.as_str());
         }
-        if anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)) {
-            if let Some(event)=select_origin(&tx,&context,source.as_deref())? {
-                crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,&mut attachment)?;
-            }
+        if (anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)))
+            && let Some(event)=select_origin(&tx,&context,source.as_deref())?
+        {
+            crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,&mut attachment)?;
         }
         if !attachment["reply_to_message_id"].is_string() {
             ensure!(matches!(intent, Some(MessageIntent::Result | MessageIntent::Decision)) && attachment["discussion_scope"].is_string(),
