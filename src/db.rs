@@ -366,6 +366,7 @@ impl Db {
               attachment TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
               UNIQUE(project_id,direction,source_id));
             CREATE INDEX IF NOT EXISTS message_pending ON messages(direction,status,created_at);
+            CREATE INDEX IF NOT EXISTS message_project_time ON messages(project_id, created_at DESC);
 
         ")?;
         if schema == 4 {
