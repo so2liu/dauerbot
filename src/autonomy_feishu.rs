@@ -21,17 +21,17 @@ pub(crate) fn card(items: &[autonomy::Proposal]) -> Value {
         } = proposal;
         for text in [
             format!("{number}. {}", draft.title),
-            format!("原因：{}", draft.why_now),
-            format!("范围：{}", draft.scope),
-            format!("排除：{}", draft.not_doing),
-            format!("验收：{}", draft.acceptance),
-            format!("风险：{}", draft.risk),
+            format!("Why now: {}", draft.why_now),
+            format!("Scope: {}", draft.scope),
+            format!("Out of scope: {}", draft.not_doing),
+            format!("Acceptance: {}", draft.acceptance),
+            format!("Risk: {}", draft.risk),
         ] {
             elements.push(json!({"tag":"div","text":{"tag":"plain_text","content":text}}));
         }
         for (label, decision, style) in [
-            ("批准", "approve", "primary_filled"),
-            ("驳回", "reject", "default"),
+            ("Approve", "approve", "primary_filled"),
+            ("Reject", "reject", "default"),
         ] {
             elements.push(json!({
                 "tag":"button","text":{"tag":"plain_text","content":format!("{label} {number}")},
@@ -41,10 +41,10 @@ pub(crate) fn card(items: &[autonomy::Proposal]) -> Value {
         }
     }
     elements.push(json!({"tag":"div","text":{"tag":"plain_text","content":
-        "也可以在本话题回复「批准 2」「全部批准」或「驳回 1,3」。只有配置的负责人可以决定。"}}));
+        "The configured owner can also reply in this topic with Approve 2, Approve all, or Reject 1,3."}}));
     json!({
         "schema":"2.0", "config":{"enable_forward":false},
-        "header":{"title":{"tag":"plain_text","content":"待审批提案"},"template":"blue"},
+        "header":{"title":{"tag":"plain_text","content":"Proposals awaiting approval"},"template":"blue"},
         "body":{"elements":elements}
     })
 }
@@ -99,7 +99,10 @@ pub(crate) fn callback(
             app.notify.notify_one();
             ("success", state)
         }
-        Err(_) => ("error", "此操作未获授权，或原提案卡片已不可用。".into()),
+        Err(_) => (
+            "error",
+            "This action is not authorized, or the original proposal card is unavailable.".into(),
+        ),
     };
     Some(CardActionTriggerResponse {
         toast: Some(CardToast {
@@ -153,7 +156,7 @@ fn accept_card(
         now,
     )?;
     Ok(format!(
-        "提案 {} · {}",
+        "Proposal {} · {}",
         proposal.number,
         state(&proposal.status)
     ))
@@ -169,11 +172,17 @@ fn parse(text: &str) -> Option<(Decision, Selection)> {
     if text == "全部批准" {
         return Some((Decision::Approve, Selection::All));
     }
-    let (decision, rest) = if let Some(rest) = text.strip_prefix("批准 ") {
-        (Decision::Approve, rest)
+    let (verb, rest) = text.split_once(' ')?;
+    let decision = if verb.eq_ignore_ascii_case("approve") || verb == "批准" {
+        Decision::Approve
+    } else if verb.eq_ignore_ascii_case("reject") || verb == "驳回" {
+        Decision::Reject
     } else {
-        (Decision::Reject, text.strip_prefix("驳回 ")?)
+        return None;
     };
+    if verb.eq_ignore_ascii_case("approve") && rest.trim().eq_ignore_ascii_case("all") {
+        return Some((Decision::Approve, Selection::All));
+    }
     let numbers: BTreeSet<i64> = rest
         .split([',', '，'])
         .map(|part| {
@@ -191,10 +200,10 @@ fn parse(text: &str) -> Option<(Decision, Selection)> {
 
 fn state(status: &str) -> &'static str {
     match status {
-        "approved" => "已批准",
-        "rejected" => "已驳回",
-        "expired" => "已过期",
-        _ => "待审批",
+        "approved" => "Approved",
+        "rejected" => "Rejected",
+        "expired" => "Expired",
+        _ => "Pending",
     }
 }
 
@@ -211,7 +220,7 @@ pub(crate) fn text(
     if source["message_type"] != "text" {
         return Ok(false);
     }
-    let Some((decision, selection)) = parse(text) else {
+    let Some((decision, selection)) = parse(crate::cli_control::command_text(text, source)) else {
         return Ok(false);
     };
     let chat = source["chat_id"].as_str().unwrap_or_default();
@@ -285,7 +294,7 @@ pub(crate) fn text(
     if let Selection::Numbered(numbers) = &selection
         && requested.len() != numbers.len()
     {
-        summary.push("卡片中找不到指定的提案编号。".into());
+        summary.push("The requested proposal numbers are not on this card.".into());
     } else {
         for (id, number, _) in requested {
             let outcome = autonomy::decide_inside(
@@ -301,7 +310,7 @@ pub(crate) fn text(
                 },
                 now,
             )?;
-            summary.push(format!("提案 {number} · {}", state(&outcome.status)));
+            summary.push(format!("Proposal {number} · {}", state(&outcome.status)));
         }
     }
     db::enqueue_out_request(
@@ -330,7 +339,21 @@ mod tests {
             parse("驳回 1，3,1"),
             Some((Decision::Reject, Selection::Numbered(ids))) if ids == BTreeSet::from([1,3])
         ));
+        assert!(matches!(
+            parse("Approve all"),
+            Some((Decision::Approve, Selection::All))
+        ));
+        assert!(matches!(
+            parse("Approve 2"),
+            Some((Decision::Approve, Selection::Numbered(ids))) if ids == BTreeSet::from([2])
+        ));
+        assert!(matches!(
+            parse("Reject 1,3"),
+            Some((Decision::Reject, Selection::Numbered(ids))) if ids == BTreeSet::from([1,3])
+        ));
         for no_command in [
+            "Reject all",
+            "Approve 2\nRun this",
             "批准 4",
             "批准 2,foo",
             "可否批准 2",
@@ -366,14 +389,20 @@ mod tests {
             },
         };
         let value = card(&[proposal]);
+        assert_eq!(
+            value["header"]["title"]["content"],
+            "Proposals awaiting approval"
+        );
         let elements = value["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements[6]["text"]["content"], "Approve 2");
+        assert_eq!(elements[7]["text"]["content"], "Reject 2");
         for (index, expected) in [
             "2. <b>warning</b>",
-            "原因：Reason",
-            "范围：Scope marker",
-            "排除：Excluded marker",
-            "验收：Acceptance marker",
-            "风险：Risk marker",
+            "Why now: Reason",
+            "Scope: Scope marker",
+            "Out of scope: Excluded marker",
+            "Acceptance: Acceptance marker",
+            "Risk: Risk marker",
         ]
         .into_iter()
         .enumerate()
@@ -431,16 +460,19 @@ mod tests {
             for action in ["approve","reject"] {
                 let tx = c.unchecked_transaction()?;
                 assert_eq!(accept_card(&tx,&binding,&right,&card_value("proposal-1",action),now)?,
-                           "提案 1 · 已批准");
+                           "Proposal 1 · Approved");
                 tx.commit()?;
             }
-            let source = |owner, root| json!({"message_type":"text","chat_id":"oc_fixture",
+            let source = |owner, root| json!({"message_type":"text","chat_type":"group","chat_id":"oc_fixture",
                 "sender":{"open_id":owner},"root_id":root});
             assert!(!text(c,&binding,"om_outside","批准 2",&source("ou_owner","om_other"),now)?);
             assert!(text(c,&binding,"om_other_user","批准 2",&source("ou_other","om_card"),now)?);
-            assert!(text(c,&binding,"om_reject","驳回 2",&source("ou_owner","om_card"),now)?);
-            assert!(text(c,&binding,"om_reject","驳回 2",&source("ou_owner","om_card"),now)?);
-            assert!(text(c,&binding,"om_approve","全部批准",&source("ou_owner","om_card"),now)?);
+            let mut owner_source = source("ou_owner","om_card");
+            assert!(!text(c,&binding,"om_unverified","@_user_1 Reject 2",&owner_source,now)?);
+            owner_source["mentions"] = json!([{"key":"@_user_1"}]);
+            assert!(text(c,&binding,"om_reject","@_user_1 Reject 2",&owner_source,now)?);
+            assert!(text(c,&binding,"om_reject","@_user_1 Reject 2",&owner_source,now)?);
+            assert!(text(c,&binding,"om_approve","@_user_1 全部批准",&owner_source,now)?);
             let states = c.prepare("SELECT status FROM proposals ORDER BY number")?
                           .query_map([], |r| r.get::<_, String>(0))?
                           .collect::<rusqlite::Result<Vec<_>>>()?;
