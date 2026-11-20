@@ -184,20 +184,30 @@ pub(crate) fn configure(
         old.chat_id.as_str(),
         old.app_id.as_str(),
     ) != (owner, chat, &app);
-    if old.enabled != enabled
-        || old.cadence_seconds != cadence
-        || old.pending_limit != pending_limit
-        || authority_changed
-    {
+    let publication_changed = old.enabled != enabled || authority_changed;
+    if publication_changed || old.cadence_seconds != cadence || old.pending_limit != pending_limit {
         tx.execute("INSERT INTO autonomy_settings(project_id,enabled,cadence_seconds,pending_limit,owner_open_id,app_id,chat_id,revision)
              VALUES(?,?,?,?,?,?,?,1)
              ON CONFLICT(project_id) DO UPDATE SET enabled=excluded.enabled,cadence_seconds=excluded.cadence_seconds,
               pending_limit=excluded.pending_limit,owner_open_id=excluded.owner_open_id,app_id=excluded.app_id,
-              chat_id=excluded.chat_id,revision=revision+1",
-            params![project, enabled, cadence, pending_limit, owner, app, chat])?;
-        if authority_changed {
-            tx.execute("UPDATE proposals SET status='expired',decided_at=? WHERE project_id=? AND status='pending'",
-                params![now,project])?;
+              chat_id=excluded.chat_id,revision=autonomy_settings.revision+?",
+            params![project, enabled, cadence, pending_limit, owner, app, chat, publication_changed])?;
+        if publication_changed {
+            // A scope change invalidates approvals under the previous owner or
+            // conversation. A toggle only expires unpublished, unsent work.
+            tx.execute(
+                "UPDATE proposals SET status='expired',decided_at=? WHERE project_id=? AND status='pending'
+                 AND (? OR (source_message_id IS NULL AND
+                      (outbox_id IS NULL OR EXISTS(SELECT 1 FROM messages m WHERE m.id=proposals.outbox_id
+                          AND m.direction='out' AND m.status IN ('pending','failed','dismissed')))))",
+                params![now, project, authority_changed],
+            )?;
+            tx.execute(
+                "UPDATE messages SET status='dismissed',error='Autonomy publication authority changed',updated_at=?
+                 WHERE project_id=? AND direction='out' AND status='pending'
+                   AND json_type(attachment,'$.autonomy_publication_revision') IS NOT NULL",
+                params![now, project],
+            )?;
         }
     }
     let current = settings(&tx, project)?;
@@ -838,6 +848,66 @@ mod tests {
             );
             configure(c, "project", update(false), now + 21 * DAY)?;
             assert!(claim_due(c, now + 23 * DAY)?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn schedule_changes_preserve_card_authority_and_toggles_reconcile_unpublished_work()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = db::Db::open(&dir.path().join("isolated.sqlite"))?;
+        store.sync(|c| {
+            seed(c)?;
+            let now = 50 * DAY;
+            configure(c, "project", update(true), now)?;
+            let sent_claim = claim_due(c, now)?.unwrap();
+            let sent = save_batch(c, &sent_claim, vec![draft("Sent pending"), draft("Sent approved")], now)?;
+            published(c, &sent, now)?;
+            let approved = decide_inside(c, &sent[1].id, Decision::Approve, owner("ou_owner", "om_batch"), now)?;
+            let later = now + DAY;
+            let claim = claim_due(c, later)?.unwrap();
+            let queued = save_batch(c, &claim, vec![draft("Queued proposal")], later)?;
+            let attachment = json!({
+                "to":"oc_fixture","discussion_intent":"decision","discussion_scope":"fixture-queued",
+                "bot_app_id":"cli_fixture", "autonomy_publication_revision":claim.revision,
+            });
+            let outbox = db::enqueue_out_request(
+                c, "project", "cli_fixture", "fixture-queued", "Pending", attachment.clone(),
+            )?;
+            set_outbox(c, "project", std::slice::from_ref(&queued[0].id), &outbox)?;
+            c.execute("UPDATE projects SET paused=1 WHERE id='project'", [])?;
+            let changed = configure(c, "project", serde_json::from_value(json!({
+                "cadence_seconds": 2 * DEFAULT_CADENCE,
+                "pending_limit": 2,
+            }))?, later)?;
+            assert_eq!(changed.revision, claim.revision);
+            assert!(!crate::autonomy_feishu::validate_publication(c, "project", &attachment)?);
+            assert_eq!(
+                save_batch(c, &claim, vec![], later).expect_err("Schedule settings changed").to_string(),
+                "The proposal request is no longer current",
+            );
+            c.execute("UPDATE projects SET paused=0 WHERE id='project'", [])?;
+            assert!(crate::autonomy_feishu::validate_publication(c, "project", &attachment)?);
+            assert_eq!(proposal(c, &queued[0].id, later)?.status, "pending");
+
+            let disabled = configure(c, "project", update(false), later)?;
+            let enabled = configure(c, "project", update(true), later)?;
+            assert_ne!(disabled.revision, enabled.revision);
+            assert!(crate::autonomy_feishu::validate_publication(c, "project", &attachment).is_err());
+            assert_eq!(proposal(c, &queued[0].id, later)?.status, "expired");
+            assert_eq!(c.query_row("SELECT status FROM messages WHERE id=?", [&outbox], |r| r.get::<_, String>(0))?, "dismissed");
+            let still_pending = proposal(c, &sent[0].id, later)?;
+            assert_eq!(still_pending.status, "pending");
+            assert_eq!(still_pending.source_message_id.as_deref(), Some("om_batch"));
+            assert_eq!(proposal(c, &sent[1].id, later)?.execution_event_id, approved.execution_event_id);
+
+            configure(c, "project", serde_json::from_value(json!({"owner_open_id":"ou_new_owner"}))?, later)?;
+            assert_eq!(proposal(c, &sent[0].id, later)?.status, "expired");
+            let still_approved = proposal(c, &sent[1].id, later)?;
+            assert_eq!(still_approved.status, "approved");
+            assert_eq!(still_approved.execution_event_id, approved.execution_event_id);
+            assert_eq!(c.query_row("SELECT status FROM messages WHERE id='outbox'", [], |r| r.get::<_, String>(0))?, "sent");
             Ok(())
         })
     }
