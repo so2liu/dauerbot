@@ -349,12 +349,41 @@ pub(crate) fn test_delegate(c: &Connection, project: &str, key: &str, origin: Op
     let p = db::project_by_key(c, project)?;
     intent(c, &p, key, "Fixture delegation", origin, false)
 }
+fn approved_origin(c: &Connection, project: &str, origin: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_events e
+            JOIN proposals p ON p.execution_event_id=e.id AND p.project_id=e.project_id
+            JOIN autonomy_settings a ON a.project_id=e.project_id
+            JOIN project_bots b ON b.project_id=e.project_id
+            WHERE e.project_id=? AND e.id=? AND e.source='autonomy' AND p.status='approved'
+              AND p.id=json_extract(e.payload,'$.proposal_id')
+              AND p.source_message_id=json_extract(e.payload,'$.anchor')
+              AND a.enabled=1 AND a.app_id=b.app_id
+              AND a.app_id=json_extract(e.payload,'$.app_id')
+              AND a.chat_id=json_extract(e.payload,'$.to')
+              AND (p.decided_by='local-admin' OR p.decided_by=a.owner_open_id)
+        )",
+        params![project,origin],|r|r.get(0),
+    )?)
+}
+
 /// Called inside the ordinary native claim transaction, after readiness checks.
 pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Result<bool> {
     if event.source != "management" {
         return Ok(!installed(c)?);
     }
     let p = db::project_by_key(c, &event.project_id)?;
+    if event.payload["proposal_id"].is_string()
+        && !event.payload["origin_event_id"].as_str()
+            .map(|id| approved_origin(c, &event.project_id, id))
+            .transpose()?.unwrap_or(false)
+    {
+        c.execute("UPDATE work_events SET status='failed',error='Approved proposal authority changed before submission',updated_at=? WHERE id=? AND status='queued'",
+            params![db::now(),event.id])?;
+        worker_changed(c,&event.project_id)?;
+        return Ok(false);
+    }
     if let Some(incident) = event.payload["repair_incident"].as_str() {
         let current:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id
             CROSS JOIN manager_provider_config g WHERE f.project_id=? AND f.incident_id=? AND f.revision=m.revision AND m.revision=?
@@ -405,9 +434,24 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
         let project = p.id.clone();
         let original = app
             .db
-            .call(move |c| work::event(c, &project, &origin))
+            .call(move |c| {
+                let original = work::event(c, &project, &origin)?;
+                if original.source == "autonomy" {
+                    ensure!(approved_origin(c, &project, &origin)?, "Approved proposal authority changed");
+                }
+                Ok(original)
+            })
             .await?;
-        if let Some(id) = original.message_id {
+        if original.source == "autonomy" {
+            let field = |key: &str| crate::envelope::escape(original.payload[key].as_str().unwrap_or_default());
+            context = format!(
+                "<approved_proposal trust=\"daemon_metadata\" proposal_id=\"{}\" source_event_id=\"{}\" chat_id=\"{}\" message_id=\"{}\">Use this source_event_id, chat_id as to, and message_id as reply_to_message_id for a result in the approval discussion.</approved_proposal>",
+                field("proposal_id"),
+                crate::envelope::escape(&original.id),
+                field("to"),
+                field("anchor"),
+            );
+        } else if let Some(id) = original.message_id {
             let message = app.db.message(&id).await?;
             context = crate::envelope::render_resources(
                 &message,
@@ -1204,9 +1248,6 @@ fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
         } else {
             json!({"event_id":id,"source_kind":e.source,"local_source_id":e.source_id})
         })
-    } else if e.source == "autonomy" {
-        Ok(json!({"event_id":id,"source_kind":e.source,"proposal_id":e.payload["proposal_id"],
-            "to":e.payload["to"],"message_id":e.payload["anchor"]}))
     } else {
         Ok(json!({"event_id":id,"source_kind":e.source,"to":e.payload["to"]}))
     }
