@@ -55,19 +55,8 @@ pub async fn process(app: &Arc<App>) -> Result<()> {
         .await;
         match accepted {
             Ok(_) => {
-                let to = attachment["source"]["chat_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
                 app.db.call(move |c| {
-                    let tx=c.unchecked_transaction()?;
-                    if let Some(binding)=crate::bot::get(&tx,&project)? {
-                        db::enqueue_out_request(&tx,&project,&binding.app_id,&format!("repair-control-{source_id}"),
-                            "Repair instructions are saved. Dauerbot is restoring the repair Agent; ordinary messages remain queued for the selected CLI.",
-                            json!({"to":to,"reply_to_message_id":source_id}))?;
-                    }
-                    tx.execute("UPDATE messages SET status='acknowledged',attachment=json_set(attachment,'$.daemon_control.status','accepted'),updated_at=? WHERE id=?",params![db::now(),message])?;
-                    tx.commit()?;
+                    c.execute("UPDATE messages SET status='acknowledged',attachment=json_set(attachment,'$.daemon_control.status','accepted'),updated_at=? WHERE id=?",params![db::now(),message])?;
                     Ok(())
                 }).await?;
                 app.notify.notify_one();

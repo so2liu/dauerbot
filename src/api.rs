@@ -786,6 +786,10 @@ struct Outbox {
     path: Option<String>,
     #[serde(default)]
     reply_to_message_id: Option<String>,
+    #[serde(default)]
+    source_event_id: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
 }
 async fn outbox(
     State(app): State<Arc<App>>,
@@ -808,11 +812,22 @@ async fn outbox(
     if let Some(anchor) = input.reply_to_message_id {
         attachment["reply_to_message_id"] = json!(anchor);
     }
+    if let Some(intent) = &input.intent {
+        if !matches!(intent.as_str(), "result" | "decision" | "progress") {
+            return Err(anyhow::anyhow!(
+                "Choose result, decision or progress as the message intent"
+            )
+            .into());
+        }
+        attachment["discussion_intent"] = json!(intent);
+    }
     if input.request_id.is_empty() || input.request_id.len() > 200 {
         return Err(anyhow::anyhow!("request_id must contain 1 to 200 characters").into());
     }
     let authority = authority(session);
-    let message_id = app
+    let project = p.id.clone();
+    let request = input.request_id.clone();
+    let (message_id, progress) = app
         .db
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
@@ -824,6 +839,33 @@ async fn outbox(
             }
             let binding = crate::bot::get(&tx, &p.id)?
                 .context("Connect a Feishu bot to this project first")?;
+            if let Some(event) = &input.source_event_id {
+                if !attachment["reply_to_message_id"].is_string() && input.intent.is_none() {
+                    anyhow::bail!(
+                        "Choose result or decision before sending without a reply anchor"
+                    );
+                }
+                let to = attachment["to"].as_str().unwrap_or_default().to_owned();
+                crate::discussion::origin(
+                    &tx,
+                    &p.id,
+                    event,
+                    &binding.app_id,
+                    &to,
+                    &mut attachment,
+                )?;
+            }
+            if input.intent.as_deref() == Some("progress") {
+                anyhow::ensure!(
+                    attachment[crate::repair_lane::OUTBOX_KEY].is_null(),
+                    "Progress is unavailable in a repair-only session"
+                );
+                tx.commit()?;
+                return Ok((
+                    String::new(),
+                    Some((binding.app_id, input.content, attachment)),
+                ));
+            }
             let message = db::enqueue_out_request(
                 &tx,
                 &p.id,
@@ -833,9 +875,15 @@ async fn outbox(
                 attachment,
             )?;
             tx.commit()?;
-            Ok(message)
+            Ok((message, None))
         })
         .await?;
+    if let Some((app_id, content, attachment)) = progress {
+        let result =
+            crate::discussion::progress(&app, project, app_id, request, content, attachment)
+                .await?;
+        return Ok(Json(result));
+    }
     app.send_out(&message_id).await?;
     let m = app.db.message(&message_id).await?;
     Ok(Json(serde_json::to_value(m).unwrap()))

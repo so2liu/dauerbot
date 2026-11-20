@@ -8,6 +8,45 @@ use std::{
 };
 use uuid::Uuid;
 
+pub(crate) fn validate_out_anchor(
+    c: &Connection,
+    project: &str,
+    app_id: &str,
+    to: &str,
+    anchor: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        anchor.starts_with("om_")
+            && anchor.len() <= 200
+            && anchor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Provide a valid reply_to_message_id from trusted message metadata"
+    );
+    // The reply endpoint ignores `to`; check one existing source/receipt so
+    // an accidental anchor cannot silently send into another conversation.
+    let known: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?
+         AND json_extract(attachment,'$.bot_app_id')=? AND (
+          (direction='in' AND (source_id=? OR json_extract(attachment,'$.source.root_id')=?
+            OR json_extract(attachment,'$.source.parent_id')=?) AND (
+            json_extract(attachment,'$.source.chat_id')=? OR (
+              json_extract(attachment,'$.source.chat_type')='p2p' AND
+              json_extract(attachment,'$.source.sender.open_id')=?))) OR
+          (direction='out' AND json_extract(attachment,'$.sent_message_id')=? AND (
+            json_extract(attachment,'$.to')=? OR json_extract(attachment,'$.sent_chat_id')=?))))",
+        params![
+            project, app_id, anchor, anchor, anchor, to, to, anchor, to, to
+        ],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        known,
+        "reply_to_message_id must belong to this project's bot and the explicit to recipient; use the original chat ID and its trusted discussion anchor"
+    );
+    Ok(())
+}
+
 /// Store the Agent's explicit destination and optional reply anchor unchanged.
 /// Callers authorize the current session inside this same database operation.
 pub(crate) fn enqueue_out_request(
@@ -41,32 +80,7 @@ pub(crate) fn enqueue_out_request(
     if previous.is_none()
         && let Some(anchor) = attachment["reply_to_message_id"].as_str()
     {
-        anyhow::ensure!(
-            anchor.starts_with("om_")
-                && anchor.len() <= 200
-                && anchor
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
-            "Provide a valid reply_to_message_id from trusted message metadata"
-        );
-        // The reply endpoint ignores `to`; check one existing source/receipt so
-        // an accidental anchor cannot silently send into another conversation.
-        let known: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?
-             AND json_extract(attachment,'$.bot_app_id')=? AND (
-              (direction='in' AND (source_id=? OR json_extract(attachment,'$.source.root_id')=?
-                OR json_extract(attachment,'$.source.parent_id')=?) AND (
-                json_extract(attachment,'$.source.chat_id')=? OR (
-                  json_extract(attachment,'$.source.chat_type')='p2p' AND
-                  json_extract(attachment,'$.source.sender.open_id')=?))) OR
-              (direction='out' AND json_extract(attachment,'$.sent_message_id')=? AND (
-                json_extract(attachment,'$.to')=? OR json_extract(attachment,'$.sent_chat_id')=?))))",
-            params![project,app_id,anchor,anchor,anchor,to,to,anchor,to,to], |r| r.get(0),
-        )?;
-        anyhow::ensure!(
-            known,
-            "reply_to_message_id must belong to this project's bot and the explicit to recipient; use the original chat ID, or omit the anchor for a new discussion"
-        );
+        validate_out_anchor(c, project, app_id, to, anchor)?;
     }
     attachment["bot_app_id"] = json!(app_id);
     if let Some((id, saved_content, raw)) = previous {
@@ -77,6 +91,8 @@ pub(crate) fn enqueue_out_request(
                 "sent_chat_id",
                 "sent_thread_id",
                 "sent_root_id",
+                "discussion_root",
+                "resolved_reply_to_message_id",
             ] {
                 object.remove(key);
             }
@@ -364,6 +380,7 @@ impl Db {
             migration.execute_batch("ALTER TABLE projects DROP COLUMN enabled;")?;
         }
         crate::conversation::migrate(&migration)?;
+        crate::discussion::migrate(&migration, recover)?;
         crate::bot::migrate(&migration)?;
         crate::group_ingress::migrate(&migration)?;
         if recover {

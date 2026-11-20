@@ -185,10 +185,8 @@ def run_checks(h):
     h.checks.append("opt-in mode, native default, private separate API credential and idempotent mode request")
 
     MODEL.script(
-        {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_write", "intent": "receipt", "text": "receipt-before-work"}},
         {"tool": "write_file", "id": "same-provider-call-id", "arguments": {"path": "manager-note.txt", "content": "restricted manager fixture\n"}},
         {"tool": "read_file", "id": "same-provider-call-id", "arguments": {"path": "manager-note.txt"}},
-        {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_different", "intent": "receipt", "text": "must-not-resend-reworded-receipt"}},
         {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_write", "text": "manager-file-roundtrip-ok"}},
         {"tool": "send_file", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_write", "path": "manager-note.txt"}},
         {"text": ""},
@@ -200,15 +198,12 @@ def run_checks(h):
     assert len(sent) == 1 and sent[0]["fixture_reply_to"] == "om_manager_write", sent
     fixture.wait_for(lambda: any(m.get("msg_type") == "file" and m.get("fixture_reply_to") == "om_manager_write" for m in fixture.FIXTURE.messages), "manager did not send its project file into the same topic")
     assert fixture.FIXTURE.uploads and b"restricted manager fixture" in fixture.FIXTURE.uploads[-1]
-    receipts = [m for m in fixture.FIXTURE.messages if "receipt-before-work" in m["content"]]
-    assert len(receipts) == 1 and receipts[0]["fixture_reply_to"] == "om_manager_write", receipts
-    assert not any("must-not-resend-reworded-receipt" in m["content"] for m in fixture.FIXTURE.messages)
-    assert fixture.FIXTURE.messages.index(receipts[0]) < fixture.FIXTURE.messages.index(sent[0])
     assert not h.api(route + "/work")["runs"], "raw manager input was also dispatched to native CLI"
     assert "om_manager_write" in json.dumps(MODEL.requests[0]), "manager context omitted the trusted source message ID required for a topic reply"
     advertised = {t["function"]["name"] for t in MODEL.requests[0]["tools"]}
     assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file", "close_agent", "cli_send_keys", "cli_view"}, advertised
-    h.checks.append("scripted model → bounded file write/read → real SDK topic outbox; no raw native delivery or Bash tool")
+    assert len([m for m in fixture.FIXTURE.messages if m.get("fixture_reply_to") == "om_manager_write"]) == 2
+    h.checks.append("scripted model → bounded file write/read → one topic result and its attachment; no default acknowledgement or raw native delivery")
 
     context = h.api(route + "/manager/context")
     assert context["project_id"] == h.key
@@ -331,12 +326,10 @@ def run_checks(h):
     # Restart the daemon with its private database; completed external effects
     # and native continuity must survive without replaying a sent topic message.
     before = len([m for m in fixture.FIXTURE.messages if "manager-file-roundtrip-ok" in m["content"]])
-    receipt_count = len([m for m in fixture.FIXTURE.messages if "receipt-before-work" in m["content"]])
     h.daemon.terminate()
     h.daemon.wait(timeout=15)
     h.boot()
     assert h.api(route + "/manager")["mode"] == "manager"
-    assert len([m for m in fixture.FIXTURE.messages if "receipt-before-work" in m["content"]]) == receipt_count == 1
     assert len([m for m in fixture.FIXTURE.messages if "manager-file-roundtrip-ok" in m["content"]]) == before
     assert "manager-fixture-secret" not in (h.run / "daemon.log").read_text()
     h.checks.append("private daemon restart retains mode and sent effects without credential leakage or message replay")

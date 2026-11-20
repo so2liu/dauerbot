@@ -234,13 +234,13 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["instructions"],
         ),
         (
-            "Send a Feishu topic reply. Choose a trusted discussion anchor; omit only for an independent initial message. Use intent=receipt only for a new task's brief acknowledgement; its original trusted source is sent at most once, including across model turns. Select source_event_id from trusted_sources when needed. Omit intent for ordinary replies.",
-            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":{"type":"string"},"intent":{"type":"string","enum":["receipt"]},"source_event_id":{"type":"string"}}),
+            "Send a Feishu topic reply. Skip acknowledgements and routine progress. Use intent=result for a requested outcome, decision for action the user must take or progress for an explicitly requested interim update in an existing topic. Select source_event_id from trusted_sources when needed.",
+            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":{"type":"string"},"intent":{"type":"string","enum":["result","decision","progress"]},"source_event_id":{"type":"string"}}),
             vec!["to", "text"],
         ),
         (
-            "Send a project file through Feishu with an explicitly chosen discussion anchor.",
-            json!({"to":{"type":"string"},"path":{"type":"string"},"reply_to_message_id":{"type":"string"}}),
+            "Send a project file through Feishu with its trusted discussion anchor, or send a requested standalone deliverable with result intent and a trusted source event.",
+            json!({"to":{"type":"string"},"path":{"type":"string"},"reply_to_message_id":{"type":"string"},"intent":{"type":"string","enum":["result"]},"source_event_id":{"type":"string"}}),
             vec!["to", "path"],
         ),
         (

@@ -178,14 +178,18 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
         if m.content.len() > 24_000 {
             bail!("Markdown exceeds 24000 bytes; send it as a file");
         }
-        (
-            "post",
-            json!({"zh_cn":{"title":"","content":[[{"tag":"md","text":m.content}]]}}),
-        )
+        let mut paragraph = Vec::new();
+        if let Some(mention) = m.attachment["discussion_mention"].as_str()
+            && mention.starts_with("ou_")
+        {
+            paragraph.push(json!({"tag":"at","user_id":mention}));
+        }
+        paragraph.push(json!({"tag":"md","text":m.content}));
+        ("post", json!({"zh_cn":{"title":"","content":[paragraph]}}))
     };
     let Some(anchor) = m.attachment["reply_to_message_id"].as_str() else {
-        // A message without an anchor starts a new discussion at the explicit
-        // destination. The Agent chooses anchors; the daemon never guesses one.
+        // send_out admits new roots only for a requested result or decision
+        // scoped to a single work occurrence and explicit destination.
         let body =
             json!({"receive_id":to,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
         let value = api_json(
@@ -1076,4 +1080,62 @@ pub async fn context(app: &App, m: &db::Message) -> Value {
         .map(|v| v["name"].clone())
         .unwrap_or(Value::Null);
     result
+}
+
+pub(crate) enum ProgressDelivery {
+    Sent(String),
+    Uneditable,
+    Rejected(String),
+}
+
+pub(crate) async fn progress_message(
+    app: &App,
+    token: &str,
+    anchor: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<ProgressDelivery> {
+    let base = app.config.read().await.feishu_base.clone();
+    let content = json!({"zh_cn":{"title":"","content":[[{"tag":"md","text":text}]]}}).to_string();
+    let editing = !message_id.is_empty();
+    let request = if editing {
+        app.http
+            .put(format!("{base}/open-apis/im/v1/messages/{message_id}"))
+            .json(&json!({"msg_type":"post","content":content}))
+    } else {
+        app.http.post(format!("{base}/open-apis/im/v1/messages/{anchor}/reply"))
+            .json(&json!({"msg_type":"post","content":content,"reply_in_thread":true,"uuid":db::id()}))
+    };
+    let response = request.bearer_auth(token).send().await?;
+    let status = response.status();
+    let reply: Value = response
+        .json()
+        .await
+        .context("Feishu progress response is not JSON")?;
+    let code = reply["code"].as_i64();
+    if status.is_server_error() || code.is_none() {
+        bail!("Feishu progress delivery could not be confirmed ({status})");
+    }
+    if editing
+        && matches!(
+            code,
+            Some(230011 | 230054 | 230071 | 230072 | 230075 | 230110)
+        )
+    {
+        return Ok(ProgressDelivery::Uneditable);
+    }
+    if !status.is_success() || code != Some(0) {
+        return Ok(ProgressDelivery::Rejected(format!(
+            "Feishu progress request rejected ({status}, code {code:?})"
+        )));
+    }
+    if editing {
+        return Ok(ProgressDelivery::Sent(message_id.into()));
+    }
+    let receipt = SendReceipt::from_response(&reply)?;
+    anyhow::ensure!(
+        !receipt.thread_id.is_empty(),
+        "Feishu progress reply has no topic receipt"
+    );
+    Ok(ProgressDelivery::Sent(receipt.message_id))
 }

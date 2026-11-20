@@ -560,10 +560,23 @@ struct MessageArgs {
     intent: Option<MessageIntent>,
     source_event_id: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Copy, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum MessageIntent {
     Receipt,
+    Result,
+    Decision,
+    Progress,
+}
+impl MessageIntent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Receipt => "receipt",
+            Self::Result => "result",
+            Self::Decision => "decision",
+            Self::Progress => "progress",
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -572,6 +585,8 @@ struct SendFileArgs {
     path: String,
     caption: Option<String>,
     reply_to_message_id: Option<String>,
+    source_event_id: Option<String>,
+    intent: Option<MessageIntent>,
 }
 fn file_parent(root: &Path, path: &str) -> Result<(fs::File, std::ffi::CString)> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -903,13 +918,62 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
    "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args).await},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
    "send_md"|"send_file"=>{
-    let (to,text,anchor,path,receipt)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;ensure!(a.intent.is_some()||a.source_event_id.is_none(),"source_event_id is only used for a receipt");let receipt=a.intent.as_ref().map(|_|MessageArgs{to:a.to.clone(),text:a.text.clone(),reply_to_message_id:a.reply_to_message_id.clone(),intent:Some(MessageIntent::Receipt),source_event_id:a.source_event_id.clone()});(a.to,a.text,a.reply_to_message_id,None,receipt)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),None)};
-    crate::feishu::recipient_type(&to)?;ensure!(!text.trim().is_empty()||path.is_some(),"Message content is empty");ensure!(text.len()<=131072,"Message is too large");
-    let context=ctx.clone();let request=effect.clone();let (message,dispatch)=app.db.call(move|c|{let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;if let Some(receipt)=receipt {let queued=enqueue_receipt(&tx,&context,&request,&receipt)?;tx.commit()?;return Ok(queued);}let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;let mut attachment=json!({"to":to,"manager_effect":request});if let Some(anchor)=anchor {attachment["reply_to_message_id"]=json!(anchor);}
-    if let Some(path)=path {attachment["path"]=json!(path);}let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;tx.commit()?;Ok((id,true))}).await?;
+    let (to,text,anchor,path,intent,source)=if call.name=="send_md" {
+        let a:MessageArgs=serde_json::from_value(call.arguments)?;
+        (a.to,a.text,a.reply_to_message_id,None,a.intent,a.source_event_id)
+    }else{
+        let a:SendFileArgs=serde_json::from_value(call.arguments)?;
+        let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;
+        let root=fs::canonicalize(&p.path)?;
+        if let Ok(relative)=path.strip_prefix(&root) {
+            file_parent(&root,&relative.to_string_lossy())?;
+        } else {
+            ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");
+        }
+        ensure!(a.intent.is_none() || a.intent == Some(MessageIntent::Result),"Use result for an independent file");
+        (a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),a.intent,a.source_event_id)
+    };
+    crate::feishu::recipient_type(&to)?;
+    ensure!(!text.trim().is_empty()||path.is_some(),"Message content is empty");
+    ensure!(text.len()<=131072,"Message is too large");
+    let context=ctx.clone();let request=effect.clone();
+    let (message,dispatch,progress)=app.db.call(move|c|{
+        let tx=c.unchecked_transaction()?;
+        let p=valid(&tx,&context)?;
+        if intent==Some(MessageIntent::Receipt) {
+            let args=MessageArgs{to,text,reply_to_message_id:anchor,intent,source_event_id:source};
+            let (message, dispatch)=enqueue_receipt(&tx,&context,&request,&args)?;
+            tx.commit()?;return Ok((message,dispatch,None));
+        }
+        let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;
+        let mut attachment=json!({"to":to,"manager_effect":request,"reply_to_message_id":anchor});
+        if let Some(intent)=intent {
+            attachment["discussion_intent"]=json!(intent.as_str());
+        }
+        if anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)) {
+            if let Some(event)=select_origin(&tx,&context,source.as_deref())? {
+                crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,&mut attachment)?;
+            }
+        }
+        if !attachment["reply_to_message_id"].is_string() {
+            ensure!(matches!(intent, Some(MessageIntent::Result | MessageIntent::Decision)) && attachment["discussion_scope"].is_string(),
+                "Choose a trusted source discussion or a specific work occurrence for this requested result or decision");
+        }
+        if intent==Some(MessageIntent::Progress) {
+            tx.commit()?;
+            return Ok((String::new(),false,Some((binding.app_id,text,attachment))));
+        }
+        if let Some(path)=path {attachment["path"]=json!(path);}
+        let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;
+        tx.commit()?;Ok((id,true,None))
+    }).await?;
     // The journal is committed before remote IO. Do not hold the project lock
     // across Feishu: fresh input and deterministic controls remain immediate.
-    drop(guard);let send_error=if dispatch {app.send_out(&message).await.err().map(|e|e.to_string())}else{None};let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
+    drop(guard);
+    if let Some((app_id,text,attachment))=progress {
+        return crate::discussion::progress(app,p.id,app_id,effect.clone(),text,attachment).await;
+    }
+    let send_error=if dispatch {app.send_out(&message).await.err().map(|e|e.to_string())}else{None};let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
    },
    _=>bail!("This management tool is not available"),
   }
@@ -979,7 +1043,13 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
     let rows=c.prepare("SELECT id,status,content,attachment FROM messages WHERE project_id=? AND direction='out' AND status IN ('sent','failed','uncertain') AND json_extract(attachment,'$.manager_effect') IS NULL AND json_extract(attachment,'$.manager_notice') IS NULL AND created_at >= COALESCE((SELECT MIN(created_at) FROM work_events WHERE project_id=? AND source='management'),9223372036854775807) ORDER BY rowid DESC LIMIT 32")?.query_map(params![project,project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, status, content, raw) in rows {
         let a: Value = serde_json::from_str(&raw)?;
-        let origin=a["reply_to_message_id"].as_str().map(|anchor|c.query_row("SELECT e.id FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.project_id=? AND m.direction='in' AND m.source_id=?",params![project,anchor],|r|r.get::<_,String>(0)).optional()).transpose()?.flatten();
+        let anchor = a["resolved_reply_to_message_id"].as_str().or_else(|| a["reply_to_message_id"].as_str());
+        let origin=anchor.map(|anchor|c.query_row("SELECT e.id FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.project_id=? AND m.direction='in' AND m.source_id=?",params![project,anchor],|r|r.get::<_,String>(0)).optional()).transpose()?.flatten();
+        let scoped_origin = a["discussion_scope"].as_str().map(|scope|
+            c.query_row("SELECT id FROM work_events WHERE project_id=? AND id=?",
+                params![project,scope], |row| row.get::<_,String>(0)).optional()
+        ).transpose()?.flatten();
+        let origin = origin.or(scoped_origin);
         observation(
             c,
             project,
@@ -987,7 +1057,7 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &id,
             &status,
             origin.as_deref(),
-            &json!({"kind":"worker_message","status":status,"already_delivered_to_user":status=="sent","content":content.chars().take(16000).collect::<String>(),"to":a["to"],"reply_to_message_id":a["reply_to_message_id"],"sent_message_id":a["sent_message_id"],"sent_chat_id":a["sent_chat_id"]}),
+            &json!({"kind":"worker_message","status":status,"already_delivered_to_user":status=="sent","content":content.chars().take(16000).collect::<String>(),"to":a["to"],"reply_to_message_id":anchor,"sent_message_id":a["sent_message_id"],"sent_chat_id":a["sent_chat_id"]}),
         )?;
     }
     let intents=c.prepare("SELECT id,error,json_extract(payload,'$.origin_event_id') FROM work_events WHERE project_id=? AND source='management' AND status='failed' ORDER BY rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1711,47 +1781,64 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
         let event = intent(&tx, &p, &repair_id, &instructions, None, false)?;
         tx.execute("UPDATE work_events SET payload=json_set(payload,'$.repair_incident',?,'$.repair_revision',?) WHERE id=?",params![incident,ctx.revision,event])?;
     }
-    if notified {
+    if notified
+        || error.retryable
+        || !matches!(error.kind.as_str(), "authorization" | "model_unavailable")
+    {
         tx.commit()?;
         return Ok(());
     }
+    let Some(binding) = crate::bot::get(&tx, &ctx.project)? else {
+        tx.commit()?;
+        return Ok(());
+    };
     let origins=tx.prepare("SELECT DISTINCT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id IS NOT NULL ORDER BY i.created_at,i.rowid")?.query_map([&ctx.run],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for origin in origins {
         let e = work::event(&tx, &ctx.project, &origin)?;
-        if let Some(id) = e.message_id {
-            let (source, raw, content): (String, String, String) = tx.query_row(
-                "SELECT source_id,attachment,content FROM messages WHERE id=?",
+        let inbound = e.message_id.as_ref().map(|id| {
+            tx.query_row(
+                "SELECT attachment,content FROM messages WHERE id=?",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            let a: Value = serde_json::from_str(&raw)?;
-            if let (Some(to), Some(binding)) = (
-                a["source"]["chat_id"].as_str(),
-                crate::bot::get(&tx, &ctx.project)?,
-            ) {
-                let message = failure_notice(
-                    error,
-                    delay,
-                    !error.retryable || attempts >= 3,
-                    content
-                        .chars()
-                        .any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch)),
-                );
-                db::enqueue_out_request(
-                    &tx,
-                    &ctx.project,
-                    &binding.app_id,
-                    &format!("manager-unavailable-{}-{incident}", ctx.project),
-                    &message,
-                    json!({"to":to,"reply_to_message_id":source,"manager_notice":true,"manager_incident":incident,"manager_revision":ctx.revision}),
-                )?;
-                tx.execute(
-                    "UPDATE manager_failures SET notified=1 WHERE project_id=?",
-                    [&ctx.project],
-                )?;
-                break;
-            }
+                |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)),
+            )
+        }).transpose()?;
+        let (source, content) = match inbound {
+            Some((raw, content)) => (serde_json::from_str::<Value>(&raw)?["source"].clone(), content),
+            None => (Value::Null, e.payload["instructions"].as_str().unwrap_or_default().to_owned()),
+        };
+        let to = source["chat_id"].as_str()
+            .or_else(|| e.payload["to"].as_str()).filter(|value| !value.is_empty())
+            .unwrap_or(&p.chat_id);
+        if to.is_empty() {
+            continue;
         }
+        let chinese = content.chars().any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch));
+        let action = match (error.kind.as_str(), chinese) {
+            ("authorization", true) => "请检查管理模型服务的授权。",
+            ("authorization", false) => " Check the management provider credentials.",
+            (_, true) => "请在设置里选择可用的管理模型。",
+            (_, false) => " Choose an available management model in Settings.",
+        };
+        let message = failure_notice(error, delay, true, chinese) + action;
+        let mut attachment = json!({"to":to,"discussion_intent":"decision","manager_notice":true,
+            "manager_incident":incident,"manager_revision":ctx.revision});
+        if let Err(error) = crate::discussion::origin(&tx, &ctx.project, &origin, &binding.app_id, to, &mut attachment) {
+            tracing::warn!(%error, "Could not route management decision to its discussion");
+            continue;
+        }
+        db::enqueue_out_request(
+            &tx,
+            &ctx.project,
+            &binding.app_id,
+            &format!("manager-unavailable-{}-{incident}", ctx.project),
+            &message,
+            attachment,
+        )?;
+        tx.execute(
+            "UPDATE manager_failures SET notified=1 WHERE project_id=?",
+            [&ctx.project],
+        )?;
+        break;
     }
     tx.commit()?;
     Ok(())
@@ -2613,8 +2700,8 @@ mod tests {
     fn prompt_keeps_receipt_cohesion_disclosure_exceptions_and_truthful_failures_together() {
         // These are the explicitly requested policy invariants, not an LLM quality test.
         for policy in [
-            "prioritize one brief, outcome-oriented acknowledgement using send_md",
-            "intent=\"receipt\"",
+            "skip acknowledgements and routine progress",
+            "intent=progress",
             "Answer simple questions directly",
             "follow-ups, corrections, work results, recovery retries",
             "Keep related work together by default",
@@ -2841,15 +2928,13 @@ mod tests {
             for attempt in 1..=4 {
                 failure(c,&turn.context,&Failure::timeout())?;
                 let state=public(c,&p.id)?;assert_eq!(state["failure"]["attempt"],attempt);
-                assert_eq!(c.query_row("SELECT COUNT(*) FROM messages WHERE json_extract(attachment,'$.manager_notice')=1",[],|r|r.get::<_,i64>(0))?,1);
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM messages WHERE json_extract(attachment,'$.manager_notice')=1",[],|r|r.get::<_,i64>(0))?,0);
             }
             assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
             let retry:i64=c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get(0))?;
             input(c,&p.id,"observation-new",None,"worker",&json!({"status":"working"}))?;
             assert_eq!(c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get::<_,i64>(0))?,retry);
             assert!(claim(c,&p.id)?.is_none());
-            let text:String=c.query_row("SELECT content FROM messages WHERE direction='out'",[],|r|r.get(0))?;
-            assert!(text.contains("请求超时"));assert!(!text.contains("temporarily unavailable"));
             Ok(())
         }).unwrap();
         ingest(&app, &p, "om_retry_new", "补充新的要求");
@@ -2865,7 +2950,7 @@ mod tests {
                         [],
                         |r| r.get::<_, i64>(0)
                     )?,
-                    1
+                    0
                 );
                 Ok(next)
             })
@@ -2929,7 +3014,7 @@ mod tests {
                         [],
                         |r| r.get::<_, i64>(0)
                     )?,
-                    2
+                    0
                 );
                 Ok(())
             })
@@ -3080,7 +3165,12 @@ mod tests {
         let (_dir, app, p) = fixture().await;
         ingest(&app, &p, "om_notice", "request");
         app.db.sync(|c| {
-            work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();failure(c,&turn.context,&Failure::timeout())?;
+            work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();
+            failure(c,&turn.context,&Failure::timeout())?;
+            assert_eq!(c.query_row("SELECT count(*) FROM messages WHERE direction='out'",[],|r|r.get::<_,i64>(0))?,0);
+            let mut actionable=Failure::internal();
+            actionable.kind="authorization".into();
+            failure(c,&turn.context,&actionable)?;
             let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out'",[],|r|r.get(0))?;
             let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
             c.execute("UPDATE projects SET paused=1 WHERE id=?",[&p.id])?;assert!(validate_outbox(c,&p.id,&notice).is_err());
@@ -3088,7 +3178,7 @@ mod tests {
             work::set_takeover(c,&p.id,"generation",true,db::now())?;assert!(validate_outbox(c,&p.id,&notice).is_err());
             work::set_takeover(c,&p.id,"generation",false,db::now())?;
             recovered(c,&turn.context)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
-            failure(c,&turn.context,&Failure::internal())?;
+            failure(c,&turn.context,&actionable)?;
             let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out' ORDER BY rowid DESC LIMIT 1",[],|r|r.get(0))?;
             let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
             stop(c,&p.id)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
