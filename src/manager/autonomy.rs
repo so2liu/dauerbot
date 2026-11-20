@@ -84,20 +84,14 @@ fn publish(
     ensure!(current, "Proposal generation provider changed");
     let proposals = autonomy::save_batch(&tx, settings, submission.proposals, now)?;
     if !proposals.is_empty() {
-        let rows: Vec<_> = proposals
+        let notice = proposals
             .iter()
             .map(|proposal| {
-                (
-                    i64::from(proposal.number),
-                    proposal.id.clone(),
-                    proposal.draft.title.clone(),
-                    proposal.draft.why_now.clone(),
+                format!(
+                    "{}. {} · {}",
+                    proposal.number, proposal.draft.title, proposal.draft.why_now
                 )
             })
-            .collect();
-        let notice = rows
-            .iter()
-            .map(|(number, _, title, why_now)| format!("{number}. {title} · {why_now}"))
             .collect::<Vec<_>>()
             .join("\n");
         let requested_at = settings
@@ -115,7 +109,7 @@ fn publish(
                 "discussion_scope": request_id,
                 "discussion_intent": "decision",
                 "autonomy_publication_revision": settings.revision,
-                "interactive_card": crate::autonomy_feishu::card(&rows),
+                "interactive_card": crate::autonomy_feishu::card(&proposals),
             }),
         )?;
         let ids = proposals

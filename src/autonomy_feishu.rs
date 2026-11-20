@@ -13,11 +13,22 @@ use std::collections::BTreeSet;
 
 const ACTION: &str = "dauerbot_proposal_decision";
 
-pub(crate) fn card(items: &[(i64, String, String, String)]) -> Value {
+pub(crate) fn card(items: &[autonomy::Proposal]) -> Value {
     let mut elements = Vec::new();
-    for (number, id, title, why_now) in items {
-        let text = format!("{number}. {title}\n{why_now}");
-        elements.push(json!({"tag":"div","text":{"tag":"plain_text","content":text}}));
+    for proposal in items {
+        let autonomy::Proposal {
+            number, id, draft, ..
+        } = proposal;
+        for text in [
+            format!("{number}. {}", draft.title),
+            format!("原因：{}", draft.why_now),
+            format!("范围：{}", draft.scope),
+            format!("排除：{}", draft.not_doing),
+            format!("验收：{}", draft.acceptance),
+            format!("风险：{}", draft.risk),
+        ] {
+            elements.push(json!({"tag":"div","text":{"tag":"plain_text","content":text}}));
+        }
         for (label, decision, style) in [
             ("批准", "approve", "primary_filled"),
             ("驳回", "reject", "default"),
@@ -333,16 +344,44 @@ mod tests {
 
     #[test]
     fn card_payload_contains_only_structured_decisions_and_plain_text() {
-        let value = card(&[(
-            2,
-            "fixture-id".into(),
-            "<b>warning</b>".into(),
-            "Reason".into(),
-        )]);
+        let proposal = autonomy::Proposal {
+            number: 2,
+            id: "fixture-id".into(),
+            project_id: "fixture".into(),
+            status: "pending".into(),
+            created_at: 0,
+            decided_at: None,
+            decided_by: None,
+            execution_event_id: None,
+            source_message_id: None,
+            draft: autonomy::Draft {
+                title: "<b>warning</b>".into(),
+                why_now: "Reason".into(),
+                scope: "Scope marker".into(),
+                not_doing: "Excluded marker".into(),
+                acceptance: "Acceptance marker".into(),
+                risk: "Risk marker".into(),
+                effort: "small".into(),
+                category: "documentation".into(),
+            },
+        };
+        let value = card(&[proposal]);
         let elements = value["body"]["elements"].as_array().unwrap();
-        assert_eq!(elements[0]["text"]["tag"], "plain_text");
-        assert_eq!(elements[0]["text"]["content"], "2. <b>warning</b>\nReason");
-        for (index, decision) in [(1, "approve"), (2, "reject")] {
+        for (index, expected) in [
+            "2. <b>warning</b>",
+            "原因：Reason",
+            "范围：Scope marker",
+            "排除：Excluded marker",
+            "验收：Acceptance marker",
+            "风险：Risk marker",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(elements[index]["text"]["tag"], "plain_text");
+            assert_eq!(elements[index]["text"]["content"], expected);
+        }
+        for (index, decision) in [(6, "approve"), (7, "reject")] {
             assert_eq!(
                 elements[index]["behaviors"][0]["value"],
                 json!({

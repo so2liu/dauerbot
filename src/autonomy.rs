@@ -392,25 +392,43 @@ fn acceptable(draft: &Draft) -> bool {
         "公证",
         "签名",
     ];
-    matches!(
-        draft.category.as_str(),
-        "documentation"
-            | "usability"
-            | "reliability"
-            | "tests"
-            | "observability"
-            | "maintainability"
-    ) && [
-        &draft.title,
-        &draft.why_now,
-        &draft.scope,
-        &draft.not_doing,
-        &draft.acceptance,
-        &draft.risk,
-        &draft.effort,
-    ]
-    .iter()
-    .all(|value| !value.trim().is_empty() && value.chars().count() <= 1000)
+    let contains_blocked = |value: &str| {
+        let normalized = normalized(value);
+        BLOCKED.iter().any(|term| normalized.contains(term))
+    };
+    let exclusions_safe = draft
+        .not_doing
+        .split(['\n', ';', '；', '.', '。', ',', '，'])
+        .all(|clause| {
+            let clause = normalized(clause.trim_start_matches([' ', '-', '*', '•']));
+            !contains_blocked(&clause)
+                || [
+                    "no ", "do not ", "don't ", "never ", "exclude ", "不", "禁止", "排除",
+                ]
+                .iter()
+                .any(|prefix| clause.starts_with(prefix))
+        });
+    exclusions_safe
+        && matches!(
+            draft.category.as_str(),
+            "documentation"
+                | "usability"
+                | "reliability"
+                | "tests"
+                | "observability"
+                | "maintainability"
+        )
+        && [
+            &draft.title,
+            &draft.why_now,
+            &draft.scope,
+            &draft.not_doing,
+            &draft.acceptance,
+            &draft.risk,
+            &draft.effort,
+        ]
+        .iter()
+        .all(|value| !value.trim().is_empty() && value.chars().count() <= 1000)
         && draft.title.chars().count() <= 120
         && [
             &draft.title,
@@ -421,10 +439,7 @@ fn acceptable(draft: &Draft) -> bool {
             &draft.effort,
         ]
         .iter()
-        .all(|value| {
-            let normalized = normalized(value);
-            !BLOCKED.iter().any(|term| normalized.contains(term))
-        })
+        .all(|value| !contains_blocked(value))
 }
 
 pub(crate) fn save_batch(
@@ -661,6 +676,15 @@ mod tests {
             effort: "small".into(),
             category: "documentation".into(),
         }
+    }
+
+    #[test]
+    fn exclusions_accept_explicit_prohibitions_and_reject_blocked_actions() {
+        let mut proposal = draft("Guide");
+        proposal.not_doing = "Do not deploy; 禁止发版".into();
+        assert!(acceptable(&proposal));
+        proposal.not_doing = "No feature work; deploy the service".into();
+        assert!(!acceptable(&proposal));
     }
 
     fn published(c: &Connection, batch: &[Proposal], now: i64) -> Result<()> {
