@@ -401,6 +401,7 @@ impl Db {
         }
         crate::manager::migrate(&migration, recover)?;
         crate::work::migrate(&migration)?;
+        crate::autonomy::migrate(&migration)?;
         crate::manager::migrate_queued(&migration)?;
         crate::handoff::migrate(&migration)?;
         crate::cli_switch::migrate(&migration, recover)?;

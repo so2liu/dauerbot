@@ -57,6 +57,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/settings", get(settings))
         .route("/conversations", get(conversations))
+        .route("/projects/{id}/autonomy", get(autonomy_settings).put(update_autonomy))
+        .route("/proposals", get(proposals))
+        .route("/proposals/{id}/decide", post(decide_proposal))
         .route("/panel/overview", get(panel_overview))
         .route("/panel/messages", get(panel_messages))
         .route("/panel/messages/{id}", get(panel_message_detail))
@@ -310,6 +313,56 @@ async fn proxy_to_owner(app: Arc<App>, req: Request) -> Response {
         }
         Err(_)=>(StatusCode::BAD_GATEWAY,Json(json!({"error":"The committed service did not return a result; preserve this request ID and verify its recorded outcome"}))).into_response(),
     }
+}
+
+
+async fn autonomy_settings(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(
+        app.db
+            .call(move |c| {
+                let project = crate::autonomy::project_id(c, &id)?;
+                Ok(json!(crate::autonomy::settings(c, &project)?))
+            })
+            .await?,
+    ))
+}
+
+async fn update_autonomy(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(update): Json<crate::autonomy::Update>,
+) -> ApiResult {
+    Ok(Json(
+        app.db
+            .call(move |c| {
+                let project = crate::autonomy::project_id(c, &id)?;
+                Ok(json!(crate::autonomy::configure(c, &project, update, db::now())?))
+            })
+            .await?,
+    ))
+}
+
+async fn proposals(State(app): State<Arc<App>>, Query(query): Query<crate::autonomy::List>) -> ApiResult {
+    Ok(Json(
+        app.db
+            .call(move |c| Ok(json!({"items":crate::autonomy::list(c, &query, db::now())?})))
+            .await?,
+    ))
+}
+
+async fn decide_proposal(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<crate::autonomy::Decide>,
+) -> ApiResult {
+    let proposal = app.db.call(move |c| {
+        let tx = c.unchecked_transaction()?;
+        let proposal = crate::autonomy::decide_inside(&tx, &id, input.decision, crate::autonomy::Authority::Admin, db::now())?;
+        tx.commit()?;
+        Ok(proposal)
+    }).await?;
+    app.notify.notify_one();
+    Ok(Json(json!(proposal)))
 }
 
 async fn panel_overview(

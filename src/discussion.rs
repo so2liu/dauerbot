@@ -24,6 +24,16 @@ pub(crate) fn origin(
     } else {
         &crate::work::event(c, project, id)?
     };
+    if origin.source == "autonomy" {
+        let anchor = origin.payload["anchor"].as_str().context("Proposal has no verified discussion")?;
+        ensure!(origin.payload["app_id"] == app_id && origin.payload["to"] == to,
+            "Approved proposal belongs to another bot or conversation");
+        ensure!(attachment["reply_to_message_id"].as_str().is_none_or(|id| id == anchor),
+            "Approved proposal reply must use its verified discussion");
+        attachment["discussion_scope"] = json!(id);
+        attachment["reply_to_message_id"] = json!(anchor);
+        return Ok(());
+    }
     if origin.source == "timer" {
         if let Some(target) = origin.payload["to"].as_str().filter(|to| !to.is_empty()) {
             ensure!(
