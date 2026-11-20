@@ -1146,73 +1146,105 @@ pub fn recipient_type(to: &str) -> Result<&'static str> {
     }
 }
 
-/// Cache a bounded, best-effort group snapshot. Missing scopes never invent members.
-pub async fn context(app: &App, m: &db::Message) -> Value {
-    let source = &m.attachment["source"];
-    let chat = source["chat_id"].as_str().unwrap_or("");
-    if source["chat_type"] != "group" {
-        return json!({});
-    }
-    let cached = app
-        .db
-        .sync(|c| {
-            Ok(c.query_row(
-                "SELECT context FROM conversations WHERE project_id=? AND chat_id=?",
-                rusqlite::params![m.project_id, chat],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap_or_else(|_| "{}".into()))
-        })
-        .unwrap_or_default();
-    let cached: Value = serde_json::from_str(&cached).unwrap_or_default();
-    let mut result = if cached["fetched_at"]
-        .as_i64()
-        .is_some_and(|t| db::now() - t < 300_000)
-    {
-        cached
+fn scoped_group(attachment: &Value) -> Option<(&str, &str)> {
+    let source = &attachment["source"];
+    let chat = source["chat_id"].as_str()?;
+    let app_id = attachment["bot_app_id"].as_str()?;
+    (source["chat_type"] == "group" && !app_id.is_empty()
+        && chat.starts_with("oc_") && recipient_type(chat).is_ok()).then_some((chat, app_id))
+}
+
+fn current_group_cache(value: &Value, chat: &str, app_id: &str) -> bool {
+    value["chat_id"] == chat && value["app_id"] == app_id
+        && value["fetched_at"].as_i64().is_some_and(|t| (0..300_000).contains(&db::now().saturating_sub(t)))
+}
+
+fn group_sender(mut value: Value, attachment: &Value) -> Value {
+    let sender = &attachment["source"]["sender"]["open_id"];
+    value["sender_name"] = value["members"].as_array()
+        .and_then(|members| members.iter().find(|member| &member["member_id"] == sender))
+        .map(|member| member["name"].clone()).unwrap_or(Value::Null);
+    value
+}
+
+/// Read only a bot-scoped snapshot for this original inbound message.
+pub(crate) fn cached_group_context(
+    c: &rusqlite::Connection,
+    project: &str,
+    attachment: &Value,
+) -> Result<Option<Value>> {
+    use rusqlite::OptionalExtension;
+    let Some((chat, app_id)) = scoped_group(attachment) else { return Ok(None) };
+    let stored: Option<Option<String>> = c.query_row(
+        "SELECT c.context FROM project_bots b LEFT JOIN conversations c ON c.project_id=b.project_id
+         AND c.chat_id=?2 WHERE b.project_id=?1 AND b.app_id=?3",
+        rusqlite::params![project, chat, app_id], |r| r.get(0),
+    ).optional()?;
+    let Some(stored) = stored else { return Ok(None) };
+    let resource = &attachment["resource_context"];
+    let snapshot = if current_group_cache(resource, chat, app_id) {
+        Some(resource.clone())
     } else {
-        let fetch = async {
-            let cfg = app.config.read().await.clone();
-            let binding = app.db.bot(&m.project_id).await?;
-            let token = token(app, &binding).await?;
-            let base = format!("{}/open-apis/im/v1/chats/{chat}", cfg.feishu_base);
-            let name = api_json(app.http.get(&base).bearer_auth(&token).send().await?)
-                .await
-                .ok()
-                .and_then(|v| v["data"]["name"].as_str().map(str::to_owned))
-                .unwrap_or_default();
-            let response = api_json(
-                app.http
-                    .get(format!("{base}/members"))
-                    .query(&[("member_id_type", "open_id"), ("page_size", "100")])
-                    .bearer_auth(&token)
-                    .send()
-                    .await?,
-            )
-            .await;
-            Ok::<_, anyhow::Error>(match response {
-                Ok(v) => {
-                    json!({"name":name,"members_status":"snapshot","members":v["data"]["items"],"truncated":v["data"]["has_more"]==true,"fetched_at":db::now()})
-                }
-                Err(_) => {
-                    json!({"name":name,"members_status":"unavailable","members":[],"fetched_at":db::now()})
-                }
-            })
-        };
-        let value = match tokio::time::timeout(Duration::from_secs(6), fetch).await {
-            Ok(Ok(v)) => v,
-            _ => json!({"members_status":"unavailable","members":[],"fetched_at":db::now()}),
-        };
-        let _ = app.db.sync(|c| {c.execute("UPDATE conversations SET context=?,name=CASE WHEN ?='' THEN name ELSE ? END WHERE project_id=? AND chat_id=?",rusqlite::params![value.to_string(),value["name"].as_str().unwrap_or(""),value["name"].as_str().unwrap_or(""),m.project_id,chat])?;Ok(())});
-        value
+        stored.and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .filter(|value| current_group_cache(value, chat, app_id))
     };
-    let sender = source["sender"]["open_id"].as_str().unwrap_or("");
-    result["sender_name"] = result["members"]
-        .as_array()
-        .and_then(|ms| ms.iter().find(|v| v["member_id"] == sender))
-        .map(|v| v["name"].clone())
-        .unwrap_or(Value::Null);
-    result
+    Ok(snapshot.map(|value| group_sender(value, attachment)))
+}
+
+/// Fetch at most one bounded page; missing scopes never invent members.
+pub async fn context(app: &App, m: &db::Message) -> Value {
+    let Some((chat, app_id)) = scoped_group(&m.attachment) else { return json!({}) };
+    if let Ok(Some(value)) = app.db.sync(|c| cached_group_context(c, &m.project_id, &m.attachment)) {
+        return value;
+    }
+    let fetch = async {
+        let cfg = app.config.read().await.clone();
+        let binding = app.db.bot(&m.project_id).await?;
+        anyhow::ensure!(binding.app_id == app_id, "The source belongs to another bot");
+        let token = token(app, &binding).await?;
+        let base = format!("{}/open-apis/im/v1/chats/{chat}", cfg.feishu_base);
+        let name = api_json(app.http.get(&base).bearer_auth(&token).send().await?)
+            .await.ok().and_then(|v| v["data"]["name"].as_str().map(bounded_group_label))
+            .unwrap_or_default();
+        let response = api_json(
+            app.http.get(format!("{base}/members"))
+                .query(&[("member_id_type", "open_id"), ("page_size", "100")])
+                .bearer_auth(&token).send().await?,
+        ).await;
+        Ok::<_, anyhow::Error>(match response {
+            Ok(v) if v["data"]["items"].is_array() => {
+                let items = v["data"]["items"].as_array().expect("checked members array");
+                let members: Vec<_> = items.iter().take(100).filter_map(|item| {
+                    let id = item["member_id"].as_str().filter(|id| id.starts_with("ou_") && recipient_type(id).is_ok())?;
+                    Some(json!({"member_id":id,"name":bounded_group_label(item["name"].as_str().unwrap_or_default())}))
+                }).collect();
+                json!({"name":name,"members_status":"snapshot","members":members,
+                    "truncated":v["data"]["has_more"]==true || items.len()>100})
+            }
+            _ => json!({"name":name,"members_status":"unavailable","members":[]}),
+        })
+    };
+    let mut value = match tokio::time::timeout(Duration::from_secs(6), fetch).await {
+        Ok(Ok(v)) => v,
+        _ => json!({"members_status":"unavailable","members":[]}),
+    };
+    value["chat_id"] = json!(chat);
+    value["app_id"] = json!(app_id);
+    value["fetched_at"] = json!(db::now());
+    let stored = app.db.sync(|c| Ok(c.execute(
+        "UPDATE conversations SET context=?1,name=CASE WHEN ?2='' THEN name ELSE ?2 END
+         WHERE project_id=?3 AND chat_id=?4 AND EXISTS(
+           SELECT 1 FROM project_bots WHERE project_id=?3 AND app_id=?5)",
+        rusqlite::params![value.to_string(),value["name"].as_str().unwrap_or_default(),m.project_id,chat,app_id],
+    )? == 1)).unwrap_or(false);
+    if !stored {
+        return json!({"members_status":"unavailable"});
+    }
+    group_sender(value, &m.attachment)
+}
+
+fn bounded_group_label(value: &str) -> String {
+    value.chars().take(120).collect()
 }
 
 pub(crate) enum ProgressDelivery {

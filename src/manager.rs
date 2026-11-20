@@ -391,9 +391,10 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
             .await?;
         if let Some(id) = original.message_id {
             let message = app.db.message(&id).await?;
+            let group = crate::feishu::context(app, &message).await;
             context = crate::envelope::render_resources(
                 &message,
-                &Value::Null,
+                &group,
                 message.attachment["resources"]
                     .as_array()
                     .map(Vec::as_slice)
@@ -1135,7 +1136,11 @@ fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
         )?;
         let a: Value = serde_json::from_str(&raw)?;
         Ok(if e.source == "feishu" {
-            json!({"event_id":id,"source_kind":"feishu","message_id":e.source_id,"source":a["source"]})
+            let mut trusted = json!({"event_id":id,"source_kind":"feishu","message_id":e.source_id,"source":a["source"]});
+            if let Some(group) = crate::feishu::cached_group_context(c, project, &a)? {
+                trusted["group_context"] = group;
+            }
+            trusted
         } else {
             json!({"event_id":id,"source_kind":e.source,"local_source_id":e.source_id})
         })
@@ -2000,6 +2005,26 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
     )?;
     Ok(())
 }
+/// Prime at most the newest ready group input before building a Manager prompt.
+async fn prepare_group_context(app: &App, project: &str) {
+    let project = project.to_owned();
+    let due = app.db.call(move |c| {
+        Ok(c.query_row(
+            &format!("SELECT m.id FROM manager_inputs JOIN work_events e ON e.id=manager_inputs.origin_event_id
+             JOIN messages m ON m.id=e.message_id AND m.project_id=manager_inputs.project_id
+             JOIN project_bots b ON b.project_id=manager_inputs.project_id
+             CROSS JOIN manager_provider_config g WHERE manager_inputs.project_id=? AND manager_inputs.status IN ('queued','processing')
+             AND e.source='feishu' AND m.direction='in' AND ({PROVIDER_CONFIGURED}) AND {PREPARED_INPUT}
+             AND json_extract(m.attachment,'$.source.chat_type')='group'
+             AND b.app_id=json_extract(m.attachment,'$.bot_app_id') ORDER BY manager_inputs.rowid DESC LIMIT 1"),
+            [&project], |r| r.get::<_, String>(0),
+        ).optional()?)
+    }).await;
+    if let Ok(Some(id)) = due && let Ok(message) = app.db.message(&id).await {
+        crate::feishu::context(app, &message).await;
+    }
+}
+
 pub async fn run(app: Arc<App>) {
     let running = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));
     loop {
@@ -2021,6 +2046,7 @@ pub async fn run(app: Arc<App>) {
                     running.lock().await.remove(&project);
                     return;
                 };
+                prepare_group_context(&app, &project).await;
                 let claim_project = project.clone();
                 let turn = {
                     let Some(_permit) = app.service.gate.enter() else {
@@ -2106,6 +2132,62 @@ mod tests {
             .unwrap();
         (dir, app, p)
     }
+    #[tokio::test]
+    async fn group_context_reaches_manager_and_worker_without_crossing_source_scope() -> Result<()> {
+        use axum::{Json, Router, routing::{get, post}};
+        let (_dir, app, p) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        app.config.write().await.feishu_base = format!("http://{}", listener.local_addr()?);
+        let fixture = Router::new()
+            .route("/open-apis/auth/v3/tenant_access_token/internal", post(|| async {
+                Json(json!({"code":0,"tenant_access_token":"fixture-token","expire":3600}))
+            }))
+            .route("/open-apis/im/v1/chats/oc_original", get(|| async {
+                Json(json!({"code":0,"data":{"name":"Original group"}}))
+            }))
+            .route("/open-apis/im/v1/chats/oc_original/members", get(|| async {
+                Json(json!({"code":0,"data":{"items":[{"member_id":"ou_fixture","name":"Fixture sender"}],"has_more":true}}))
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, fixture).await.unwrap() });
+        let id = app.db.ingest_bot(&p.id,"cli_fixture","oc_original","om_group","hello",
+            &json!({"source":{
+                "chat_id":"oc_original","chat_type":"group","message_type":"text",
+                "sender":{"open_id":"ou_fixture"}
+            }}))?.unwrap();
+        app.db.sync(work::sync_inbound)?;
+        prepare_group_context(&app, &p.id).await;
+        let mut worker = app.db.sync(|c| {
+            let managed = trusted_source(c, &p.id, &id)?;
+            assert_eq!(managed["group_context"]["name"], "Original group");
+            assert_eq!(managed["group_context"]["sender_name"], "Fixture sender");
+            assert_eq!(managed["group_context"]["truncated"], true);
+            let event = test_delegate(c, &p.id, "group-context-worker", Some(&id))?;
+            work::event(c, &p.id, &event)
+        })?;
+        worker.payload["target_generation"] = json!(p.generation);
+        let xml = body(&app, &p, &worker).await?;
+        assert!(xml.contains(r#"<chat name="Original group"/>"#));
+        assert!(xml.contains(r#"name="Fixture sender""#));
+        app.db.ingest_bot(&p.id,"cli_fixture","oc_other","om_other_group","hello",
+            &json!({"source":{"chat_id":"oc_other","chat_type":"group","message_type":"text"}}))?;
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            let other: String = c.query_row(
+                "SELECT id FROM work_events WHERE source_id='om_other_group'",
+                [], |r| r.get(0),
+            )?;
+            assert!(trusted_source(c, &p.id, &other)?["group_context"].is_null());
+            crate::bot::save(c, &p.id, "cli_other", "fixture-replacement", false)?;
+            assert!(trusted_source(c, &p.id, &id)?["group_context"].is_null());
+            Ok(())
+        })?;
+        let rebound = body(&app, &p, &worker).await?;
+        assert!(!rebound.contains("Original group"));
+        assert!(!rebound.contains("Fixture sender"));
+        server.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unconfigured_projects_hold_input_without_delegating_and_share_the_saved_provider() {
         let (_dir, app, first) = fixture().await;
