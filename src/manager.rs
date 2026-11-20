@@ -1,4 +1,4 @@
-//! Optional restricted management actor. Native CLI authority stays in the worker.
+//! Restricted management actor. Native CLI authority stays in the worker.
 use crate::{
     App, db,
     db::Project,
@@ -27,7 +27,7 @@ pub(crate) fn owner() -> &'static str {
     OWNER.get_or_init(db::id)
 }
 
-fn installed(c: &Connection) -> Result<bool> {
+pub(crate) fn installed(c: &Connection) -> Result<bool> {
     Ok(c.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_config')",
         [],
@@ -35,7 +35,7 @@ fn installed(c: &Connection) -> Result<bool> {
     )?)
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'native',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id) ON DELETE CASCADE,note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'manager',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id) ON DELETE CASCADE,note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_failures(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,incident_id TEXT NOT NULL,attempts INTEGER NOT NULL,diagnostic TEXT NOT NULL,notified INTEGER NOT NULL DEFAULT 0,repair_probe INTEGER NOT NULL DEFAULT 0);")?;
     if !c
         .prepare("PRAGMA table_info(manager_config)")?
@@ -49,6 +49,37 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
             [],
         )?;
     }
+    c.execute_batch("CREATE TABLE IF NOT EXISTS manager_provider_config(
+        id INTEGER PRIMARY KEY CHECK(id=1), base_url TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
+        supports_images INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0, migration_conflict INTEGER NOT NULL DEFAULT 0
+    );")?;
+    // A blank singleton also marks a completed migration, including after a key is cleared.
+    let migrated = c.execute("INSERT OR IGNORE INTO manager_provider_config(id,base_url,model,api_key,supports_images,migration_conflict)
+        SELECT 1,old.base_url,old.model,old.api_key,old.supports_images,
+            EXISTS(SELECT 1 FROM manager_config other WHERE
+                trim(other.base_url)!='' AND trim(other.model)!='' AND trim(other.api_key)!=''
+                AND (other.base_url,other.model,other.api_key,other.supports_images) !=
+                    (old.base_url,old.model,old.api_key,old.supports_images))
+        FROM manager_config old WHERE trim(old.base_url)!='' AND trim(old.model)!='' AND trim(old.api_key)!=''
+        ORDER BY old.revision DESC,old.project_id LIMIT 1", [])?;
+    let empty = c.execute("INSERT OR IGNORE INTO manager_provider_config(id) VALUES(1)", [])?;
+    if migrated == 1 || empty == 1 {
+        // An existing checkpoint belongs to its original provider identity.
+        c.execute("UPDATE manager_config AS old SET revision=revision+1,input_revision=input_revision+1,error='',next_attempt_at=0
+            WHERE old.mode='manager' AND EXISTS(SELECT 1 FROM manager_provider_config current WHERE
+                (old.base_url,old.model,old.api_key,old.supports_images) !=
+                (current.base_url,current.model,current.api_key,current.supports_images))", [])?;
+        if empty == 1 {
+            c.execute("UPDATE manager_config SET error='',next_attempt_at=0", [])?;
+        }
+        c.execute("UPDATE manager_runs SET status='superseded' WHERE status='working' AND
+            revision!=(SELECT revision FROM manager_config WHERE project_id=manager_runs.project_id)", [])?;
+    }
+    c.execute("INSERT OR IGNORE INTO manager_config(project_id,mode) SELECT id,'manager' FROM projects", [])?;
+    c.execute("UPDATE manager_config SET mode='manager',base_url='',model='',api_key='',supports_images=0
+        WHERE mode!='manager' OR base_url!='' OR model!='' OR api_key!='' OR supports_images!=0", [])?;
     // Turn notes share the owning project's lifetime, just like their runs.
     let notes_cascade: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('manager_turn_notes') WHERE [table]='manager_runs' AND [from]='run_id' AND on_delete='CASCADE')", [], |r|r.get(0))?;
     if !notes_cascade {
@@ -80,54 +111,51 @@ pub struct ConfigInput {
 #[serde(deny_unknown_fields)]
 pub struct ModeInput {
     pub mode: String,
+    #[serde(default)]
     pub request_id: String,
+    #[serde(default)]
     pub expected_revision: i64,
 }
-pub fn public(c: &Connection, project: &str) -> Result<Value> {
-    let row=c.query_row("SELECT mode,base_url,model,api_key!='',revision,error FROM manager_config WHERE project_id=?",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?))).optional()?;
-    let (mode, base, model, has_key, revision, error) = row.unwrap_or((
-        "native".into(),
-        String::new(),
-        String::new(),
-        false,
-        0,
-        String::new(),
-    ));
-    let error = if mode == "manager" && (!has_key || model.trim().is_empty()) {
-        "Configure a management endpoint, model and API key".to_owned()
-    } else {
-        error
-    };
-    let supports_images: bool = c
-        .query_row(
-            "SELECT supports_images FROM manager_config WHERE project_id=?",
-            [project],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(false);
-    let paused: bool = c.query_row("SELECT paused FROM projects WHERE id=?", [project], |r| {
-        r.get(0)
-    })?;
-    let active: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_runs WHERE project_id=? AND status='working')",
-        [project],
-        |r| r.get(0),
-    )?;
-    let failure: Option<String> = c
-        .query_row(
-            "SELECT diagnostic FROM manager_failures WHERE project_id=? AND revision=?",
-            params![project, revision],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(
-        json!({"mode":mode,"base_url":base,"model":model,"supports_images":supports_images,"has_api_key":has_key,"revision":revision,"status":if mode=="native"{"disabled"}else if paused{"paused"}else if !error.is_empty(){"unavailable"}else if active{"working"}else{"ready"},"error":error,"failure":failure.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?}),
-    )
+const PROVIDER_REQUIRED: &str = "Global manager credentials are not configured. Open Settings to configure the manager endpoint, model, and API key.";
+const PROVIDER_CONFIGURED: &str = "trim(base_url)!='' AND trim(model)!='' AND trim(api_key)!=''";
+
+pub fn public_provider(c: &Connection) -> Result<Value> {
+    Ok(c.query_row(
+        &format!("SELECT base_url,model,trim(api_key)!='',supports_images,revision,migration_conflict,
+            ({PROVIDER_CONFIGURED}) FROM manager_provider_config WHERE id=1"),
+        [],
+        |row| Ok(json!({
+            "base_url":row.get::<_,String>(0)?,"model":row.get::<_,String>(1)?,
+            "has_api_key":row.get::<_,bool>(2)?,"supports_images":row.get::<_,bool>(3)?,
+            "revision":row.get::<_,i64>(4)?,"migration_conflict":row.get::<_,bool>(5)?,
+            "configured":row.get::<_,bool>(6)?
+        })),
+    )?)
 }
-pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> {
+pub fn public(c: &Connection, project: &str) -> Result<Value> {
+    let mut public = public_provider(c)?;
+    public["mode"] = json!("manager");
+    let (paused, revision, error, active): (bool, i64, String, bool) = c.query_row(
+        "SELECT p.paused, m.revision, m.error,
+          EXISTS(SELECT 1 FROM manager_runs WHERE project_id=p.id AND status='working')
+         FROM projects p JOIN manager_config m ON m.project_id=p.id WHERE p.id=?",
+        [project], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let failure: Option<String> = c.query_row(
+        "SELECT diagnostic FROM manager_failures WHERE project_id=? AND revision=?",
+        params![project, revision], |row| row.get(0),
+    ).optional()?;
+    let error = if public["configured"] == true { error } else { PROVIDER_REQUIRED.into() };
+    public["status"] = json!(if paused { "paused" } else if !error.is_empty() {
+        "unavailable"
+    } else if active { "working" } else { "ready" });
+    public["error"] = json!(error);
+    public["failure"] = failure.map(|raw|serde_json::from_str::<Value>(&raw)).transpose()?.unwrap_or(Value::Null);
+    Ok(public)
+}
+pub fn save_provider(c: &Connection, input: ConfigInput) -> Result<Value> {
     let tx = c.unchecked_transaction()?;
-    let current = public(&tx, project)?;
+    let current = public_provider(&tx)?;
     ensure!(
         current["revision"] == input.expected_revision,
         "Manager settings changed; refresh before saving"
@@ -136,14 +164,9 @@ pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> 
         !(input.clear_api_key && input.api_key.is_some()),
         "Choose either a new key or clear key"
     );
-    let previous: String = tx
-        .query_row(
-            "SELECT api_key FROM manager_config WHERE project_id=?",
-            [project],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or_default();
+    let previous: String = tx.query_row(
+        "SELECT api_key FROM manager_provider_config WHERE id=1", [], |row| row.get(0),
+    )?;
     let key = if input.clear_api_key {
         String::new()
     } else {
@@ -153,130 +176,36 @@ pub fn save(c: &Connection, project: &str, input: ConfigInput) -> Result<Value> 
         base_url: input.base_url.clone(),
         model: input.model.clone(),
         supports_images: false,
-        api_key: if key.is_empty() {
-            "configuration-placeholder".into()
-        } else {
-            key.clone()
-        },
+        api_key: if key.is_empty() { "configuration-placeholder".into() } else { key.clone() },
     };
     config.validate()?;
-    // An omitted declaration survives only for the exact configured provider/model.
     let supports_images = input.supports_images.unwrap_or_else(|| {
         current["base_url"] == input.base_url
             && current["model"] == input.model
             && current["supports_images"] == true
     });
-    tx.execute("INSERT INTO manager_config(project_id,base_url,model,api_key,revision) VALUES(?,?,?,?,1) ON CONFLICT(project_id) DO UPDATE SET base_url=excluded.base_url,model=excluded.model,api_key=excluded.api_key,revision=manager_config.revision+1,input_revision=manager_config.input_revision+1,error='',next_attempt_at=0",params![project,input.base_url,input.model,key])?;
-    tx.execute(
-        "UPDATE manager_config SET supports_images=? WHERE project_id=?",
-        params![supports_images, project],
-    )?;
-    tx.execute(
-        "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
-        [project],
-    )?;
-    let result = public(&tx, project)?;
+    tx.execute("UPDATE manager_provider_config SET base_url=?,model=?,api_key=?,supports_images=?,
+        revision=revision+1,updated_at=?,migration_conflict=0 WHERE id=1",
+        params![input.base_url,input.model,key,supports_images,db::now()])?;
+    tx.execute("UPDATE manager_config SET revision=revision+1,input_revision=input_revision+1,error='',next_attempt_at=0", [])?;
+    tx.execute("UPDATE manager_runs SET status='superseded' WHERE status='working'", [])?;
+    let result = public_provider(&tx)?;
     tx.commit()?;
     Ok(result)
 }
 pub fn set_mode(c: &Connection, project: &str, input: ModeInput) -> Result<Value> {
-    ensure!(
-        ["native", "manager"].contains(&input.mode.as_str()),
-        "Invalid Agent mode"
-    );
-    ensure!(
-        !input.request_id.is_empty() && input.request_id.len() <= 200,
-        "Invalid mode request ID"
-    );
-    let tx = c.unchecked_transaction()?;
-    let payload =
-        json!({"mode":input.mode,"expected_revision":input.expected_revision}).to_string();
-    if let Some(previous) = tx
-        .query_row(
-            "SELECT payload FROM manager_mode_requests WHERE project_id=? AND request_id=?",
-            params![project, input.request_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        ensure!(
-            previous == payload,
-            "Mode request ID refers to different content"
-        );
-        return public(&tx, project);
+    if input.mode == "native" {
+        bail!("Single-agent mode has been removed; all projects use manager/worker mode.");
     }
-    crate::cli_control::classify(&tx)?;
-    work::sync_inbound(&tx)?;
-    let current = public(&tx, project)?;
-    ensure!(
-        current["revision"] == input.expected_revision,
-        "Manager settings changed; refresh before switching"
-    );
-    if input.mode == "manager" {
-        ensure!(
-            current["has_api_key"] == true
-                && !current["model"].as_str().unwrap_or_default().is_empty(),
-            "Configure the management model first"
-        );
-    }
-    tx.execute("INSERT INTO manager_config(project_id,mode,revision) VALUES(?,?,1) ON CONFLICT(project_id) DO UPDATE SET mode=excluded.mode,revision=manager_config.revision+1,input_revision=manager_config.input_revision+1,error='',next_attempt_at=0",params![project,input.mode])?;
-    if input.mode == "native" && current["mode"] == "manager" {
-        let effects=tx.prepare("SELECT e.id,e.name,e.status,e.result FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=? ORDER BY e.rowid DESC LIMIT 32")?.query_map([project],|r|Ok(json!({"effect_id":r.get::<_,String>(0)?,"tool":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"evidence":r.get::<_,String>(3)?.chars().take(1000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let p = db::project_by_key(&tx, project)?;
-        let mut query=tx.prepare("SELECT id,origin_event_id,payload FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing') ORDER BY rowid")?;
-        let rows = query.query_map([project], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, origin, raw) = row?;
-            let chars: Vec<char> = raw.chars().collect();
-            let total = chars.len().div_ceil(16000).max(1);
-            for (part, chunk) in chars.chunks(16000).enumerate() {
-                let handoff=json!({"instruction":"Explicit Agent-mode handoff. These ordered data chunks preserve unresolved user input. Assemble all parts for this input before acting. Do not repeat completed, committed or uncertain effects; inspect evidence first. Worker messages already sent must not be resent.","input_id":id,"part":part+1,"parts":total,"input_data_chunk":chunk.iter().collect::<String>(),"effect_evidence":effects}).to_string();
-                intent(
-                    &tx,
-                    &p,
-                    &format!("manager-mode-{}-{id}-{part}", input.request_id),
-                    &handoff,
-                    origin.as_deref(),
-                    false,
-                )?;
-            }
-        }
-        drop(query);
-        tx.execute(
-            "UPDATE manager_inputs SET status='transferred' WHERE project_id=? AND status IN ('queued','processing')",
-            [project],
-        )?;
-    }
-    tx.execute(
-        "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
-        [project],
-    )?;
-    tx.execute(
-        "INSERT INTO manager_mode_requests(project_id,request_id,payload) VALUES(?,?,?)",
-        params![project, input.request_id, payload],
-    )?;
-    let result = public(&tx, project)?;
-    tx.commit()?;
-    Ok(result)
+    ensure!(input.mode == "manager", "Invalid Agent mode");
+    public(c, project)
 }
-/// Stamp ownership at actual insertion; enabling never reclassifies an old inbox.
-pub fn stamp(c: &Connection, project: &str, attachment: &mut Value) -> Result<()> {
-    let enabled: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager')",
-        [project],
-        |r| r.get(0),
-    )?;
-    if enabled {
-        if !attachment.is_object() {
-            *attachment = json!({});
-        }
-        attachment["manager_owned"] = json!(true);
+pub fn migrate_queued(c: &Connection) -> Result<()> {
+    let events = c.prepare("SELECT id FROM work_events WHERE status='queued' AND source!='management' ORDER BY rowid")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for event in events {
+        route_event(c, &event)?;
     }
     Ok(())
 }
@@ -298,18 +227,6 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
         return Ok(());
     }
     let payload: Value = serde_json::from_str(&raw)?;
-    let enabled = if source == "timer" {
-        c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager')",
-            [&project],
-            |r| r.get::<_, bool>(0),
-        )?
-    } else {
-        payload["attachment"]["manager_owned"] == true
-    };
-    if !enabled {
-        return Ok(());
-    }
     let native_event = work::event(c, &project, event)?;
     let trusted_source = if source == "feishu" || source == "local" {
         json!({"message_id":if source=="feishu"{Some(&native_event.source_id)}else{None},"local_source_id":if source=="local"{Some(&native_event.source_id)}else{None},"source":payload["attachment"]["source"],"bot_app_id":payload["attachment"]["bot_app_id"]})
@@ -348,6 +265,7 @@ fn input(
     kind: &str,
     payload: &Value,
 ) -> Result<()> {
+    c.execute("INSERT OR IGNORE INTO manager_config(project_id,mode) VALUES(?,'manager')", [project])?;
     if c.execute("INSERT OR IGNORE INTO manager_inputs(id,project_id,origin_event_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)",params![id,project,origin,kind,payload.to_string(),db::now()])?==1 {
  c.execute("UPDATE manager_config SET input_revision=input_revision+CASE WHEN ?='user' THEN 1 ELSE 0 END,next_attempt_at=CASE WHEN ?='user' THEN 0 ELSE next_attempt_at END WHERE project_id=?",params![kind,kind,project])?; }
     Ok(())
@@ -361,7 +279,7 @@ pub(crate) struct Context {
 }
 pub(crate) fn valid(c: &Connection, ctx: &Context) -> Result<Project> {
     let p = crate::db::project_by_key(c, &ctx.project)?;
-    let matches:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager' AND revision=? AND input_revision=?)",params![ctx.project,ctx.revision,ctx.input_revision],|r|r.get(0))?;
+    let matches:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND revision=? AND input_revision=?)",params![ctx.project,ctx.revision,ctx.input_revision],|r|r.get(0))?;
     ensure!(
         matches && !p.paused,
         "Management input or policy changed; effect cancelled"
@@ -401,21 +319,28 @@ fn intent(
     let transition = if steer {
         None
     } else {
-        crate::cli_switch::latest(c, &p.id)?.filter(|r| r.holds_input)
+        crate::cli_switch::latest(c, &p.id)?.filter(crate::cli_switch::blocks_worker)
     };
     let payload = json!({"instructions":instructions,"origin_event_id":origin,"manager_effect_id":id,"steer":steer,"expected_agent":transition.as_ref().map(|r|r.target.as_str()).unwrap_or(&p.agent),"expected_native":if transition.is_some(){""}else{&p.native_session},"target_generation":if transition.is_none()&&p.terminal.is_some(){Some(&p.generation)}else{None},"transition_id":transition.as_ref().map(|r|&r.id)});
     c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)",params![task,p.id,"Management delegation",instructions,db::now(),db::now()])?;
     c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at) VALUES(?,?,?,'management',?,?,'queued',?,?)",params![event,p.id,task,id,payload.to_string(),db::now(),db::now()])?;
     Ok(event)
 }
+#[cfg(test)]
+pub(crate) fn test_delegate(c: &Connection, project: &str, key: &str, origin: Option<&str>) -> Result<String> {
+    let p = db::project_by_key(c, project)?;
+    intent(c, &p, key, "Fixture delegation", origin, false)
+}
 /// Called inside the ordinary native claim transaction, after readiness checks.
 pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Result<bool> {
     if event.source != "management" {
-        return Ok(true);
+        return Ok(!installed(c)?);
     }
     let p = db::project_by_key(c, &event.project_id)?;
     if let Some(incident) = event.payload["repair_incident"].as_str() {
-        let current:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=m.revision AND m.revision=? AND m.mode='manager')",params![p.id,incident,event.payload["repair_revision"].as_i64()],|r|r.get(0))?;
+        let current:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id
+            CROSS JOIN manager_provider_config g WHERE f.project_id=? AND f.incident_id=? AND f.revision=m.revision AND m.revision=?
+            AND trim(g.base_url)!='' AND trim(g.model)!='' AND trim(g.api_key)!='')",params![p.id,incident,event.payload["repair_revision"].as_i64()],|r|r.get(0))?;
         if !current {
             cancel_repair(
                 c,
@@ -450,6 +375,7 @@ pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Resu
     Ok(true)
 }
 pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String> {
+    ensure!(event.source == "management", "Only manager delegations may reach the coding worker");
     ensure!(
         event.payload["expected_agent"] == p.agent
             && event.payload["target_generation"] == p.generation,
@@ -560,10 +486,23 @@ struct MessageArgs {
     intent: Option<MessageIntent>,
     source_event_id: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Copy, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum MessageIntent {
     Receipt,
+    Result,
+    Decision,
+    Progress,
+}
+impl MessageIntent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Receipt => "receipt",
+            Self::Result => "result",
+            Self::Decision => "decision",
+            Self::Progress => "progress",
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -572,6 +511,8 @@ struct SendFileArgs {
     path: String,
     caption: Option<String>,
     reply_to_message_id: Option<String>,
+    source_event_id: Option<String>,
+    intent: Option<MessageIntent>,
 }
 fn file_parent(root: &Path, path: &str) -> Result<(fs::File, std::ffi::CString)> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -814,9 +755,19 @@ fn enqueue_receipt(
     Ok((id, true))
 }
 pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
+    if let Some(revision) = attachment["manager_provider_revision"].as_i64() {
+        let allowed: bool = c.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM manager_provider_config g JOIN projects p ON p.id=?
+                WHERE g.revision=? AND p.paused=0 AND NOT ({PROVIDER_CONFIGURED}))"),
+            params![project, revision], |row| row.get(0),
+        )?;
+        let p = db::project_by_key(c, project)?;
+        ensure!(allowed && !work::has_takeover(c, project, &p.generation)?,
+            "The manager configuration notice is no longer active");
+    }
     if let Some(origin) = attachment["manager_receipt_origin"].as_str() {
         let allowed: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_config m ON m.project_id=i.project_id JOIN projects p ON p.id=m.project_id WHERE i.project_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status IN ('queued','processing','consumed') AND m.mode='manager' AND m.revision=? AND p.paused=0)",
+            "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_config m ON m.project_id=i.project_id JOIN projects p ON p.id=m.project_id WHERE i.project_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status IN ('queued','processing','consumed') AND m.revision=? AND p.paused=0)",
             params![project, origin, attachment["manager_revision"].as_i64()],
             |r| r.get(0),
         )?;
@@ -832,7 +783,7 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
         return Ok(());
     }
     if attachment["manager_notice"] == true {
-        let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN projects p ON p.id=m.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=? AND f.revision=m.revision AND m.mode='manager' AND p.paused=0)",params![project,attachment["manager_incident"].as_str(),attachment["manager_revision"].as_i64()],|r|r.get(0))?;
+        let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN projects p ON p.id=m.project_id WHERE f.project_id=? AND f.incident_id=? AND f.revision=? AND f.revision=m.revision AND p.paused=0)",params![project,attachment["manager_incident"].as_str(),attachment["manager_revision"].as_i64()],|r|r.get(0))?;
         ensure!(
             allowed,
             "Management notice no longer belongs to an active incident"
@@ -846,7 +797,7 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
     let Some(effect) = attachment["manager_effect"].as_str() else {
         return Ok(());
     };
-    let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id JOIN manager_config m ON m.project_id=r.project_id JOIN projects p ON p.id=m.project_id WHERE e.id=? AND r.project_id=? AND r.status IN ('working','complete') AND r.revision=m.revision AND r.input_revision=m.input_revision AND m.mode='manager' AND p.paused=0)",params![effect,project],|r|r.get(0))?;
+    let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id JOIN manager_config m ON m.project_id=r.project_id JOIN projects p ON p.id=m.project_id WHERE e.id=? AND r.project_id=? AND r.status IN ('working','complete') AND r.revision=m.revision AND r.input_revision=m.input_revision AND p.paused=0)",params![effect,project],|r|r.get(0))?;
     ensure!(allowed, "Management reply was superseded or stopped");
     let p = db::project_by_key(c, project)?;
     ensure!(
@@ -887,7 +838,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
       let origin=select_origin(&tx,&context,a.source_event_id.as_deref())?;
       if let Some(target) = &a.target_cli { crate::cli_switch::request(&tx,&p,target)?; }
-      let held=crate::cli_switch::holds_input(&tx,&p.id)?;
+      let held=crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
       // An explicit target participates in the ordinary cooperative handoff.
       // Its instructions remain held for that successor, never sent to the old CLI.
       let steer_current = steer && !(a.target_cli.is_some() && held);
@@ -898,18 +849,67 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
    },
-   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let transition_project=p.id.clone();let transition=app.db.call(move|c|crate::cli_switch::latest(c,&transition_project)).await?;let authority=ctx.clone();app.db.call(move|c|valid(c,&authority)).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete,"cli_transition":transition,"input_effect_journal":journal}))},
+   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();let mut snapshot=app.db.call(move|c|{let current=valid(c,&authority)?;worker_snapshot(c,&current.id,&current.generation)}).await?;snapshot["agent"]=json!(p.agent);snapshot["generation"]=json!(p.generation);snapshot["native_session"]=json!(p.native_session);snapshot["ready"]=json!(p.ready);snapshot["paused"]=json!(p.paused);snapshot["mcp_registered"]=json!(p.execution["mcp_registered"]==true);snapshot["obsolete_executions"]=json!(obsolete);snapshot["input_effect_journal"]=journal;Ok(snapshot)},
    "cli_send_keys"=>{drop(guard);let args:crate::manager_terminal::SendArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::send(app,ctx,args).await},
    "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args).await},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
    "send_md"|"send_file"=>{
-    let (to,text,anchor,path,receipt)=if call.name=="send_md" {let a:MessageArgs=serde_json::from_value(call.arguments)?;ensure!(a.intent.is_some()||a.source_event_id.is_none(),"source_event_id is only used for a receipt");let receipt=a.intent.as_ref().map(|_|MessageArgs{to:a.to.clone(),text:a.text.clone(),reply_to_message_id:a.reply_to_message_id.clone(),intent:Some(MessageIntent::Receipt),source_event_id:a.source_event_id.clone()});(a.to,a.text,a.reply_to_message_id,None,receipt)}else{let a:SendFileArgs=serde_json::from_value(call.arguments)?;let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;let root=fs::canonicalize(&p.path)?;if let Ok(relative)=path.strip_prefix(&root){file_parent(&root,&relative.to_string_lossy())?;}else{ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");}(a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),None)};
-    crate::feishu::recipient_type(&to)?;ensure!(!text.trim().is_empty()||path.is_some(),"Message content is empty");ensure!(text.len()<=131072,"Message is too large");
-    let context=ctx.clone();let request=effect.clone();let (message,dispatch)=app.db.call(move|c|{let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;if let Some(receipt)=receipt {let queued=enqueue_receipt(&tx,&context,&request,&receipt)?;tx.commit()?;return Ok(queued);}let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;let mut attachment=json!({"to":to,"manager_effect":request});if let Some(anchor)=anchor {attachment["reply_to_message_id"]=json!(anchor);}
-    if let Some(path)=path {attachment["path"]=json!(path);}let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;tx.commit()?;Ok((id,true))}).await?;
+    let (to,text,anchor,path,intent,source)=if call.name=="send_md" {
+        let a:MessageArgs=serde_json::from_value(call.arguments)?;
+        (a.to,a.text,a.reply_to_message_id,None,a.intent,a.source_event_id)
+    }else{
+        let a:SendFileArgs=serde_json::from_value(call.arguments)?;
+        let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;
+        let root=fs::canonicalize(&p.path)?;
+        if let Ok(relative)=path.strip_prefix(&root) {
+            file_parent(&root,&relative.to_string_lossy())?;
+        } else {
+            ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");
+        }
+        ensure!(a.intent.is_none() || a.intent == Some(MessageIntent::Result),"Use result for an independent file");
+        (a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),a.intent,a.source_event_id)
+    };
+    crate::feishu::recipient_type(&to)?;
+    ensure!(!text.trim().is_empty()||path.is_some(),"Message content is empty");
+    ensure!(text.len()<=131072,"Message is too large");
+    let context=ctx.clone();let request=effect.clone();
+    let (message,dispatch,progress)=app.db.call(move|c|{
+        let tx=c.unchecked_transaction()?;
+        let p=valid(&tx,&context)?;
+        if intent==Some(MessageIntent::Receipt) {
+            let args=MessageArgs{to,text,reply_to_message_id:anchor,intent,source_event_id:source};
+            let (message, dispatch)=enqueue_receipt(&tx,&context,&request,&args)?;
+            tx.commit()?;return Ok((message,dispatch,None));
+        }
+        let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;
+        let mut attachment=json!({"to":to,"manager_effect":request,"reply_to_message_id":anchor});
+        if let Some(intent)=intent {
+            attachment["discussion_intent"]=json!(intent.as_str());
+        }
+        if (anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)))
+            && let Some(event)=select_origin(&tx,&context,source.as_deref())?
+        {
+            crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,&mut attachment)?;
+        }
+        if !attachment["reply_to_message_id"].is_string() {
+            ensure!(matches!(intent, Some(MessageIntent::Result | MessageIntent::Decision)) && attachment["discussion_scope"].is_string(),
+                "Choose a trusted source discussion or a specific work occurrence for this requested result or decision");
+        }
+        if intent==Some(MessageIntent::Progress) {
+            tx.commit()?;
+            return Ok((String::new(),false,Some((binding.app_id,text,attachment))));
+        }
+        if let Some(path)=path {attachment["path"]=json!(path);}
+        let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;
+        tx.commit()?;Ok((id,true,None))
+    }).await?;
     // The journal is committed before remote IO. Do not hold the project lock
     // across Feishu: fresh input and deterministic controls remain immediate.
-    drop(guard);let send_error=if dispatch {app.send_out(&message).await.err().map(|e|e.to_string())}else{None};let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
+    drop(guard);
+    if let Some((app_id,text,attachment))=progress {
+        return crate::discussion::progress(app,p.id,app_id,effect.clone(),text,attachment).await;
+    }
+    let send_error=if dispatch {app.send_out(&message).await.err().map(|e|e.to_string())}else{None};let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
    },
    _=>bail!("This management tool is not available"),
   }
@@ -935,23 +935,58 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     app.notify.notify_one();
     Ok(value)
 }
+fn worker_snapshot(c: &Connection, project: &str, generation: &str) -> Result<Value> {
+    let transition = crate::cli_switch::latest(c, project)?;
+    let delegations = c.prepare("SELECT e.id,e.status,r.status,e.error,json_extract(e.payload,'$.transition_id'),json_extract(e.payload,'$.expected_agent') FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?
+        .query_map([project],|r| {
+            let status: String = r.get(1)?;
+            let held = status == "queued" && transition.as_ref().is_some_and(|request| request.holds_input || request.phase == "recovery_exhausted");
+            Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":status,"held":held,"run_status":r.get::<_,Option<String>>(2)?,"error":r.get::<_,String>(3)?,"transition_id":r.get::<_,Option<String>>(4)?,"expected_agent":r.get::<_,Option<String>>(5)?}))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let work = work::snapshot(c, project)?;
+    Ok(json!({
+        "delegations":delegations,
+        "cli_transition":transition,
+        "last_failure":transition.as_ref().and_then(|r|r.source["last_failure"].as_str()),
+        "work_attention":work.attention,
+        "takeover":work::has_takeover(c,project,generation)?,
+    }))
+}
+
+pub(crate) fn observe_cli_transition(
+    c: &Connection,
+    project: &str,
+    id: &str,
+    state: &str,
+    error: &str,
+) -> Result<()> {
+    if installed(c)? {
+        observation(
+            c,
+            project,
+            "cli_transition",
+            id,
+            state,
+            None,
+            &json!({"kind":"cli_transition","request_id":id,"phase":state,"error":error}),
+        )?;
+        c.execute(
+            "UPDATE manager_config SET next_attempt_at=0 WHERE project_id=? AND error=''",
+            [project],
+        )?;
+    }
+    worker_changed(c, project)
+}
 pub fn worker_changed(c: &Connection, project: &str) -> Result<()> {
     if !installed(c)? {
         return Ok(());
     }
-    let enabled: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND mode='manager')",
-        [project],
-        |r| r.get(0),
-    )?;
-    if enabled {
-        observe(c, project)?;
-        repair_finished(c, project)?;
-    }
+    observe(c, project)?;
+    repair_finished(c, project)?;
     Ok(())
 }
 fn repair_finished(c: &Connection, project: &str) -> Result<()> {
-    let current:Option<(String,i64)>=c.query_row("SELECT f.incident_id,f.revision FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN work_events e ON e.project_id=f.project_id AND json_extract(e.payload,'$.repair_incident')=f.incident_id AND json_extract(e.payload,'$.repair_revision')=f.revision JOIN work_runs r ON r.event_id=e.id WHERE f.project_id=? AND f.revision=m.revision AND m.mode='manager' AND f.repair_probe=0 AND r.finished_at IS NOT NULL AND r.status IN ('settled','completed') LIMIT 1",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let current:Option<(String,i64)>=c.query_row("SELECT f.incident_id,f.revision FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id JOIN work_events e ON e.project_id=f.project_id AND json_extract(e.payload,'$.repair_incident')=f.incident_id AND json_extract(e.payload,'$.repair_revision')=f.revision JOIN work_runs r ON r.event_id=e.id WHERE f.project_id=? AND f.revision=m.revision AND f.repair_probe=0 AND r.finished_at IS NOT NULL AND r.status IN ('settled','completed') LIMIT 1",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((incident, revision)) = current else {
         return Ok(());
     };
@@ -979,7 +1014,13 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
     let rows=c.prepare("SELECT id,status,content,attachment FROM messages WHERE project_id=? AND direction='out' AND status IN ('sent','failed','uncertain') AND json_extract(attachment,'$.manager_effect') IS NULL AND json_extract(attachment,'$.manager_notice') IS NULL AND created_at >= COALESCE((SELECT MIN(created_at) FROM work_events WHERE project_id=? AND source='management'),9223372036854775807) ORDER BY rowid DESC LIMIT 32")?.query_map(params![project,project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, status, content, raw) in rows {
         let a: Value = serde_json::from_str(&raw)?;
-        let origin=a["reply_to_message_id"].as_str().map(|anchor|c.query_row("SELECT e.id FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.project_id=? AND m.direction='in' AND m.source_id=?",params![project,anchor],|r|r.get::<_,String>(0)).optional()).transpose()?.flatten();
+        let anchor = a["resolved_reply_to_message_id"].as_str().or_else(|| a["reply_to_message_id"].as_str());
+        let origin=anchor.map(|anchor|c.query_row("SELECT e.id FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.project_id=? AND m.direction='in' AND m.source_id=?",params![project,anchor],|r|r.get::<_,String>(0)).optional()).transpose()?.flatten();
+        let scoped_origin = a["discussion_scope"].as_str().map(|scope|
+            c.query_row("SELECT id FROM work_events WHERE project_id=? AND id=?",
+                params![project,scope], |row| row.get::<_,String>(0)).optional()
+        ).transpose()?.flatten();
+        let origin = origin.or(scoped_origin);
         observation(
             c,
             project,
@@ -987,7 +1028,7 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &id,
             &status,
             origin.as_deref(),
-            &json!({"kind":"worker_message","status":status,"already_delivered_to_user":status=="sent","content":content.chars().take(16000).collect::<String>(),"to":a["to"],"reply_to_message_id":a["reply_to_message_id"],"sent_message_id":a["sent_message_id"],"sent_chat_id":a["sent_chat_id"]}),
+            &json!({"kind":"worker_message","status":status,"already_delivered_to_user":status=="sent","content":content.chars().take(16000).collect::<String>(),"to":a["to"],"reply_to_message_id":anchor,"sent_message_id":a["sent_message_id"],"sent_chat_id":a["sent_chat_id"]}),
         )?;
     }
     let intents=c.prepare("SELECT id,error,json_extract(payload,'$.origin_event_id') FROM work_events WHERE project_id=? AND source='management' AND status='failed' ORDER BY rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1043,6 +1084,46 @@ struct Turn {
     context: Context,
     config: ProviderConfig,
     checkpoint: Value,
+    debug_dispatch: Option<DebugDispatch>,
+}
+struct DebugDispatch {
+    bot_app_id: String,
+    to: String,
+    anchor: String,
+    payload: String,
+}
+
+fn debug_dispatch(
+    c: &Connection,
+    project: &str,
+    origins: impl Iterator<Item = impl AsRef<str>>,
+    payload: &str,
+) -> Result<Option<DebugDispatch>> {
+    let mut source = c.prepare(
+        "SELECT b.app_id, json_extract(m.attachment,'$.source.chat_id'), m.source_id
+         FROM work_events e JOIN messages m ON m.id=e.message_id
+         JOIN project_bots b ON b.project_id=e.project_id
+         WHERE e.id=? AND e.project_id=? AND e.source='feishu' AND m.direction='in'
+           AND json_extract(m.attachment,'$.bot_app_id')=b.app_id
+           AND json_extract(m.attachment,'$.source.chat_id') GLOB 'oc_*'
+           AND m.source_id GLOB 'om_*'",
+    )?;
+    for origin in origins {
+        let target = source
+            .query_row(params![origin.as_ref(), project], |row| {
+                Ok(DebugDispatch {
+                    bot_app_id: row.get(0)?,
+                    to: row.get(1)?,
+                    anchor: row.get(2)?,
+                    payload: payload.to_owned(),
+                })
+            })
+            .optional()?;
+        if target.is_some() {
+            return Ok(target);
+        }
+    }
+    Ok(None)
 }
 fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
     let e = work::event(c, project, id)?;
@@ -1222,7 +1303,7 @@ fn prepare_images(
 fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
     let tx = c.unchecked_transaction()?;
     let p = db::project_by_key(&tx, project)?;
-    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row("SELECT base_url,model,api_key,revision,input_revision,supports_images FROM manager_config WHERE project_id=? AND mode='manager' AND next_attempt_at<=?",params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row("SELECT g.base_url,g.model,g.api_key,m.revision,m.input_revision,g.supports_images FROM manager_config m CROSS JOIN manager_provider_config g WHERE m.project_id=? AND m.next_attempt_at<=? AND trim(g.base_url)!='' AND trim(g.model)!='' AND trim(g.api_key)!=''",params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
     let Some((base_url, model, api_key, revision, _, supports_images)) = config else {
         return Ok(None);
     };
@@ -1235,8 +1316,8 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         |r| r.get(0),
     )?;
     adopt_legacy_claim(&tx, project)?;
-    let existing=tx.query_row("SELECT id,origin_event_id,checkpoint,owner FROM manager_runs WHERE project_id=? AND revision=? AND input_revision=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1",params![project,revision,input_revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
-    let (run, _origin, checkpoint) = if let Some((run, origin, raw, previous_owner)) = existing {
+    let existing=tx.query_row("SELECT id,checkpoint,owner FROM manager_runs WHERE project_id=? AND revision=? AND input_revision=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1",params![project,revision,input_revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
+    let (run, checkpoint, debug_dispatch) = if let Some((run, raw, previous_owner)) = existing {
         if previous_owner != owner() {
             tx.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE run_id=? AND status='submitting'",params![json!({"status":"uncertain","message":"The previous host stopped during this effect; inspect evidence, do not replay."}).to_string(),run])?;
             tx.execute(
@@ -1244,7 +1325,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 params![owner(), run],
             )?;
         }
-        (run, origin, serde_json::from_str(&raw)?)
+        (run, serde_json::from_str(&raw)?, None)
     } else {
         let candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {PREPARED_INPUT} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1454,6 +1535,36 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             prompt.len() <= 250000,
             "Management context exceeds its bound"
         );
+        let debug_dispatch = if p.debug_mode {
+            let admitted_steering = latest_context.as_ref().and_then(|(id, origin, _, _)| {
+                origin
+                    .as_ref()
+                    .filter(|_| inputs.iter().any(|input| &input.0 == id))
+            });
+            let origins = admitted_steering.into_iter().chain(
+                inputs
+                    .iter()
+                    .rev()
+                    .chain(continuing.iter().rev())
+                    .filter_map(|input| input.1.as_ref()),
+            );
+            match debug_dispatch(&tx, project, origins, &prompt) {
+                Ok(Some(dispatch)) => Some(dispatch),
+                Ok(None) => {
+                    tracing::debug!(
+                        project,
+                        "Manager prompt debug has no trusted Feishu discussion"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(project, "Manager prompt debug discussion lookup failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let checkpoint = manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?;
         let run = db::id();
         tx.execute(
@@ -1468,7 +1579,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 params![run, id],
             )?;
         }
-        (run, origin, checkpoint)
+        (run, checkpoint, debug_dispatch)
     };
     tx.commit()?;
     Ok(Some(Turn {
@@ -1485,9 +1596,50 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             supports_images,
         },
         checkpoint,
+        debug_dispatch,
     }))
 }
+fn provider_unavailable(c: &Connection, project: &str) -> Result<bool> {
+    let (configured, revision): (bool, i64) = c.query_row(
+        &format!("SELECT ({PROVIDER_CONFIGURED}),revision FROM manager_provider_config WHERE id=1"),
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if configured {
+        return Ok(false);
+    }
+    let p = db::project_by_key(c, project)?;
+    if p.paused || work::has_takeover(c, project, &p.generation)? {
+        return Ok(true);
+    }
+    let Some(binding) = crate::bot::get(c, project)? else {
+        return Ok(true);
+    };
+    let request = format!("manager-provider-required-{project}-{revision}");
+    let source: Option<(String, String, String)> = c.query_row(
+        "SELECT m.source_id,json_extract(m.attachment,'$.source.chat_id'),m.content
+         FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id
+         JOIN messages m ON m.id=e.message_id
+         WHERE i.project_id=? AND i.status IN ('queued','processing') AND e.source='feishu'
+         AND json_extract(m.attachment,'$.bot_app_id')=?
+         AND json_type(m.attachment,'$.source.chat_id')='text'
+         AND m.source_id GLOB 'om_*'
+         AND NOT EXISTS(SELECT 1 FROM messages WHERE project_id=i.project_id AND direction='out' AND source_id=?)
+         ORDER BY i.rowid LIMIT 1",
+        params![project,binding.app_id,request], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).optional()?;
+    if let Some((anchor, to, body)) = source {
+        let content = if body.chars().any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch)) {
+            "尚未配置全局管理智能体凭据。消息已保留，请在 Dauerbot 的设置中配置服务地址、模型和 API 密钥。"
+        } else {
+            "Your message is saved. Configure the shared manager endpoint, model, and API key in Dauerbot Settings to continue."
+        };
+        db::enqueue_out_request(c, project, &binding.app_id, &request, content,
+            json!({"to":to,"reply_to_message_id":anchor,"manager_provider_revision":revision}))?;
+    }
+    Ok(true)
+}
 fn claim_or_repair(c: &Connection, project: &str) -> Result<Option<Turn>> {
+    if provider_unavailable(c, project)? { return Ok(None); }
     match claim(c, project) {
         Ok(turn) => Ok(turn),
         Err(_) => {
@@ -1495,7 +1647,7 @@ fn claim_or_repair(c: &Connection, project: &str) -> Result<Option<Turn>> {
             if p.paused || work::has_takeover(c, project, &p.generation)? {
                 return Ok(None);
             }
-            let config:Option<(i64,i64)>=c.query_row("SELECT revision,input_revision FROM manager_config WHERE project_id=? AND mode='manager'",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let config:Option<(i64,i64)>=c.query_row("SELECT revision,input_revision FROM manager_config WHERE project_id=?",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let Some((revision, input_revision)) = config else {
                 return Ok(None);
             };
@@ -1557,10 +1709,56 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
             current(&app, &turn.context).await,
             "Management turn superseded"
         );
+        if let Some(dispatch) = turn.debug_dispatch.take() {
+            let echo = crate::feishu::send_debug_reply(
+                &app,
+                &turn.context.project,
+                &dispatch.bot_app_id,
+                &dispatch.to,
+                &dispatch.anchor,
+                &dispatch.payload,
+            );
+            tokio::pin!(echo);
+            loop {
+                tokio::select! {
+                    result = &mut echo => {
+                        if let Err(error) = result {
+                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, %error, "Debug echo failed; continuing manager dispatch");
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if app.shutdown.is_cancelled() || !current(&app, &turn.context).await {
+                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, "Debug echo interrupted by management turn supersession");
+                            bail!("Management turn superseded");
+                        }
+                        if app.service.manager_gate.is_closed() {
+                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, "Debug echo interrupted by service handover");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            // Revalidate after Feishu I/O, which may overlap new steering.
+            if app.service.manager_gate.is_closed() {
+                return Ok(());
+            }
+            ensure!(
+                current(&app, &turn.context).await,
+                "Management turn superseded"
+            );
+        }
         let cancel = CancellationToken::new();
-        let model = manager_loop::advance_observed(&turn.config, turn.checkpoint.clone(), cancel.clone(), Some(crate::manager_context::Observer {
-            store: app.manager_context.clone(), project: turn.context.project.clone(), run: turn.context.run.clone(),
-        }));
+        let model = manager_loop::advance_observed(
+            &turn.config,
+            turn.checkpoint.clone(),
+            cancel.clone(),
+            Some(crate::manager_context::Observer {
+                store: app.manager_context.clone(),
+                project: turn.context.project.clone(),
+                run: turn.context.run.clone(),
+            }),
+        );
         tokio::pin!(model);
         let step = loop {
             tokio::select! {result=&mut model=>break result?,_=tokio::time::sleep(Duration::from_millis(100))=>{if app.shutdown.is_cancelled()||!current(&app,&turn.context).await{cancel.cancel();bail!("Management turn superseded");}}}
@@ -1711,47 +1909,64 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
         let event = intent(&tx, &p, &repair_id, &instructions, None, false)?;
         tx.execute("UPDATE work_events SET payload=json_set(payload,'$.repair_incident',?,'$.repair_revision',?) WHERE id=?",params![incident,ctx.revision,event])?;
     }
-    if notified {
+    if notified
+        || error.retryable
+        || !matches!(error.kind.as_str(), "authorization" | "model_unavailable")
+    {
         tx.commit()?;
         return Ok(());
     }
+    let Some(binding) = crate::bot::get(&tx, &ctx.project)? else {
+        tx.commit()?;
+        return Ok(());
+    };
     let origins=tx.prepare("SELECT DISTINCT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id IS NOT NULL ORDER BY i.created_at,i.rowid")?.query_map([&ctx.run],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for origin in origins {
         let e = work::event(&tx, &ctx.project, &origin)?;
-        if let Some(id) = e.message_id {
-            let (source, raw, content): (String, String, String) = tx.query_row(
-                "SELECT source_id,attachment,content FROM messages WHERE id=?",
+        let inbound = e.message_id.as_ref().map(|id| {
+            tx.query_row(
+                "SELECT attachment,content FROM messages WHERE id=?",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            let a: Value = serde_json::from_str(&raw)?;
-            if let (Some(to), Some(binding)) = (
-                a["source"]["chat_id"].as_str(),
-                crate::bot::get(&tx, &ctx.project)?,
-            ) {
-                let message = failure_notice(
-                    error,
-                    delay,
-                    !error.retryable || attempts >= 3,
-                    content
-                        .chars()
-                        .any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch)),
-                );
-                db::enqueue_out_request(
-                    &tx,
-                    &ctx.project,
-                    &binding.app_id,
-                    &format!("manager-unavailable-{}-{incident}", ctx.project),
-                    &message,
-                    json!({"to":to,"reply_to_message_id":source,"manager_notice":true,"manager_incident":incident,"manager_revision":ctx.revision}),
-                )?;
-                tx.execute(
-                    "UPDATE manager_failures SET notified=1 WHERE project_id=?",
-                    [&ctx.project],
-                )?;
-                break;
-            }
+                |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)),
+            )
+        }).transpose()?;
+        let (source, content) = match inbound {
+            Some((raw, content)) => (serde_json::from_str::<Value>(&raw)?["source"].clone(), content),
+            None => (Value::Null, e.payload["instructions"].as_str().unwrap_or_default().to_owned()),
+        };
+        let to = source["chat_id"].as_str()
+            .or_else(|| e.payload["to"].as_str()).filter(|value| !value.is_empty())
+            .unwrap_or(&p.chat_id);
+        if to.is_empty() {
+            continue;
         }
+        let chinese = content.chars().any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch));
+        let action = match (error.kind.as_str(), chinese) {
+            ("authorization", true) => "请检查管理模型服务的授权。",
+            ("authorization", false) => " Check the management provider credentials.",
+            (_, true) => "请在设置里选择可用的管理模型。",
+            (_, false) => " Choose an available management model in Settings.",
+        };
+        let message = failure_notice(error, delay, true, chinese) + action;
+        let mut attachment = json!({"to":to,"discussion_intent":"decision","manager_notice":true,
+            "manager_incident":incident,"manager_revision":ctx.revision});
+        if let Err(error) = crate::discussion::origin(&tx, &ctx.project, &origin, &binding.app_id, to, &mut attachment) {
+            tracing::warn!(%error, "Could not route management decision to its discussion");
+            continue;
+        }
+        db::enqueue_out_request(
+            &tx,
+            &ctx.project,
+            &binding.app_id,
+            &format!("manager-unavailable-{}-{incident}", ctx.project),
+            &message,
+            attachment,
+        )?;
+        tx.execute(
+            "UPDATE manager_failures SET notified=1 WHERE project_id=?",
+            [&ctx.project],
+        )?;
+        break;
     }
     tx.commit()?;
     Ok(())
@@ -1774,18 +1989,13 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
         "UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=?",
         [project],
     )?;
-    c.execute("UPDATE work_events SET status='cancelled' WHERE id IN(SELECT origin_event_id FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing')) AND status='managed'",[project])?;
-    c.execute("UPDATE work_events SET status='cancelled',error='Stopped by the user' WHERE project_id=? AND source='management' AND status='queued'",[project])?;
+    c.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE status='submitting' AND run_id IN (SELECT id FROM manager_runs WHERE project_id=? AND status='working')", params![json!({"status":"uncertain","message":"Stopped during submission; inspect original effect evidence before retrying."}).to_string(),project])?;
     c.execute(
         "UPDATE manager_config SET input_revision=input_revision+1 WHERE project_id=?",
         [project],
     )?;
     c.execute(
         "UPDATE manager_runs SET status='stopped' WHERE project_id=? AND status='working'",
-        [project],
-    )?;
-    c.execute(
-        "UPDATE manager_inputs SET status='cancelled' WHERE project_id=? AND status IN ('queued','processing')",
         [project],
     )?;
     Ok(())
@@ -1797,7 +2007,7 @@ pub async fn run(app: Arc<App>) {
         let Some(_permit) = app.service.gate.enter() else {
             continue;
         };
-        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE m.mode='manager' AND p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status IN ('queued','processing')) OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
+        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status IN ('queued','processing')) OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
         for project in projects {
             if !running.lock().await.insert(project.clone()) {
                 continue;
@@ -1880,9 +2090,8 @@ mod tests {
         app.db
             .sync(|c| {
                 crate::bot::save(c, &p.id, "cli_fixture", "private-fixture-key", false)?;
-                save(
+                save_provider(
                     c,
-                    &p.id,
                     ConfigInput {
                         base_url: "http://127.0.0.1:9/v1".into(),
                         model: "fixture-manager".into(),
@@ -1892,23 +2101,295 @@ mod tests {
                         supports_images: None,
                     },
                 )?;
-                set_mode(
-                    c,
-                    &p.id,
-                    ModeInput {
-                        mode: "manager".into(),
-                        request_id: "enable".into(),
-                        expected_revision: 1,
-                    },
-                )?;
                 Ok(())
             })
             .unwrap();
         (dir, app, p)
     }
+    #[tokio::test]
+    async fn unconfigured_projects_hold_input_without_delegating_and_share_the_saved_provider() {
+        let (_dir, app, first) = fixture().await;
+        let second = app.db.create(ProjectInput {
+            name: "Second fixture".into(),
+            path: first.path.clone(),
+            agent: "codex".into(),
+            chat_id: String::new(),
+            native_session: String::new(),
+            extra_args: vec![],
+        }).await.unwrap();
+        // A nonempty model/key still requires an endpoint.
+        app.db.sync(|c| {
+            c.execute("UPDATE manager_provider_config SET base_url='' WHERE id=1", [])?;
+            Ok(())
+        }).unwrap();
+        ingest(&app, &first, "om_provider_required", "Hold this request");
+        ingest(&app, &first, "om_provider_required_again", "Also keep this request");
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            for project in [&first.id, &second.id] {
+                let state = public(c, project)?;
+                assert_eq!(state["mode"], "manager");
+                assert_eq!(state["status"], "unavailable");
+                assert_eq!(state["error"], PROVIDER_REQUIRED);
+                assert!(state.get("api_key").is_none());
+                assert!(claim(c, project)?.is_none());
+                assert!(claim_or_repair(c, project)?.is_none());
+                assert!(work::claim_next(c, project, "fixture", db::now())?.is_none());
+            }
+            // Repeated actor polling retains the original topic and at most one notice.
+            assert!(claim_or_repair(c, &first.id)?.is_none());
+            for table in ["manager_failures", "manager_runs", "work_runs"] {
+                let count: u32 = c.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))?;
+                assert_eq!(count, 0, "{table}");
+            }
+            let pending: u32 = c.query_row("SELECT count(*) FROM manager_inputs WHERE status='queued'", [], |row| row.get(0))?;
+            assert_eq!(pending, 2);
+            let notices = c.prepare("SELECT attachment FROM messages WHERE direction='out'")?
+                .query_map([], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(notices.len(), 1);
+            let notice: Value = serde_json::from_str(&notices[0])?;
+            assert_eq!(notice["reply_to_message_id"], "om_provider_required");
+            validate_outbox(c, &first.id, &notice)?;
+            assert!(set_mode(c, &first.id, ModeInput {
+                mode:"native".into(), request_id:String::new(), expected_revision:0
+            }).is_err());
+
+            let current = public_provider(c)?;
+            save_provider(c, ConfigInput {
+                base_url:"https://provider.example/v1".into(), model:"shared-fixture".into(), api_key:None,
+                clear_api_key:false, expected_revision:current["revision"].as_i64().unwrap(),
+                supports_images:Some(true),
+            })?;
+            assert!(validate_outbox(c, &first.id, &notice).is_err());
+            for project in [&first.id, &second.id] {
+                let state = public(c, project)?;
+                assert_eq!(state["model"], "shared-fixture");
+                assert_eq!(state["status"], "ready");
+                assert_eq!(state["supports_images"], true);
+            }
+            assert!(claim_or_repair(c, &first.id)?.is_some());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_provider_migration_is_single_shot_and_preserves_unclaimed_and_uncertain_work() {
+        let (_dir, app, first) = fixture().await;
+        let new_project = |name: &str| ProjectInput {
+            name:name.into(), path:first.path.clone(), agent:"codex".into(),
+            chat_id:String::new(), native_session:String::new(), extra_args:vec![],
+        };
+        let different = app.db.create(new_project("Compared legacy fixture")).await.unwrap();
+        let native = app.db.create(new_project("Legacy native fixture")).await.unwrap();
+        let absent = app.db.create(new_project("Legacy fixture without configuration")).await.unwrap();
+        app.db.sync(|c| {
+            c.execute_batch("DROP TABLE manager_provider_config;")?;
+            c.execute("UPDATE manager_config SET base_url='https://fixture.example',model='old-fixture',
+                api_key='fixture-key-a',mode='manager',revision=3 WHERE project_id=?", [&first.id])?;
+            c.execute("UPDATE manager_config SET base_url='https://fixture.example/v1',model='chosen-fixture',
+                api_key='fixture-key-b',supports_images=1,mode='manager',revision=4 WHERE project_id=?", [&different.id])?;
+            c.execute("UPDATE manager_config SET mode='native' WHERE project_id=?", [&native.id])?;
+            c.execute("DELETE FROM manager_config WHERE project_id=?", [&absent.id])?;
+            for (id, state) in [("legacy-queued", "queued"), ("legacy-uncertain", "uncertain")] {
+                c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at)
+                    VALUES(?,?,'Legacy task','Legacy payload',?,1,1)", params![id,native.id,state])?;
+                c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
+                    VALUES(?,?,?,'local',?,?,?,1,1)",
+                    params![id,native.id,id,id,json!({"content":"preserve this"}).to_string(),state])?;
+            }
+            c.execute("INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at)
+                VALUES('legacy-run',?,'legacy-uncertain','legacy-uncertain','legacy-generation','uncertain',1,1)", [&native.id])?;
+            Ok(())
+        }).unwrap();
+        let path = app.dir.join("bridge.sqlite3");
+        // Handover opens the real migration pipeline on a private fixture store.
+        let db = db::Db::open_handover(&path).unwrap();
+        db.sync(|c| {
+            let schema: i64 = c.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            assert_eq!(schema, 7);
+            assert_eq!(crate::api::PROTOCOL, 7);
+            let selected = public_provider(c)?;
+            assert_eq!(selected["model"], "chosen-fixture");
+            assert_eq!(selected["migration_conflict"], true);
+            assert_eq!(selected["supports_images"], true);
+            for project in [&first.id,&different.id,&native.id,&absent.id] {
+                assert_eq!(public(c, project)?["model"], "chosen-fixture");
+            }
+            assert_eq!(work::event(c, &native.id, "legacy-queued")?.status, "managed");
+            assert_eq!(work::event(c, &native.id, "legacy-uncertain")?.status, "uncertain");
+            assert_eq!(work::run(c, &native.id, "legacy-run")?.status, "uncertain");
+            let moved: u32 = c.query_row("SELECT count(*) FROM manager_inputs WHERE origin_event_id='legacy-queued'", [], |row| row.get(0))?;
+            assert_eq!(moved, 1);
+            save_provider(c, ConfigInput {
+                base_url:"https://fixture.example/v1".into(),model:"chosen-fixture".into(),api_key:None,
+                clear_api_key:true,expected_revision:selected["revision"].as_i64().unwrap(),supports_images:None,
+            })?;
+            Ok(())
+        }).unwrap();
+        drop(db);
+        db::Db::open_handover(&path).unwrap().sync(|c| {
+            let provider = public_provider(c)?;
+            assert_eq!(provider["has_api_key"], false);
+            assert_eq!(provider["migration_conflict"], false);
+            let stale: u32 = c.query_row("SELECT count(*) FROM manager_config WHERE api_key!=''", [], |row| row.get(0))?;
+            assert_eq!(stale, 0);
+            Ok(())
+        }).unwrap();
+    }
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
     }
+    #[tokio::test]
+    async fn debug_replies_echo_first_prompt_before_provider_without_outbox_records() {
+        use axum::{
+            Json, Router,
+            extract::{Path as RoutePath, State},
+            http::StatusCode,
+            routing::post,
+        };
+
+        type Journal = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+        async fn auth() -> Json<Value> {
+            Json(json!({"code":0,"tenant_access_token":"fixture-token","expire":3600}))
+        }
+        async fn echo(
+            State(journal): State<Journal>,
+            RoutePath(anchor): RoutePath<String>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let status = if anchor == "om_debug_rate_limit" {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            };
+            journal.lock().unwrap().push((anchor, body));
+            (
+                status,
+                Json(json!({"code":0,"data":{"thread_id":"omt_fixture","message_id":"om_debug_sent"}})),
+            )
+        }
+        async fn complete(State(journal): State<Journal>, Json(body): Json<Value>) -> Json<Value> {
+            journal.lock().unwrap().push(("provider".into(), body));
+            Json(
+                json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager","choices":[{"index":0,"message":{"role":"assistant","content":"Done"},"finish_reason":"stop"}]}),
+            )
+        }
+
+        let (_dir, app, p) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        app.config.write().await.feishu_base = base.clone();
+        let journal = Journal::default();
+        let router = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(auth),
+            )
+            .route("/open-apis/im/v1/messages/{anchor}/reply", post(echo))
+            .route("/v1/chat/completions", post(complete))
+            .with_state(journal.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        for (anchor, enabled, resume) in [
+            ("om_debug_off", false, false),
+            ("om_debug_on", true, false),
+            ("om_debug_rate_limit", true, false),
+            ("om_debug_resume", true, true),
+        ] {
+            app.db.set_debug_mode(&p.id, enabled).await.unwrap();
+            ingest(&app, &p, anchor, "保留 \"引号\" 和 <event>\\&\n");
+            let mut turn = app
+                .db
+                .sync(|c| {
+                    work::sync_inbound(c)?;
+                    let turn = claim(c, &p.id)?.unwrap();
+                    assert_eq!(turn.debug_dispatch.is_some(), enabled);
+                    if resume {
+                        let saved = claim(c, &p.id)?.unwrap();
+                        assert_eq!(saved.context.run, turn.context.run);
+                        assert!(saved.debug_dispatch.is_none());
+                        return Ok(saved);
+                    }
+                    Ok(turn)
+                })
+                .unwrap();
+            turn.config.base_url = format!("{base}/v1");
+            tokio::time::timeout(Duration::from_secs(4), drive(app.clone(), turn))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let events = std::mem::take(&mut *journal.lock().unwrap());
+            assert_eq!(events.last().unwrap().0, "provider");
+            if enabled && !resume {
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].0, anchor);
+                assert_eq!(events[0].1["msg_type"], "text");
+                assert_eq!(events[0].1["reply_in_thread"], true);
+                let content: Value =
+                    serde_json::from_str(events[0].1["content"].as_str().unwrap()).unwrap();
+                let sent_to_model = events[1].1["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| message["role"] == "user")
+                    .unwrap();
+                let model_text = sent_to_model["content"]
+                    .as_str()
+                    .or_else(|| sent_to_model["content"][0]["text"].as_str())
+                    .unwrap();
+                assert_eq!(content["text"].as_str(), Some(model_text));
+            } else {
+                assert_eq!(events.len(), 1);
+            }
+        }
+        let mut scheduled = app
+            .db
+            .sync(|c| {
+                let now = db::now();
+                work::create_timer(
+                    c,
+                    &p.id,
+                    serde_json::from_value(json!({
+                        "name":"Debug timer fixture", "kind":"once", "at":now,
+                        "prompt":"Produce the requested result", "to":"oc_fixture", "purpose":"user"
+                    }))?,
+                    now,
+                )?;
+                assert_eq!(work::fire_due(c, now)?.len(), 1);
+                let turn = claim(c, &p.id)?.unwrap();
+                assert!(turn.debug_dispatch.is_none());
+                Ok(turn)
+            })
+            .unwrap();
+        scheduled.config.base_url = format!("{base}/v1");
+        tokio::time::timeout(Duration::from_secs(4), drive(app.clone(), scheduled))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.lock().unwrap()[0].0, "provider");
+        assert_eq!(journal.lock().unwrap().len(), 1);
+        app.db
+            .sync(|c| {
+                assert_eq!(
+                    c.query_row(
+                        "SELECT COUNT(*) FROM messages WHERE direction='out'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM manager_failures", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn upgrade_yield_preserves_run_claims_and_stop_authority() {
         let (_dir, app, p) = fixture().await;
@@ -1943,7 +2424,7 @@ mod tests {
             assert_eq!(original["supports_images"], false);
             let configure = |model: &str, declared: Option<bool>| -> Result<Value> {
                 let current = public(c, &p.id)?;
-                save(c, &p.id, ConfigInput { base_url: current["base_url"].as_str().unwrap().into(), model: model.into(), api_key: None, clear_api_key: false, expected_revision: current["revision"].as_i64().unwrap(), supports_images: declared })
+                save_provider(c, ConfigInput { base_url: current["base_url"].as_str().unwrap().into(), model: model.into(), api_key: None, clear_api_key: false, expected_revision: current["revision"].as_i64().unwrap(), supports_images: declared })
             };
             assert_eq!(configure("fixture-vision-name-is-not-proof", None)?["supports_images"], false);
             assert_eq!(configure("fixture-vision-name-is-not-proof", Some(true))?["supports_images"], true);
@@ -1952,7 +2433,7 @@ mod tests {
             assert_eq!(configure("different-model", Some(true))?["supports_images"], true);
             let current = public(c, &p.id)?;
             let changed: ConfigInput = serde_json::from_value(json!({"base_url":"http://127.0.0.1:8/v1","model":"different-model","expected_revision":current["revision"]}))?;
-            assert_eq!(save(c, &p.id, changed)?["supports_images"], false);
+            assert_eq!(save_provider(c, changed)?["supports_images"], false);
             Ok(())
         }).unwrap();
     }
@@ -1983,7 +2464,7 @@ mod tests {
             assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE id=?", [&image_input], |r|r.get::<_,String>(0))?, "processing");
             let current = public(c,&p.id)?;
             let config: ConfigInput = serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?;
-            save(c,&p.id,config)?;
+            save_provider(c,config)?;
             let inline = claim(c,&p.id)?.unwrap();
             assert_eq!(inline.checkpoint["images"].as_array().unwrap().len(),1);
             assert_eq!(inline.checkpoint["images"][0]["message_id"],id);
@@ -2031,7 +2512,7 @@ mod tests {
         app.db.sync(|c| {
             work::sync_inbound(c)?;
             let current = public(c,&p.id)?;
-            save(c,&p.id,serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?)?;
+            save_provider(c,serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?)?;
             let turn = claim(c,&p.id)?.unwrap();
             assert_eq!(turn.checkpoint["images"].as_array().unwrap().len(),2);
             let ids = turn.checkpoint["images"].as_array().unwrap().iter().map(|image|image["message_id"].as_str().unwrap()).collect::<Vec<_>>();
@@ -2400,7 +2881,7 @@ mod tests {
         }).unwrap();
     }
     #[tokio::test]
-    async fn processing_inputs_obey_pause_stop_and_native_mode_handoff() {
+    async fn processing_inputs_obey_pause_and_stop() {
         let (_dir, app, p) = fixture().await;
         ingest(&app, &p, "om_processing_stop", "preserve this instruction");
         app.db
@@ -2418,46 +2899,10 @@ mod tests {
                 assert_eq!(
                     c.query_row("SELECT status FROM manager_inputs", [], |r| r
                         .get::<_, String>(0))?,
-                    "cancelled"
+                    "processing"
                 );
-                assert!(claim(c, &p.id)?.is_none());
-                Ok(())
-            })
-            .unwrap();
-        let (_dir, app, p) = fixture().await;
-        ingest(
-            &app,
-            &p,
-            "om_processing_transfer",
-            "preserve the full original input",
-        );
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let old = claim(c, &p.id)?.unwrap();
-                set_mode(
-                    c,
-                    &p.id,
-                    ModeInput {
-                        mode: "native".into(),
-                        request_id: "processing-handoff".into(),
-                        expected_revision: 2,
-                    },
-                )?;
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "transferred"
-                );
-                assert!(valid(c, &old.context).is_err());
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
+                assert!(valid(c, &first.context).is_err());
+                assert_ne!(claim(c, &p.id)?.unwrap().context.run, first.context.run);
                 Ok(())
             })
             .unwrap();
@@ -2556,7 +3001,7 @@ mod tests {
                 );
                 assert_eq!(
                     c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='cancelled'",
+                        "SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",
                         [],
                         |r| r.get::<_, i64>(0)
                     )?,
@@ -2613,8 +3058,8 @@ mod tests {
     fn prompt_keeps_receipt_cohesion_disclosure_exceptions_and_truthful_failures_together() {
         // These are the explicitly requested policy invariants, not an LLM quality test.
         for policy in [
-            "prioritize one brief, outcome-oriented acknowledgement using send_md",
-            "intent=\"receipt\"",
+            "skip acknowledgements and routine progress",
+            "intent=progress",
             "Answer simple questions directly",
             "follow-ups, corrections, work results, recovery retries",
             "Keep related work together by default",
@@ -2841,15 +3286,13 @@ mod tests {
             for attempt in 1..=4 {
                 failure(c,&turn.context,&Failure::timeout())?;
                 let state=public(c,&p.id)?;assert_eq!(state["failure"]["attempt"],attempt);
-                assert_eq!(c.query_row("SELECT COUNT(*) FROM messages WHERE json_extract(attachment,'$.manager_notice')=1",[],|r|r.get::<_,i64>(0))?,1);
+                assert_eq!(c.query_row("SELECT COUNT(*) FROM messages WHERE json_extract(attachment,'$.manager_notice')=1",[],|r|r.get::<_,i64>(0))?,0);
             }
             assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
             let retry:i64=c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get(0))?;
             input(c,&p.id,"observation-new",None,"worker",&json!({"status":"working"}))?;
             assert_eq!(c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get::<_,i64>(0))?,retry);
             assert!(claim(c,&p.id)?.is_none());
-            let text:String=c.query_row("SELECT content FROM messages WHERE direction='out'",[],|r|r.get(0))?;
-            assert!(text.contains("请求超时"));assert!(!text.contains("temporarily unavailable"));
             Ok(())
         }).unwrap();
         ingest(&app, &p, "om_retry_new", "补充新的要求");
@@ -2865,7 +3308,7 @@ mod tests {
                         [],
                         |r| r.get::<_, i64>(0)
                     )?,
-                    1
+                    0
                 );
                 Ok(next)
             })
@@ -2929,7 +3372,7 @@ mod tests {
                         [],
                         |r| r.get::<_, i64>(0)
                     )?,
-                    2
+                    0
                 );
                 Ok(())
             })
@@ -3080,7 +3523,12 @@ mod tests {
         let (_dir, app, p) = fixture().await;
         ingest(&app, &p, "om_notice", "request");
         app.db.sync(|c| {
-            work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();failure(c,&turn.context,&Failure::timeout())?;
+            work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();
+            failure(c,&turn.context,&Failure::timeout())?;
+            assert_eq!(c.query_row("SELECT count(*) FROM messages WHERE direction='out'",[],|r|r.get::<_,i64>(0))?,0);
+            let mut actionable=Failure::internal();
+            actionable.kind="authorization".into();
+            failure(c,&turn.context,&actionable)?;
             let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out'",[],|r|r.get(0))?;
             let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
             c.execute("UPDATE projects SET paused=1 WHERE id=?",[&p.id])?;assert!(validate_outbox(c,&p.id,&notice).is_err());
@@ -3088,7 +3536,7 @@ mod tests {
             work::set_takeover(c,&p.id,"generation",true,db::now())?;assert!(validate_outbox(c,&p.id,&notice).is_err());
             work::set_takeover(c,&p.id,"generation",false,db::now())?;
             recovered(c,&turn.context)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
-            failure(c,&turn.context,&Failure::internal())?;
+            failure(c,&turn.context,&actionable)?;
             let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out' ORDER BY rowid DESC LIMIT 1",[],|r|r.get(0))?;
             let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
             stop(c,&p.id)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
@@ -3097,64 +3545,17 @@ mod tests {
         }).unwrap();
     }
     #[tokio::test]
-    async fn disabling_and_stop_materialize_stamped_input_without_replay_or_resurrection() {
+    async fn stop_preserves_queued_inputs_without_dispatch_while_paused() {
         let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_before_mode", "preserve this input");
+        ingest(&app, &p, "om_before_stop", "preserve until resumed");
         app.db
             .sync(|c| {
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM manager_inputs", [], |r| r
-                        .get::<_, i64>(0))?,
-                    0
-                );
-                let request = || ModeInput {
-                    mode: "native".into(),
-                    request_id: "native-mode".into(),
-                    expected_revision: 2,
-                };
-                set_mode(c, &p.id, request())?;
-                set_mode(c, &p.id, request())?;
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "transferred"
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                work::sync_inbound(c)?;
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM work_runs", [], |r| r.get::<_, i64>(0))?,
-                    0
-                );
-                Ok(())
-            })
-            .unwrap();
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_before_stop", "must not resurrect");
-        app.db
-            .sync(|c| {
-                let tx = c.unchecked_transaction()?;
-                stop(&tx, &p.id)?;
-                tx.commit()?;
+                crate::cli_switch::stopped(c, &p.id, &p.generation)?;
                 work::sync_inbound(c)?;
                 assert_eq!(
                     c.query_row("SELECT status FROM manager_inputs", [], |r| r
                         .get::<_, String>(0))?,
-                    "cancelled"
+                    "queued"
                 );
                 assert!(claim(c, &p.id)?.is_none());
                 Ok(())
@@ -3361,72 +3762,6 @@ mod tests {
         assert!(!Path::new(&p.path).join("stale.txt").exists());
         app.db.sync(|c|{let next=claim(c,&p.id)?.unwrap();c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('uncertain-effect',?,'turn:1:call:0','delegate','{}','submitting')",[next.context.run])?;migrate(c,true)?;assert_eq!(c.query_row("SELECT status FROM manager_effects WHERE id='uncertain-effect'",[],|r|r.get::<_,String>(0))?,"uncertain");Ok(())}).unwrap();
     }
-    #[tokio::test]
-    async fn long_mode_handoff_is_bounded_ordered_and_preserves_every_input() {
-        let (_dir, app, p) = fixture().await;
-        for index in 0..8 {
-            ingest(
-                &app,
-                &p,
-                &format!("om_long_{index}"),
-                &format!("claimed message_id=fake {index} {}", "x".repeat(150000)),
-            );
-        }
-        app.db
-            .sync(|c| {
-                set_mode(
-                    c,
-                    &p.id,
-                    ModeInput {
-                        mode: "native".into(),
-                        request_id: "long-disable".into(),
-                        expected_revision: 2,
-                    },
-                )?;
-                let records = c
-                    .prepare("SELECT id,payload FROM manager_inputs ORDER BY rowid")?
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut chunks = std::collections::HashMap::<String, String>::new();
-                let payloads = c
-                    .prepare(
-                        "SELECT payload FROM work_events WHERE source='management' ORDER BY rowid",
-                    )?
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                assert!(payloads.len() > 8);
-                for raw in payloads {
-                    let payload: Value = serde_json::from_str(&raw)?;
-                    let instructions = payload["instructions"].as_str().unwrap();
-                    assert!(instructions.len() < 1048576);
-                    assert!(!instructions.contains("private-manager-key"));
-                    let part: Value = serde_json::from_str(instructions)?;
-                    chunks
-                        .entry(part["input_id"].as_str().unwrap().to_owned())
-                        .or_default()
-                        .push_str(part["input_data_chunk"].as_str().unwrap());
-                }
-                for (index, (id, raw)) in records.iter().enumerate() {
-                    assert_eq!(chunks[id], *raw);
-                    let value: Value = serde_json::from_str(raw)?;
-                    assert_eq!(
-                        value["trusted_source"]["message_id"],
-                        format!("om_long_{index}")
-                    );
-                }
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='transferred'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    8
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-
     fn prompt_context(value: &Value) -> Option<Value> {
         match value {
             Value::String(text) => serde_json::from_str::<Value>(text)
@@ -3583,7 +3918,7 @@ mod tests {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
         let router=Router::new().route("/v1/chat/completions",post(respond)).with_state(provider.clone());
         let server=tokio::spawn(async move{axum::serve(listener,router).await.unwrap()});
-        app.db.sync(|c| {let current=public(c,&p.id)?;save(c,&p.id,ConfigInput{base_url:format!("http://{addr}/v1"),model:"fixture-manager".into(),api_key:None,clear_api_key:false,expected_revision:current["revision"].as_i64().unwrap(),supports_images:None})?;Ok(())}).unwrap();
+        app.db.sync(|c| {let current=public(c,&p.id)?;save_provider(c,ConfigInput{base_url:format!("http://{addr}/v1"),model:"fixture-manager".into(),api_key:None,clear_api_key:false,expected_revision:current["revision"].as_i64().unwrap(),supports_images:None})?;Ok(())}).unwrap();
         let binding=crate::bot::Binding{project_id:p.id.clone(),app_id:"cli_fixture".into(),app_secret:"fixture-bot-secret".into()};
         let input=|id:&str,text:&str|serde_json::to_vec(&json!({"header":{"app_id":"cli_fixture","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_fixture"}},"message":{"message_id":id,"chat_id":"oc_fixture","chat_type":"p2p","message_type":"text","content":json!({"text":text}).to_string()}}})).unwrap();
         crate::feishu::ingest(&app,&binding,&input("om_first_blocked","Start original task")).unwrap();
@@ -3676,6 +4011,107 @@ mod tests {
             .unwrap();
         ingest(&app, &p, "om_later", "later unrelated plain instructions");
         app.db.sync(|c|{work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();let origins=c.prepare("SELECT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=?")?.query_map([&turn.context.run],|r|r.get::<_,Option<String>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;let later=c.query_row("SELECT id FROM work_events WHERE source_id='om_later'",[],|r|r.get::<_,String>(0))?;assert!(origins.contains(&Some(later)));c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true')) WHERE source_id='om_resource'",[])?;assert!(work::claim_next(c,&p.id,"generation",db::now())?.is_some());Ok(())}).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resource_preparation_unblocks_consumed_origins_without_replaying_stale_workers() {
+        for stale_worker in [false, true] {
+            let (_dir, app, p) = fixture().await;
+            let message = app
+                .db
+                .ingest_bot(
+                    &p.id,
+                    "cli_fixture",
+                    "oc_fixture",
+                    "om_prior_delegation",
+                    "Inspect the attached evidence",
+                    &json!({
+                        "source":{"message_type":"image","chat_type":"p2p","chat_id":"oc_fixture"},
+                        "kind":"image",
+                        "file_key":"img_fixture"
+                    }),
+                )
+                .unwrap()
+                .unwrap();
+            let delegation = app
+                .db
+                .sync(|c| {
+                    work::sync_inbound(c)?;
+                    c.execute(
+                    "UPDATE projects SET terminal='fixture-pane',generation='generation' WHERE id=?",
+                    [&p.id],
+                )?;
+                    let source = work::event(c, &p.id, &message)?;
+                    assert_eq!(source.status, "managed");
+                    assert!(claim(c, &p.id)?.is_none());
+                    let current = db::project_by_key(c, &p.id)?;
+                    let delegation = intent(
+                        c,
+                        &current,
+                        "prior-delegation",
+                        "Inspect attached evidence",
+                        Some(&source.id),
+                        false,
+                    )?;
+                    assert_eq!(
+                        c.execute(
+                            "UPDATE manager_inputs SET status='consumed' WHERE origin_event_id=?",
+                            [&source.id],
+                        )?,
+                        1
+                    );
+                    settle_sources(c)?;
+                    assert_eq!(work::event(c, &p.id, &source.id)?.status, "managed");
+                    assert!(work::claim_next(c, &p.id, "generation", db::now())?.is_none());
+                    Ok(delegation)
+                })
+                .unwrap();
+
+            let original = app.db.message(&message).await.unwrap();
+            assert_eq!(original.status, "acknowledged");
+            assert!(original.attachment["resources_ready"].is_null());
+            app.db.sync(|c| {
+                let preparation = crate::feishu::begin_resource_preparation(c, &original)?
+                    .expect("a queued delegation owns the consumed input's resources");
+                assert!(crate::feishu::begin_resource_preparation(c, &original)?.is_none());
+                let resources = [json!({
+                    "kind":"image","file_key":"img_fixture","error":"Fixture resource unavailable"
+                })];
+                assert!(crate::feishu::finish_resource_preparation(
+                    c,
+                    &preparation,
+                    &resources,
+                    &json!({"members_status":"unavailable"}),
+                )?);
+                if stale_worker {
+                    c.execute(
+                        "UPDATE projects SET agent='agy',generation='replacement',native_session='other-session' WHERE id=?",
+                        [&p.id],
+                    )?;
+                    assert!(work::claim_next(c, &p.id, "replacement", db::now())?.is_none());
+                    let rejected = work::event(c, &p.id, &delegation)?;
+                    assert_eq!(rejected.status, "failed");
+                    assert!(rejected.error.contains("Worker identity changed"));
+                    let runs: u32 = c.query_row(
+                        "SELECT COUNT(*) FROM work_runs WHERE event_id=?",
+                        [&delegation],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(runs, 0);
+                } else {
+                    let run = work::claim_next(c, &p.id, "generation", db::now())?.unwrap();
+                    assert_eq!(run.event_id, delegation);
+                }
+                Ok(())
+            }).unwrap();
+            let prepared = app.db.message(&message).await.unwrap();
+            assert_eq!(prepared.attachment["resources_ready"], true);
+            assert!(prepared.attachment["resource_preparation"].is_null());
+            assert_eq!(
+                prepared.attachment["resources"][0]["error"],
+                "Fixture resource unavailable"
+            );
+        }
     }
 
     #[test]

@@ -520,13 +520,7 @@ impl ModelPicker {
         } else {
             "unknown"
         };
-        let title = self
-            .language
-            .text(if crate::manager_settings::enabled(&self.project) {
-                "Coding worker model"
-            } else {
-                "Model"
-            });
+        let title = self.language.text("Coding worker model");
         let label = self.language.text(label);
         let caption = self.language.text(caption);
         let display = if label == self.language.text("Native CLI/session settings") {

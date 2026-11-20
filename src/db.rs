@@ -8,6 +8,45 @@ use std::{
 };
 use uuid::Uuid;
 
+pub(crate) fn validate_out_anchor(
+    c: &Connection,
+    project: &str,
+    app_id: &str,
+    to: &str,
+    anchor: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        anchor.starts_with("om_")
+            && anchor.len() <= 200
+            && anchor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Provide a valid reply_to_message_id from trusted message metadata"
+    );
+    // The reply endpoint ignores `to`; check one existing source/receipt so
+    // an accidental anchor cannot silently send into another conversation.
+    let known: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?
+         AND json_extract(attachment,'$.bot_app_id')=? AND (
+          (direction='in' AND (source_id=? OR json_extract(attachment,'$.source.root_id')=?
+            OR json_extract(attachment,'$.source.parent_id')=?) AND (
+            json_extract(attachment,'$.source.chat_id')=? OR (
+              json_extract(attachment,'$.source.chat_type')='p2p' AND
+              json_extract(attachment,'$.source.sender.open_id')=?))) OR
+          (direction='out' AND json_extract(attachment,'$.sent_message_id')=? AND (
+            json_extract(attachment,'$.to')=? OR json_extract(attachment,'$.sent_chat_id')=?))))",
+        params![
+            project, app_id, anchor, anchor, anchor, to, to, anchor, to, to
+        ],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        known,
+        "reply_to_message_id must belong to this project's bot and the explicit to recipient; use the original chat ID and its trusted discussion anchor"
+    );
+    Ok(())
+}
+
 /// Store the Agent's explicit destination and optional reply anchor unchanged.
 /// Callers authorize the current session inside this same database operation.
 pub(crate) fn enqueue_out_request(
@@ -41,32 +80,7 @@ pub(crate) fn enqueue_out_request(
     if previous.is_none()
         && let Some(anchor) = attachment["reply_to_message_id"].as_str()
     {
-        anyhow::ensure!(
-            anchor.starts_with("om_")
-                && anchor.len() <= 200
-                && anchor
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
-            "Provide a valid reply_to_message_id from trusted message metadata"
-        );
-        // The reply endpoint ignores `to`; check one existing source/receipt so
-        // an accidental anchor cannot silently send into another conversation.
-        let known: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?
-             AND json_extract(attachment,'$.bot_app_id')=? AND (
-              (direction='in' AND (source_id=? OR json_extract(attachment,'$.source.root_id')=?
-                OR json_extract(attachment,'$.source.parent_id')=?) AND (
-                json_extract(attachment,'$.source.chat_id')=? OR (
-                  json_extract(attachment,'$.source.chat_type')='p2p' AND
-                  json_extract(attachment,'$.source.sender.open_id')=?))) OR
-              (direction='out' AND json_extract(attachment,'$.sent_message_id')=? AND (
-                json_extract(attachment,'$.to')=? OR json_extract(attachment,'$.sent_chat_id')=?))))",
-            params![project,app_id,anchor,anchor,anchor,to,to,anchor,to,to], |r| r.get(0),
-        )?;
-        anyhow::ensure!(
-            known,
-            "reply_to_message_id must belong to this project's bot and the explicit to recipient; use the original chat ID, or omit the anchor for a new discussion"
-        );
+        validate_out_anchor(c, project, app_id, to, anchor)?;
     }
     attachment["bot_app_id"] = json!(app_id);
     if let Some((id, saved_content, raw)) = previous {
@@ -77,6 +91,8 @@ pub(crate) fn enqueue_out_request(
                 "sent_chat_id",
                 "sent_thread_id",
                 "sent_root_id",
+                "discussion_root",
+                "resolved_reply_to_message_id",
             ] {
                 object.remove(key);
             }
@@ -117,6 +133,8 @@ pub struct Project {
     pub agent: String,
     pub chat_id: String,
     pub paused: bool,
+    #[serde(default)]
+    pub debug_mode: bool,
     pub terminal: Option<String>,
     pub terminal_pid: Option<i64>,
     pub generation: String,
@@ -187,9 +205,10 @@ fn project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(12)?,
         mcp_token: row.get(13)?,
         execution: serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
+        debug_mode: row.get(15)?,
     })
 }
-const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token,execution";
+const PROJECT: &str = "id,name,path,agent,chat_id,paused,terminal,terminal_pid,generation,ready,native_session,extra_args,created_at,mcp_token,execution,debug_mode";
 fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: row.get(0)?,
@@ -281,7 +300,6 @@ fn ingest_message(
             });
         }
     }
-    crate::manager::stamp(&tx, project, &mut attachment)?;
     let key = id();
     let inserted=tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",params![key,project,source,content,attachment.to_string(),now(),now()])?;
     if inserted == 1 && attachment["daemon_control"] == "model" {
@@ -340,7 +358,7 @@ impl Db {
               terminal TEXT, terminal_pid INTEGER, generation TEXT NOT NULL DEFAULT '',
               ready INTEGER NOT NULL DEFAULT 0, native_session TEXT NOT NULL DEFAULT '',
               extra_args TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, mcp_token TEXT NOT NULL,
-              execution TEXT NOT NULL DEFAULT 'null');
+              execution TEXT NOT NULL DEFAULT 'null', debug_mode INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS messages (
               id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
               direction TEXT NOT NULL, source_id TEXT NOT NULL, content TEXT NOT NULL,
@@ -363,7 +381,18 @@ impl Db {
         if has_enabled {
             migration.execute_batch("ALTER TABLE projects DROP COLUMN enabled;")?;
         }
+        let has_debug_mode: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name='debug_mode')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_debug_mode {
+            migration.execute_batch(
+                "ALTER TABLE projects ADD COLUMN debug_mode INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         crate::conversation::migrate(&migration)?;
+        crate::discussion::migrate(&migration, recover)?;
         crate::bot::migrate(&migration)?;
         crate::group_ingress::migrate(&migration)?;
         if recover {
@@ -371,6 +400,7 @@ impl Db {
         }
         crate::manager::migrate(&migration, recover)?;
         crate::work::migrate(&migration)?;
+        crate::manager::migrate_queued(&migration)?;
         crate::handoff::migrate(&migration)?;
         crate::cli_switch::migrate(&migration, recover)?;
         crate::models::migrate(&migration)?;
@@ -437,6 +467,7 @@ impl Db {
             let tx = c.unchecked_transaction()?;
             tx.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
             params![key,input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,now(),id()])?;
+            tx.execute("INSERT INTO manager_config(project_id,mode) VALUES(?,'manager')", [&key])?;
             crate::conversation::primary(&tx, &key, input.chat_id.trim(), "")?;
             tx.commit()?;
             Ok(())
@@ -473,6 +504,17 @@ impl Db {
             c.execute(
                 "UPDATE projects SET paused=? WHERE id=?",
                 params![value, key],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn set_debug_mode(&self, key: &str, value: bool) -> Result<()> {
+        let id = self.project(key).await?.id;
+        self.call(move |c| {
+            c.execute(
+                "UPDATE projects SET debug_mode=? WHERE id=?",
+                params![value, id],
             )?;
             Ok(())
         })

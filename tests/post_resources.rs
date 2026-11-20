@@ -445,9 +445,8 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
     app.db
         .sync(|c| {
             bot::save(c, &project.id, "cli_fixture", "fixture", false)?;
-            let config = manager::save(
+            manager::save_provider(
                 c,
-                &project.id,
                 manager::ConfigInput {
                     base_url: format!("{base}/v1"),
                     model: "fixture".into(),
@@ -455,15 +454,6 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
                     clear_api_key: false,
                     expected_revision: 0,
                     supports_images: Some(true),
-                },
-            )?;
-            manager::set_mode(
-                c,
-                &project.id,
-                manager::ModeInput {
-                    mode: "manager".into(),
-                    request_id: "race-mode".into(),
-                    expected_revision: config["revision"].as_i64().unwrap(),
                 },
             )?;
             Ok(())
@@ -554,7 +544,7 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
         .await
         .unwrap()
         .unwrap();
-    // Stop cancels the authoritative owner before the worker can discover it.
+    // Stop preserves admitted input but pauses resource preparation.
     let stopped = app
         .db
         .ingest_bot(
@@ -567,8 +557,19 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
         )
         .unwrap()
         .unwrap();
-    app.db.sync(|c| manager::stop(c, &project.id)).unwrap();
+    app.stop(&project.id).await.unwrap();
+    assert!(app.db.project(&project.id).await.unwrap().paused);
     let stopped = app.db.message(&stopped).await.unwrap();
+    assert_eq!(stopped.status, "acknowledged");
+    app.db.sync(|c| {
+        let status = c.query_row(
+            "SELECT i.status FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id WHERE e.message_id=?",
+            [&stopped.id],
+            |r| r.get::<_, String>(0),
+        )?;
+        assert_eq!(status, "queued");
+        Ok(())
+    }).unwrap();
     assert!(
         app.db
             .sync(|c| feishu::begin_resource_preparation(c, &stopped))
@@ -580,5 +581,23 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
         vec!["om_before_begin", "om_during_download"]
     );
     assert_eq!(state.model_requests.lock().unwrap().len(), 2);
+
+    app.db.pause(&project.id, false).await.unwrap();
+    state.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        feishu::download_resources(&app, &stopped),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        app.db.message(&stopped.id).await.unwrap().attachment["resources_ready"],
+        true
+    );
+    assert_eq!(
+        *state.downloads.lock().unwrap(),
+        vec!["om_before_begin", "om_during_download", "om_stopped_image"]
+    );
     server.abort();
 }

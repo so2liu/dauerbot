@@ -178,14 +178,18 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
         if m.content.len() > 24_000 {
             bail!("Markdown exceeds 24000 bytes; send it as a file");
         }
-        (
-            "post",
-            json!({"zh_cn":{"title":"","content":[[{"tag":"md","text":m.content}]]}}),
-        )
+        let mut paragraph = Vec::new();
+        if let Some(mention) = m.attachment["discussion_mention"].as_str()
+            && mention.starts_with("ou_")
+        {
+            paragraph.push(json!({"tag":"at","user_id":mention}));
+        }
+        paragraph.push(json!({"tag":"md","text":m.content}));
+        ("post", json!({"zh_cn":{"title":"","content":[paragraph]}}))
     };
     let Some(anchor) = m.attachment["reply_to_message_id"].as_str() else {
-        // A message without an anchor starts a new discussion at the explicit
-        // destination. The Agent chooses anchors; the daemon never guesses one.
+        // send_out admits new roots only for a requested result or decision
+        // scoped to a single work occurrence and explicit destination.
         let body =
             json!({"receive_id":to,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
         let value = api_json(
@@ -232,6 +236,115 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
     Ok(receipt)
 }
 
+fn debug_reply_body(text: &str) -> Value {
+    json!({"msg_type":"text","content":json!({"text":text}).to_string(),"reply_in_thread":true})
+}
+
+fn debug_reply_parts(prompt: &str) -> Vec<Value> {
+    const BODY_LIMIT: usize = 60_000;
+    // Leave room for both JSON wrappers and the part number.
+    const TEXT_BUDGET: usize = BODY_LIMIT - 256;
+    let single = debug_reply_body(prompt);
+    if single.to_string().len() <= BODY_LIMIT {
+        return vec![single];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = prompt;
+    while !remaining.is_empty() {
+        let mut bytes = 0;
+        let mut end = remaining.len();
+        let mut newline = 0;
+        for (index, ch) in remaining.char_indices() {
+            bytes += match ch {
+                '"' | '\\' => 4,
+                ch if ch.is_ascii_control() => 7,
+                ch => ch.len_utf8(),
+            };
+            if bytes > TEXT_BUDGET {
+                end = if newline > 0 { newline } else { index };
+                break;
+            }
+            if ch == '\n' {
+                newline = index + 1;
+            }
+        }
+        chunks.push(&remaining[..end]);
+        remaining = &remaining[end..];
+    }
+    let total = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| debug_reply_body(&format!("[debug {}/{}]\n{text}", index + 1, total)))
+        .collect()
+}
+
+/// Echo a prompt without writing its message, outbox or worker observation to the store.
+/// Feishu clients may still render markup present in the original plain text.
+pub async fn send_debug_reply(
+    app: &App,
+    project: &str,
+    bot_app_id: &str,
+    to: &str,
+    anchor: &str,
+    prompt: &str,
+) -> Result<()> {
+    recipient_type(to)?;
+    anyhow::ensure!(
+        anchor.starts_with("om_")
+            && anchor.len() <= 200
+            && anchor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Invalid debug reply anchor"
+    );
+    let parts = debug_reply_parts(prompt);
+    let total = parts.len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let authorization = tokio::time::timeout_at(deadline, async {
+        let binding = app.db.bot(project).await?;
+        anyhow::ensure!(binding.app_id == bot_app_id, "Feishu bot changed");
+        let base = app.config.read().await.feishu_base.clone();
+        let token = token(app, &binding).await?;
+        Ok::<_, anyhow::Error>((base, token))
+    })
+    .await;
+    let Ok(Ok((base, token))) = authorization else {
+        bail!("Debug reply stopped after 0/{total} parts: Feishu authorization unavailable");
+    };
+
+    for (sent, body) in parts.into_iter().enumerate() {
+        let response = tokio::time::timeout_at(deadline, async {
+            let response = app
+                .http
+                .post(format!("{base}/open-apis/im/v1/messages/{anchor}/reply"))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|_| anyhow::anyhow!("Feishu transport failed"))?;
+            let status = response.status();
+            let data = api_json(response)
+                .await
+                .map_err(|_| anyhow::anyhow!("Feishu API rejected the reply (HTTP {status})"))?;
+            let receipt = SendReceipt::from_response(&data)?;
+            anyhow::ensure!(
+                !receipt.thread_id.is_empty(),
+                "Feishu did not confirm a topic reply"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        match response {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("Debug reply stopped after {sent}/{total} parts: {error}"),
+            Err(_) => bail!("Debug reply stopped after {sent}/{total} parts: timed out"),
+        }
+    }
+    Ok(())
+}
+
 pub fn allowed_file(p: &db::Project, path: &Path, data_dir: &Path) -> Result<PathBuf> {
     let absolute = std::fs::canonicalize(if path.is_absolute() {
         path.to_owned()
@@ -261,10 +374,28 @@ pub struct ResourcePreparation {
     pub bot_app_id: String,
 }
 
-// Manager routing acknowledges a message before asynchronous preparation. Only
-// its live authoritative owner (or an explicit, still-live native transfer) may
-// keep that source eligible; historical acknowledgements and Stop stay fenced.
-const RESOURCE_ELIGIBLE: &str = "(m.status IN ('pending','queued') OR (m.status='acknowledged' AND EXISTS(SELECT 1 FROM work_events e JOIN manager_inputs i ON i.origin_event_id=e.id AND i.project_id=e.project_id WHERE e.message_id=m.id AND e.project_id=m.project_id AND e.source='feishu' AND e.status='managed' AND (i.status IN ('queued','processing') OR (i.status='transferred' AND EXISTS(SELECT 1 FROM work_events d WHERE d.project_id=e.project_id AND d.source='management' AND json_extract(d.payload,'$.origin_event_id')=e.id AND d.status IN ('queued','submitting','submitted','uncertain')))))))";
+// Acknowledged messages still need resources while a live manager input
+// or an outstanding delegation owns their original inbound work event.
+const RESOURCE_ELIGIBLE: &str = "EXISTS(
+    SELECT 1 FROM projects p WHERE p.id=m.project_id AND p.paused=0
+) AND (
+    m.status IN ('pending','queued') OR
+    (m.status='acknowledged' AND EXISTS(
+        SELECT 1 FROM work_events e
+        WHERE e.message_id=m.id AND e.project_id=m.project_id AND e.source='feishu'
+        AND (
+            (e.status='managed' AND EXISTS(
+                SELECT 1 FROM manager_inputs i
+                WHERE i.project_id=e.project_id AND i.origin_event_id=e.id
+                AND i.status IN ('queued','processing')
+            )) OR EXISTS(
+                SELECT 1 FROM work_events d
+                WHERE d.project_id=e.project_id AND d.source='management'
+                AND d.status='queued' AND json_extract(d.payload,'$.origin_event_id')=e.id
+            )
+        )
+    ))
+)";
 
 pub fn begin_resource_preparation(
     c: &rusqlite::Connection,
@@ -304,7 +435,7 @@ pub fn finish_resource_preparation(
     } else {
         json!({"members_status":"unavailable"})
     };
-    let changed=c.execute(&format!("UPDATE messages AS m SET attachment=json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND {RESOURCE_ELIGIBLE}"),rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
+    let changed=c.execute(&format!("UPDATE messages AS m SET attachment=json_remove(json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)),'$.resource_preparation') WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND {RESOURCE_ELIGIBLE}"),rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
     Ok(changed == 1)
 }
 
@@ -366,11 +497,17 @@ pub async fn download_resources(app: &App, m: &db::Message) -> Result<Vec<Value>
         .unwrap_or_else(|_| json!({"members_status":"unavailable"}));
     let prepared = preparation.clone();
     let result = resources.clone();
-    if !app
+    let finished = app
         .db
         .call(move |c| finish_resource_preparation(c, &prepared, &result, &context))
-        .await?
-    {
+        .await;
+    if !matches!(finished, Ok(true)) {
+        app.db.call(move |c| {
+            c.execute("UPDATE messages SET attachment=json_remove(attachment,'$.resource_preparation') WHERE id=? AND json_extract(attachment,'$.resource_preparation')=?",
+                rusqlite::params![preparation.message_id, preparation.token])?;
+            Ok(())
+        }).await?;
+        finished?;
         bail!("Resource preparation no longer owns the original source message");
     }
     // Read the committed, binding-fenced result rather than an obsolete local copy.
@@ -580,7 +717,7 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
             ));
         }
         let model_command = attachment["source"]["message_type"] == "text"
-            && crate::model_control::is_command(&text);
+            && crate::model_control::is_command(crate::cli_control::command_text(&text, &attachment["source"]));
         if model_command {
             attachment["daemon_control"] = json!("model");
         }
@@ -1076,4 +1213,90 @@ pub async fn context(app: &App, m: &db::Message) -> Value {
         .map(|v| v["name"].clone())
         .unwrap_or(Value::Null);
     result
+}
+
+pub(crate) enum ProgressDelivery {
+    Sent(String),
+    Uneditable,
+    Rejected(String),
+}
+
+pub(crate) async fn progress_message(
+    app: &App,
+    token: &str,
+    anchor: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<ProgressDelivery> {
+    let base = app.config.read().await.feishu_base.clone();
+    let content = json!({"zh_cn":{"title":"","content":[[{"tag":"md","text":text}]]}}).to_string();
+    let editing = !message_id.is_empty();
+    let request = if editing {
+        app.http
+            .put(format!("{base}/open-apis/im/v1/messages/{message_id}"))
+            .json(&json!({"msg_type":"post","content":content}))
+    } else {
+        app.http.post(format!("{base}/open-apis/im/v1/messages/{anchor}/reply"))
+            .json(&json!({"msg_type":"post","content":content,"reply_in_thread":true,"uuid":db::id()}))
+    };
+    let response = request.bearer_auth(token).send().await?;
+    let status = response.status();
+    let reply: Value = response
+        .json()
+        .await
+        .context("Feishu progress response is not JSON")?;
+    let code = reply["code"].as_i64();
+    if status.is_server_error() || code.is_none() {
+        bail!("Feishu progress delivery could not be confirmed ({status})");
+    }
+    if editing
+        && matches!(
+            code,
+            Some(230011 | 230054 | 230071 | 230072 | 230075 | 230110)
+        )
+    {
+        return Ok(ProgressDelivery::Uneditable);
+    }
+    if !status.is_success() || code != Some(0) {
+        return Ok(ProgressDelivery::Rejected(format!(
+            "Feishu progress request rejected ({status}, code {code:?})"
+        )));
+    }
+    if editing {
+        return Ok(ProgressDelivery::Sent(message_id.into()));
+    }
+    let receipt = SendReceipt::from_response(&reply)?;
+    anyhow::ensure!(
+        !receipt.thread_id.is_empty(),
+        "Feishu progress reply has no topic receipt"
+    );
+    Ok(ProgressDelivery::Sent(receipt.message_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_parts_preserve_utf8_and_escaped_bytes_under_wire_budget() {
+        let payload = "行\u{0001} \\ \" <at user_id=\"example\">text</at> &\n".repeat(4500);
+        assert!(payload.len() > 150_000);
+        let parts = debug_reply_parts(&payload);
+        assert!(parts.len() > 1);
+        let mut reconstructed = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            assert!(serde_json::to_vec(part).unwrap().len() <= 60_000);
+            let content: Value = serde_json::from_str(part["content"].as_str().unwrap()).unwrap();
+            let header = format!("[debug {}/{}]\n", index + 1, parts.len());
+            // This verifies API payload bytes. Feishu clients may render supported markup.
+            reconstructed.push_str(
+                content["text"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix(&header)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(reconstructed, payload);
+    }
 }

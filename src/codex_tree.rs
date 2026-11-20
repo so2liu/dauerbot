@@ -1,10 +1,11 @@
-//! Version-scoped, metadata-only Codex app-server observer. No direct native DB access.
+//! Version-scoped native identity and persisted lifecycle metadata only.
+pub(crate) mod metadata;
 use crate::db::Project;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::OnceLock,
     time::Duration,
@@ -65,6 +66,108 @@ struct Server {
     output: tokio::io::Take<BufReader<ChildStdout>>,
     sequence: u64,
 }
+pub(crate) async fn version(cli: &Path, cwd: &Path) -> Result<String> {
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        Command::new(cli)
+            .arg("--version")
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    ensure!(result.status.success(), "Native CLI version query failed");
+    Ok(std::str::from_utf8(&result.stdout)?.trim().to_owned())
+}
+
+pub(crate) fn native_home() -> Result<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
+        .context("Native CLI home is unavailable")
+}
+
+enum Observer {
+    Protocol(Box<Server>),
+    Lifecycle {
+        home: PathBuf,
+        version: String,
+        cli: PathBuf,
+        cwd: PathBuf,
+    },
+}
+
+impl Observer {
+    async fn start(cli: &Path, cwd: &Path) -> Result<Self> {
+        let version = version(cli, cwd).await?;
+        ensure!(
+            metadata::verified(&version),
+            "Native metadata version is not verified"
+        );
+        if version == "codex-cli 0.171.0" {
+            Ok(Self::Lifecycle {
+                home: native_home()?,
+                version,
+                cli: cli.to_owned(),
+                cwd: cwd.to_owned(),
+            })
+        } else {
+            Ok(Self::Protocol(Box::new(Server::start(cli, cwd).await?)))
+        }
+    }
+
+    async fn children(&mut self, root: &str) -> Result<Vec<Value>> {
+        match self {
+            Self::Protocol(server) => server.children(root).await,
+            Self::Lifecycle {
+                home,
+                version: pinned,
+                cli,
+                cwd,
+            } => {
+                ensure!(
+                    version(cli, cwd).await? == *pinned,
+                    "Native metadata CLI version changed"
+                );
+                let home = home.clone();
+                let version = pinned.clone();
+                let root = root.to_owned();
+                let snapshot =
+                    tokio::task::spawn_blocking(move || metadata::read(&home, &root, &version))
+                        .await??;
+                lifecycle_nodes(snapshot)
+            }
+        }
+    }
+
+    async fn close(&mut self) {
+        if let Self::Protocol(server) = self {
+            server.close().await;
+        }
+    }
+}
+
+fn lifecycle_nodes(snapshot: metadata::Snapshot) -> Result<Vec<Value>> {
+    let records: HashMap<_, _> = snapshot.records.iter().map(|record| (record.id.as_str(), record)).collect();
+    let visible = |record: &metadata::Record| record.state != metadata::State::Closed && !record.archived;
+    let view_id = |id: &str| if id == snapshot.root { "root".into() } else { format!("codex:{id}") };
+    let mut nodes = Vec::new();
+    for record in snapshot.records.iter().filter(|record| visible(record)).take(MAX_NODES) {
+        let mut parent = record.parent.as_str();
+        let mut seen = HashSet::from([record.id.as_str()]);
+        while parent != snapshot.root {
+            ensure!(seen.insert(parent), "Native presentation ancestry is cyclic");
+            let ancestor = records.get(parent).context("Native presentation ancestor is missing")?;
+            if visible(ancestor) {
+                break;
+            }
+            parent = &ancestor.parent;
+        }
+        nodes.push(json!({"id":format!("codex:{}",record.id),"parent_id":view_id(parent),"original_parent_id":view_id(&record.parent),"name":record.name,"cli":"codex","state":"open","archived":false,"updated_at_ms":record.updated_at_ms,"observation":"Visible native spawn lifecycle; closed or archived ancestors are omitted from presentation, original_parent_id retains native ancestry; live activity and concurrent resume are not established"}));
+    }
+    Ok(nodes)
+}
+
 impl Server {
     async fn start(cli: &Path, cwd: &Path) -> Result<Self> {
         // Public protocol proof: official rust-v0.169.1, c376cf7396eff83ce4c6ac61b9553df142e7a0be,
@@ -150,14 +253,14 @@ impl Server {
     }
 }
 async fn run(cli: &Path, cwd: &Path, mut receiver: mpsc::Receiver<Query>) {
-    let mut server: Option<Server> = None;
+    let mut server: Option<Observer> = None;
     while let Ok(Some(query)) = tokio::time::timeout(Duration::from_secs(15), receiver.recv()).await
     {
         if query.reply.is_closed() {
             continue;
         }
         if server.is_none() {
-            match tokio::time::timeout(TIMEOUT, Server::start(cli, cwd)).await {
+            match tokio::time::timeout(TIMEOUT, Observer::start(cli, cwd)).await {
                 Ok(Ok(started)) => server = Some(started),
                 _ => {
                     let _ = query
@@ -252,6 +355,54 @@ mod tests {
     const ROOT: &str = "00000000-0000-4000-8000-000000000001";
     const CHILD: &str = "00000000-0000-4000-8000-000000000002";
     const GRAND: &str = "00000000-0000-4000-8000-000000000003";
+    #[tokio::test]
+    async fn pinned_171_lifecycle_observer_exports_native_states_and_rejects_version_drift() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,agent_nickname TEXT,agent_role TEXT,updated_at_ms INTEGER,archived INTEGER,preview TEXT); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT,status TEXT);").unwrap();
+        for id in [ROOT, CHILD, GRAND] {
+            db.execute(
+                "INSERT INTO threads VALUES(?,'worker',NULL,1234,0,'PRIVATE CONTENT')",
+                [id],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO thread_spawn_edges VALUES(?,?,'closed')",
+            [ROOT, CHILD],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO thread_spawn_edges VALUES(?,?,'open')",
+            [CHILD, GRAND],
+        )
+        .unwrap();
+        let cli = home.path().join("codex-fixture");
+        std::fs::write(&cli, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.171.0'\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut observer = Observer::Lifecycle {
+            home: home.path().to_owned(),
+            version: "codex-cli 0.171.0".into(),
+            cli: cli.clone(),
+            cwd: home.path().to_owned(),
+        };
+        let nodes = observer.children(ROOT).await.unwrap();
+        let native = metadata::read(home.path(), ROOT, "codex-cli 0.171.0").unwrap();
+        assert_eq!(native.records[0].state, metadata::State::Closed);
+        assert_eq!(native.records[1].state, metadata::State::Open);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["state"], "open");
+        assert_eq!(nodes[0]["parent_id"], "root");
+        assert_eq!(nodes[0]["original_parent_id"], format!("codex:{CHILD}"));
+        assert!(!serde_json::to_string(&nodes).unwrap().contains("PRIVATE"));
+        std::fs::write(&cli, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.172.0'\n").unwrap();
+        assert!(
+            observer.children(ROOT).await.is_err(),
+            "A cached observer cannot bless an unverified CLI update"
+        );
+    }
+
     #[test]
     fn scoped_metadata_rejects_cycles_duplicates_and_orphans_without_exposing_previews() {
         let rows = json!({"data":[{"id":GRAND,"parentThreadId":CHILD,"agentNickname":"validator","preview":"private prompt"},{"id":CHILD,"parentThreadId":ROOT,"agentNickname":"reviewer","preview":"private prompt","turns":["private turn"]}]});

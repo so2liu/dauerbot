@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
 const BUDGET_MS: i64 = 180_000;
+const RECOVERY_BUDGET_MS: i64 = 3 * BUDGET_MS;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -104,6 +105,10 @@ pub fn latest(c: &Connection, project: &str) -> Result<Option<Request>> {
     }).optional()?)
 }
 
+pub(crate) fn blocks_worker(r: &Request) -> bool {
+    r.holds_input || r.phase == "recovery_exhausted"
+}
+
 pub fn active(r: &Request) -> bool {
     r.holds_input && !matches!(r.phase.as_str(), "ready" | "cancelled")
 }
@@ -157,7 +162,10 @@ fn remember_retiring_candidate(source: &mut Value, execution: &Value, generation
 /// Reuse its saved original CLI when possible; never invent a source session.
 pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
     let previous = latest(c, project)?;
-    if let Some(r) = previous.as_ref().filter(|r| active(r)) {
+    if let Some(r) = previous
+        .as_ref()
+        .filter(|r| active(r) || r.phase == "recovery_exhausted")
+    {
         return Ok(r.clone());
     }
     let (agent, native, args, generation, execution): (String, String, String, String, String) = c
@@ -260,7 +268,7 @@ pub fn holds_input(c: &Connection, project: &str) -> Result<bool> {
     Ok(latest(c, project)?.is_some_and(|r| r.holds_input))
 }
 pub fn cancel(c: &Connection, project: &str, error: &str) -> Result<()> {
-    c.execute("UPDATE cli_switch_requests SET phase='cancelled',holds_input=0,error=? WHERE project_id=? AND (holds_input=1 OR phase IN ('preparing','requested','switching','starting','startup_failed','uncertain'))",params![error,project])?;
+    c.execute("UPDATE cli_switch_requests SET phase='cancelled',holds_input=0,error=? WHERE project_id=? AND (holds_input=1 OR phase IN ('preparing','requested','switching','starting','startup_failed','uncertain','recovery_exhausted'))",params![error,project])?;
     Ok(())
 }
 /// Only after a verified stop: abandon the transition and pause atomically, so
@@ -276,8 +284,11 @@ pub(crate) fn stopped_mode(
 ) -> Result<()> {
     let tx = c.unchecked_transaction()?;
     let held = holds_input(&tx, project)?;
-    if cancel_intake {
+    let managed = cancel_intake && crate::manager::installed(&tx)?;
+    if managed {
         crate::manager::stop(&tx, project)?;
+    }
+    if cancel_intake {
         tx.execute("UPDATE feishu_group_intake SET status='cancelled' WHERE project_id=? AND status='pending'",[project])?;
     }
     work::finish_execution(
@@ -293,7 +304,7 @@ pub(crate) fn stopped_mode(
         project,
         "Stopped explicitly by the user; pending input is paused",
     )?;
-    ensure!(tx.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null',paused=CASE WHEN ? THEN 1 ELSE paused END WHERE id=? AND generation=?",params![held,project,generation])?==1,"Execution changed before stop completion");
+    ensure!(tx.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null',paused=CASE WHEN ? THEN 1 ELSE paused END WHERE id=? AND generation=?",params![held || managed,project,generation])?==1,"Execution changed before stop completion");
     tx.commit()?;
     Ok(())
 }
@@ -353,7 +364,35 @@ fn record_failure(c: &Connection, id: &str, error: &str) -> Result<()> {
         "UPDATE cli_switch_requests SET source=json_set(source,'$.last_failure',?) WHERE id=?",
         params![error, id],
     )?;
-    phase(c, id, "recovery_pending", error)
+    phase(c, id, "recovery_pending", error)?;
+    notify_manager(c, id, "recovery_pending", error)
+}
+
+fn notify_manager(c: &Connection, id: &str, state: &str, error: &str) -> Result<()> {
+    let project: String = c.query_row(
+        "SELECT project_id FROM cli_switch_requests WHERE id=?",
+        [id],
+        |row| row.get(0),
+    )?;
+    crate::manager::observe_cli_transition(c, &project, id, state, error)
+}
+
+fn recovery_budget_spent(request: &Request) -> bool {
+    let started = request.source["recovery_budget_started_at"]
+        .as_i64().unwrap_or(request.created_at);
+    db::now().saturating_sub(started) >= RECOVERY_BUDGET_MS
+}
+
+fn suspend_recovery(c: &Connection, id: &str) -> Result<bool> {
+    let reason = "CLI recovery timed out. Pending work is preserved. Retry recovery or stop the current execution before choosing a different CLI.";
+    let changed = c.execute(
+        "UPDATE cli_switch_requests SET phase='recovery_exhausted',holds_input=0,error=?,next_attempt_at=0 WHERE id=? AND holds_input=1",
+        params![reason, id],
+    )?;
+    if changed == 1 {
+        notify_manager(c, id, "recovery_exhausted", reason)?;
+    }
+    Ok(changed == 1)
 }
 
 pub fn proof(r: &Request, text: Option<&str>, sequence: Option<i64>) -> bool {
@@ -507,6 +546,9 @@ fn ready(c: &Connection, project: &str, generation: &str, r: &Request) -> Result
         return Ok(false);
     }
     let changed=tx.execute("UPDATE cli_switch_requests SET phase='ready',error='',holds_input=0 WHERE id=? AND phase IN ('starting','startup_failed','failed','recovery_pending') AND rowid=(SELECT MAX(rowid) FROM cli_switch_requests WHERE project_id=?)",params![r.id,project])?;
+    if changed == 1 {
+        notify_manager(&tx, &r.id, "ready", "")?;
+    }
     tx.commit()?;
     Ok(changed == 1)
 }
@@ -559,23 +601,45 @@ async fn artifact(p: &Project) -> Result<Option<String>> {
 /// Accept a native CLI selection while the caller owns the project lock and
 /// transaction. This shares the ordinary UI handoff and delivery-lock path.
 pub(crate) fn request(c: &Connection, p: &Project, target: &str) -> Result<Option<Request>> {
-    ensure!(["codex", "claude", "pi", "agy"].contains(&target),
-        "Unsupported target CLI; choose codex, claude, pi, or agy");
+    ensure!(
+        ["codex", "claude", "pi", "agy"].contains(&target),
+        "Unsupported target CLI; choose codex, claude, pi, or agy"
+    );
     ensure!(!p.paused, "Resume this project before changing its CLI");
-    ensure!(!App::update_required(p),
-        "Recover this project after its service update before changing the CLI");
-    ensure!(!work::has_takeover(c, &p.id, &p.generation)?,
-        "Release terminal input before changing the CLI");
+    ensure!(
+        !App::update_required(p),
+        "Recover this project after its service update before changing the CLI"
+    );
+    ensure!(
+        !work::has_takeover(c, &p.id, &p.generation)?,
+        "Release terminal input before changing the CLI"
+    );
     let previous = latest(c, &p.id)?;
+    ensure!(
+        previous
+            .as_ref()
+            .is_none_or(|r| r.phase != "recovery_exhausted"),
+        "Retry recovery or stop the unresolved execution before changing the target CLI"
+    );
     if let Some(r) = previous.as_ref().filter(|r| active(r)) {
-        ensure!(r.target == target,
-            "A CLI handoff is already in progress; review its result before starting another");
-        c.execute("UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?", [&r.id])?;
+        ensure!(
+            r.target == target,
+            "A CLI handoff is already in progress; review its result before starting another"
+        );
+        c.execute(
+            "UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?",
+            [&r.id],
+        )?;
         return latest(c, &p.id);
     }
-    let retry = p.agent == target && p.terminal.is_none()
-        && previous.as_ref().is_some_and(|r| r.phase == "startup_failed" && r.target == target);
-    if p.agent == target && !retry { return Ok(None); }
+    let retry = p.agent == target
+        && p.terminal.is_none()
+        && previous
+            .as_ref()
+            .is_some_and(|r| r.phase == "startup_failed" && r.target == target);
+    if p.agent == target && !retry {
+        return Ok(None);
+    }
     let initial_phase = if retry { "starting" } else { "preparing" };
     let mut source = json!({"agent":p.agent,"native_session":p.native_session,
         "extra_args":p.extra_args,"generation":p.generation});
@@ -782,6 +846,19 @@ impl App {
         let Some(mut r) = self.db.call(move |c| latest(c, &id)).await? else {
             return Ok(false);
         };
+        if r.phase == "recovery_exhausted" {
+            self.set_phase(
+                p,
+                if p.paused {
+                    "paused"
+                } else {
+                    "needs_attention"
+                },
+                record.cloned().unwrap_or(Value::Null),
+            )
+            .await;
+            return Ok(true);
+        }
         if !active(&r) {
             return Ok(false);
         }
@@ -810,6 +887,35 @@ impl App {
                 record.cloned().unwrap_or(Value::Null),
             )
             .await;
+            return Ok(true);
+        }
+        if recovery_budget_spent(&r)
+            && !matches!(r.phase.as_str(), "starting" | "switching")
+            && !(p.agent == r.target
+                && p.ready
+                && p.execution["mcp_registered"] == true
+                && p.execution["cli_switch_request"] == r.id
+                && record.is_some_and(|v| {
+                    crate::repair_lane::check_identity(p, v).is_ok()
+                        && matches!(
+                            v["status"]["state"].as_str(),
+                            Some("idle" | "done" | "working")
+                        )
+                })
+                && target_selection_matches(&r, &p.execution)
+                && target_native_matches(&r, &p.execution, &p.native_session)
+                && r.phase != "recovery_stopping")
+        {
+            let id = r.id.clone();
+            if self.db.call(move |c| {
+                    let tx = c.unchecked_transaction()?;
+                    let changed = suspend_recovery(&tx, &id)?;
+                    tx.commit()?;
+                    Ok(changed)
+                }).await? {
+                self.set_phase(p, "needs_attention", record.cloned().unwrap_or(Value::Null))
+                    .await;
+            }
             return Ok(true);
         }
         if crate::repair_lane::descriptor(p).is_some() {
@@ -970,7 +1076,7 @@ impl App {
                     return Ok(false);
                 }
                 if record["status"]["state"] == "blocked" {
-                    if matches!(p.agent.as_str(), "agy" | "claude")
+                    if !recovery_budget_spent(&r) && matches!(p.agent.as_str(), "agy" | "claude")
                         && herdr::confirm_project_trust(cfg, p).await.is_ok()
                     {
                         self.set_phase(p, "switching_cli", record.clone()).await;
@@ -1285,6 +1391,9 @@ impl App {
         self.db
             .call(move |c| {
                 let r = ensure_repair_request(c, &project)?;
+                if r.phase == "recovery_exhausted" {
+                    return Ok(());
+                }
                 record_failure(c, &r.id, &diagnostic)
             })
             .await?;
@@ -1309,7 +1418,19 @@ impl App {
                 return Ok(false);
             }
             work::touch_execution(&tx, &p.id, &p.generation, db::now())?;
-            if !latest(&tx, &p.id)?.is_some_and(|request| active(&request)) {
+            let latest = latest(&tx, &p.id)?;
+            if let Some(request) = latest.as_ref() {
+                if request.phase == "recovery_exhausted" {
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                if active(request) && recovery_budget_spent(request) {
+                    suspend_recovery(&tx, &request.id)?;
+                    tx.commit()?;
+                    return Ok(false);
+                }
+            }
+            if !latest.as_ref().is_some_and(active) {
                 let request = ensure_repair_request(&tx, &p.id)?;
                 record_failure(&tx, &request.id,
                     "Native execution observation is unavailable; supervised recovery is waiting for verified identity before taking any action.")?;
@@ -1335,6 +1456,11 @@ impl App {
         self.db
             .call(move |c| {
                 let r = ensure_repair_request(c, &id)?;
+                if r.phase == "recovery_exhausted" {
+                    c.execute("UPDATE cli_switch_requests SET phase='recovery_pending',holds_input=1,phase_started_at=?,next_attempt_at=0,recovery_attempts=0,source=json_set(source,'$.recovery_budget_started_at',?) WHERE id=?",
+                        params![db::now(),db::now(),r.id])?;
+                    return Ok(());
+                }
                 c.execute(
                     "UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?",
                     [&r.id],
@@ -2059,13 +2185,13 @@ mod tests {
     #[tokio::test]
     async fn vanished_execution_retirement_preserves_native_pending_and_uncertain_effects() {
         let (_dir, app, p) = fixture().await;
-        app.db
+        let submitted = app.db
             .sync(|c| {
-                queue(c, &p, "already-submitted", 1)?;
+                let submitted = crate::manager::test_delegate(c, &p.id, "already-submitted", None)?;
                 let run = work::claim_steering(c, &p.id, &p.generation, 2)?.unwrap();
                 work::delivery(c, &run.id, "submitted", "", 2)?;
                 queue(c, &p, "still-pending", 3)?;
-                Ok(())
+                Ok(submitted)
             })
             .unwrap();
         app.request_cli_switch(&p.id, "agy").await.unwrap();
@@ -2074,10 +2200,10 @@ mod tests {
                 let r = latest(c, &p.id)?.unwrap();
                 assert!(retire_vanished(c, &p, &r)?);
                 assert_eq!(
-                    work::event(c, &p.id, "already-submitted")?.status,
+                    work::event(c, &p.id, &submitted)?.status,
                     "uncertain"
                 );
-                assert_eq!(work::event(c, &p.id, "still-pending")?.status, "queued");
+                assert_eq!(work::event(c, &p.id, "still-pending")?.status, "managed");
                 assert!(holds_input(c, &p.id)?);
                 assert!(work::claim_steering(c, &p.id, "repair-generation", 4)?.is_none());
                 let retired = latest(c, &p.id)?.unwrap();
@@ -2126,18 +2252,20 @@ mod tests {
     #[tokio::test]
     async fn accepted_switch_holds_all_unclaimed_input_without_invalidating_handoff() {
         let (_dir, app, p) = fixture().await;
-        app.db
+        let submitted = app.db
             .sync(|c| {
-                queue(c, &p, "already-submitted", 1)?;
+                let submitted = crate::manager::test_delegate(c, &p.id, "already-submitted", None)?;
                 let run = work::claim_steering(c, &p.id, &p.generation, 2)?.unwrap();
                 work::delivery(c, &run.id, "submitted", "", 2)?;
-                queue(c, &p, "pending-before", 3)
+                queue(c, &p, "pending-before", 3)?;
+                Ok(submitted)
             })
             .unwrap();
         app.request_cli_switch(&p.id, "pi").await.unwrap();
         app.db.sync(|c|{
             let r=requested(c,&p)?;
             queue(c,&p,"pending-after",4)?;
+            let held = crate::manager::test_delegate(c,&p.id,"held-delegation",Some("pending-after"))?;
             let timer=work::create_timer(c,&p.id,serde_json::from_value(serde_json::json!({"name":"While switching","prompt":"scheduled input","kind":"once","at":5}))?,0)?;
             assert_eq!(work::fire_due(c,6)?.len(),1);
             assert!(work::claim_steering(c,&p.id,&p.generation,7)?.is_none());
@@ -2146,21 +2274,22 @@ mod tests {
             assert!(claim(c,&p.id,&r,"accepted")?,"queued input cannot invalidate the handoff");
             complete(c,&p.id,&r)?;
             assert!(holds_input(c,&p.id)?);
-            assert_eq!(work::event(c,&p.id,"already-submitted")?.status,"uncertain");
+            assert_eq!(work::event(c,&p.id,&submitted)?.status,"uncertain");
             // Old registration and a wrong observed generation cannot unlock input.
             assert!(!ready(c,&p.id,&p.generation,&r)?);
             c.execute("UPDATE projects SET generation='new-gen',terminal='new-pane',ready=1,execution=json_object('cli_switch_request',?,'mcp_registered',json('true')) WHERE id=?",params![r.id,p.id])?;
             assert!(!ready(c,&p.id,"stale-generation",&r)?);
             assert!(ready(c,&p.id,"new-gen",&r)?);
             assert!(!holds_input(c,&p.id)?);
-            for expected in ["pending-before","pending-after"] {
-                let run=work::claim_steering(c,&p.id,"new-gen",8)?.unwrap();
-                assert_eq!(work::event(c,&p.id,&run.event_id)?.source_id,expected);
-                work::delivery(c,&run.id,"submitted","",8)?;
+            let delegation=work::claim_steering(c,&p.id,"new-gen",8)?.unwrap();
+            assert_eq!(delegation.event_id,held);
+            work::delivery(c,&delegation.id,"submitted","",8)?;
+            for source in ["pending-before","pending-after"] {
+                assert_eq!(work::event(c,&p.id,source)?.status,"managed");
+                assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE origin_event_id=?",[source],|v|v.get::<_,String>(0))?,"queued");
             }
-            let scheduled=work::claim_next(c,&p.id,"new-gen",9)?.unwrap();
-            assert_eq!(c.query_row("SELECT count(*) FROM work_occurrences WHERE timer_id=?",[timer.id],|v|v.get::<_,i64>(0))?,1);
-            work::delivery(c,&scheduled.id,"submitted","",9)?;
+            let status: String = c.query_row("SELECT e.status FROM work_events e JOIN work_occurrences o ON o.event_id=e.id WHERE o.timer_id=?", [timer.id], |v|v.get(0))?;
+            assert_eq!(status,"managed");
             assert!(work::claim_next(c,&p.id,"new-gen",10)?.is_none());
             Ok(())
         }).unwrap();
@@ -2206,7 +2335,8 @@ mod tests {
                 c.query_row("SELECT paused FROM projects WHERE id=?", [&p.id], |v| v
                     .get::<_, bool>(0))?
             );
-            assert_eq!(work::event(c, &p.id, "held")?.status, "queued");
+            assert_eq!(work::event(c, &p.id, "held")?.status, "managed");
+            assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE origin_event_id='held'", [], |r| r.get::<_, String>(0))?, "queued");
             Ok(())
         })
         .unwrap();
@@ -2502,7 +2632,7 @@ mod tests {
             c.execute("UPDATE projects SET execution=?,ready=?,native_session=? WHERE id=?",params![execution.to_string(),!startup,if startup { "" } else { "old-native" },p.id])?;
             c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input,source) VALUES('completed',?,'codex','ready','previous-generation',1,0,?)",
                 params![p.id,json!({"agent":"claude","native_session":"previous-claude-native","extra_args":[]}).to_string()])?;
-            queue(c,&p,"pending-observation",1)?;
+            crate::manager::test_delegate(c,&p.id,"pending-observation",None)?;
             Ok(())
         }).unwrap();
         let p = app.db.project(&p.id).await.unwrap();
@@ -2698,7 +2828,7 @@ mod tests {
             assert_eq!(repair.phase, "recovery_pending");
             assert!(repair.holds_input);
             assert!(work::claim_steering(c, &p.id, &p.generation, 2)?.is_none());
-            assert_eq!(work::event(c, &p.id, "pending-after-ready")?.status, "queued");
+            assert_eq!(work::event(c, &p.id, "pending-after-ready")?.status, "managed");
             assert_eq!(c.query_row("SELECT status FROM messages WHERE id='uncertain-effect'",[],|r|r.get::<_,String>(0))?, "uncertain");
             c.execute("UPDATE cli_switch_requests SET phase='requested',nonce='preserved-nonce',next_attempt_at=12345 WHERE id=?",[&repair.id])?;
             c.execute("INSERT INTO cli_repair_prompts(id,request_id,generation,payload,status,sequence,created_at) VALUES('uncertain-prompt',?,'old-gen','preserved prompt','uncertain',1,1)",[&repair.id])?;

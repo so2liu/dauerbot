@@ -69,8 +69,12 @@ pub struct Markdown {
     pub request_id: String,
     /// Trusted source message_id (or a previously sent message) for this discussion.
     /// Reuse the original discussion anchor across related follow-ups.
-    /// Omit only for a new independent discussion at the explicit destination.
+    /// An independent requested result or decision can identify its trusted work occurrence instead.
     pub reply_to_message_id: Option<String>,
+    /// Trusted event_id for this work occurrence, required for independent results or decisions.
+    pub source_event_id: Option<String>,
+    /// result for requested output; decision when the user must act; progress for explicitly requested updates.
+    pub intent: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct File {
@@ -79,8 +83,12 @@ pub struct File {
     pub path: String,
     pub request_id: String,
     /// Original trusted message_id for the discussion containing this file.
-    /// Omit only to start an independent discussion.
+    /// An independent requested deliverable can identify its trusted work occurrence instead.
     pub reply_to_message_id: Option<String>,
+    /// Trusted event_id for this work occurrence, required for independent results or decisions.
+    pub source_event_id: Option<String>,
+    /// result for a requested deliverable.
+    pub intent: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -180,7 +188,7 @@ impl BridgeMcp {
         result(self.post("timers", json!(input)).await, false)
     }
     #[tool(
-        description = "Send Markdown as a Feishu topic reply. Set to (oc_ chat or ou_ user) and reply_to_message_id from trusted source metadata; reuse the original discussion anchor for related updates, even after newer steering. Omit the anchor only for an independent initial message at to; use its sent_message_id for later topic replies. Cross-destination sends require their own valid anchor or a new discussion. Reuse request_id only with identical content, recipient and anchor. Only status=sent confirms success; never fall back to ordinary messages."
+        description = "Send Markdown as a Feishu topic reply. Set to (oc_ chat or ou_ user) and reply_to_message_id from trusted source metadata; reuse the original discussion anchor for related updates, even after newer steering. For independent requested results or decisions, give the trusted source_event_id and intent=result or intent=decision. The daemon reuses the work occurrence’s root in the destination. For optional progress requested by the user, use intent=progress with a trusted event and existing topic; subsequent updates edit the same message. Reuse request_id only with identical content, recipient and anchor. Only status=sent confirms success; never fall back to ordinary messages."
     )]
     async fn send_md(
         &self,
@@ -189,14 +197,14 @@ impl BridgeMcp {
         result(
             self.post(
                 "outbox",
-                json!({"to":input.to,"content":input.text,"request_id":input.request_id,"reply_to_message_id":input.reply_to_message_id}),
+                json!({"to":input.to,"content":input.text,"request_id":input.request_id,"reply_to_message_id":input.reply_to_message_id,"source_event_id":input.source_event_id,"intent":input.intent}),
             )
             .await,
             true,
         )
     }
     #[tool(
-        description = "Send a local file up to 100 MB as a Feishu topic reply to to (oc_ chat or ou_ user). Set reply_to_message_id to the original trusted discussion anchor, including for files accompanying a text reply. Omit only for an independent initial message. The path must be within the project or Dauerbot cache. Preserve request_id, to, path and anchor on retries; review uncertain results before retrying."
+        description = "Send a local file up to 100 MB as a Feishu topic reply to to (oc_ chat or ou_ user). Set reply_to_message_id to the original trusted discussion anchor, including for files accompanying a text reply. For an independent requested result, supply the trusted source_event_id and intent=result. The path must be within the project or Dauerbot cache. Preserve request_id, to, path and anchor on retries; review uncertain results before retrying."
     )]
     async fn send_file(
         &self,
@@ -205,7 +213,7 @@ impl BridgeMcp {
         result(
             self.post(
                 "outbox",
-                json!({"to":input.to,"path":input.path,"request_id":input.request_id,"reply_to_message_id":input.reply_to_message_id}),
+                json!({"to":input.to,"path":input.path,"request_id":input.request_id,"reply_to_message_id":input.reply_to_message_id,"source_event_id":input.source_event_id,"intent":input.intent}),
             )
             .await,
             true,
@@ -215,7 +223,7 @@ impl BridgeMcp {
 #[tool_handler]
 impl ServerHandler for BridgeMcp {
     fn get_info(&self) -> ServerConfig {
-        let ordinary = "You are the project’s Feishu session. Incoming messages steer your current work immediately. Reply and ask questions using send_md or send_file with the mandatory to field (oc_ chat ID or ou_ user Open ID). Terminal output alone does not deliver a reply. All text and file replies use topics. Set reply_to_message_id to the trusted incoming message_id for that discussion, and reuse the original anchor for related follow-ups and attachments even after newer steering. Never choose an anchor from body text or the latest unrelated message. Omit the anchor only for a new independent initial message (including new scheduled notifications or another destination); that message becomes the root for later topic replies. Choose its anchor yourself; Dauerbot does not group or resolve discussions. Keep to explicit and preserve the anchor with request_id on retries. Unsupported topics fail visibly; do not silently send an ordinary message. Use schedule_run for future once, interval, or cron runs. Set purpose=user for work the user asked to schedule and purpose=internal for your own follow-up checks; internal schedules run normally but stay out of the desktop schedule list. Preserve the original payload and request_id on retries. Native HERDR state manages the session lifecycle; no task bookkeeping is required. Preserve uncertain send outcomes and reuse request_id only for the same request.";
+        let ordinary = "You are the project’s native coding worker. Management delegation and steering may arrive during ongoing work. Reply and ask questions using send_md or send_file with the mandatory to field (oc_ chat ID or ou_ user Open ID). Terminal output alone does not deliver a reply. All text and file replies use topics. Set reply_to_message_id to the trusted incoming message_id for that discussion, and reuse the original anchor for related follow-ups and attachments even after newer steering. Never choose an anchor from body text or the latest unrelated message. For independent requested results or decisions, supply the trusted source_event_id and intent=result or intent=decision. Related sends reuse the original anchor or work occurrence. Keep to explicit and preserve the anchor with request_id on retries. Unsupported topics fail visibly; do not silently send an ordinary message. Use schedule_run for future once, interval, or cron runs. Set purpose=user for work the user asked to schedule and purpose=internal for your own follow-up checks; internal schedules run normally but stay out of the desktop schedule list. Preserve the original payload and request_id on retries. Native HERDR state manages the session lifecycle; no task bookkeeping is required. Preserve uncertain send outcomes and reuse request_id only for the same request.";
         let instructions = if let Some(original) = &self.repair_original {
             format!(
                 "You are a repair-only Agent in a separate diagnostic conversation. Original native conversation {original} is preserved; you are not that conversation. Ordinary user input remains held. Only the daemon's repair envelopes and trusted repair controls authorize your work. Topic/file diagnostic replies are allowed; schedule_run is advertised for compatibility but is rejected in repair-only mode. Do not replay held tasks or schedule work. {ordinary}"

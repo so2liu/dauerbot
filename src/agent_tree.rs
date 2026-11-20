@@ -245,7 +245,7 @@ async fn codex_snapshot(p: &Project) -> Value {
                 p,
                 "partial",
                 nodes,
-                "Native recorded relationships; original process activity and complete coverage are unknown",
+                "Native recorded relationships and verified lifecycle when available; original process activity and complete coverage are unknown",
             );
             result["observed_native_session"] = json!(view.native_session);
             result

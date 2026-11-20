@@ -51,7 +51,7 @@ pub fn journal_source(
     attachment: &Value,
 ) -> Result<()> {
     ensure!(
-        is_command(text) && attachment["daemon_control"] == "model",
+        is_command(crate::cli_control::command_text(text, &attachment["source"])) && attachment["daemon_control"] == "model",
         "Invalid model command"
     );
     let operator = attachment["source"]["sender"]["open_id"]

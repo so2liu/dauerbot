@@ -1,4 +1,4 @@
-//! Opt-in manager configuration; provider credentials never enter public state or snapshots.
+//! Shared manager configuration; provider credentials never enter public state or snapshots.
 use crate::{control_label, locale::Language};
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -12,13 +12,11 @@ use std::{path::PathBuf, sync::mpsc, time::Duration};
 
 #[derive(Clone, PartialEq, Eq)]
 struct Ticket {
-    project: String,
     serial: u64,
 }
 struct Work {
     ticket: Ticket,
     method: &'static str,
-    suffix: &'static str,
     body: Option<Value>,
 }
 struct Reply {
@@ -27,9 +25,6 @@ struct Reply {
     result: Result<Value, String>,
 }
 
-pub fn enabled(project: &Value) -> bool {
-    project["agent_mode"] == "manager"
-}
 pub fn status(project: &Value) -> &str {
     project["manager"]["status"]
         .as_str()
@@ -45,7 +40,6 @@ fn image_identity_changed(
 }
 
 pub struct ManagerSettings {
-    project: Value,
     config: Value,
     language: Language,
     ticket: Option<Ticket>,
@@ -103,12 +97,7 @@ impl ManagerSettings {
                         let mut request = http
                             .request(
                                 reqwest::Method::from_bytes(work.method.as_bytes())?,
-                                format!(
-                                    "{}/api/projects/{}/{}",
-                                    cfg.url(),
-                                    work.ticket.project,
-                                    work.suffix
-                                ),
+                                format!("{}/api/manager/provider", cfg.url()),
                             )
                             .bearer_auth(&cfg.token);
                         if let Some(body) = work.body {
@@ -156,9 +145,7 @@ impl ManagerSettings {
             while let Ok(reply) = rx.recv_async().await {
                 if entity
                     .update(cx, |this, cx| {
-                        if this.ticket.as_ref() != Some(&reply.ticket)
-                            || this.project["id"] != reply.ticket.project
-                        {
+                        if this.ticket.as_ref() != Some(&reply.ticket) {
                             return;
                         }
                         this.ticket = None;
@@ -206,7 +193,6 @@ impl ManagerSettings {
             .detach();
         }
         Self {
-            project: Value::Null,
             config: Value::Null,
             language: Language::default(),
             ticket: None,
@@ -224,55 +210,30 @@ impl ManagerSettings {
             key,
         }
     }
-    pub fn select(&mut self, project: &Value, language: Language, cx: &mut Context<Self>) {
-        let changed = self.project["id"] != project["id"];
-        self.project = project.clone();
+    pub fn refresh(&mut self, provider: &Value, language: Language) {
         self.language = language;
-        if changed {
-            self.config = Value::Null;
-            self.clear_inputs = true;
-            self.fill_inputs = false;
-            self.open = false;
-            self.dirty = false;
-            self.supports_images = false;
-            self.message.clear();
-            self.request("GET", "manager", None, cx);
-        } else if self.ticket.is_none()
-            && !self.dirty
-            && !self.config.is_null()
-            && project["manager"]["revision"].as_u64().unwrap_or(0)
-                > self.config["revision"].as_u64().unwrap_or(0)
-        {
-            self.request("GET", "manager", None, cx);
+        if self.ticket.is_some() || self.dirty {
+            return;
+        }
+        if provider["revision"].as_u64() > self.config["revision"].as_u64() {
+            let first = self.config.is_null();
+            self.config = provider.clone();
+            self.fill_inputs = true;
+            if first && (self.config["configured"] != true || self.config["migration_conflict"] == true) {
+                self.open = true;
+            }
         }
     }
     fn request(
         &mut self,
         method: &'static str,
-        suffix: &'static str,
         body: Option<Value>,
         cx: &mut Context<Self>,
     ) {
-        let project = self.project["id"].as_str().unwrap_or("").to_owned();
-        if project.is_empty() {
-            return;
-        }
         self.serial += 1;
-        let ticket = Ticket {
-            project,
-            serial: self.serial,
-        };
+        let ticket = Ticket { serial: self.serial };
         self.ticket = Some(ticket.clone());
-        if self
-            .tx
-            .send(Work {
-                ticket,
-                method,
-                suffix,
-                body,
-            })
-            .is_err()
-        {
+        if self.tx.send(Work { ticket, method, body }).is_err() {
             self.ticket = None;
             self.message = "Manager settings are unavailable".into();
         }
@@ -335,28 +296,15 @@ impl Render for ManagerSettings {
                 || !self.key.read(cx).value().is_empty()
                 || self.supports_images != (self.config["supports_images"] == true));
         let busy = self.ticket.is_some();
-        let mode = self.config["mode"]
-            .as_str()
-            .unwrap_or(if enabled(&self.project) {
-                "manager"
-            } else {
-                "native"
-            });
-        let blocked = self.project["paused"] == true || self.project["lifecycle"] == "taken_over";
         let revision = self.config["revision"].as_u64();
-        let mut modes = div().flex().flex_wrap().gap_2();
-        for (key, label) in [("native", "Native CLI"), ("manager", "Built-in manager")] {
-            modes=modes.child(Button::new(SharedString::from(format!("agent-mode-{key}"))).small()
-                .child(control_label(self.language.text(label))).selected(mode==key)
-                .disabled(busy||blocked||revision.is_none()||mode==key||self.dirty)
-                .on_click(cx.listener(move |this,_,_,cx| {
-                    this.request("POST","agent/mode",Some(json!({"mode":key,"request_id":uuid::Uuid::new_v4().to_string(),"expected_revision":revision})),cx);
-                })));
-        }
-        let mut view=div().flex().flex_col().gap_3().child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(self.language.text("Project Agent")))
-            .child(modes).child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("The manager uses its own model and delegates coding to your native CLI. CLI login and model settings stay separate.")))
+        let mut view=div().flex().flex_col().gap_3().child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(self.language.text("Shared manager provider")))
+            .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("Every project uses this manager endpoint, model, and API key. Coding CLI login and settings stay separate.")))
             .child(Button::new("manager-config-toggle").small().child(control_label(self.language.text(if self.open {"Hide manager settings"}else{"Manager model settings"})))
                 .on_click(cx.listener(|this,_,_,cx|{this.open = !this.open;cx.notify();})));
+        if self.config["migration_conflict"] == true {
+            view = view.child(div().text_size(px(11.)).text_color(rgb(palette.error))
+                .child(self.language.text("The previous projects used different managers. Review and save the shared provider.")));
+        }
         if self.open {
             view=view.child(self.field("OpenAI-compatible endpoint", &self.endpoint, palette)).child(self.field("Manager model", &self.model, palette)).child(self.field("Manager API key", &self.key, palette))
                 .child(Button::new("manager-image-capability").small().selected(self.supports_images).disabled(busy||!self.config["supports_images"].is_boolean())
@@ -371,14 +319,14 @@ impl Render for ManagerSettings {
                             let mut body=json!({"base_url":this.endpoint.read(cx).value().to_string(),"model":this.model.read(cx).value().to_string(),"expected_revision":this.config["revision"]});
                             if this.config["supports_images"].is_boolean() { body["supports_images"] = json!(this.supports_images); }
                             let key=this.key.read(cx).value().to_string();if !key.is_empty(){body["api_key"]=json!(key);}
-                            this.request("PUT","manager",Some(body),cx);
+                            this.request("PUT",Some(body),cx);
                         })))
                     .child(Button::new("reload-manager-config").small().child(control_label(self.language.text("Reload"))).disabled(busy)
-                        .on_click(cx.listener(|this,_,_,cx|{this.clear_inputs=true;this.request("GET","manager",None,cx);})))
+                        .on_click(cx.listener(|this,_,_,cx|{this.clear_inputs=true;this.request("GET",None,cx);})))
                     .child(Button::new("clear-manager-key").small().child(control_label(self.language.text("Clear saved API key")))
                         .disabled(busy||revision.is_none()||self.config["has_api_key"]!=true||self.dirty)
                         .on_click(cx.listener(|this,_,_,cx|{
-                            this.request("PUT","manager",Some(json!({"base_url":this.config["base_url"],"model":this.config["model"],"clear_api_key":true,"expected_revision":this.config["revision"]})),cx);
+                            this.request("PUT",Some(json!({"base_url":this.config["base_url"],"model":this.config["model"],"clear_api_key":true,"expected_revision":this.config["revision"]})),cx);
                         }))));
         }
         if !self.message.is_empty() {
@@ -387,27 +335,6 @@ impl Render for ManagerSettings {
                     .text_size(px(12.))
                     .child(self.language.text(&self.message)),
             );
-        }
-        if mode == "manager" {
-            view = view.child(
-                div()
-                    .text_size(px(12.))
-                    .child(self.language.text(status(&self.project))),
-            );
-            if let Some(error) = self.project["manager"]["error"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-            {
-                view = view.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(palette.error))
-                        .child(self.language.text(error)),
-                );
-            }
-        }
-        if mode == "manager" {
-            view=view.child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("The terminal belongs to the coding worker. Model and repair controls remain available if the manager cannot connect.")));
         }
         view
     }
