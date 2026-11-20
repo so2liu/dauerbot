@@ -2335,7 +2335,8 @@ mod tests {
                 c.query_row("SELECT paused FROM projects WHERE id=?", [&p.id], |v| v
                     .get::<_, bool>(0))?
             );
-            assert_eq!(work::event(c, &p.id, "held")?.status, "cancelled");
+            assert_eq!(work::event(c, &p.id, "held")?.status, "managed");
+            assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE origin_event_id='held'", [], |r| r.get::<_, String>(0))?, "queued");
             Ok(())
         })
         .unwrap();

@@ -1193,7 +1193,7 @@ impl Desktop {
             }
             if project["lifecycle"] == "update_required" {
                 body = body.child(self.card("Update pending", "This project is waiting for a compatible update. Its conversation and saved messages are preserved."))
-                    .child(self.project_recovery_actions(project, cx));
+                    .child(self.project_recovery_actions(&project, cx));
             }
             let debug_project = id.clone();
             let debug_mode = project["debug_mode"] == true;
