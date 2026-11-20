@@ -539,8 +539,7 @@ impl App {
                 Ok(Some(anchor)) => m.attachment["reply_to_message_id"] = json!(anchor),
                 Ok(None) => new_root = true,
                 Err(error) if error.downcast_ref::<rusqlite::Error>().is_some() => {
-                    tracing::warn!(%error, "Could not read saved discussion root");
-                    new_root = true;
+                    return Err(error.context("Could not read saved discussion root"));
                 }
                 Err(error) => {
                     self.db.state(&m.id, "failed", &error.to_string()).await?;
