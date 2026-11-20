@@ -889,6 +889,10 @@ fn proposal_tool_allowed(name: &str, arguments: &Value) -> bool {
     }
 }
 
+// A dispatch is journaled in work_runs in the same transaction as its claim.
+const FAILED_BEFORE_SUBMISSION: &str = "e.status='failed' AND e.received_at IS NULL
+    AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.event_id=e.id)";
+
 async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     let Some(_permit) = app.service.gate.enter() else {
         bail!("Service ownership changed")
@@ -931,9 +935,11 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
         .filter(|event| event.source == "autonomy");
       let instructions = if let Some(proposal) = &proposal {
           ensure!(!steer && a.target_cli.is_none(), "Approved proposal must use the current worker");
+          ensure!(approved_origin(&tx, &p.id, &proposal.id)?, "Approved proposal authority changed");
           if let Some(existing) = tx.query_row(
-              "SELECT id FROM work_events WHERE project_id=? AND source='management'
-               AND json_extract(payload,'$.origin_event_id')=? ORDER BY rowid LIMIT 1",
+              &format!("SELECT e.id FROM work_events e WHERE e.project_id=? AND e.source='management'
+               AND json_extract(e.payload,'$.origin_event_id')=? AND NOT ({FAILED_BEFORE_SUBMISSION})
+               ORDER BY e.rowid LIMIT 1"),
               params![p.id,proposal.id], |row| row.get::<_,String>(0)
           ).optional()? {
               let event = work::event(&tx, &p.id, &existing)?;
@@ -1137,7 +1143,9 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &json!({"kind":"worker_message","status":status,"already_delivered_to_user":status=="sent","content":content.chars().take(16000).collect::<String>(),"to":a["to"],"reply_to_message_id":anchor,"sent_message_id":a["sent_message_id"],"sent_chat_id":a["sent_chat_id"]}),
         )?;
     }
-    let intents=c.prepare("SELECT id,error,json_extract(payload,'$.origin_event_id') FROM work_events WHERE project_id=? AND source='management' AND status='failed' ORDER BY rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let intents=c.prepare(&format!("SELECT e.id,e.error,json_extract(e.payload,'$.origin_event_id')
+        FROM work_events e WHERE e.project_id=? AND e.source='management' AND ({FAILED_BEFORE_SUBMISSION})
+        ORDER BY e.rowid DESC LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, error, origin) in intents {
         observation(
             c,
@@ -2298,6 +2306,14 @@ mod tests {
             c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
               VALUES('proposal-event',?,'proposal-task','autonomy','prop',?,'queued',?,?)",
               params![project.id,approval.to_string(),now,now])?;
+            c.execute("INSERT INTO autonomy_settings(project_id,enabled,owner_open_id,app_id,chat_id)
+                VALUES(?,1,'ou_fixture','cli_fixture','oc_fixture')", [&project.id])?;
+            c.execute("INSERT INTO proposals(id,project_id,number,title,why_now,scope,not_doing,
+                acceptance,risk,effort,category,dedupe_hash,status,created_at,decided_by,
+                execution_event_id,source_message_id)
+                VALUES('prop',?,1,'Fixture','Fixture','Fixture','Fixture','Fixture','Fixture','small',
+                'documentation','fixture','approved',?,'ou_fixture','proposal-event','om_approval')",
+                params![project.id, now])?;
             route_event(c, "proposal-event")?;
             input(c, &project.id, "ordinary", None, "user", &json!({"body":"An unrelated request"}))
         })?;
@@ -2331,12 +2347,43 @@ mod tests {
             assert!(delegated.as_ref().is_none_or(|previous| previous == &id));
             delegated = Some(id);
         }
+        let first = delegated.unwrap();
         app.db.sync(|c| {
-            let count:u32 = c.query_row("SELECT count(*) FROM work_events WHERE source='management'", [], |r| r.get(0))?;
-            assert_eq!(count,1);
-            let event = work::event(c,&project.id,&delegated.unwrap())?;
-            assert_eq!(event.payload["proposal_id"],"prop");
-            assert_eq!(event.payload["instructions"],approved);
+            let count: u32 = c.query_row("SELECT count(*) FROM work_events WHERE source='management'", [], |r| r.get(0))?;
+            assert_eq!(count, 1);
+            let event = work::event(c, &project.id, &first)?;
+            assert_eq!(event.payload["proposal_id"], "prop");
+            assert_eq!(event.payload["instructions"], approved);
+            c.execute("UPDATE projects SET agent='pi' WHERE id=?", [&project.id])?;
+            assert!(work::claim_next(c, &project.id, "", now)?.is_none());
+            assert_eq!(work::event(c, &project.id, &first)?.status, "failed");
+            let count: u32 = c.query_row("SELECT count(*) FROM work_runs WHERE event_id=?", [&first], |r| r.get(0))?;
+            assert_eq!(count, 0);
+            Ok(())
+        })?;
+
+        let retry = tool(&app, &proposal.context, locate("retry-preclaim", "delegate",
+            json!({"source_event_id":"proposal-event","instructions":"unapproved instructions"}))).await?;
+        let replacement = retry["event_id"].as_str().unwrap();
+        assert_ne!(replacement, &first);
+        let run = app.db.sync(|c| {
+            let event = work::event(c, &project.id, replacement)?;
+            assert_eq!(event.payload["expected_agent"], "pi");
+            assert_eq!(event.payload["instructions"], approved);
+            let run = work::claim_next(c, &project.id, "", now)?.unwrap();
+            assert_eq!(run.event_id, replacement);
+            Ok(run)
+        })?;
+        for (delivery, occurrence) in [("uncertain", "repeat-uncertain"), ("failed", "repeat-after-claim")] {
+            app.db.sync(|c| work::delivery(c, &run.id, delivery, "Fixture transport", now))?;
+            let replay = tool(&app, &proposal.context, locate(occurrence, "delegate",
+                json!({"source_event_id":"proposal-event","instructions":"unapproved instructions"}))).await?;
+            assert_eq!(replay["event_id"], replacement);
+            assert_eq!(replay["status"], delivery);
+        }
+        app.db.sync(|c| {
+            let count: u32 = c.query_row("SELECT count(*) FROM work_events WHERE source='management'", [], |r| r.get(0))?;
+            assert_eq!(count, 2);
             Ok(())
         })
     }
