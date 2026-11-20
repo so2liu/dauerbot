@@ -261,6 +261,10 @@ impl ManagerContext {
             cx.notify();
         }
     }
+    pub fn open(&mut self, cx: &mut Context<Self>) {
+        self.open = true;
+        self.refresh(cx);
+    }
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.project.is_empty() {
             return;

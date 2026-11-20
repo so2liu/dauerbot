@@ -57,6 +57,9 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/settings", get(settings))
         .route("/conversations", get(conversations))
+        .route("/panel/overview", get(panel_overview))
+        .route("/panel/messages", get(panel_messages))
+        .route("/panel/messages/{id}", get(panel_message_detail))
         .route("/projects", post(create_project))
         .route(
             "/projects/{id}",
@@ -307,6 +310,47 @@ async fn proxy_to_owner(app: Arc<App>, req: Request) -> Response {
         }
         Err(_)=>(StatusCode::BAD_GATEWAY,Json(json!({"error":"The committed service did not return a result; preserve this request ID and verify its recorded outcome"}))).into_response(),
     }
+}
+
+async fn panel_overview(
+    State(app): State<Arc<App>>,
+    Query(query): Query<crate::panel::Query>,
+) -> ApiResult {
+    let bots = app.runtime.read().await.bots.clone();
+    Ok(Json(
+        app.db
+            .call(move |c| crate::panel::overview(c, &bots, &query, db::now()))
+            .await?,
+    ))
+}
+
+async fn panel_messages(
+    State(app): State<Arc<App>>,
+    Query(query): Query<crate::panel::Query>,
+) -> ApiResult {
+    Ok(Json(
+        app.db
+            .call(move |c| crate::panel::messages(c, &query, db::now()))
+            .await?,
+    ))
+}
+
+async fn panel_message_detail(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    let value = app
+        .db
+        .call(move |c| crate::panel::message_detail(c, &id, db::now()))
+        .await?;
+    Ok(match value {
+        Some(value) => Json(value).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"Activity message not found"})),
+        )
+            .into_response(),
+    })
 }
 
 async fn activation_prepare(

@@ -25,6 +25,7 @@ action_icons! {
     Sidebar => "sidebar",
     Plus => "plus",
     Settings => "settings",
+    ChartBar => "chart-bar",
     Language => "language",
     Handoff => "handoff",
     Agents => "agents",
