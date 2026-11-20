@@ -65,16 +65,16 @@ pub fn status_dot(
     palette: crate::ui_theme::Palette,
 ) -> Stateful<Div> {
     let color = match status {
-        "busy" | "running" | "working" => palette.accent,
-        "error" | "offline" | "needs_attention" | "failed" | "unavailable" => palette.error,
-        "blocked" | "paused" | "taken_over" | "pending" | "held" => palette.warning,
+        "busy" | "running" | "working" | "switching_cli" | "starting" => palette.accent,
+        "error" | "offline" | "needs_attention" | "failed" | "unavailable" | "exited" => palette.error,
+        "blocked" | "paused" | "taken_over" | "pending" | "held" | "recovering_cli" | "update_required" => palette.warning,
         "done" | "ready" | "completed" => palette.success,
         "aborted" => palette.muted,
         _ => palette.muted,
     };
     let ring = matches!(
         status,
-        "idle" | "sleeping" | "unknown" | "pending" | "aborted"
+        "idle" | "sleeping" | "unknown" | "open" | "pending" | "aborted"
     );
     div()
         .id(SharedString::from(id))
@@ -111,6 +111,8 @@ pub struct Node {
     pub name: String,
     pub cli: String,
     pub state: String,
+    #[serde(default)]
+    pub archived: bool,
     #[serde(default)]
     pub observation: String,
     #[serde(default)]
@@ -202,24 +204,54 @@ impl Tree {
             }
         }
         let mut tree = Self { nodes, status };
-        if tree.rows(&HashSet::new()).len() != tree.nodes.len() {
+        let visible = tree
+            .nodes
+            .iter()
+            .filter(|node| node.state != "closed" && !node.archived)
+            .count();
+        if tree.rows(&HashSet::new()).len() != visible {
             tree.status = "partial".into();
         }
         tree
     }
 
     pub fn rows(&self, folded: &HashSet<String>) -> Vec<Row<'_>> {
+        let by_id: HashMap<&str, &Node> = self
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect();
         let mut children: HashMap<Option<&str>, Vec<&Node>> = HashMap::new();
         for node in &self.nodes {
-            children
-                .entry(node.parent_id.as_deref())
-                .or_default()
-                .push(node);
+            if node.state == "closed" || node.archived {
+                continue;
+            }
+            // Lifecycle is not activity: retain open/unknown descendants of a
+            // closed/archived ancestor. Only the presentation edge is promoted;
+            // Node.parent_id remains the native evidence for read-only details.
+            let mut parent = node.parent_id.as_deref();
+            let mut seen = HashSet::from([node.id.as_str()]);
+            while let Some(id) = parent {
+                if !seen.insert(id) {
+                    parent = Some(id);
+                    break;
+                }
+                let Some(ancestor) = by_id.get(id) else { break };
+                if ancestor.state != "closed" && !ancestor.archived {
+                    break;
+                }
+                parent = ancestor.parent_id.as_deref();
+            }
+            children.entry(parent).or_default().push(node);
         }
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         Self::append(&children, None, &[], folded, &mut seen, &mut rows);
         rows
+    }
+
+    pub fn has_visible_nodes(&self) -> bool {
+        !self.rows(&HashSet::new()).is_empty()
     }
 
     fn append<'a>(
@@ -509,6 +541,40 @@ mod tests {
         let mut stale = project;
         stale["generation"] = json!("new");
         assert!(Tree::from_project(&stale).nodes.is_empty());
+    }
+
+    #[test]
+    fn native_closed_and_archived_rows_disappear_without_hiding_open_descendants() {
+        let project = json!({"id":"p","generation":"g","native_session":"a","execution":{"agent_tree":{
+        "project_id":"p","generation":"g","native_session":"a","status":"observed","nodes":[
+            {"id":"root","parent_id":null,"name":"Project","cli":"codex","state":"unknown"},
+            {"id":"closed","parent_id":"root","name":"Closed parent","cli":"codex","state":"closed"},
+            {"id":"open","parent_id":"closed","name":"Resumed descendant","cli":"codex","state":"open"},
+            {"id":"archived","parent_id":"open","name":"Archived child","cli":"codex","state":"open","archived":true},
+            {"id":"unknown","parent_id":"archived","name":"Unknown descendant","cli":"codex","state":"unknown"}
+        ]}}});
+        let tree = Tree::from_project(&project);
+        let rows = tree.rows(&HashSet::new());
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["open", "unknown"]
+        );
+        assert_eq!(
+            rows[0].node.parent_id.as_deref(),
+            Some("closed"),
+            "Read-only evidence must retain native ancestry"
+        );
+        assert!(rows[0].branches.is_empty());
+        assert_eq!(rows[1].branches, [false]);
+        assert_eq!(tree.status, "observed");
+        let folded = tree.rows(&HashSet::from(["open".into()]));
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].node.id, "open");
+        let mut closed_only = project;
+        closed_only["execution"]["agent_tree"]["nodes"].as_array_mut().unwrap().retain(|node| matches!(node["id"].as_str(), Some("root" | "closed")));
+        assert!(!Tree::from_project(&closed_only).has_visible_nodes(), "A hidden-only tree must not retain an empty disclosure control");
     }
 
     #[test]

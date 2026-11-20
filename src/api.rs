@@ -81,6 +81,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/projects/{id}/manager",
             get(manager_config).put(manager_save),
         )
+        .route("/manager/provider", get(manager_provider).put(manager_save_provider))
         .route("/projects/{id}/agent/mode", post(manager_mode))
         .route("/projects/{id}/manager/context", get(manager_context))
         .route("/projects/{id}/models", get(project_models))
@@ -88,6 +89,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/projects/{id}/documents/{document}", get(project_document))
         .route("/projects/{id}/stop", post(stop))
         .route("/projects/{id}/pause", post(pause))
+        .route("/projects/{id}/debug", post(project_debug))
         .route("/projects/{id}/show", post(show))
         .route("/projects/{id}/screen", get(screen))
         .route("/projects/{id}/terminal", get(show))
@@ -378,6 +380,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
     let mut records = Vec::new();
     let mut work_states = serde_json::Map::new();
     let bindings = app.db.bots().await?;
+    let manager_provider = app.db.call(crate::manager::public_provider).await?;
     for p in projects {
         let id = p.id.clone();
         let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
@@ -418,7 +421,7 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
         records.push(record);
     }
     Ok(Json(
-        json!({"projects":records,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL,"mcp_contracts":[crate::mcp::CONTRACT],"service_activation":app.service.state()}),
+        json!({"projects":records,"manager_provider":manager_provider,"work":work_states,"conversations":app.db.conversations().await?,"runtime":runtime,"settings":feishu::public_config(&*app.config.read().await),"version":env!("CARGO_PKG_VERSION"),"api_protocol":PROTOCOL,"mcp_contracts":[crate::mcp::CONTRACT],"service_activation":app.service.state()}),
     ))
 }
 async fn settings(State(app): State<Arc<App>>) -> ApiResult {
@@ -689,6 +692,18 @@ async fn pause(
 
     Ok(Json(json!({"ok":true})))
 }
+#[derive(Deserialize)]
+struct ProjectDebug {
+    debug_mode: bool,
+}
+async fn project_debug(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(input): Json<ProjectDebug>,
+) -> ApiResult {
+    app.db.set_debug_mode(&id, input.debug_mode).await?;
+    Ok(Json(json!({"debug_mode":input.debug_mode})))
+}
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult {
     Ok(Json(app.show(&id).await?))
 }
@@ -725,20 +740,27 @@ async fn manager_context(State(app): State<Arc<App>>, Path(id): Path<String>) ->
     }
     Ok(Json(crate::manager_context::bounded(view)))
 }
-async fn manager_save(
+async fn manager_provider(State(app): State<Arc<App>>) -> ApiResult {
+    Ok(Json(app.db.call(crate::manager::public_provider).await?))
+}
+async fn manager_save_provider(
     State(app): State<Arc<App>>,
-    Path(id): Path<String>,
     Json(input): Json<crate::manager::ConfigInput>,
 ) -> ApiResult {
-    let p = app.db.project(&id).await?;
-    let lock = app.project_lock(&p.id).await;
-    let _guard = lock.lock().await;
-    let value = app
-        .db
-        .call(move |c| crate::manager::save(c, &p.id, input))
-        .await?;
+    // The same project locks fence individual manager effects while a shared
+    // update invalidates their provider revisions.
+    let mut projects = app.db.projects().await?;
+    projects.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    let mut guards = Vec::with_capacity(projects.len());
+    for project in projects {
+        guards.push(app.project_lock(&project.id).await.lock_owned().await);
+    }
+    let value = app.db.call(move |c| crate::manager::save_provider(c,input)).await?;
     app.notify.notify_one();
     Ok(Json(value))
+}
+async fn manager_save() -> ApiResult {
+    Err(anyhow::anyhow!("Manager credentials are shared. Update them at /api/manager/provider.").into())
 }
 async fn manager_mode(
     State(app): State<Arc<App>>,
@@ -767,7 +789,7 @@ async fn inject(
     let key = db::id();
     let source = format!("local-{}", db::id());
     let out = key.clone();
-    app.db.call(move|c|{let tx=c.unchecked_transaction()?;let mut attachment=json!({});crate::manager::stamp(&tx,&p.id,&mut attachment)?;tx.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
+    app.db.call(move|c|{let tx=c.unchecked_transaction()?;let attachment=json!({});tx.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",
         rusqlite::params![key,p.id,source,input.content,attachment.to_string(),db::now(),db::now()])?;tx.commit()?;Ok(())}).await?;
     app.notify.notify_one();
 
@@ -786,6 +808,10 @@ struct Outbox {
     path: Option<String>,
     #[serde(default)]
     reply_to_message_id: Option<String>,
+    #[serde(default)]
+    source_event_id: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
 }
 async fn outbox(
     State(app): State<Arc<App>>,
@@ -808,11 +834,22 @@ async fn outbox(
     if let Some(anchor) = input.reply_to_message_id {
         attachment["reply_to_message_id"] = json!(anchor);
     }
+    if let Some(intent) = &input.intent {
+        if !matches!(intent.as_str(), "result" | "decision" | "progress") {
+            return Err(anyhow::anyhow!(
+                "Choose result, decision or progress as the message intent"
+            )
+            .into());
+        }
+        attachment["discussion_intent"] = json!(intent);
+    }
     if input.request_id.is_empty() || input.request_id.len() > 200 {
         return Err(anyhow::anyhow!("request_id must contain 1 to 200 characters").into());
     }
     let authority = authority(session);
-    let message_id = app
+    let project = p.id.clone();
+    let request = input.request_id.clone();
+    let (message_id, progress) = app
         .db
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
@@ -824,6 +861,34 @@ async fn outbox(
             }
             let binding = crate::bot::get(&tx, &p.id)?
                 .context("Connect a Feishu bot to this project first")?;
+            if let Some(event) = &input.source_event_id {
+                if !attachment["reply_to_message_id"].is_string() && input.intent.is_none() {
+                    anyhow::bail!(
+                        "Choose result or decision before sending without a reply anchor"
+                    );
+                }
+                let to = attachment["to"].as_str().unwrap_or_default().to_owned();
+                crate::discussion::origin(
+                    &tx,
+                    &p.id,
+                    event,
+                    &binding.app_id,
+                    &to,
+                    input.to.is_some(),
+                    &mut attachment,
+                )?;
+            }
+            if input.intent.as_deref() == Some("progress") {
+                anyhow::ensure!(
+                    attachment[crate::repair_lane::OUTBOX_KEY].is_null(),
+                    "Progress is unavailable in a repair-only session"
+                );
+                tx.commit()?;
+                return Ok((
+                    String::new(),
+                    Some((binding.app_id, input.content, attachment)),
+                ));
+            }
             let message = db::enqueue_out_request(
                 &tx,
                 &p.id,
@@ -833,9 +898,15 @@ async fn outbox(
                 attachment,
             )?;
             tx.commit()?;
-            Ok(message)
+            Ok((message, None))
         })
         .await?;
+    if let Some((app_id, content, attachment)) = progress {
+        let result =
+            crate::discussion::progress(&app, project, app_id, request, content, attachment)
+                .await?;
+        return Ok(Json(result));
+    }
     app.send_out(&message_id).await?;
     let m = app.db.message(&message_id).await?;
     Ok(Json(serde_json::to_value(m).unwrap()))

@@ -5,6 +5,26 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+/// Feishu replaces leading group mentions with generated placeholders. Strip
+/// only those recorded in this event; retain the original message in storage.
+pub(crate) fn command_text<'a>(text: &'a str, source: &Value) -> &'a str {
+    let mut text = text.trim();
+    if source["chat_type"] != "group" {
+        return text;
+    }
+    while let Some((key, rest)) = text.split_once(char::is_whitespace) {
+        if !key.strip_prefix("@_user_").is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit())
+        }) || !source["mentions"].as_array().is_some_and(|mentions| {
+            mentions.iter().any(|mention| mention["key"] == key)
+        }) {
+            break;
+        }
+        text = rest.trim_start();
+    }
+    text
+}
+
 fn instruction(text: &str) -> Option<&str> {
     let text = text.trim();
     let rest = text.strip_prefix("/repair")?;
@@ -26,7 +46,7 @@ pub fn classify(c: &rusqlite::Connection) -> Result<()> {
         // quoted snippet or attachment must not become a daemon operation.
         if attachment["source"]["message_type"] != "text"
             || !attachment["source"]["chat_id"].is_string()
-            || instruction(&text).is_none()
+            || instruction(command_text(&text, &attachment["source"])).is_none()
         {
             continue;
         }
@@ -43,7 +63,7 @@ pub async fn process(app: &Arc<App>) -> Result<()> {
     }).await?;
     for (message, project, source_id, content, raw) in commands {
         let attachment: Value = serde_json::from_str(&raw)?;
-        let control = json!({"content":instruction(&content).unwrap_or_default(),"message_id":source_id,"source":attachment["source"]});
+        let control = json!({"content":instruction(command_text(&content, &attachment["source"])).unwrap_or_default(),"message_id":source_id,"source":attachment["source"]});
         let key = project.clone();
         let source = source_id.clone();
         let accepted = async {
@@ -55,19 +75,8 @@ pub async fn process(app: &Arc<App>) -> Result<()> {
         .await;
         match accepted {
             Ok(_) => {
-                let to = attachment["source"]["chat_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
                 app.db.call(move |c| {
-                    let tx=c.unchecked_transaction()?;
-                    if let Some(binding)=crate::bot::get(&tx,&project)? {
-                        db::enqueue_out_request(&tx,&project,&binding.app_id,&format!("repair-control-{source_id}"),
-                            "Repair instructions are saved. Dauerbot is restoring the repair Agent; ordinary messages remain queued for the selected CLI.",
-                            json!({"to":to,"reply_to_message_id":source_id}))?;
-                    }
-                    tx.execute("UPDATE messages SET status='acknowledged',attachment=json_set(attachment,'$.daemon_control.status','accepted'),updated_at=? WHERE id=?",params![db::now(),message])?;
-                    tx.commit()?;
+                    c.execute("UPDATE messages SET status='acknowledged',attachment=json_set(attachment,'$.daemon_control.status','accepted'),updated_at=? WHERE id=?",params![db::now(),message])?;
                     Ok(())
                 }).await?;
                 app.notify.notify_one();

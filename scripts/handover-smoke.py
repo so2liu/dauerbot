@@ -165,6 +165,8 @@ def main():
                     fixture.wait_for(lambda:api(f"/projects/{p['id']}")["project"]["ready"],"native published MCP not ready")
                     fixture.wait_for(lambda:(workspace/"launches.jsonl").exists(),"native published MCP startup failed")
                     native.append((api(f"/projects/{p['id']}")["project"],workspace))
+            if native:
+                emit_to(old_connection, "om_handover_gate")
             id, ready = prepare()
             # Deliberately verify a clean handover does not run crash recovery
             # against live in-flight metadata merely by preparing/opening a copy.
@@ -173,7 +175,7 @@ def main():
             candidate_connection = fixture.FIXTURE.connections[-1]
             if native:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                    payload=json.dumps({"to":"oc_fixture","content":"gate-block","request_id":"gate-block"}).encode()
+                    payload=json.dumps({"to":"oc_fixture","content":"gate-block","request_id":"gate-block","reply_to_message_id":"om_handover_gate"}).encode()
                     abandoned=socket.create_connection(("127.0.0.1",port),timeout=3)
                     abandoned.sendall((f"POST /api/projects/{project['id']}/outbox HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {config['token']}\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n").encode()+payload)
                     assert blocked.wait(10)

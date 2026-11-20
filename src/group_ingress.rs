@@ -936,7 +936,7 @@ mod tests {
         assert_eq!(status(&app, &a, "om_before_stop"), Some("cancelled".into()));
         assert_eq!(
             status(&app, &a, "om_ordinary_pending"),
-            Some("queued".into())
+            Some("acknowledged".into())
         );
         ingest(
             &app,

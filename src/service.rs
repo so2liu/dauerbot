@@ -1162,6 +1162,39 @@ mod tests {
         .unwrap();
         assert_ne!(fingerprint(&path, &cfg).unwrap(), legacy);
     }
+    #[tokio::test]
+    async fn project_debug_is_additive_to_protocol_seven_stores_and_activation_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge.sqlite3");
+        let cfg = Config::default();
+        let db = Db::open(&path).unwrap();
+        db.sync(|c| {
+            c.execute("INSERT INTO projects(id,name,path,agent,generation,created_at,mcp_token) VALUES('p','p','','codex','generation',0,'token')", [])?;
+            c.execute("ALTER TABLE projects DROP COLUMN debug_mode", [])?;
+            Ok(())
+        }).unwrap();
+        drop(db);
+        let previous = fingerprint(&path, &cfg).unwrap();
+        let db = Db::open(&path).unwrap();
+        let project = db.project("p").await.unwrap();
+        assert!(!project.debug_mode);
+        let mut historical_json = json!(project);
+        historical_json.as_object_mut().unwrap().remove("debug_mode");
+        historical_json["mcp_token"] = json!("fixture");
+        let historical = serde_json::from_value::<crate::db::Project>(historical_json).unwrap();
+        assert!(!historical.debug_mode);
+        assert_eq!(fingerprint(&path, &cfg).unwrap(), previous);
+        db.set_debug_mode("p", true).await.unwrap();
+        drop(db);
+        let db = Db::open_handover(&path).unwrap();
+        assert!(db.project("p").await.unwrap().debug_mode);
+        let version = db
+            .sync(|c| Ok(c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?))
+            .unwrap();
+        assert_eq!(version, 7);
+        assert_eq!(api::PROTOCOL, 7);
+        assert_eq!(fingerprint(&path, &cfg).unwrap(), previous);
+    }
     #[test]
     fn insertion_order_compatibility_requires_the_actual_060_parent() {
         let mut owner = Owner {

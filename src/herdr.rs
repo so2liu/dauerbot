@@ -1852,7 +1852,7 @@ mod tests {
         assert_eq!(saved.terminal.as_deref(), Some("saved-terminal"));
         app.db
             .sync(|c| {
-                assert_eq!(crate::work::event(c, &p.id, "pending")?.status, "queued");
+                assert_eq!(crate::work::event(c, &p.id, "pending")?.status, "managed");
                 Ok(())
             })
             .unwrap();

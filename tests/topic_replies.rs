@@ -261,8 +261,7 @@ async fn source_thread_context_and_outbound_receipts_are_usable_without_a_discus
 }
 
 #[tokio::test]
-async fn independent_messages_and_pre_upgrade_request_retries_have_no_extra_root_or_null_mismatch()
-{
+async fn only_requested_results_create_roots_and_confirmed_legacy_requests_remain_idempotent() {
     let (_dir, app, project, fixture, server) = setup().await;
     let legacy = app
         .db
@@ -271,11 +270,12 @@ async fn independent_messages_and_pre_upgrade_request_retries_have_no_extra_root
             "legacy",
             "Original",
             json!({
-                "to":"oc_private","bot_app_id":"cli_topics"
+                "to":"oc_private","bot_app_id":"cli_topics","sent_message_id":"om_legacy"
             }),
         )
         .await
         .unwrap();
+    app.db.state(&legacy.id, "sent", "").await.unwrap();
     let again = app
         .outbox_to(
             &project.id,
@@ -288,6 +288,7 @@ async fn independent_messages_and_pre_upgrade_request_retries_have_no_extra_root
         .unwrap();
     assert_eq!(legacy.id, again.id);
     assert_eq!(again.status, "sent");
+    assert_eq!(again.attachment["sent_message_id"], "om_legacy");
     app.outbox_to(
         &project.id,
         "legacy",
@@ -297,27 +298,33 @@ async fn independent_messages_and_pre_upgrade_request_retries_have_no_extra_root
     )
     .await
     .unwrap();
-    app.outbox_to(
-        &project.id,
-        "independent",
-        "Scheduled notice",
-        json!({}),
-        Some("oc_private"),
-    )
-    .await
-    .unwrap();
+    let unsolicited = app
+        .outbox_to(
+            &project.id,
+            "unsolicited",
+            "Unsolicited notice",
+            json!({}),
+            Some("oc_private"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsolicited.status, "failed");
+    assert!(fixture.requests.lock().unwrap().is_empty());
+
+    let result = app
+        .outbox_to(
+            &project.id,
+            "independent",
+            "Requested result",
+            json!({"discussion_scope":"requested-fixture-work","discussion_intent":"result"}),
+            Some("oc_private"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, "sent");
     let requests = fixture.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.get("create").is_some())
-    );
-    assert!(
-        requests
-            .iter()
-            .all(|request| request["create"]["msg_type"] == "post")
-    );
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["create"]["msg_type"], "post");
     server.abort();
 }
 
@@ -360,5 +367,26 @@ async fn unsupported_uncertain_and_accepted_without_thread_never_fall_back_or_au
             .iter()
             .all(|request| request["anchor"] == "om_original")
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn unreadable_discussion_root_keeps_requested_result_pending() {
+    let (_dir, app, project, fixture, server) = setup().await;
+    let scope = json!({"to":"oc_private","bot_app_id":"cli_topics",
+        "discussion_scope":"fixture-work","discussion_intent":"result"});
+    let saved = app.db.enqueue_out(&project.id, "existing-root", "Existing result", scope.clone())
+        .await.unwrap();
+    let pending = app.db.enqueue_out(&project.id, "next-result", "Follow-up", scope)
+        .await.unwrap();
+    app.db.sync(|c| {
+        c.execute("UPDATE messages SET status='uncertain',attachment='{' WHERE id=?", [&saved.id])?;
+        Ok(())
+    }).unwrap();
+
+    let error = app.send_out(&pending.id).await.unwrap_err();
+    assert!(error.to_string().contains("Could not read saved discussion root"));
+    assert_eq!(app.db.message(&pending.id).await.unwrap().status, "pending");
+    assert!(fixture.requests.lock().unwrap().is_empty());
     server.abort();
 }

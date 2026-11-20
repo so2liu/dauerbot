@@ -103,13 +103,15 @@ impl Language {
             "The management run could not continue" => "管理流程未能继续",
             "held" => "等待中",
             "Project Agent" => "项目主智能体",
-            "Native CLI" => "原生 CLI",
-            "Built-in manager" => "内置管理智能体",
             "Declare image input support" => "声明支持图片输入",
             "Image input declared supported" => "已声明支持图片输入",
             "Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references." => {
                 "仅在此接口和模型确实支持图片输入时启用；否则仅提供明确的图片文件引用。"
             }
+            "Shared manager provider" => "全局管理智能体配置",
+            "Every project uses this manager endpoint, model, and API key. Coding CLI login and settings stay separate." => "所有项目共用此管理智能体的服务地址、模型和 API 密钥。编码 CLI 的登录与设置保持独立。",
+            "The previous projects used different managers. Review and save the shared provider." => "旧项目的管理智能体配置不同，请检查并保存全局配置。",
+            "Configure the shared manager in Settings" => "前往设置配置全局管理智能体",
             "Manager model settings" => "管理模型设置",
             "Hide manager settings" => "收起管理模型设置",
             "OpenAI-compatible endpoint" => "OpenAI 兼容接口地址",
@@ -219,6 +221,7 @@ impl Language {
                 "后台服务已更新。兼容的 Agent 会继续运行；其他项目会显示恢复操作。"
             }
             "update_required" | "Agent update required" => "Agent 需要更新",
+            "Stop and pause" => "停止并暂停",
             "Recover Agent after update" => "更新后恢复 Agent",
             herdr_feishu_bridge::UPDATE_RESUME_NOTICE => {
                 "后台服务的 Agent 协议已变更。点击“更新后恢复 Agent”，仅重启此 Agent 并恢复已保存的原生会话。排队消息和结果不确定的操作将保留。"
@@ -615,6 +618,11 @@ impl Language {
             "No projects yet" => "还没有项目",
             "Add a project, choose an agent, and start your main session." => {
                 "添加项目，选择 Agent，然后启动主会话。"
+            }
+            "Manager prompt debug" => "调试 Manager 提示词",
+            "Debug setting saved" => "调试设置已保存",
+            "When enabled, the full manager prompt is visible to participants in its Feishu discussion." => {
+                "开启后，飞书讨论的参与者可看到完整的 Manager 提示词。"
             }
             "Delivery paused" => "已暂停接收",
             "Exited" => "已退出",
