@@ -918,6 +918,7 @@ async fn outbox(
                     event,
                     &binding.app_id,
                     &to,
+                    input.to.is_some(),
                     &mut attachment,
                 )?;
             }

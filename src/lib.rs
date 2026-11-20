@@ -700,7 +700,7 @@ impl App {
                 feishu::recipient_type(to)?;
                 let mut attachment = json!({"to":to,"discussion_intent":"decision"});
                 if let Some((event, _)) = &affected {
-                    if let Err(error) = discussion::origin(&tx,&id,event,&binding.app_id,to,&mut attachment) {
+                    if let Err(error) = discussion::origin(&tx,&id,event,&binding.app_id,to,false,&mut attachment) {
                         tracing::warn!(%error, "Could not route work attention to its discussion");
                         tx.commit()?;
                         return Ok(());

@@ -889,7 +889,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
         if (anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)))
             && let Some(event)=select_origin(&tx,&context,source.as_deref())?
         {
-            crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,&mut attachment)?;
+            crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,true,&mut attachment)?;
         }
         if !attachment["reply_to_message_id"].is_string() {
             ensure!(matches!(intent, Some(MessageIntent::Result | MessageIntent::Decision)) && attachment["discussion_scope"].is_string(),
@@ -1950,7 +1950,7 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
         let message = failure_notice(error, delay, true, chinese) + action;
         let mut attachment = json!({"to":to,"discussion_intent":"decision","manager_notice":true,
             "manager_incident":incident,"manager_revision":ctx.revision});
-        if let Err(error) = crate::discussion::origin(&tx, &ctx.project, &origin, &binding.app_id, to, &mut attachment) {
+        if let Err(error) = crate::discussion::origin(&tx, &ctx.project, &origin, &binding.app_id, to, false, &mut attachment) {
             tracing::warn!(%error, "Could not route management decision to its discussion");
             continue;
         }

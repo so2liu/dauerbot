@@ -9,6 +9,7 @@ pub(crate) fn origin(
     event: &str,
     app_id: &str,
     to: &str,
+    explicit_destination: bool,
     attachment: &mut Value,
 ) -> Result<()> {
     let event = crate::work::event(c, project, event)?;
@@ -58,11 +59,19 @@ pub(crate) fn origin(
 
         let source = &input["source"];
         let requester = source["sender"]["open_id"].as_str();
-        ensure!(
-            source["chat_id"].as_str() == Some(to)
-                || (source["chat_type"] == "p2p" && requester == Some(to)),
-            "The source discussion belongs to another recipient"
-        );
+        let same_recipient = source["chat_id"].as_str() == Some(to)
+            || (source["chat_type"] == "p2p" && requester == Some(to));
+        if !same_recipient {
+            // A requested result can start its own discussion in an explicit
+            // destination. The source topic's anchor only belongs to its chat.
+            ensure!(
+                explicit_destination
+                    && attachment["discussion_intent"] == "result"
+                    && attachment["reply_to_message_id"].is_null(),
+                "The source discussion belongs to another recipient"
+            );
+            return Ok(());
+        }
         if attachment["discussion_intent"] == "progress" {
             let supplied = attachment["reply_to_message_id"].as_str();
             ensure!(
@@ -330,6 +339,7 @@ mod tests {
                     &event.id,
                     "cli_fixture",
                     "oc_fixture",
+                    true,
                     &mut attachment,
                 );
                 if purpose == "internal" {
@@ -414,9 +424,34 @@ mod tests {
                     &event,
                     "cli_fixture",
                     "oc_fixture",
+                    true,
                     &mut attachment,
                 )?;
                 assert_eq!(attachment["reply_to_message_id"], "om_request");
+                for (intent, explicit, anchor, allowed) in [
+                    ("result", true, None, true),
+                    ("result", false, None, false),
+                    ("result", true, Some("om_request"), false),
+                    ("decision", true, None, false),
+                    ("progress", true, None, false),
+                ] {
+                    let mut outbound =
+                        json!({"discussion_intent":intent,"reply_to_message_id":anchor});
+                    let scoped = origin(
+                        c,
+                        &p.id,
+                        &event,
+                        "cli_fixture",
+                        "ou_requester",
+                        explicit,
+                        &mut outbound,
+                    );
+                    assert_eq!(scoped.is_ok(), allowed, "{intent} {explicit} {anchor:?}");
+                    if allowed {
+                        assert_eq!(outbound["discussion_scope"], event);
+                        assert!(outbound["reply_to_message_id"].is_null());
+                    }
+                }
                 Ok((attachment, event))
             })
             .unwrap();
