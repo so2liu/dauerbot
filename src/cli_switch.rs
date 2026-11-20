@@ -287,7 +287,8 @@ pub(crate) fn stopped_mode(
     let managed = cancel_intake && crate::manager::installed(&tx)?;
     if managed {
         crate::manager::stop(&tx, project)?;
-    } else if cancel_intake {
+    }
+    if cancel_intake {
         tx.execute("UPDATE feishu_group_intake SET status='cancelled' WHERE project_id=? AND status='pending'",[project])?;
     }
     work::finish_execution(

@@ -210,7 +210,9 @@ def run_checks(h):
     assert "om_manager_write" in json.dumps(MODEL.requests[0]), "manager context omitted the trusted source message ID required for a topic reply"
     advertised = {t["function"]["name"] for t in MODEL.requests[0]["tools"]}
     assert advertised == {"read_file", "write_file", "delegate", "worker_status", "steer_worker", "send_md", "send_file", "close_agent", "cli_send_keys", "cli_view"}, advertised
-    assert len([m for m in fixture.FIXTURE.messages if m.get("fixture_reply_to") == "om_manager_write"]) == 2
+    related = [m for m in fixture.FIXTURE.messages if m.get("fixture_reply_to") == "om_manager_write"]
+    assert sum("Your message is saved" in m["content"] for m in related) == 1
+    assert len(related) == 3
     h.checks.append("scripted model → bounded file write/read → one topic result and its attachment; no default acknowledgement or raw native delivery")
 
     context = h.api(route + "/manager/context")
