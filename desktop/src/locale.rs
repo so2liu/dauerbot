@@ -221,6 +221,7 @@ impl Language {
                 "后台服务已更新。兼容的 Agent 会继续运行；其他项目会显示恢复操作。"
             }
             "update_required" | "Agent update required" => "Agent 需要更新",
+            "Stop and pause" => "停止并暂停",
             "Recover Agent after update" => "更新后恢复 Agent",
             herdr_feishu_bridge::UPDATE_RESUME_NOTICE => {
                 "后台服务的 Agent 协议已变更。点击“更新后恢复 Agent”，仅重启此 Agent 并恢复已保存的原生会话。排队消息和结果不确定的操作将保留。"

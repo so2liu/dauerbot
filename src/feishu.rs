@@ -715,7 +715,7 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
             ));
         }
         let model_command = attachment["source"]["message_type"] == "text"
-            && crate::model_control::is_command(&text);
+            && crate::model_control::is_command(crate::cli_control::command_text(&text, &attachment["source"]));
         if model_command {
             attachment["daemon_control"] = json!("model");
         }

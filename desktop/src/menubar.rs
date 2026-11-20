@@ -1,6 +1,6 @@
 //! Native menu-bar entry and a GPUI project popover. The daemon outlives all windows.
 use super::{Desktop, Quit, project_status};
-use crate::{action_icons::ActionIcon, agent_tree, control_label, manager_settings};
+use crate::{action_icons::ActionIcon, agent_tree, control_label};
 use anyhow::{Context as _, Result};
 use gpui::{prelude::*, *};
 use gpui_component::{Root, Sizable, button::*, tooltip::Tooltip};
@@ -243,7 +243,7 @@ fn constrained_popover(panel: [f64; 2], anchor: [f64; 2], visible: [f64; 4]) -> 
 }
 
 fn menu_project_status(project: &Value) -> &str {
-    manager_settings::status(project)
+    super::combined_project_status(project)
 }
 
 fn show_status_label(status: &str) -> bool {
@@ -255,6 +255,10 @@ fn show_status_label(status: &str) -> bool {
             | "unavailable"
             | "update_required"
             | "switching_cli"
+            | "recovering_cli"
+            | "paused"
+            | "blocked"
+            | "exited"
     )
 }
 

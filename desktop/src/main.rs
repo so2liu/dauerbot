@@ -1192,7 +1192,8 @@ impl Desktop {
                     .child(self.btn("release-reservation", "Release reservation", move |this, _, _| { let _ = this.backend.tx.send(CommandRequest::Takeover { project:project.clone(),generation:generation.clone(),active:false }); }, cx));
             }
             if project["lifecycle"] == "update_required" {
-                body = body.child(self.card("Update pending", "This project is waiting for a compatible update. Its conversation and saved messages are preserved."));
+                body = body.child(self.card("Update pending", "This project is waiting for a compatible update. Its conversation and saved messages are preserved."))
+                    .child(self.project_recovery_actions(project, cx));
             }
             let debug_project = id.clone();
             let debug_mode = project["debug_mode"] == true;
@@ -1571,6 +1572,25 @@ impl Desktop {
                 cx.notify();
             }))
     }
+    fn project_recovery_actions(&self, project: &Value, cx: &mut Context<Self>) -> Div {
+        let update = project["lifecycle"] == "update_required";
+        let transition = &project["cli_transition"];
+        let locked = transition["holds_input"] == true || transition["phase"] == "recovery_exhausted";
+        let id = project["id"].as_str().unwrap_or_default().to_owned();
+        let mut actions = div().flex().gap_2().items_center();
+        if update {
+            let path = format!("/projects/{id}/recover-after-update");
+            actions = actions.child(self.btn("recover-after-update", "Recover Agent after update", move |this, _, _| {
+                this.api("POST", path.clone(), None, "Agent recovered");
+            }, cx));
+        } else if locked {
+            let path = format!("/projects/{id}/stop");
+            actions = actions.child(self.btn("stop-cli-transition", "Stop and pause", move |this, _, _| {
+                this.api("POST", path.clone(), None, "Project paused");
+            }, cx));
+        }
+        actions
+    }
     fn workspace(&self, sidebar_hidden: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette();
         let top_actions = div()
@@ -1621,7 +1641,7 @@ impl Desktop {
             picker.select(project, self.setup.language, cx);
             picker.trigger(cx)
         });
-        let status = manager_settings::status(project);
+        let status = combined_project_status(project);
         let timers = visible_timers(&self.timers);
         let content = div().flex().flex_col().gap_4()
             .when(self.state["manager_provider"]["configured"] == false, |view| {
@@ -1692,6 +1712,11 @@ impl Desktop {
                         .child(self.project_tools.clone())
                         .child(self.model_picker.clone()),
                 ),
+        );
+        let content = content.when(
+            project["lifecycle"] == "update_required" || project["cli_transition"]["holds_input"] == true
+                || project["cli_transition"]["phase"] == "recovery_exhausted",
+            |content| content.child(self.project_recovery_actions(project, cx)),
         );
         let mut schedules = div()
             .rounded_xl()
@@ -2153,7 +2178,7 @@ impl Render for Desktop {
             }
             let keyboard_id = id.clone();
             let selected = id == self.selected && page == 6;
-            let status = manager_settings::status(project);
+            let status = combined_project_status(project);
             let tree = agent_tree::Tree::from_project(project);
             let fold_scope = format!(
                 "{}:{}:{}",
@@ -2862,6 +2887,20 @@ fn project_status(project: &Value) -> &str {
             }
         })
     }
+}
+fn combined_project_status(project: &Value) -> &str {
+    let worker = project_status(project);
+    let manager = manager_settings::status(project);
+    if matches!(worker, "paused" | "taken_over" | "error" | "offline" | "needs_attention" | "update_required" | "exited" | "blocked") {
+        return worker;
+    }
+    if matches!(manager, "unavailable" | "error" | "blocked") {
+        return manager;
+    }
+    if matches!(worker, "recovering_cli" | "switching_cli" | "starting" | "working" | "busy" | "running") {
+        return worker;
+    }
+    manager
 }
 fn records(value: &Value, field: &str) -> Vec<Value> {
     value

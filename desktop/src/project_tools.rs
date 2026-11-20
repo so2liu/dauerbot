@@ -265,7 +265,7 @@ fn recovery_control(project: &Value, busy: bool) -> Option<(&'static str, bool)>
     );
     let label = match phase {
         "failed" | "startup_failed" | "uncertain" | "repairing" => "Repair Agent",
-        "recovery_pending" | "recovery_stopping" | "recovery_starting" => "Retry recovery",
+        "recovery_pending" | "recovery_stopping" | "recovery_starting" | "recovery_exhausted" => "Retry recovery",
         "requested" | "preparing" if owner => "Repair Agent",
         _ if unavailable => "Repair Agent",
         _ => return None,
@@ -402,7 +402,7 @@ impl Render for ProjectTools {
             {
                 "Selected CLI is ready."
             }
-            Some("failed" | "startup_failed" | "uncertain") => transition["error"]
+            Some("failed" | "startup_failed" | "uncertain" | "recovery_exhausted") => transition["error"]
                 .as_str()
                 .unwrap_or("CLI handoff did not finish."),
             _ => "",

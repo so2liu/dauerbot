@@ -65,9 +65,9 @@ pub fn status_dot(
     palette: crate::ui_theme::Palette,
 ) -> Stateful<Div> {
     let color = match status {
-        "busy" | "running" | "working" => palette.accent,
-        "error" | "offline" | "needs_attention" | "failed" | "unavailable" => palette.error,
-        "blocked" | "paused" | "taken_over" | "pending" | "held" => palette.warning,
+        "busy" | "running" | "working" | "switching_cli" | "starting" => palette.accent,
+        "error" | "offline" | "needs_attention" | "failed" | "unavailable" | "exited" => palette.error,
+        "blocked" | "paused" | "taken_over" | "pending" | "held" | "recovering_cli" | "update_required" => palette.warning,
         "done" | "ready" | "completed" => palette.success,
         "aborted" => palette.muted,
         _ => palette.muted,
