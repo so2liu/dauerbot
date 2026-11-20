@@ -319,7 +319,7 @@ fn intent(
     let transition = if steer {
         None
     } else {
-        crate::cli_switch::latest(c, &p.id)?.filter(|r| r.holds_input)
+        crate::cli_switch::latest(c, &p.id)?.filter(crate::cli_switch::blocks_worker)
     };
     let payload = json!({"instructions":instructions,"origin_event_id":origin,"manager_effect_id":id,"steer":steer,"expected_agent":transition.as_ref().map(|r|r.target.as_str()).unwrap_or(&p.agent),"expected_native":if transition.is_some(){""}else{&p.native_session},"target_generation":if transition.is_none()&&p.terminal.is_some(){Some(&p.generation)}else{None},"transition_id":transition.as_ref().map(|r|&r.id)});
     c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)",params![task,p.id,"Management delegation",instructions,db::now(),db::now()])?;
@@ -838,7 +838,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
       let origin=select_origin(&tx,&context,a.source_event_id.as_deref())?;
       if let Some(target) = &a.target_cli { crate::cli_switch::request(&tx,&p,target)?; }
-      let held=crate::cli_switch::holds_input(&tx,&p.id)?;
+      let held=crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
       // An explicit target participates in the ordinary cooperative handoff.
       // Its instructions remain held for that successor, never sent to the old CLI.
       let steer_current = steer && !(a.target_cli.is_some() && held);
@@ -849,7 +849,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
    },
-   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let project=p.id.clone();let runs=app.db.call(move|c|{Ok(c.prepare("SELECT e.id,e.status,r.status FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?.query_map([project],|r|Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":r.get::<_,String>(1)?,"run_status":r.get::<_,Option<String>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let transition_project=p.id.clone();let transition=app.db.call(move|c|crate::cli_switch::latest(c,&transition_project)).await?;let authority=ctx.clone();app.db.call(move|c|valid(c,&authority)).await?;Ok(json!({"agent":p.agent,"generation":p.generation,"native_session":p.native_session,"ready":p.ready,"paused":p.paused,"delegations":runs,"obsolete_executions":obsolete,"cli_transition":transition,"input_effect_journal":journal}))},
+   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();let mut snapshot=app.db.call(move|c|{let current=valid(c,&authority)?;worker_snapshot(c,&current.id,&current.generation)}).await?;snapshot["agent"]=json!(p.agent);snapshot["generation"]=json!(p.generation);snapshot["native_session"]=json!(p.native_session);snapshot["ready"]=json!(p.ready);snapshot["paused"]=json!(p.paused);snapshot["mcp_registered"]=json!(p.execution["mcp_registered"]==true);snapshot["obsolete_executions"]=json!(obsolete);snapshot["input_effect_journal"]=journal;Ok(snapshot)},
    "cli_send_keys"=>{drop(guard);let args:crate::manager_terminal::SendArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::send(app,ctx,args).await},
    "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args).await},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
@@ -934,6 +934,48 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
         .await?;
     app.notify.notify_one();
     Ok(value)
+}
+fn worker_snapshot(c: &Connection, project: &str, generation: &str) -> Result<Value> {
+    let transition = crate::cli_switch::latest(c, project)?;
+    let delegations = c.prepare("SELECT e.id,e.status,r.status,e.error,json_extract(e.payload,'$.transition_id'),json_extract(e.payload,'$.expected_agent') FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?
+        .query_map([project],|r| {
+            let status: String = r.get(1)?;
+            let held = status == "queued" && transition.as_ref().is_some_and(|request| request.holds_input || request.phase == "recovery_exhausted");
+            Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":status,"held":held,"run_status":r.get::<_,Option<String>>(2)?,"error":r.get::<_,String>(3)?,"transition_id":r.get::<_,Option<String>>(4)?,"expected_agent":r.get::<_,Option<String>>(5)?}))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let work = work::snapshot(c, project)?;
+    Ok(json!({
+        "delegations":delegations,
+        "cli_transition":transition,
+        "last_failure":transition.as_ref().and_then(|r|r.source["last_failure"].as_str()),
+        "work_attention":work.attention,
+        "takeover":work::has_takeover(c,project,generation)?,
+    }))
+}
+
+pub(crate) fn observe_cli_transition(
+    c: &Connection,
+    project: &str,
+    id: &str,
+    state: &str,
+    error: &str,
+) -> Result<()> {
+    if installed(c)? {
+        observation(
+            c,
+            project,
+            "cli_transition",
+            id,
+            state,
+            None,
+            &json!({"kind":"cli_transition","request_id":id,"phase":state,"error":error}),
+        )?;
+        c.execute(
+            "UPDATE manager_config SET next_attempt_at=0 WHERE project_id=? AND error=''",
+            [project],
+        )?;
+    }
+    worker_changed(c, project)
 }
 pub fn worker_changed(c: &Connection, project: &str) -> Result<()> {
     if !installed(c)? {
@@ -1947,18 +1989,13 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
         "UPDATE manager_config SET error='',next_attempt_at=0 WHERE project_id=?",
         [project],
     )?;
-    c.execute("UPDATE work_events SET status='cancelled' WHERE id IN(SELECT origin_event_id FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing')) AND status='managed'",[project])?;
-    c.execute("UPDATE work_events SET status='cancelled',error='Stopped by the user' WHERE project_id=? AND source='management' AND status='queued'",[project])?;
+    c.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE status='submitting' AND run_id IN (SELECT id FROM manager_runs WHERE project_id=? AND status='working')", params![json!({"status":"uncertain","message":"Stopped during submission; inspect original effect evidence before retrying."}).to_string(),project])?;
     c.execute(
         "UPDATE manager_config SET input_revision=input_revision+1 WHERE project_id=?",
         [project],
     )?;
     c.execute(
         "UPDATE manager_runs SET status='stopped' WHERE project_id=? AND status='working'",
-        [project],
-    )?;
-    c.execute(
-        "UPDATE manager_inputs SET status='cancelled' WHERE project_id=? AND status IN ('queued','processing')",
         [project],
     )?;
     Ok(())
@@ -2862,9 +2899,10 @@ mod tests {
                 assert_eq!(
                     c.query_row("SELECT status FROM manager_inputs", [], |r| r
                         .get::<_, String>(0))?,
-                    "cancelled"
+                    "processing"
                 );
-                assert!(claim(c, &p.id)?.is_none());
+                assert!(valid(c, &first.context).is_err());
+                assert_ne!(claim(c, &p.id)?.unwrap().context.run, first.context.run);
                 Ok(())
             })
             .unwrap();
@@ -2963,7 +3001,7 @@ mod tests {
                 );
                 assert_eq!(
                     c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='cancelled'",
+                        "SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",
                         [],
                         |r| r.get::<_, i64>(0)
                     )?,
@@ -3507,19 +3545,17 @@ mod tests {
         }).unwrap();
     }
     #[tokio::test]
-    async fn stop_materializes_input_without_resurrection() {
+    async fn stop_preserves_queued_inputs_without_dispatch_while_paused() {
         let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_before_stop", "must not resurrect");
+        ingest(&app, &p, "om_before_stop", "preserve until resumed");
         app.db
             .sync(|c| {
-                let tx = c.unchecked_transaction()?;
-                stop(&tx, &p.id)?;
-                tx.commit()?;
+                crate::cli_switch::stopped(c, &p.id, &p.generation)?;
                 work::sync_inbound(c)?;
                 assert_eq!(
                     c.query_row("SELECT status FROM manager_inputs", [], |r| r
                         .get::<_, String>(0))?,
-                    "cancelled"
+                    "queued"
                 );
                 assert!(claim(c, &p.id)?.is_none());
                 Ok(())

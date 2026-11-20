@@ -568,7 +568,10 @@ fn claim(
     steering_only: bool,
 ) -> Result<Option<Run>> {
     transaction(c, |c| {
-        if has_takeover(c, project, generation)? || crate::cli_switch::holds_input(c, project)? {
+        if has_takeover(c, project, generation)?
+            || crate::cli_switch::latest(c, project)?
+                .as_ref().is_some_and(crate::cli_switch::blocks_worker)
+        {
             return Ok(None);
         }
         // Resource preparation runs independently of project reconciliation.
@@ -624,10 +627,10 @@ pub fn delivery(c: &Connection, run_id: &str, status: &str, error: &str, now: i6
         "Invalid delivery state"
     );
     transaction(c, |c| {
-        let (event, task, current): (String, String, String) = c.query_row(
-            "SELECT event_id,task_id,status FROM work_runs WHERE id=?",
+        let (event, task, current, project): (String, String, String, String) = c.query_row(
+            "SELECT event_id,task_id,status,project_id FROM work_runs WHERE id=?",
             [run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         // A fast MCP receipt or finish can arrive before the send call returns.
         if !["submitting", "submitted", "uncertain"].contains(&current.as_str()) {
@@ -659,6 +662,9 @@ pub fn delivery(c: &Connection, run_id: &str, status: &str, error: &str, now: i6
                 task
             ],
         )?;
+        if matches!(status, "failed" | "uncertain") {
+            crate::manager::worker_changed(c, &project)?;
+        }
         Ok(())
     })
 }
@@ -1243,6 +1249,7 @@ pub fn finish_execution(
         )?;
         c.execute("UPDATE work_tasks SET status='uncertain',updated_at=? WHERE id IN(
           SELECT task_id FROM work_runs WHERE project_id=? AND generation=? AND status='uncertain')",params![now,project,generation])?;
+        crate::manager::worker_changed(c, project)?;
         Ok(())
     })
 }
