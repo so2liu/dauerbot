@@ -1226,6 +1226,45 @@ mod tests {
     }
 
     #[test]
+    fn autonomy_migration_preserves_activation_fingerprints_and_schema_version() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("bridge.sqlite3");
+        let config = Config::default();
+        let db = Db::open(&path)?;
+        db.sync(|c| {
+            c.execute_batch(
+                "DROP TABLE proposals;
+                 DROP TABLE autonomy_settings;
+                 INSERT INTO projects(id,name,path,agent,created_at,mcp_token)
+                 VALUES('fixture','Fixture','/tmp/fixture','codex',0,'synthetic-fixture');",
+            )?;
+            Ok(())
+        })?;
+        drop(db);
+        let before = fingerprint(&path, &config)?;
+        let ordered_before = fingerprint_with_order(&path, &config, true)?;
+        for _ in 0..2 {
+            let reopened = Db::open_handover(&path)?;
+            reopened.sync(|c| {
+                let version = c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
+                let tables = c.query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='table'
+                     AND name IN ('proposals','autonomy_settings')",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?;
+                assert_eq!(version, 7);
+                assert_eq!(tables, 2);
+                Ok(())
+            })?;
+            assert_eq!(fingerprint(&path, &config)?, before);
+            assert_eq!(fingerprint_with_order(&path, &config, true)?, ordered_before);
+        }
+        assert_eq!(api::PROTOCOL, 7);
+        Ok(())
+    }
+
+    #[test]
     fn insertion_order_compatibility_requires_the_actual_060_parent() {
         let mut owner = Owner {
             activation_id: "previous-activation".into(),

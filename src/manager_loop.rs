@@ -261,6 +261,81 @@ fn definitions() -> Vec<ToolDefinition> {
     ];
     TOOLS.into_iter().zip(schemas).map(|(name,(description,properties,required))|ToolDefinition::new(name.try_into().expect("static tool name"),description,json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}))).collect()
 }
+/// One proposal-only model turn. No code or generic tool dispatcher is reachable.
+pub(crate) async fn propose(
+    config: &ProviderConfig,
+    system: &str,
+    context: &Value,
+    shutdown: CancellationToken,
+) -> Result<Value> {
+    config.validate()?;
+    let request = CompletionRequest::new(context.to_string())
+        .preamble(system)
+        .tools(vec![proposal_definition()]);
+    let client = OpenAIConfig::new(config.api_key.clone())
+        .with_base_url(&config.base_url)
+        .client();
+    let model = client.chat(&config.model);
+    let response = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => bail!("Proposal generation cancelled"),
+        response = tokio::time::timeout(Duration::from_secs(120), model.call(request)) =>
+            response.map_err(|_| Failure::timeout())?.map_err(Failure::provider)?,
+    };
+    ensure!(
+        response.finish_reason() != Some(FinishReason::Length),
+        "Incomplete proposal response"
+    );
+    proposal_arguments(response.choice.iter())
+}
+
+fn proposal_definition() -> ToolDefinition {
+    let fields = [
+        "title",
+        "why_now",
+        "scope",
+        "not_doing",
+        "acceptance",
+        "risk",
+        "effort",
+        "category",
+    ];
+    let properties = fields
+        .iter()
+        .map(|field| ((*field).to_owned(), json!({"type":"string"})))
+        .collect::<serde_json::Map<_, _>>();
+    ToolDefinition::new(
+        "propose_changes".try_into().expect("static tool name"),
+        "Submit up to three structured project proposals for owner review.",
+        json!({
+            "type":"object","additionalProperties":false,"required":["proposals"],
+            "properties":{"proposals":{"type":"array","maxItems":3,"items":{
+                "type":"object","additionalProperties":false,"required":fields,"properties":properties
+            }}}
+        }),
+    )
+}
+
+fn proposal_arguments<'a>(parts: impl IntoIterator<Item = &'a AssistantContent>) -> Result<Value> {
+    let mut calls = parts.into_iter().filter_map(|part| match part {
+        AssistantContent::ToolCall(call) => Some(call),
+        _ => None,
+    });
+    let call = calls.next().ok_or_else(Failure::invalid_response)?;
+    ensure!(
+        calls.next().is_none()
+            && call.function.name.as_str() == "propose_changes"
+            && call.function.invalid_arguments.is_none(),
+        "Proposal generation allows only one propose_changes call"
+    );
+    let args = Value::Object(call.function.arguments.clone());
+    ensure!(
+        serde_json::to_vec(&args)?.len() <= 32_768,
+        "Proposal response exceeds the request bound"
+    );
+    Ok(args)
+}
+
 /// Existing persisted context, without claiming hydration or historical wire identity.
 pub(crate) fn normalized_context(checkpoint: Value) -> Option<CompletionRequest> {
     let state = decode(checkpoint).ok()?;
@@ -583,11 +658,19 @@ mod tests {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
         hold: bool,
+        tools: &'static [&'static str],
         bodies: Arc<std::sync::Mutex<Vec<Value>>>,
     }
     async fn fixture(
         script: Vec<Value>,
         hold: bool,
+    ) -> (ProviderConfig, Fixture, tokio::task::JoinHandle<()>) {
+        fixture_with_tools(script, hold, &TOOLS).await
+    }
+    async fn fixture_with_tools(
+        script: Vec<Value>,
+        hold: bool,
+        tools: &'static [&'static str],
     ) -> (ProviderConfig, Fixture, tokio::task::JoinHandle<()>) {
         let fixture = Fixture {
             requests: Arc::new(AtomicUsize::new(0)),
@@ -596,6 +679,7 @@ mod tests {
             started: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
             hold,
+            tools,
             bodies: Arc::new(std::sync::Mutex::new(vec![])),
         };
         async fn handler(
@@ -614,7 +698,7 @@ mod tests {
                 .iter()
                 .map(|v| v["function"]["name"].as_str().unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(names, TOOLS);
+            assert_eq!(names, f.tools);
             assert!(!body.to_string().contains("private-fixture-secret"));
             if body["messages"].as_array().unwrap().iter().any(|message| {
                 message["role"] == "system"
@@ -952,6 +1036,45 @@ mod tests {
         server.abort();
         let _ = server.await;
     }
+    #[tokio::test]
+    async fn proposal_turn_exposes_only_the_structured_tool_and_rejects_sibling_effects() {
+        let proposal = json!({"id":"proposal","type":"function","function":{
+            "name":"propose_changes","arguments":"{\"proposals\":[]}"
+        }});
+        let forbidden = json!({"id":"write","type":"function","function":{
+            "name":"write_file","arguments":"{\"path\":\"changed.txt\",\"content\":\"unexpected\"}"
+        }});
+        let (config, recorder, server) = fixture_with_tools(
+            vec![
+                answer(Value::Null, json!([proposal.clone()])),
+                answer(Value::Null, json!([proposal, forbidden])),
+                answer(json!("unstructured prose"), Value::Null),
+            ],
+            false,
+            &["propose_changes"],
+        )
+        .await;
+        let evidence = json!({"recent_input":[]});
+        let run = || {
+            propose(
+                &config,
+                "proposal system",
+                &evidence,
+                CancellationToken::new(),
+            )
+        };
+        assert_eq!(run().await.unwrap(), json!({"proposals":[]}));
+        assert!(run().await.is_err());
+        assert!(run().await.is_err());
+        for request in recorder.bodies.lock().unwrap().iter() {
+            let tools = request["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0]["function"]["name"], "propose_changes");
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn model_cannot_expand_registry_or_resume_unsupported_checkpoint() {
         let call = json!([{"id":"evil","type":"function","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]);

@@ -1,6 +1,8 @@
 pub mod adapter;
 mod agent_tree;
 pub mod api;
+pub(crate) mod autonomy;
+mod autonomy_feishu;
 pub mod bot;
 pub mod child_thread_gc;
 mod child_threads;
@@ -551,8 +553,23 @@ impl App {
         let message = m.clone();
         let admitted=self.db.call(move|c|{
             let tx=c.unchecked_transaction()?;
-            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment).and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment)) {
-                tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;tx.commit()?;return Ok(false);
+            if message.attachment.get("autonomy_publication_revision").is_some()
+                && autonomy::dismiss_expired_publication(&tx,&message.project_id,&message.id,db::now())?
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let publication=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment)
+                .and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment))
+                .and_then(|_|autonomy_feishu::validate_publication(&tx,&message.project_id,&message.attachment));
+            match publication {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;
+                    tx.commit()?;
+                    return Ok(false);
+                }
             }
             let changed=tx.execute(
                 "UPDATE messages SET status='sending',error='',updated_at=?,
@@ -572,9 +589,16 @@ impl App {
                     .as_str()
                     .map(str::to_owned);
                 self.db.call(move|c|{
-                    c.execute("UPDATE messages SET status='sent',error='',attachment=json_set(attachment,
+                    let tx = c.unchecked_transaction()?;
+                    tx.execute("UPDATE messages SET status='sent',error='',attachment=json_set(attachment,
                       '$.sent_message_id',?,'$.sent_chat_id',?,'$.sent_thread_id',?,'$.sent_root_id',?,'$.resolved_reply_to_message_id',?),updated_at=? WHERE id=?",
                       rusqlite::params![receipt.message_id,receipt.chat_id,receipt.thread_id,receipt.root_id,anchor,db::now(),id])?;
+                    tx.execute(
+                        "UPDATE proposals SET source_message_id=? WHERE outbox_id=? AND source_message_id IS NULL
+                         AND EXISTS(SELECT 1 FROM autonomy_settings s WHERE s.project_id=proposals.project_id AND s.chat_id=?)",
+                        rusqlite::params![receipt.message_id,id,receipt.chat_id],
+                    )?;
+                    tx.commit()?;
                     Ok(())
                 }).await?;
             }
@@ -1507,6 +1531,144 @@ fn xml(text: &str) -> String {
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+    #[tokio::test]
+    async fn autonomy_card_delivery_waits_for_project_controls_without_blocking_the_outbox()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = App::new(
+            dir.path().join("store"),
+            Config {
+                feishu_base: "http://127.0.0.1:1".into(),
+                ..Config::default()
+            },
+        )?;
+        let (proposal, ordinary) = app.db.sync(|c| {
+            c.execute_batch("INSERT INTO projects(id,name,path,agent,created_at,mcp_token,generation)
+                  VALUES('project','Fixture','/isolated','codex',0,'local-fixture','generation');
+                INSERT INTO autonomy_settings(project_id,enabled,owner_open_id,app_id,chat_id)
+                  VALUES('project',1,'ou_owner','cli_fixture','oc_fixture');")?;
+            crate::bot::save(c, "project", "cli_fixture", "local-fixture", false)?;
+            let proposal = db::enqueue_out_request(
+                c, "project", "cli_fixture", "proposal", "Pending proposal",
+                json!({"to":"oc_fixture","discussion_intent":"decision","discussion_scope":"proposal",
+                    "autonomy_publication_revision":0}),
+            )?;
+            c.execute(
+                "INSERT INTO proposals(id,project_id,number,title,why_now,scope,not_doing,acceptance,risk,effort,category,dedupe_hash,status,created_at,outbox_id)
+                 VALUES('live-proposal','project',1,'Fixture','Reason','Scope','No other changes',
+                        'Verify','Low','Small','documentation','fixture','pending',?,?)",
+                rusqlite::params![db::now(), proposal],
+            )?;
+            let ordinary = db::enqueue_out_request(
+                c, "project", "cli_fixture", "ordinary", "Pending ordinary message",
+                json!({"to":"oc_fixture","discussion_intent":"result","discussion_scope":"ordinary"}),
+            )?;
+            Ok((proposal, ordinary))
+        })?;
+
+        let held_and_released = [
+            ("UPDATE projects SET paused=1", "UPDATE projects SET paused=0"),
+            ("INSERT INTO work_leases(project_id,generation,active,updated_at)
+                 VALUES('project','generation',1,0)", "DELETE FROM work_leases"),
+            ("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input)
+                 VALUES('switch','project','agy','preparing','generation',0,1)",
+             "DELETE FROM cli_switch_requests"),
+        ];
+        for (hold, release) in held_and_released {
+            app.db.sync(|c| Ok(c.execute_batch(hold)?))?;
+            let candidates = app.db.pending("out").await?;
+            assert_eq!(
+                candidates.iter().map(|m| &m.id).collect::<Vec<_>>(),
+                [&ordinary]
+            );
+            app.send_out(&proposal).await?;
+            assert_eq!(app.db.message(&proposal).await?.status, "pending");
+            app.db.sync(|c| Ok(c.execute_batch(release)?))?;
+            assert!(
+                app.db
+                    .pending("out")
+                    .await?
+                    .iter()
+                    .any(|m| m.id == proposal)
+            );
+        }
+        app.stop("project").await?;
+        app.send_out(&proposal).await?;
+        assert_eq!(app.db.message(&proposal).await?.status, "pending");
+        assert!(
+            !app.db
+                .pending("out")
+                .await?
+                .iter()
+                .any(|m| m.id == proposal)
+        );
+        app.db.pause("project", false).await?;
+        let attachment = app.db.message(&proposal).await?.attachment;
+        assert!(app.db.sync(|c| autonomy_feishu::validate_publication(
+            c,
+            "project",
+            &attachment
+        ))?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn autonomy_send_admission_dismisses_only_the_expired_pending_card() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = App::new(
+            dir.path().join("store"),
+            Config {
+                feishu_base: "http://127.0.0.1:1".into(),
+                ..Config::default()
+            },
+        )?;
+        app.db.sync(|c| {
+            c.execute_batch("INSERT INTO projects(id,name,path,agent,created_at,mcp_token,paused)
+                  VALUES('project','Fixture','/isolated','codex',0,'local-fixture',1);
+                INSERT INTO autonomy_settings(project_id,enabled,owner_open_id,app_id,chat_id)
+                  VALUES('project',1,'ou_owner','cli_fixture','oc_fixture');")?;
+            crate::bot::save(c, "project", "cli_fixture", "local-fixture", false)?;
+            for (id, status, at) in [
+                ("expired-card", "pending", db::now() - 8 * 86_400_000),
+                ("fresh-card", "pending", db::now()),
+                ("sent-card", "sent", db::now() - 8 * 86_400_000),
+                ("uncertain-card", "uncertain", db::now() - 8 * 86_400_000),
+            ] {
+                let attachment = json!({"to":"oc_fixture","bot_app_id":"cli_fixture",
+                    "discussion_intent":"decision","discussion_scope":id,
+                    "autonomy_publication_revision":0});
+                c.execute(
+                    "INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
+                     VALUES(?1,'project','out',?1,'Fixture',?2,?3,?4,?4)",
+                    rusqlite::params![id, status, attachment.to_string(), at],
+                )?;
+                c.execute(
+                    "INSERT INTO proposals(id,project_id,number,title,why_now,scope,not_doing,acceptance,risk,effort,category,dedupe_hash,status,created_at,outbox_id)
+                     VALUES(?1,'project',1,'Fixture','Reason','Scope','No other changes',
+                            'Verify','Low','Small','documentation',?1,'pending',?2,?1)",
+                    rusqlite::params![id, at],
+                )?;
+            }
+            Ok(())
+        })?;
+        app.db.pause("project", false).await?;
+        for id in ["expired-card", "sent-card", "uncertain-card"] {
+            app.send_out(id).await?;
+        }
+        assert_eq!(app.db.message("expired-card").await?.status, "dismissed");
+        assert_eq!(app.db.message("fresh-card").await?.status, "pending");
+        assert_eq!(app.db.message("sent-card").await?.status, "sent");
+        assert_eq!(app.db.message("uncertain-card").await?.status, "uncertain");
+        app.db.sync(|c| {
+            let states = c
+                .prepare("SELECT status FROM proposals ORDER BY id")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(states, ["expired", "pending", "pending", "pending"]);
+            Ok(())
+        })
+    }
+
     #[tokio::test]
     async fn resumed_fork_cannot_overwrite_project_or_execution_journal_before_repair() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
