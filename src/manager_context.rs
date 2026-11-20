@@ -277,7 +277,7 @@ fn redact_text(text: &str) -> (String, bool) {
     }
     (output, changed)
 }
-fn clean(text: &str) -> (String, bool) {
+pub(crate) fn clean(text: &str) -> (String, bool) {
     let mut budget = RedactionBudget {
         remaining: MAX_REDACTION_WORK_BYTES,
         changed: false,

@@ -21,6 +21,7 @@ WITH source AS (
                   json_extract(m.attachment,'$.discussion_intent')='receipt' THEN 'receipt'
              WHEN m.source_id GLOB 'attention-*' OR
                   json_extract(m.attachment,'$.manager_notice')=1 OR
+                  json_extract(m.attachment,'$.autonomy_publication_revision') IS NOT NULL OR
                   json_extract(m.attachment,'$.manager_provider_revision') IS NOT NULL THEN 'notice'
              ELSE 'reply' END AS outbound_kind,
         0 AS routing
@@ -111,6 +112,7 @@ WITH source AS (
                   json_extract(m.attachment,'$.discussion_intent')='receipt' THEN 'receipt'
              WHEN m.source_id GLOB 'attention-*' OR
                   json_extract(m.attachment,'$.manager_notice')=1 OR
+                  json_extract(m.attachment,'$.autonomy_publication_revision') IS NOT NULL OR
                   json_extract(m.attachment,'$.manager_provider_revision') IS NOT NULL THEN 'notice'
              ELSE 'reply' END AS kind
     FROM messages m

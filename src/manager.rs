@@ -20,6 +20,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod autonomy;
+
 const SYSTEM: &str = include_str!("manager_prompt.md");
 
 pub(crate) fn owner() -> &'static str {
@@ -233,7 +235,12 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
     } else {
         json!({"timer_id":payload["timer_id"],"to":payload["to"],"scheduled_at":payload["scheduled_at"],"purpose":payload["purpose"]})
     };
-    let user_input = if source == "timer" {
+    let trusted_source = if source == "autonomy" {
+        json!({"proposal_id":payload["proposal_id"],"to":payload["to"],"message_id":payload["anchor"],"app_id":payload["app_id"]})
+    } else {
+        trusted_source
+    };
+    let user_input = if source == "timer" || source == "autonomy" {
         json!({"body":payload["instructions"]})
     } else {
         json!({"body":payload["content"],"resources":payload["attachment"]["resources"]})
@@ -243,10 +250,10 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
         &project,
         event,
         Some(event),
-        if source == "timer" {
-            "schedule"
-        } else {
-            "user"
+        match source.as_str() {
+            "timer" => "schedule",
+            "autonomy" => "proposal",
+            _ => "user",
         },
         &json!({"event_id":event,"source":source,"trusted_source":trusted_source,"user_input":user_input}),
     )?;
@@ -321,7 +328,18 @@ fn intent(
     } else {
         crate::cli_switch::latest(c, &p.id)?.filter(crate::cli_switch::blocks_worker)
     };
-    let payload = json!({"instructions":instructions,"origin_event_id":origin,"manager_effect_id":id,"steer":steer,"expected_agent":transition.as_ref().map(|r|r.target.as_str()).unwrap_or(&p.agent),"expected_native":if transition.is_some(){""}else{&p.native_session},"target_generation":if transition.is_none()&&p.terminal.is_some(){Some(&p.generation)}else{None},"transition_id":transition.as_ref().map(|r|&r.id)});
+    let mut payload = json!({"instructions":instructions,"origin_event_id":origin,"manager_effect_id":id,"steer":steer,"expected_agent":transition.as_ref().map(|r|r.target.as_str()).unwrap_or(&p.agent),"expected_native":if transition.is_some(){""}else{&p.native_session},"target_generation":if transition.is_none()&&p.terminal.is_some(){Some(&p.generation)}else{None},"transition_id":transition.as_ref().map(|r|&r.id)});
+    if let Some(origin) = origin {
+        let proposal: Option<String> = c.query_row(
+            "SELECT json_extract(payload,'$.proposal_id') FROM work_events
+             WHERE id=? AND project_id=? AND source='autonomy'",
+            params![origin, p.id],
+            |r| r.get(0),
+        ).optional()?.flatten();
+        if let Some(proposal) = proposal {
+            payload["proposal_id"] = json!(proposal);
+        }
+    }
     c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)",params![task,p.id,"Management delegation",instructions,db::now(),db::now()])?;
     c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at) VALUES(?,?,?,'management',?,?,'queued',?,?)",params![event,p.id,task,id,payload.to_string(),db::now(),db::now()])?;
     Ok(event)
@@ -806,6 +824,26 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
     );
     Ok(())
 }
+fn proposal_run(c: &Connection, run: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM manager_run_inputs b
+         JOIN manager_inputs i ON i.id=b.input_id
+         JOIN work_events e ON e.id=i.origin_event_id
+         WHERE b.run_id=? AND e.source='autonomy')",
+        [run],
+        |row| row.get(0),
+    )?)
+}
+
+fn proposal_tool_allowed(name: &str, arguments: &Value) -> bool {
+    match name {
+        "worker_status" => true,
+        "delegate" => arguments["target_cli"].is_null(),
+        "send_md" => !matches!(arguments["intent"].as_str(), Some("receipt" | "progress")),
+        _ => false,
+    }
+}
+
 async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     let Some(_permit) = app.service.gate.enter() else {
         bail!("Service ownership changed")
@@ -816,6 +854,13 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     let occurrence = call.occurrence.clone();
     let name = call.name.clone();
     let arguments = call.arguments.to_string();
+    let approved_proposal = app.db.call({
+        let run = ctx.run.clone();
+        move |c| proposal_run(c, &run)
+    }).await?;
+    if approved_proposal && !proposal_tool_allowed(&call.name, &call.arguments) {
+        return Ok(json!({"error":"Approved proposals can only delegate to the current worker and update the approved discussion"}));
+    }
     let admitted=app.db.call(move|c|{
   let tx=c.unchecked_transaction()?;valid(&tx,&context)?;
   if let Some((id,old_name,old_arguments,status,result))=tx.query_row("SELECT id,name,arguments,status,result FROM manager_effects WHERE run_id=? AND occurrence=?",params![context.run,occurrence],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()? {
@@ -837,6 +882,22 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     let context=ctx.clone();let request=effect.clone();app.db.call(move|c|{
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
       let origin=select_origin(&tx,&context,a.source_event_id.as_deref())?;
+      let proposal = origin.as_deref().map(|id| work::event(&tx, &p.id, id)).transpose()?
+        .filter(|event| event.source == "autonomy");
+      let instructions = if let Some(proposal) = &proposal {
+          ensure!(!steer && a.target_cli.is_none(), "Approved proposal must use the current worker");
+          if let Some(existing) = tx.query_row(
+              "SELECT id FROM work_events WHERE project_id=? AND source='management'
+               AND json_extract(payload,'$.origin_event_id')=? ORDER BY rowid LIMIT 1",
+              params![p.id,proposal.id], |row| row.get::<_,String>(0)
+          ).optional()? {
+              let event = work::event(&tx, &p.id, &existing)?;
+              return Ok(json!({"event_id":existing,"status":event.status,"proposal_id":proposal.payload["proposal_id"]}));
+          }
+          proposal.payload["instructions"].as_str().context("Approved proposal instructions are missing")?
+      } else {
+          &a.instructions
+      };
       if let Some(target) = &a.target_cli { crate::cli_switch::request(&tx,&p,target)?; }
       let held=crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
       // An explicit target participates in the ordinary cooperative handoff.
@@ -844,7 +905,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       let steer_current = steer && !(a.target_cli.is_some() && held);
       ensure!(!steer_current||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
       ensure!(!steer_current||!held,"Worker steering is held by a CLI transition");
-      let id=intent(&tx,&p,&request,&a.instructions,origin.as_deref(),steer_current)?;
+      let id=intent(&tx,&p,&request,instructions,origin.as_deref(),steer_current)?;
       let event=work::event(&tx,&p.id,&id)?;tx.commit()?;
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
@@ -886,7 +947,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
         if let Some(intent)=intent {
             attachment["discussion_intent"]=json!(intent.as_str());
         }
-        if (anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)))
+        if (approved_proposal || anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)))
             && let Some(event)=select_origin(&tx,&context,source.as_deref())?
         {
             crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,&mut attachment)?;
@@ -1011,7 +1072,7 @@ fn repair_finished(c: &Connection, project: &str) -> Result<()> {
 }
 /// Durable observations contain receipts, never invented task-completion signals.
 fn observe(c: &Connection, project: &str) -> Result<()> {
-    let rows=c.prepare("SELECT id,status,content,attachment FROM messages WHERE project_id=? AND direction='out' AND status IN ('sent','failed','uncertain') AND json_extract(attachment,'$.manager_effect') IS NULL AND json_extract(attachment,'$.manager_notice') IS NULL AND created_at >= COALESCE((SELECT MIN(created_at) FROM work_events WHERE project_id=? AND source='management'),9223372036854775807) ORDER BY rowid DESC LIMIT 32")?.query_map(params![project,project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=c.prepare("SELECT id,status,content,attachment FROM messages WHERE project_id=? AND direction='out' AND status IN ('sent','failed','uncertain') AND json_extract(attachment,'$.manager_effect') IS NULL AND json_extract(attachment,'$.manager_notice') IS NULL AND json_extract(attachment,'$.autonomy_publication_revision') IS NULL AND created_at >= COALESCE((SELECT MIN(created_at) FROM work_events WHERE project_id=? AND source='management'),9223372036854775807) ORDER BY rowid DESC LIMIT 32")?.query_map(params![project,project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, status, content, raw) in rows {
         let a: Value = serde_json::from_str(&raw)?;
         let anchor = a["resolved_reply_to_message_id"].as_str().or_else(|| a["reply_to_message_id"].as_str());
@@ -1127,6 +1188,10 @@ fn debug_dispatch(
 }
 fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
     let e = work::event(c, project, id)?;
+    if e.source == "autonomy" {
+        return Ok(json!({"event_id":id,"source_kind":"autonomy","proposal_id":e.payload["proposal_id"],
+            "message_id":e.payload["anchor"],"to":e.payload["to"]}));
+    }
     if let Some(message) = e.message_id {
         let raw: String = c.query_row(
             "SELECT attachment FROM messages WHERE id=?",
@@ -1139,6 +1204,9 @@ fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
         } else {
             json!({"event_id":id,"source_kind":e.source,"local_source_id":e.source_id})
         })
+    } else if e.source == "autonomy" {
+        Ok(json!({"event_id":id,"source_kind":e.source,"proposal_id":e.payload["proposal_id"],
+            "to":e.payload["to"],"message_id":e.payload["anchor"]}))
     } else {
         Ok(json!({"event_id":id,"source_kind":e.source,"to":e.payload["to"]}))
     }
@@ -1300,6 +1368,43 @@ fn prepare_images(
     data["user_input"]["resources"] = json!(resources);
     Ok(images)
 }
+type InputRow = (String, Option<String>, String, String);
+
+fn isolate_proposal_inputs(
+    c: &Connection,
+    project: &str,
+    queued: &mut Vec<InputRow>,
+    continuing: &mut Vec<InputRow>,
+) -> Result<bool> {
+    let mut proposal_source = c.prepare(
+        "SELECT source='autonomy' FROM work_events WHERE project_id=? AND id=?",
+    )?;
+    let mut proposals = HashSet::new();
+    for (_, origin, _, _) in continuing.iter().chain(queued.iter()) {
+        if let Some(origin) = origin
+            && proposal_source.query_row(params![project, origin], |r| r.get::<_,bool>(0))
+                .optional()?.unwrap_or(false)
+        {
+            proposals.insert(origin.clone());
+        }
+    }
+    if proposals.is_empty() {
+        return Ok(false);
+    }
+    let ordinary = continuing.iter().chain(queued.iter())
+        .any(|(_, origin, _, _)| origin.as_ref().is_none_or(|origin| !proposals.contains(origin)));
+    let scope = (!ordinary).then(|| {
+        continuing.iter().chain(queued.iter()).find_map(|(_, origin, _, _)| origin.clone())
+    }).flatten();
+    let include = |(_, origin, _, _): &InputRow| match &scope {
+        Some(scope) => origin.as_ref() == Some(scope),
+        None => origin.as_ref().is_none_or(|origin| !proposals.contains(origin)),
+    };
+    queued.retain(&include);
+    continuing.retain(include);
+    Ok(scope.is_some())
+}
+
 fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
     let tx = c.unchecked_transaction()?;
     let p = db::project_by_key(&tx, project)?;
@@ -1327,8 +1432,9 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         }
         (run, serde_json::from_str(&raw)?, None)
     } else {
-        let candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {PREPARED_INPUT} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {PREPARED_INPUT} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let proposal_only = isolate_proposal_inputs(&tx, project, &mut candidates, &mut continuing)?;
         if candidates.is_empty() && continuing.is_empty() {
             tx.commit()?;
             return Ok(None);
@@ -1349,7 +1455,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             }
         }
         let notes=tx.prepare("SELECT n.note FROM manager_turn_notes n JOIN manager_runs r ON r.id=n.run_id WHERE r.project_id=? ORDER BY r.rowid DESC LIMIT 8")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let latest=tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {PREPARED_INPUT} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
+        let latest=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {PREPARED_INPUT} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
         // A new trusted user source selects the discussion; otherwise retain only
         // the selected, still-owned user objective, never consumed conversation history.
         let image_scope = latest
@@ -1360,7 +1466,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             .transpose()?
             .flatten()
             .map(|(_, _, scope)| scope);
-        let latest_context=tx.query_row("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','processing','consumed') ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?;
+        let latest_context=if proposal_only { None } else { tx.query_row("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','processing','consumed') ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
         // User steering may interrupt an owned batch; observations never do. Reserve
         // one of the 32 NEW claim slots for that control input, without reordering
         // ordinary fresh batches or changing their persisted input order.
@@ -1511,6 +1617,11 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             None
         };
         let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes});
+        if proposal_only {
+            for field in ["prior_conversation", "effect_evidence", "manager_decisions"] {
+                context[field] = json!([]);
+            }
+        }
         if context.to_string().len() > 250000
             && let Some(evidence) = context["effect_evidence"].as_array_mut()
         {
@@ -2001,6 +2112,7 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
     Ok(())
 }
 pub async fn run(app: Arc<App>) {
+    tokio::spawn(autonomy::run(app.clone()));
     let running = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));
     loop {
         tokio::select! {_=app.shutdown.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(200))=>{}}
@@ -2106,6 +2218,62 @@ mod tests {
             .unwrap();
         (dir, app, p)
     }
+    #[tokio::test]
+    async fn proposal_turn_is_scoped_and_delegates_the_approved_instructions_exactly_once() -> Result<()> {
+        let (_dir, app, project) = fixture().await;
+        let approved = "Change only the workspace README and verify that its example is accurate.";
+        let now = db::now();
+        let approval = json!({"proposal_id":"prop","to":"oc_fixture","app_id":"cli_fixture","anchor":"om_approval","instructions":approved});
+        app.db.sync(|c| {
+            c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at)
+              VALUES('proposal-task',?,'Approved proposal',?,'queued',?,?)",
+              params![project.id,approved,now,now])?;
+            c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
+              VALUES('proposal-event',?,'proposal-task','autonomy','prop',?,'queued',?,?)",
+              params![project.id,approval.to_string(),now,now])?;
+            route_event(c, "proposal-event")?;
+            input(c, &project.id, "ordinary", None, "user", &json!({"body":"An unrelated request"}))
+        })?;
+        let proposal = app.db.sync(|c| {
+            let ordinary = claim(c, &project.id)?.unwrap();
+            assert!(!proposal_run(c, &ordinary.context.run)?);
+            finish_turn(c, &ordinary.context, "")?;
+            let proposal = claim(c, &project.id)?.unwrap();
+            assert!(proposal_run(c, &proposal.context.run)?);
+            let prompt = prompt_context(&proposal.checkpoint).unwrap();
+            assert_eq!(prompt["trusted_sources"].as_array().unwrap().len(), 1);
+            assert_eq!(prompt["trusted_sources"][0]["message_id"], "om_approval");
+            assert_eq!(prompt["prior_conversation"], json!([]));
+            Ok(proposal)
+        })?;
+        let locate = |occurrence: &str, name: &str, arguments: Value| ToolCall {
+            occurrence: occurrence.to_owned(), name: name.to_owned(), arguments,
+        };
+        let denied = tool(&app, &proposal.context, locate("write", "write_file",
+            json!({"path":"should-not-exist","content":"fixed"}))).await?;
+        assert!(denied["error"].is_string());
+        assert!(!Path::new(&project.path).join("should-not-exist").exists());
+        let wrong_origin = tool(&app, &proposal.context, locate("wrong", "delegate",
+            json!({"source_event_id":"ordinary","instructions":"broader changes"}))).await?;
+        assert!(wrong_origin["error"].is_string());
+        let mut delegated = None;
+        for call in ["delegate-first", "delegate-duplicate"] {
+            let result = tool(&app, &proposal.context, locate(call, "delegate",
+                json!({"source_event_id":"proposal-event","instructions":"broader changes"}))).await?;
+            let id = result["event_id"].as_str().unwrap().to_owned();
+            assert!(delegated.as_ref().is_none_or(|previous| previous == &id));
+            delegated = Some(id);
+        }
+        app.db.sync(|c| {
+            let count:u32 = c.query_row("SELECT count(*) FROM work_events WHERE source='management'", [], |r| r.get(0))?;
+            assert_eq!(count,1);
+            let event = work::event(c,&project.id,&delegated.unwrap())?;
+            assert_eq!(event.payload["proposal_id"],"prop");
+            assert_eq!(event.payload["instructions"],approved);
+            Ok(())
+        })
+    }
+
     #[tokio::test]
     async fn unconfigured_projects_hold_input_without_delegating_and_share_the_saved_provider() {
         let (_dir, app, first) = fixture().await;

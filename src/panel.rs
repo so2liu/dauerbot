@@ -458,6 +458,43 @@ pub(crate) fn messages(c: &Connection, query: &Query, now: i64) -> Result<Value>
     )
 }
 
+/// Proposal evidence uses the same destination scope and closure classifier as Activity.
+pub(crate) fn proposal_context(
+    c: &Connection,
+    project: &str,
+    chat: &str,
+    now: i64,
+) -> Result<Value> {
+    let select = |filter: &str, limit| -> Result<Vec<Value>> {
+        let rows = messages(
+            c,
+            &Query {
+                project_id: Some(project.to_owned()),
+                chat_id: Some(chat.to_owned()),
+                range: Some("30d".into()),
+                filter: Some(filter.to_owned()),
+                limit: Some(limit),
+                ..Query::default()
+            },
+            now,
+        )?;
+        Ok(rows["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| {
+                json!({
+                    "preview": row["preview"],
+                    "created_at": row["created_at"],
+                    "closure_state": row["closure_state"],
+                    "closure_reason": row["closure_reason"],
+                })
+            })
+            .collect())
+    };
+    Ok(json!({"recent_input":select("all_user",24)?,"unresolved":select("needs_action",12)?}))
+}
+
 fn preview(content: &str, mentions: &Value) -> String {
     let mut result = content.to_owned();
     if let Some(mentions) = mentions.as_array() {
