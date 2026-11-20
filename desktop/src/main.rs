@@ -2298,7 +2298,7 @@ impl Render for Desktop {
                     let worker_layout = agent_tree::row_layout(
                         &[],
                         true,
-                        !tree.nodes.is_empty(),
+                        tree.has_visible_nodes(),
                         28.,
                         f32::from(geometry.sidebar) - 16.,
                         28.,
