@@ -308,6 +308,55 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
+    async fn fired_internal_schedule_cannot_start_a_result_discussion() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = App::new(temp.path().join("store"), Config::default())?;
+        let project = app
+            .db
+            .create(db::ProjectInput {
+                name: "Schedule discussion fixture".into(),
+                path: temp.path().to_string_lossy().into(),
+                agent: "codex".into(),
+                chat_id: "oc_fixture".into(),
+                native_session: String::new(),
+                extra_args: vec![],
+            })
+            .await?;
+        app.db.sync(|c| {
+            for (purpose, due) in [("internal", 10), ("user", 20)] {
+                let input = serde_json::from_value(json!({
+                    "name":purpose,"prompt":"Fixture","kind":"once","at":due,
+                    "to":"oc_fixture","purpose":purpose
+                }))?;
+                crate::work::create_timer(c, &project.id, input, 0)?;
+                let events = crate::work::fire_due(c, due)?;
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.payload["purpose"], purpose);
+                let mut attachment = json!({"discussion_intent":"result"});
+                let scoped = origin(
+                    c,
+                    &project.id,
+                    &event.id,
+                    "cli_fixture",
+                    "oc_fixture",
+                    &mut attachment,
+                );
+                if purpose == "internal" {
+                    assert!(
+                        scoped.unwrap_err().to_string().contains("internal follow-up")
+                    );
+                    assert!(attachment["discussion_scope"].is_null());
+                } else {
+                    scoped?;
+                    assert_eq!(attachment["discussion_scope"], event.id);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
     async fn per_occurrence_roots_and_in_place_progress_share_no_outbox_state() {
         let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = http.local_addr().unwrap();

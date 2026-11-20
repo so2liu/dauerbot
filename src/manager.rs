@@ -119,12 +119,12 @@ pub struct ModeInput {
     pub expected_revision: i64,
 }
 const PROVIDER_REQUIRED: &str = "Global manager credentials are not configured. Open Settings to configure the manager endpoint, model, and API key.";
-const PROVIDER_CONFIGURED: &str = "trim(base_url)!='' AND trim(model)!='' AND trim(api_key)!=''";
+const PROVIDER_CONFIGURED: &str = "g.migration_conflict=0 AND trim(g.base_url)!='' AND trim(g.model)!='' AND trim(g.api_key)!=''";
 
 pub fn public_provider(c: &Connection) -> Result<Value> {
     Ok(c.query_row(
         &format!("SELECT base_url,model,trim(api_key)!='',supports_images,revision,migration_conflict,
-            ({PROVIDER_CONFIGURED}) FROM manager_provider_config WHERE id=1"),
+            ({PROVIDER_CONFIGURED}) FROM manager_provider_config g WHERE g.id=1"),
         [],
         |row| Ok(json!({
             "base_url":row.get::<_,String>(0)?,"model":row.get::<_,String>(1)?,
@@ -385,9 +385,9 @@ pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Resu
         return Ok(false);
     }
     if let Some(incident) = event.payload["repair_incident"].as_str() {
-        let current:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id
+        let current:bool=c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM manager_failures f JOIN manager_config m ON m.project_id=f.project_id
             CROSS JOIN manager_provider_config g WHERE f.project_id=? AND f.incident_id=? AND f.revision=m.revision AND m.revision=?
-            AND trim(g.base_url)!='' AND trim(g.model)!='' AND trim(g.api_key)!='')",params![p.id,incident,event.payload["repair_revision"].as_i64()],|r|r.get(0))?;
+            AND ({PROVIDER_CONFIGURED}))"),params![p.id,incident,event.payload["repair_revision"].as_i64()],|r|r.get(0))?;
         if !current {
             cancel_repair(
                 c,
@@ -1449,7 +1449,7 @@ fn isolate_proposal_inputs(
 fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
     let tx = c.unchecked_transaction()?;
     let p = db::project_by_key(&tx, project)?;
-    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row("SELECT g.base_url,g.model,g.api_key,m.revision,m.input_revision,g.supports_images FROM manager_config m CROSS JOIN manager_provider_config g WHERE m.project_id=? AND m.next_attempt_at<=? AND trim(g.base_url)!='' AND trim(g.model)!='' AND trim(g.api_key)!=''",params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row(&format!("SELECT g.base_url,g.model,g.api_key,m.revision,m.input_revision,g.supports_images FROM manager_config m CROSS JOIN manager_provider_config g WHERE m.project_id=? AND m.next_attempt_at<=? AND ({PROVIDER_CONFIGURED})"),params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
     let Some((base_url, model, api_key, revision, _, supports_images)) = config else {
         return Ok(None);
     };
@@ -1753,7 +1753,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
 }
 fn provider_unavailable(c: &Connection, project: &str) -> Result<bool> {
     let (configured, revision): (bool, i64) = c.query_row(
-        &format!("SELECT ({PROVIDER_CONFIGURED}),revision FROM manager_provider_config WHERE id=1"),
+        &format!("SELECT ({PROVIDER_CONFIGURED}),revision FROM manager_provider_config g WHERE g.id=1"),
         [], |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if configured {
@@ -2420,6 +2420,8 @@ mod tests {
             let selected = public_provider(c)?;
             assert_eq!(selected["model"], "chosen-fixture");
             assert_eq!(selected["migration_conflict"], true);
+            assert_eq!(selected["configured"], false);
+            assert!(claim(c, &native.id)?.is_none());
             assert_eq!(selected["supports_images"], true);
             for project in [&first.id,&different.id,&native.id,&absent.id] {
                 assert_eq!(public(c, project)?["model"], "chosen-fixture");
@@ -2429,9 +2431,15 @@ mod tests {
             assert_eq!(work::run(c, &native.id, "legacy-run")?.status, "uncertain");
             let moved: u32 = c.query_row("SELECT count(*) FROM manager_inputs WHERE origin_event_id='legacy-queued'", [], |row| row.get(0))?;
             assert_eq!(moved, 1);
+            let confirmed = save_provider(c, ConfigInput {
+                base_url:"https://fixture.example/v1".into(),model:"chosen-fixture".into(),api_key:None,
+                clear_api_key:false,expected_revision:selected["revision"].as_i64().unwrap(),supports_images:None,
+            })?;
+            assert_eq!(confirmed["configured"], true);
+            assert!(claim(c, &native.id)?.is_some());
             save_provider(c, ConfigInput {
                 base_url:"https://fixture.example/v1".into(),model:"chosen-fixture".into(),api_key:None,
-                clear_api_key:true,expected_revision:selected["revision"].as_i64().unwrap(),supports_images:None,
+                clear_api_key:true,expected_revision:confirmed["revision"].as_i64().unwrap(),supports_images:None,
             })?;
             Ok(())
         }).unwrap();

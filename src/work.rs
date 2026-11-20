@@ -1027,7 +1027,7 @@ pub fn fire_due(c: &Connection, now: i64) -> Result<Vec<Event>> {
                     "timer",
                     &source_id,
                     json!({"timer_id":timer.id,"revision":timer.revision,"scheduled_at":due,"fired_at":now,
-                    "instructions":timer.prompt,"to":timer.to,"timezone":timer.timezone,"catch_up":"coalesce_one"}),
+                    "instructions":timer.prompt,"to":timer.to,"timezone":timer.timezone,"purpose":timer.purpose,"catch_up":"coalesce_one"}),
                     now,
                 )?;
                 c.execute("UPDATE work_occurrences SET status='queued',event_id=? WHERE timer_id=? AND revision=? AND scheduled_at=?",

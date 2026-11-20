@@ -369,3 +369,24 @@ async fn unsupported_uncertain_and_accepted_without_thread_never_fall_back_or_au
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn unreadable_discussion_root_keeps_requested_result_pending() {
+    let (_dir, app, project, fixture, server) = setup().await;
+    let scope = json!({"to":"oc_private","bot_app_id":"cli_topics",
+        "discussion_scope":"fixture-work","discussion_intent":"result"});
+    let saved = app.db.enqueue_out(&project.id, "existing-root", "Existing result", scope.clone())
+        .await.unwrap();
+    let pending = app.db.enqueue_out(&project.id, "next-result", "Follow-up", scope)
+        .await.unwrap();
+    app.db.sync(|c| {
+        c.execute("UPDATE messages SET status='uncertain',attachment='{' WHERE id=?", [&saved.id])?;
+        Ok(())
+    }).unwrap();
+
+    let error = app.send_out(&pending.id).await.unwrap_err();
+    assert!(error.to_string().contains("Could not read saved discussion root"));
+    assert_eq!(app.db.message(&pending.id).await.unwrap().status, "pending");
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    server.abort();
+}
