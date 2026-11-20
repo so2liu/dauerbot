@@ -376,7 +376,9 @@ pub struct ResourcePreparation {
 
 // Acknowledged messages still need resources while a live manager input
 // or an outstanding delegation owns their original inbound work event.
-const RESOURCE_ELIGIBLE: &str = "(
+const RESOURCE_ELIGIBLE: &str = "EXISTS(
+    SELECT 1 FROM projects p WHERE p.id=m.project_id AND p.paused=0
+) AND (
     m.status IN ('pending','queued') OR
     (m.status='acknowledged' AND EXISTS(
         SELECT 1 FROM work_events e
