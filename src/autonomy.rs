@@ -631,8 +631,8 @@ mod tests {
             [],
         )?;
         c.execute(
-            "INSERT INTO project_bots(project_id,app_id,app_secret)
-            VALUES('project','cli_fixture','fixture-only')",
+            "INSERT INTO project_bots(project_id,app_id,app_secret,updated_at)
+            VALUES('project','cli_fixture','fixture-only',0)",
             [],
         )?;
         c.execute("INSERT INTO conversations(project_id,chat_id,kind) VALUES('project','oc_fixture','group')", [])?;
