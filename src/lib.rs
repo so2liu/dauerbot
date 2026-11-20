@@ -2,6 +2,8 @@ pub mod adapter;
 mod agent_tree;
 pub mod api;
 pub mod bot;
+pub mod child_thread_gc;
+mod child_threads;
 pub mod cli_control;
 pub mod cli_switch;
 mod codex_tree;
@@ -1389,6 +1391,20 @@ impl App {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => tracing::debug!("Companion collection skipped: {error}"),
                     Err(error) => tracing::warn!("Companion collection worker: {error}"),
+                }
+                // Use the same startup/hourly collection lifecycle. Native
+                // archival is reversible and never changes bridge input state.
+                if let Some(_permit) = app.service.gate.enter() {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(20),
+                        child_thread_gc::collect(
+                            &app.dir.join("bridge.sqlite3"),
+                            &app.dir.join("child-thread-collection"),
+                            true,
+                            8,
+                        ),
+                    )
+                    .await;
                 }
                 tokio::select! {
                     _ = app.shutdown.cancelled() => break,
