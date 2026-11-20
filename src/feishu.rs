@@ -374,10 +374,26 @@ pub struct ResourcePreparation {
     pub bot_app_id: String,
 }
 
-// Manager routing acknowledges a message before asynchronous preparation. Only
-// its live authoritative owner (or an explicit, still-live native transfer) may
-// keep that source eligible; historical acknowledgements and Stop stay fenced.
-const RESOURCE_ELIGIBLE: &str = "(m.status IN ('pending','queued') OR (m.status='acknowledged' AND EXISTS(SELECT 1 FROM work_events e JOIN manager_inputs i ON i.origin_event_id=e.id AND i.project_id=e.project_id WHERE e.message_id=m.id AND e.project_id=m.project_id AND e.source='feishu' AND e.status='managed' AND (i.status IN ('queued','processing') OR (i.status='transferred' AND EXISTS(SELECT 1 FROM work_events d WHERE d.project_id=e.project_id AND d.source='management' AND json_extract(d.payload,'$.origin_event_id')=e.id AND d.status IN ('queued','submitting','submitted','uncertain')))))))";
+// Acknowledged messages still need resources while a live manager input
+// or an outstanding delegation owns their original inbound work event.
+const RESOURCE_ELIGIBLE: &str = "(
+    m.status IN ('pending','queued') OR
+    (m.status='acknowledged' AND EXISTS(
+        SELECT 1 FROM work_events e
+        WHERE e.message_id=m.id AND e.project_id=m.project_id AND e.source='feishu'
+        AND (
+            (e.status='managed' AND EXISTS(
+                SELECT 1 FROM manager_inputs i
+                WHERE i.project_id=e.project_id AND i.origin_event_id=e.id
+                AND i.status IN ('queued','processing')
+            )) OR EXISTS(
+                SELECT 1 FROM work_events d
+                WHERE d.project_id=e.project_id AND d.source='management'
+                AND d.status='queued' AND json_extract(d.payload,'$.origin_event_id')=e.id
+            )
+        )
+    ))
+)";
 
 pub fn begin_resource_preparation(
     c: &rusqlite::Connection,
@@ -417,7 +433,7 @@ pub fn finish_resource_preparation(
     } else {
         json!({"members_status":"unavailable"})
     };
-    let changed=c.execute(&format!("UPDATE messages AS m SET attachment=json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND {RESOURCE_ELIGIBLE}"),rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
+    let changed=c.execute(&format!("UPDATE messages AS m SET attachment=json_remove(json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)),'$.resource_preparation') WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND {RESOURCE_ELIGIBLE}"),rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
     Ok(changed == 1)
 }
 
@@ -479,11 +495,17 @@ pub async fn download_resources(app: &App, m: &db::Message) -> Result<Vec<Value>
         .unwrap_or_else(|_| json!({"members_status":"unavailable"}));
     let prepared = preparation.clone();
     let result = resources.clone();
-    if !app
+    let finished = app
         .db
         .call(move |c| finish_resource_preparation(c, &prepared, &result, &context))
-        .await?
-    {
+        .await;
+    if !matches!(finished, Ok(true)) {
+        app.db.call(move |c| {
+            c.execute("UPDATE messages SET attachment=json_remove(attachment,'$.resource_preparation') WHERE id=? AND json_extract(attachment,'$.resource_preparation')=?",
+                rusqlite::params![preparation.message_id, preparation.token])?;
+            Ok(())
+        }).await?;
+        finished?;
         bail!("Resource preparation no longer owns the original source message");
     }
     // Read the committed, binding-fenced result rather than an obsolete local copy.

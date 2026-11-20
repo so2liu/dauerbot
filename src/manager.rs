@@ -3977,6 +3977,107 @@ mod tests {
         app.db.sync(|c|{work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();let origins=c.prepare("SELECT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=?")?.query_map([&turn.context.run],|r|r.get::<_,Option<String>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;let later=c.query_row("SELECT id FROM work_events WHERE source_id='om_later'",[],|r|r.get::<_,String>(0))?;assert!(origins.contains(&Some(later)));c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true')) WHERE source_id='om_resource'",[])?;assert!(work::claim_next(c,&p.id,"generation",db::now())?.is_some());Ok(())}).unwrap();
     }
 
+    #[tokio::test]
+    async fn resource_preparation_unblocks_consumed_origins_without_replaying_stale_workers() {
+        for stale_worker in [false, true] {
+            let (_dir, app, p) = fixture().await;
+            let message = app
+                .db
+                .ingest_bot(
+                    &p.id,
+                    "cli_fixture",
+                    "oc_fixture",
+                    "om_prior_delegation",
+                    "Inspect the attached evidence",
+                    &json!({
+                        "source":{"message_type":"image","chat_type":"p2p","chat_id":"oc_fixture"},
+                        "kind":"image",
+                        "file_key":"img_fixture"
+                    }),
+                )
+                .unwrap()
+                .unwrap();
+            let delegation = app
+                .db
+                .sync(|c| {
+                    work::sync_inbound(c)?;
+                    c.execute(
+                    "UPDATE projects SET terminal='fixture-pane',generation='generation' WHERE id=?",
+                    [&p.id],
+                )?;
+                    let source = work::event(c, &p.id, &message)?;
+                    assert_eq!(source.status, "managed");
+                    assert!(claim(c, &p.id)?.is_none());
+                    let current = db::project_by_key(c, &p.id)?;
+                    let delegation = intent(
+                        c,
+                        &current,
+                        "prior-delegation",
+                        "Inspect attached evidence",
+                        Some(&source.id),
+                        false,
+                    )?;
+                    assert_eq!(
+                        c.execute(
+                            "UPDATE manager_inputs SET status='consumed' WHERE origin_event_id=?",
+                            [&source.id],
+                        )?,
+                        1
+                    );
+                    settle_sources(c)?;
+                    assert_eq!(work::event(c, &p.id, &source.id)?.status, "managed");
+                    assert!(work::claim_next(c, &p.id, "generation", db::now())?.is_none());
+                    Ok(delegation)
+                })
+                .unwrap();
+
+            let original = app.db.message(&message).await.unwrap();
+            assert_eq!(original.status, "acknowledged");
+            assert!(original.attachment["resources_ready"].is_null());
+            app.db.sync(|c| {
+                let preparation = crate::feishu::begin_resource_preparation(c, &original)?
+                    .expect("a queued delegation owns the consumed input's resources");
+                assert!(crate::feishu::begin_resource_preparation(c, &original)?.is_none());
+                let resources = [json!({
+                    "kind":"image","file_key":"img_fixture","error":"Fixture resource unavailable"
+                })];
+                assert!(crate::feishu::finish_resource_preparation(
+                    c,
+                    &preparation,
+                    &resources,
+                    &json!({"members_status":"unavailable"}),
+                )?);
+                if stale_worker {
+                    c.execute(
+                        "UPDATE projects SET agent='agy',generation='replacement',native_session='other-session' WHERE id=?",
+                        [&p.id],
+                    )?;
+                    assert!(work::claim_next(c, &p.id, "replacement", db::now())?.is_none());
+                    let rejected = work::event(c, &p.id, &delegation)?;
+                    assert_eq!(rejected.status, "failed");
+                    assert!(rejected.error.contains("Worker identity changed"));
+                    let runs: u32 = c.query_row(
+                        "SELECT COUNT(*) FROM work_runs WHERE event_id=?",
+                        [&delegation],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(runs, 0);
+                } else {
+                    let run = work::claim_next(c, &p.id, "generation", db::now())?.unwrap();
+                    assert_eq!(run.event_id, delegation);
+                }
+                Ok(())
+            }).unwrap();
+            let prepared = app.db.message(&message).await.unwrap();
+            assert_eq!(prepared.attachment["resources_ready"], true);
+            assert!(prepared.attachment["resource_preparation"].is_null());
+            assert_eq!(
+                prepared.attachment["resources"][0]["error"],
+                "Fixture resource unavailable"
+            );
+        }
+    }
+
     #[test]
     fn file_capabilities_reject_private_case_aliases_and_symlinks_and_preserve_executability() {
         use std::os::unix::fs::{PermissionsExt, symlink};
