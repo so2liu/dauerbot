@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use open_lark::ws_client::{CardActionTrigger, CardActionTriggerResponse, CardToast};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -49,32 +49,33 @@ pub(crate) fn card(items: &[autonomy::Proposal]) -> Value {
     })
 }
 
-// Validate the published request before the outbox claims an external send.
+// Reject stale publication authority and defer while project controls hold delivery.
 pub(crate) fn validate_publication(
     c: &Connection,
     project: &str,
     attachment: &Value,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(revision) = attachment.get("autonomy_publication_revision") else {
-        return Ok(());
+        return Ok(true);
     };
-    let current: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM autonomy_settings s JOIN project_bots b
-         ON b.project_id=s.project_id AND b.app_id=s.app_id
-         WHERE s.project_id=? AND s.enabled=1 AND s.revision=? AND s.app_id=? AND s.chat_id=?)",
-        params![
-            project,
-            revision.as_i64(),
-            attachment["bot_app_id"].as_str(),
-            attachment["to"].as_str()
-        ],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        current,
-        "Project autonomy decision destination changed before delivery"
-    );
-    Ok(())
+    let ready: Option<bool> = c
+        .query_row(
+            &format!(
+                "SELECT ({}) FROM autonomy_settings s JOIN project_bots b
+         ON b.project_id=s.project_id AND b.app_id=s.app_id JOIN projects p ON p.id=s.project_id
+         WHERE s.project_id=? AND s.enabled=1 AND s.revision=? AND s.app_id=? AND s.chat_id=?",
+                autonomy::PROJECT_READY_SQL
+            ),
+            params![
+                project,
+                revision.as_i64(),
+                attachment["bot_app_id"].as_str(),
+                attachment["to"].as_str()
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ready.context("Project autonomy decision destination changed before delivery")
 }
 
 pub(crate) fn callback(

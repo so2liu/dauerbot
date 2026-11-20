@@ -553,10 +553,17 @@ impl App {
         let message = m.clone();
         let admitted=self.db.call(move|c|{
             let tx=c.unchecked_transaction()?;
-            if let Err(error)=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment)
+            let publication=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment)
                 .and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment))
-                .and_then(|_|autonomy_feishu::validate_publication(&tx,&message.project_id,&message.attachment)) {
-                tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;tx.commit()?;return Ok(false);
+                .and_then(|_|autonomy_feishu::validate_publication(&tx,&message.project_id,&message.attachment));
+            match publication {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    tx.execute("UPDATE messages SET status='failed',error=?,updated_at=? WHERE id=? AND status='pending'",rusqlite::params![error.to_string(),db::now(),message.id])?;
+                    tx.commit()?;
+                    return Ok(false);
+                }
             }
             let changed=tx.execute(
                 "UPDATE messages SET status='sending',error='',updated_at=?,
@@ -1518,6 +1525,81 @@ fn xml(text: &str) -> String {
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+    #[tokio::test]
+    async fn autonomy_card_delivery_waits_for_project_controls_without_blocking_the_outbox()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let app = App::new(
+            dir.path().join("store"),
+            Config {
+                feishu_base: "http://127.0.0.1:1".into(),
+                ..Config::default()
+            },
+        )?;
+        let (proposal, ordinary) = app.db.sync(|c| {
+            c.execute_batch("INSERT INTO projects(id,name,path,agent,created_at,mcp_token,generation)
+                  VALUES('project','Fixture','/isolated','codex',0,'local-fixture','generation');
+                INSERT INTO autonomy_settings(project_id,enabled,owner_open_id,app_id,chat_id)
+                  VALUES('project',1,'ou_owner','cli_fixture','oc_fixture');")?;
+            crate::bot::save(c, "project", "cli_fixture", "local-fixture", false)?;
+            let proposal = db::enqueue_out_request(
+                c, "project", "cli_fixture", "proposal", "Pending proposal",
+                json!({"to":"oc_fixture","discussion_intent":"decision","discussion_scope":"proposal",
+                    "autonomy_publication_revision":0}),
+            )?;
+            let ordinary = db::enqueue_out_request(
+                c, "project", "cli_fixture", "ordinary", "Pending ordinary message",
+                json!({"to":"oc_fixture","discussion_intent":"result","discussion_scope":"ordinary"}),
+            )?;
+            Ok((proposal, ordinary))
+        })?;
+
+        let held_and_released = [
+            ("UPDATE projects SET paused=1", "UPDATE projects SET paused=0"),
+            ("INSERT INTO work_leases(project_id,generation,active,updated_at)
+                 VALUES('project','generation',1,0)", "DELETE FROM work_leases"),
+            ("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input)
+                 VALUES('switch','project','agy','preparing','generation',0,1)",
+             "DELETE FROM cli_switch_requests"),
+        ];
+        for (hold, release) in held_and_released {
+            app.db.sync(|c| Ok(c.execute_batch(hold)?))?;
+            let candidates = app.db.pending("out").await?;
+            assert_eq!(
+                candidates.iter().map(|m| &m.id).collect::<Vec<_>>(),
+                [&ordinary]
+            );
+            app.send_out(&proposal).await?;
+            assert_eq!(app.db.message(&proposal).await?.status, "pending");
+            app.db.sync(|c| Ok(c.execute_batch(release)?))?;
+            assert!(
+                app.db
+                    .pending("out")
+                    .await?
+                    .iter()
+                    .any(|m| m.id == proposal)
+            );
+        }
+        app.stop("project").await?;
+        app.send_out(&proposal).await?;
+        assert_eq!(app.db.message(&proposal).await?.status, "pending");
+        assert!(
+            !app.db
+                .pending("out")
+                .await?
+                .iter()
+                .any(|m| m.id == proposal)
+        );
+        app.db.pause("project", false).await?;
+        let attachment = app.db.message(&proposal).await?.attachment;
+        assert!(app.db.sync(|c| autonomy_feishu::validate_publication(
+            c,
+            "project",
+            &attachment
+        ))?);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn resumed_fork_cannot_overwrite_project_or_execution_journal_before_repair() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

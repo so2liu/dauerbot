@@ -12,10 +12,10 @@ const DEFAULT_COOLDOWN: i64 = 14 * DAY / 1000;
 const MAX_PENDING: u32 = 5;
 const PROPOSAL_FIELDS: &str = "id,project_id,number,title,why_now,scope,not_doing,acceptance,risk,effort,category,status,created_at,decided_at,decided_by,execution_event_id,source_message_id";
 const SETTINGS_FIELDS: &str = "project_id,enabled,cadence_seconds,pending_limit,cooldown_seconds,last_requested_at,owner_open_id,app_id,chat_id,revision";
-const CAN_REQUEST: &str = "p.paused=0
+pub(crate) const PROJECT_READY_SQL: &str = "p.paused=0
     AND NOT EXISTS(SELECT 1 FROM work_leases l WHERE l.project_id=p.id AND l.generation=p.generation AND l.active=1)
-    AND NOT EXISTS(SELECT 1 FROM cli_switch_requests s WHERE s.project_id=p.id AND s.holds_input=1)
-    AND b.app_id=a.app_id AND a.owner_open_id!='' AND a.chat_id!=''
+    AND NOT EXISTS(SELECT 1 FROM cli_switch_requests s WHERE s.project_id=p.id AND s.holds_input=1)";
+const CAN_REQUEST: &str = "b.app_id=a.app_id AND a.owner_open_id!='' AND a.chat_id!=''
     AND EXISTS(SELECT 1 FROM manager_provider_config m WHERE m.migration_conflict=0 AND trim(m.base_url)!='' AND trim(m.model)!='' AND trim(m.api_key)!='')
     AND NOT EXISTS(SELECT 1 FROM proposals r WHERE r.project_id=p.id AND r.status='rejected'
                     AND r.decided_at>:now-a.cooldown_seconds*1000)
@@ -218,7 +218,7 @@ pub(crate) fn claim_due(c: &Connection, now: i64) -> Result<Option<Settings>> {
         "SELECT p.id FROM autonomy_settings a JOIN projects p ON p.id=a.project_id
         JOIN project_bots b ON b.project_id=p.id
         WHERE a.enabled=1 AND (a.last_requested_at IS NULL OR a.last_requested_at <= :now-max(a.cadence_seconds,86400)*1000)
-          AND {CAN_REQUEST} ORDER BY a.last_requested_at NULLS FIRST,p.id LIMIT 1"),
+          AND {PROJECT_READY_SQL} AND {CAN_REQUEST} ORDER BY a.last_requested_at NULLS FIRST,p.id LIMIT 1"),
         rusqlite::named_params!{":now": now}, |r| r.get(0)).optional()?;
     let claim = if let Some(project) = target {
         tx.execute(
@@ -459,7 +459,7 @@ pub(crate) fn save_batch(
     let allowed: bool = c.query_row(
         &format!(
             "SELECT EXISTS(SELECT 1 FROM autonomy_settings a JOIN projects p ON p.id=a.project_id
-         JOIN project_bots b ON b.project_id=p.id WHERE p.id=:project AND {CAN_REQUEST})"
+         JOIN project_bots b ON b.project_id=p.id WHERE p.id=:project AND {PROJECT_READY_SQL} AND {CAN_REQUEST})"
         ),
         rusqlite::named_params! {":project":claim.project_id,":now":now},
         |r| r.get(0),

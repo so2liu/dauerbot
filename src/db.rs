@@ -672,7 +672,11 @@ impl Db {
             let sql=if direction=="in"{
                 format!("SELECT {MESSAGE} FROM messages WHERE rowid IN (SELECT MIN(rowid) FROM messages WHERE direction='in' AND status='queued' GROUP BY project_id) ORDER BY rowid")
             }else{
-                format!("SELECT {MESSAGE} FROM messages WHERE direction='out' AND status='pending' ORDER BY rowid LIMIT 32")
+                // Deferred proposal cards should not use the rest of the outbox's delivery slots.
+                format!("SELECT {MESSAGE} FROM messages WHERE direction='out' AND status='pending'
+                  AND (json_type(attachment,'$.autonomy_publication_revision') IS NULL OR
+                       NOT EXISTS(SELECT 1 FROM projects p WHERE p.id=messages.project_id AND NOT ({})))
+                  ORDER BY rowid LIMIT 32", crate::autonomy::PROJECT_READY_SQL)
             };
             Ok(c.prepare(&sql)?.query_map([],message)?.collect::<rusqlite::Result<_>>()?)
         }).await

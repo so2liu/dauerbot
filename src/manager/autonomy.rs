@@ -84,6 +84,8 @@ fn publish(
     ensure!(current, "Proposal generation provider changed");
     let proposals = autonomy::save_batch(&tx, settings, submission.proposals, now)?;
     if !proposals.is_empty() {
+        let card = crate::autonomy_feishu::card(&proposals);
+        crate::feishu::ensure_card(&card)?;
         let notice = proposals
             .iter()
             .map(|proposal| {
@@ -109,7 +111,7 @@ fn publish(
                 "discussion_scope": request_id,
                 "discussion_intent": "decision",
                 "autonomy_publication_revision": settings.revision,
-                "interactive_card": crate::autonomy_feishu::card(&proposals),
+                "interactive_card": card,
             }),
         )?;
         let ids = proposals
@@ -214,6 +216,23 @@ mod tests {
                 effort: "Small.".into(),
                 category: "documentation".into(),
             });
+            let oversized = Submission {
+                proposals: (0..3).map(|index| autonomy::Draft {
+                    title: format!("Oversized proposal {index}"),
+                    why_now: "议".repeat(620),
+                    scope: "界".repeat(620),
+                    not_doing: "外".repeat(620),
+                    acceptance: "验".repeat(620),
+                    risk: "难".repeat(620),
+                    ..drafts[0].clone()
+                }).collect(),
+            };
+            let error = publish(c, &request.settings, request.provider_revision, oversized, now)
+                .expect_err("Oversized card must not commit");
+            assert_eq!(error.to_string(), "Interactive card exceeds the supported size");
+            for table in ["proposals", "messages"] {
+                assert_eq!(c.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,u32>(0))?,0);
+            }
             publish(c,&request.settings,request.provider_revision,Submission { proposals: drafts.into() },now)?;
             let (count, batches): (u32, u32) = c.query_row(
                 "SELECT count(*),count(DISTINCT outbox_id) FROM proposals WHERE status='pending'",

@@ -111,7 +111,7 @@ impl SendReceipt {
     }
 }
 
-fn ensure_card(card: &Value) -> Result<()> {
+pub(crate) fn ensure_card(card: &Value) -> Result<()> {
     anyhow::ensure!(
         card["schema"] == "2.0" && card["body"]["elements"].is_array(),
         "Invalid interactive card"
