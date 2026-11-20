@@ -2758,7 +2758,10 @@ impl Render for Desktop {
                             .compact()
                             .selected(page == 9)
                             .child(ActionIcon::ChartBar.draw(palette.accent, 16.))
-                            .child(control_label(self.tr("Activity")))
+                            .tooltip(self.tr("Activity"))
+                            .when(geometry.sidebar >= px(200.), |button| {
+                                button.child(control_label(self.tr("Activity")))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.go(9);
                                 cx.notify();
@@ -2862,6 +2865,10 @@ impl Render for Desktop {
                                 .border_color(rgb(palette.line))
                                 .child(self.sidebar_toggle(geometry.sidebar_hidden, cx))
                                 .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(self.tr(STEPS[page])))
+                                .when(page == 9 && self.independent_data, |row| {
+                                    row.child(div().text_size(px(11.)).text_color(rgb(palette.warning))
+                                        .child(self.tr("Independent instance")))
+                                })
                                 .when(geometry.sidebar_hidden, |row| row.child(self.language_toggle(cx))),
                         )
                     })
@@ -2905,7 +2912,7 @@ impl Render for Desktop {
                             .into_any_element()
                     })
                     .when(
-                        page != 6
+                        !matches!(page, 6 | 9)
                             || self.connection_error.is_some()
                             || self.error
                             || !matches!(self.notice.as_str(), ""
