@@ -76,11 +76,12 @@ fn entries(state: &Value, language: Language) -> Vec<Entry> {
         (4, "macOS permissions", "permissions access 权限"),
         (7, "App Updates", "updates version 升级 版本"),
         (5, "Add project", "add project 添加 项目"),
+        (9, "Activity", "activity messages conversations trends 观察 消息 群聊 趋势"),
     ] {
         entries.push(entry(
             Target::Page(page),
             language.text(label),
-            language.text("Settings"),
+            language.text(if page == 9 { "Message trends" } else { "Settings" }),
             aliases,
         ));
     }
@@ -90,7 +91,7 @@ fn entries(state: &Value, language: Language) -> Vec<Entry> {
 /// Navigation never treats a stale session snapshot as the current execution.
 pub fn target_available(target: &Target, state: &Value) -> bool {
     match target {
-        Target::Page(page) => matches!(page, 1 | 4 | 5 | 7 | 8),
+        Target::Page(page) => matches!(page, 1 | 4 | 5 | 7 | 8 | 9),
         Target::Project(id) => state["projects"]
             .as_array()
             .into_iter()
