@@ -261,21 +261,22 @@ async fn agent_to_controls_destination_and_idempotent_retries_never_change_it() 
         .await
         .unwrap();
     bind(&app.db, &p.id, "cli_fixture");
+    let result = json!({"discussion_scope":"requested-fixture-work","discussion_intent":"result"});
     let m = app
-        .outbox_to(&p.id, "one", "主动私聊", json!({}), Some("ou_person"))
+        .outbox_to(&p.id, "one", "主动私聊", result.clone(), Some("ou_person"))
         .await
         .unwrap();
     assert_eq!(m.status, "sent");
-    app.outbox_to(&p.id, "one", "主动私聊", json!({}), Some("ou_person"))
+    app.outbox_to(&p.id, "one", "主动私聊", result.clone(), Some("ou_person"))
         .await
         .unwrap();
     assert_eq!(receipts.0.lock().unwrap().len(), 1);
     assert!(
-        app.outbox_to(&p.id, "one", "主动私聊", json!({}), Some("oc_different"))
+        app.outbox_to(&p.id, "one", "主动私聊", result.clone(), Some("oc_different"))
             .await
             .is_err()
     );
-    app.outbox_to(&p.id, "two", "发到另一群", json!({}), Some("oc_elsewhere"))
+    app.outbox_to(&p.id, "two", "发到另一群", result.clone(), Some("oc_elsewhere"))
         .await
         .unwrap();
     let messages = receipts.0.lock().unwrap();
