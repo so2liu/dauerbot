@@ -1958,8 +1958,8 @@ impl Desktop {
     }
     fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette();
-        self.manager_settings.update(cx, |settings, cx| {
-            settings.refresh(&self.state["manager_provider"], self.setup.language, cx);
+        self.manager_settings.update(cx, |settings, _| {
+            settings.refresh(&self.state["manager_provider"], self.setup.language);
         });
         let mut links = div().flex().flex_wrap().gap_2();
         for (index, label) in [

@@ -210,7 +210,7 @@ impl ManagerSettings {
             key,
         }
     }
-    pub fn refresh(&mut self, provider: &Value, language: Language, cx: &mut Context<Self>) {
+    pub fn refresh(&mut self, provider: &Value, language: Language) {
         self.language = language;
         if self.ticket.is_some() || self.dirty {
             return;
