@@ -5,11 +5,6 @@ use rig_core::{
 };
 use serde_json::Value;
 
-pub(super) const FIELD_LIMIT: usize = 8192;
-pub(super) const BATCH_LIMIT: usize = 65536;
-const SCAN_LIMIT: usize = 256 * 1024;
-const TRUNCATED: &str = "\n[truncated]";
-
 pub(super) fn sensitive_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.contains("library/application support/dev.herdr.feishu-bridge")
@@ -71,16 +66,13 @@ fn token_like(token: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b)))
 }
 
-fn clean(text: &str) -> String {
-    if text.len() > SCAN_LIMIT {
-        return "[omitted: inspection limit]".into();
-    }
+pub(super) fn clean(text: &str) -> String {
     // Reuse the diagnostic walk for complete JSON values, including strings
     // that encode other JSON documents. Free-form text still goes through
     // the stricter lexical export filter below.
     let structured;
     let text = if text.trim_start().starts_with(['{', '[', '"']) {
-        structured = crate::manager_context::clean(text).0;
+        structured = crate::manager_context::clean_for_export(text);
         structured.as_str()
     } else {
         text
@@ -150,22 +142,15 @@ fn clean(text: &str) -> String {
             start = index + ch.len_utf8();
         }
     }
-    crate::manager_context::clean(&result).0
+    crate::manager_context::clean_for_export(&result)
 }
 
-pub(super) fn bounded(text: &str, limit: usize) -> String {
-    let text = clean(text);
-    if text.len() <= limit {
-        return text;
+pub(super) fn model_name(text: &str) -> String {
+    let mut name = clean(text);
+    if name.len() > 256 {
+        name.truncate(name.floor_char_boundary(256));
     }
-    if limit < TRUNCATED.len() {
-        return String::new();
-    }
-    let mut end = limit - TRUNCATED.len();
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{TRUNCATED}", &text[..end])
+    name
 }
 
 pub(super) fn has_protected_tool(request: &CompletionRequest) -> bool {
@@ -182,22 +167,19 @@ pub(super) fn has_protected_tool(request: &CompletionRequest) -> bool {
 
 pub(super) fn request_text(request: &CompletionRequest) -> String {
     let mut result = String::new();
-    for message in request.chat_history.iter().take(64) {
+    for message in request.chat_history.iter() {
         match message {
             Message::User { content } => {
-                for item in content.iter().take(32) {
+                for item in content.iter() {
                     if let UserContent::Text(text) = item {
                         // Manager user text is a host-created context envelope.
                         // Allow only human text and leave files, observations,
                         // configuration, system instructions and metadata behind.
-                        if text.text.len() <= SCAN_LIMIT
-                            && let Ok(context) = serde_json::from_str::<Value>(&text.text)
+                        if let Ok(context) = serde_json::from_str::<Value>(&text.text)
                             && context["trusted_project"].is_object()
                         {
                             for field in ["new_inputs", "continuing_inputs"] {
-                                for input in
-                                    context[field].as_array().into_iter().flatten().take(64)
-                                {
+                                for input in context[field].as_array().into_iter().flatten() {
                                     if input["kind"] == "user" {
                                         append(
                                             &mut result,
@@ -218,7 +200,7 @@ pub(super) fn request_text(request: &CompletionRequest) -> String {
                 }
             }
             Message::Assistant(message) => {
-                for item in message.content.iter().take(32) {
+                for item in message.content.iter() {
                     if let AssistantContent::Text(text) = item {
                         append(&mut result, "assistant", Some(&text.text));
                     }
@@ -226,20 +208,15 @@ pub(super) fn request_text(request: &CompletionRequest) -> String {
             }
             _ => {}
         }
-        if result.len() >= FIELD_LIMIT {
-            break;
-        }
     }
     result
 }
 
 pub(super) fn append(target: &mut String, role: &str, value: Option<&str>) {
-    if let Some(value) = value
-        && target.len() + role.len() + 3 < FIELD_LIMIT
-    {
+    if let Some(value) = value {
         target.push_str(role);
         target.push_str(": ");
-        target.push_str(&bounded(value, FIELD_LIMIT - target.len() - 1));
+        target.push_str(&clean(value));
         target.push('\n');
     }
 }
@@ -249,7 +226,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redacts_known_credentials_and_sensitive_paths_before_utf8_truncation() {
+    fn redacts_known_credentials_and_sensitive_paths() {
         for secret in [
             "sk-fixture-secret",
             "pk-fixture-public",
@@ -271,21 +248,21 @@ mod tests {
             "nested/.env.production",
             "langfuse.json",
         ] {
-            assert!(!bounded(secret, FIELD_LIMIT).contains(secret), "{secret}");
+            assert!(!clean(secret).contains(secret), "{secret}");
         }
         for escaped in [
             r#"{"config":"{\"password\":\"fixture-short!\"}"}"#,
             r#"pasted JSON: {\"secret_key\":\"fixture-short!\"}"#,
             r#"{"config":"{\"pass\\u0077ord\":\"fixture-short!\"}"}"#,
         ] {
-            assert!(!bounded(escaped, FIELD_LIMIT).contains("fixture-short!"));
+            assert!(!clean(escaped).contains("fixture-short!"));
         }
         for command in [
             "sshpass -p 'fixture-short!' ssh fixture-host",
             "curl --user account:fixture-short! https://fixture.invalid",
             "git clone https://account:fixture-short!@fixture.invalid/repo",
         ] {
-            assert!(!bounded(command, FIELD_LIMIT).contains("fixture-short!"));
+            assert!(!clean(command).contains("fixture-short!"));
         }
         assert!(
             !crate::manager_context::clean(r#"{"base64":"aGVsbG8="}"#)
@@ -293,13 +270,25 @@ mod tests {
                 .contains("aGVsbG8=")
         );
         let yaml = "ordinary text\npassword: |\n  first-part\n  second-part\nregular after secret";
-        let redacted = bounded(yaml, FIELD_LIMIT);
+        let redacted = clean(yaml);
         assert!(redacted.starts_with("ordinary text"));
         assert!(!redacted.contains("first-part") && !redacted.contains("second-part"));
-        let oversized = "消息正文。".repeat(FIELD_LIMIT);
-        let output = bounded(&oversized, FIELD_LIMIT);
-        assert!(output.starts_with("消息正文。"));
-        assert!(output.ends_with("[truncated]"));
-        assert!(output.len() <= FIELD_LIMIT);
+    }
+
+    #[test]
+    fn preserves_large_plain_and_structured_text_without_size_omission() {
+        let body = format!("BEGIN\n{}\nEND", "消息正文。".repeat(30000));
+        assert_eq!(clean(&body), body);
+        let safe_document = serde_json::json!({"body": body}).to_string();
+        assert_eq!(clean(&safe_document), safe_document);
+        let structured =
+            serde_json::json!({"body": body, "password": "fixture-hidden!"}).to_string();
+        let redacted: Value = serde_json::from_str(&clean(&structured)).unwrap_or(Value::Null);
+        // The structured scanner must not bypass credential detection at large sizes.
+        assert!(!clean(&structured).contains("fixture-hidden!"));
+        assert!(
+            redacted.is_object()
+                || clean(&structured).ends_with("[redacted credential-bearing text]")
+        );
     }
 }
