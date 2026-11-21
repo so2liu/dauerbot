@@ -22,9 +22,8 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
             execution TEXT NOT NULL DEFAULT 'null', native_session TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL, origin_event_id TEXT
         );
-        DROP INDEX IF EXISTS manager_worker_active_cli;
-        CREATE UNIQUE INDEX IF NOT EXISTS manager_worker_active_plain_cli
-        ON manager_workers(project_id,agent) WHERE state IN ('starting','ready') AND token='';",
+        CREATE UNIQUE INDEX IF NOT EXISTS manager_worker_active_cli
+        ON manager_workers(project_id,agent) WHERE state IN ('starting','ready');",
     )?;
     Ok(())
 }
@@ -225,7 +224,8 @@ fn current_seat(c: &Connection, parent: &Project, target: &str) -> Result<Option
     let generation = c
         .query_row(
             "SELECT w.generation FROM manager_workers w
-         WHERE w.project_id=? AND w.agent=? AND w.token='' AND w.state!='closed'
+         WHERE w.project_id=? AND w.agent=? AND w.state!='closed'
+           AND (w.token='' OR w.state IN ('starting','ready'))
            AND NOT (w.state='unavailable' AND w.execution='null' AND w.native_session=''
              AND w.created_at<=?
              AND NOT EXISTS(SELECT 1 FROM work_executions e WHERE e.generation=w.generation))
@@ -258,7 +258,7 @@ fn installed_candidates(
             let current = current_seat(c, p, name)?;
             if current
                 .as_ref()
-                .is_none_or(|seat| seat.state != "unavailable")
+                .is_none_or(|seat| is_plain(&seat.project) && seat.state != "unavailable")
             {
                 candidates.push((name, current));
             }
@@ -324,6 +324,12 @@ pub(crate) async fn select(
             })
             .await?;
         if let Some(current) = current {
+            if !is_plain(&current.project) {
+                return Ok(unavailable(
+                    target,
+                    "An active legacy worker owns this CLI slot; preserve it or stop it before creating a plain worker",
+                ));
+            }
             return Ok(match current.state.as_str() {
                 "ready" if available(&app.config.read().await.clone(), &current.project).await => {
                     Selection::Ready(Box::new(current.project))
