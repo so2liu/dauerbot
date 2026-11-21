@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.11 — 2026-11-21
+
+### Added
+
+- Add the advanced, opt-in `include_content` setting for Manager Langfuse traces. It exports redacted user messages, conversational request text and assistant replies. Tool spans include selected arguments and outcome categories. Content capture defaults to off. Known credential patterns are filtered, but arbitrary unmarked secrets cannot be reliably identified. (#164)
+
 ## 0.6.10 — 2026-11-21
 
 ### Added
