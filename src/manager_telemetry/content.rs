@@ -75,6 +75,16 @@ fn clean(text: &str) -> String {
     if text.len() > SCAN_LIMIT {
         return "[omitted: inspection limit]".into();
     }
+    // Reuse the diagnostic walk for complete JSON values, including strings
+    // that encode other JSON documents. Free-form text still goes through
+    // the stricter lexical export filter below.
+    let structured;
+    let text = if text.trim_start().starts_with(['{', '[', '"']) {
+        structured = crate::manager_context::clean(text).0;
+        structured.as_str()
+    } else {
+        text
+    };
     let lower = text.to_ascii_lowercase();
     if lower.contains("-----begin") && lower.contains("private key-----") {
         return "[redacted private key material]".into();
@@ -82,7 +92,7 @@ fn clean(text: &str) -> String {
     let mut result = String::new();
     for line in text.split_inclusive('\n') {
         let lower = line.to_ascii_lowercase();
-        let normalized = lower.replace(['_', '-', ' ', '\t', '"', '\''], "");
+        let normalized = lower.replace(['_', '-', ' ', '\t', '"', '\'', '\\'], "");
         let credential_header = lower
             .split(|ch: char| !ch.is_ascii_alphanumeric())
             .any(|word| word == "bearer" || word == "basic");
@@ -237,6 +247,13 @@ mod tests {
             "langfuse.json",
         ] {
             assert!(!bounded(secret, FIELD_LIMIT).contains(secret), "{secret}");
+        }
+        for escaped in [
+            r#"{"config":"{\"password\":\"fixture-short!\"}"}"#,
+            r#"pasted JSON: {\"secret_key\":\"fixture-short!\"}"#,
+            r#"{"config":"{\"pass\\u0077ord\":\"fixture-short!\"}"}"#,
+        ] {
+            assert!(!bounded(escaped, FIELD_LIMIT).contains("fixture-short!"));
         }
         let yaml = "ordinary text\npassword: |\n  first-part\n  second-part\nregular after secret";
         let redacted = bounded(yaml, FIELD_LIMIT);
