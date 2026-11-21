@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.9 — 2026-11-21
+
+### Changed
+
+- Instruct the built-in Manager to acknowledge each new user message with one short, separate reply before continuing work. The Manager can use its source-scoped `send_md` receipt intent for this reply. Existing projects keep their execution mode. (#159)
+
+### Fixed
+
+- Run the CLI-switch smoke fixture in native compatibility mode and verify that held messages and the fired timer are delivered only to the ready target. (#159)
+
 ## 0.6.8 — 2026-11-21
 
 ### Changed
