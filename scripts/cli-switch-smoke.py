@@ -45,6 +45,13 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                 with urllib.request.urlopen(r,timeout=20) as response:return json.load(response)
             smoke.wait_for(lambda:api('/state'),'fixture daemon not ready')
             p=api('/projects',{'name':'Cooperative switch fixture','path':str(workspace),'agent':'custom','extra_args':[sys.executable,str(ROOT/'scripts/mock_agent.py'),'{bridge_exe}','{credentials}','{native_session}','{instructions}']});key=p['id']
+            def use_native_compatibility(project_id):
+                # The bridge placeholders deliberately preserve the legacy
+                # custom launcher. Seed the native compatibility mode in the
+                # private fixture so raw user input exercises the delivery lock.
+                with sqlite3.connect(data/'bridge.sqlite3',timeout=10) as conn:
+                    conn.execute('INSERT INTO standalone_projects(project_id) VALUES(?)',(project_id,))
+            use_native_compatibility(key)
             api(f'/projects/{key}/bot',{'app_id':'cli_fixture','app_secret':'fixture-secret'},'PUT')
             smoke.wait_for(lambda:smoke.FIXTURE.connections,'no private websocket')
             api(f'/projects/{key}/start',{})
@@ -63,12 +70,16 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                 state=api(f'/projects/{key}/work')
                 events=[e for e in state['events'] if e['source_id'] in sources]
                 if len(events)!=len(sources):return None
-                assert all(e['status']=='queued' and not any(r['event_id']==e['id'] for r in state['runs']) for e in events),state
+                assert {e['source_id'] for e in events}==set(sources),state
+                assert all(e['status']=='queued' and e['received_at'] is None and not any(r['event_id']==e['id'] for r in state['runs']) for e in events),state
                 return state
             smoke.wait_for(lambda:held_input(held_sources),'preclaim messages were not retained')
             smoke.wait_for(lambda:any(e['source']=='timer' for e in api(f'/projects/{key}/work')['events']),'timer occurrence was not journaled')
             time.sleep(2.2)
-            held_input(held_sources)
+            state=held_input(held_sources)
+            fired=[e for e in state['events'] if e['source']=='timer']
+            assert len(fired)==1 and fired[0]['status']=='queued' and fired[0]['received_at'] is None,state
+            assert not any(r['event_id']==fired[0]['id'] for r in state['runs']),state
             same=next(p['cli_transition'] for p in api('/state')['projects'] if p['id']==key)
             assert same['id']==before['id'] and same['nonce']==before['nonce'] and same['attempts']==1 and same['holds_input'] is True,same
             assert not (workspace/'.fixture-deliveries').exists(),'old CLI received held input'
@@ -136,6 +147,7 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                 original_args=[sys.executable,str(ROOT/'scripts/mock_agent.py'),'{bridge_exe}','{credentials}','{native_session}','{instructions}']
                 project=api('/projects',{'name':name,'path':str(folder),'agent':'custom','extra_args':original_args})
                 project_id=project['id']
+                use_native_compatibility(project_id)
                 api(f'/projects/{project_id}/bot',{'app_id':app_id,'app_secret':'fixture-secret'},'PUT')
                 smoke.wait_for(lambda:app_id in smoke.FIXTURE.connection_bots.values(),'repair fixture websocket not ready')
                 api(f'/projects/{project_id}/start',{})
@@ -156,7 +168,8 @@ runpy.run_path(sys.argv[0],run_name='__main__')
                 state=api(f'/projects/{project_id}/work')
                 events=[e for e in state['events'] if e['source_id'] in sources]
                 if len(events)!=len(sources):return None
-                assert all(e['status']=='queued' and not any(r['event_id']==e['id'] for r in state['runs']) for e in events),state
+                assert {e['source_id'] for e in events}==set(sources),state
+                assert all(e['status']=='queued' and e['received_at'] is None and not any(r['event_id']==e['id'] for r in state['runs']) for e in events),state
                 return state
 
             def delivered_once(project_id,folder,sources):

@@ -3765,10 +3765,14 @@ mod tests {
     fn prompt_keeps_receipt_cohesion_disclosure_exceptions_and_truthful_failures_together() {
         // These are the explicitly requested policy invariants, not an LLM quality test.
         for policy in [
-            "skip acknowledgements and routine progress",
+            "立刻独立调用一次 send_md",
+            "intent=receipt",
+            "在原会话回一句话",
+            "不得等任务结束再确认",
+            "不得把确认和最终结果合并",
+            "第一条回复禁止写成长解释",
+            "不反复播报常规进度",
             "intent=progress",
-            "Answer simple questions directly",
-            "follow-ups, corrections, work results, recovery retries",
             "Keep related work together by default",
             "调研 A 和 B",
             "并行开发互不依赖的 feature A、B、C",
