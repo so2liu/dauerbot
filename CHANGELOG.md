@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.10 — 2026-11-21
+
+### Added
+
+- Add optional Langfuse observability for the built-in Manager. Configure it in the daemon data directory to inspect interaction, model and tool timing and usage. Telemetry is off by default and excludes conversation text. (#162)
+
 ## 0.6.9 — 2026-11-21
 
 ### Changed
