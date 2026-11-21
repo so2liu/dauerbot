@@ -1,3 +1,5 @@
+mod content;
+
 use reqwest::{Client, Url, redirect::Policy};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -18,6 +20,7 @@ const MAX_SPANS: usize = 256;
 #[serde(default, deny_unknown_fields)]
 struct Settings {
     enabled: bool,
+    include_content: bool,
     host: String,
     public_key: String,
     secret_key: String,
@@ -27,6 +30,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            include_content: false,
             host: "https://cloud.langfuse.com".into(),
             public_key: String::new(),
             secret_key: String::new(),
@@ -51,6 +55,10 @@ impl std::fmt::Debug for Exporter {
 }
 
 impl Exporter {
+    pub(crate) fn includes_content(&self) -> bool {
+        self.settings.include_content
+    }
+
     pub(crate) fn load(dir: &Path) -> Option<Self> {
         let path = dir.join("langfuse.json");
         let mut options = std::fs::OpenOptions::new();
@@ -192,7 +200,9 @@ fn trace_id(input: &str) -> String {
 
 pub(crate) struct Trace {
     exporter: Exporter,
-    inputs: Vec<String>,
+    inputs: Vec<(String, Option<String>)>,
+    remaining_content: usize,
+    protected_tool_seen: bool,
     started: u128,
     ended: u128,
     root: String,
@@ -203,8 +213,21 @@ pub(crate) struct Trace {
 }
 
 impl Trace {
-    pub(crate) fn new(exporter: Exporter, inputs: Vec<String>) -> Self {
+    pub(crate) fn new(exporter: Exporter, mut inputs: Vec<(String, Option<String>)>) -> Self {
+        // Shared spans are replicated for every input. Budget before replication
+        // so a large batch cannot multiply the aggregate content without bound.
+        let share = content::BATCH_LIMIT / inputs.len().max(1);
+        let mut reserved = 0;
+        for (_, body) in &mut inputs {
+            if let Some(raw) = body.take().filter(|_| exporter.includes_content()) {
+                let clean = content::bounded(&raw, (share / 4).min(content::FIELD_LIMIT));
+                reserved = reserved.max(clean.len() * 2);
+                *body = Some(clean);
+            }
+        }
         Self {
+            remaining_content: share.saturating_sub(reserved),
+            protected_tool_seen: false,
             exporter,
             inputs,
             started: now(),
@@ -235,9 +258,9 @@ impl Trace {
         let spans: Vec<_> = self
             .inputs
             .iter()
-            .flat_map(|input| {
-                let trace_id = trace_id(input);
-                let root = json!({
+            .flat_map(|(id, body)| {
+                let trace_id = trace_id(id);
+                let mut root = json!({
                     "traceId":trace_id,"spanId":self.root,"name":"manager.interaction","kind":1,
                     "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":end.to_string(),
                     "status":status(self.outcome),"attributes":[
@@ -247,11 +270,17 @@ impl Trace {
                         number("dauerbot.dropped_spans",self.dropped as u64)
                     ]
                 });
-                let admitted = json!({
+                let mut admitted = json!({
                 "spanId":span_id(),"name":"manager.user_input","kind":1,
                 "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":self.started.to_string(),
                 "status":{"code":1},"attributes":[text("langfuse.observation.type","span")]
             });
+            if let Some(body) = body {
+                for span in [&mut root, &mut admitted] {
+                    span["attributes"].as_array_mut().expect("span attributes")
+                        .push(observation_content("langfuse.observation.input", body));
+                }
+            }
             std::iter::once(root).chain(std::iter::once(admitted).chain(self.spans.iter().cloned()).map(move |mut span| {
                     span["traceId"] = json!(trace_id);
                     span["parentSpanId"] = json!(self.root);
@@ -280,6 +309,8 @@ impl Drop for Trace {
         };
         let trace = Self {
             exporter: self.exporter.clone(),
+            remaining_content: 0,
+            protected_tool_seen: false,
             inputs: std::mem::take(&mut self.inputs),
             root: std::mem::take(&mut self.root),
             spans: std::mem::take(&mut self.spans),
@@ -304,11 +335,85 @@ pub(crate) struct Span<'a> {
 }
 
 impl Span<'_> {
+    fn capture(&mut self, key: &str, value: &str) {
+        if !self.trace.exporter.includes_content() || self.trace.remaining_content == 0 {
+            return;
+        }
+        let budget = self.trace.remaining_content.min(content::FIELD_LIMIT);
+        let clean = content::bounded(value, budget);
+        if !clean.is_empty() {
+            self.trace.remaining_content -= clean.len();
+            self.attributes.push(observation_content(key, &clean));
+        }
+    }
+
+    pub(crate) fn request(&mut self, request: &rig_core::completion::CompletionRequest) {
+        if !self.trace.exporter.includes_content() || self.trace.remaining_content == 0 {
+            return;
+        }
+        // A subsequent model call could quote an unmarked value from a
+        // protected file even though we omit the tool's raw result.
+        self.trace.protected_tool_seen |= content::has_protected_tool(request);
+        if !self.trace.protected_tool_seen {
+            self.capture(
+                "langfuse.observation.input",
+                &content::request_text(request),
+            );
+        }
+    }
+
+    pub(crate) fn assistant(&mut self, output: impl Iterator<Item = impl AsRef<str>>) {
+        if !self.trace.exporter.includes_content()
+            || self.trace.protected_tool_seen
+            || self.trace.remaining_content == 0
+        {
+            return;
+        }
+        let mut projected = String::new();
+        for part in output.take(32) {
+            content::append(&mut projected, "assistant", Some(part.as_ref()));
+        }
+        self.capture("langfuse.observation.output", &projected);
+    }
+
+    pub(crate) fn tool_input(&mut self, name: &str, arguments: &Value) {
+        if !self.trace.exporter.includes_content() || self.trace.protected_tool_seen {
+            return;
+        }
+        match name {
+            "read_file" | "write_file" | "send_file" => {
+                if let Some(path) = arguments["path"].as_str() {
+                    let display = if content::sensitive_path(path) {
+                        self.trace.protected_tool_seen = true;
+                        "[redacted path]"
+                    } else {
+                        path
+                    };
+                    self.capture("langfuse.observation.input", display);
+                }
+            }
+            "send_md" | "delegate" | "steer_worker" => {
+                let field = if name == "send_md" {
+                    "text"
+                } else {
+                    "instructions"
+                };
+                if let Some(value) = arguments[field].as_str() {
+                    self.capture("langfuse.observation.input", value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn tool_outcome(&mut self, outcome: &'static str) {
+        self.capture("langfuse.observation.output", outcome);
+        self.finish(outcome);
+    }
+
     pub(crate) fn model(&mut self, model: &str) {
-        self.attributes.push(text(
-            "gen_ai.request.model",
-            &model.chars().take(256).collect::<String>(),
-        ));
+        self.attributes
+            .push(text("gen_ai.request.model", &content::bounded(model, 256)));
     }
 
     pub(crate) fn response(&mut self, usage: rig_core::completion::Usage) {
@@ -353,6 +458,10 @@ fn text(key: &str, value: &str) -> Value {
     json!({"key":key,"value":{"stringValue":value}})
 }
 
+fn observation_content(key: &str, redacted: &str) -> Value {
+    text(key, &json!(redacted).to_string())
+}
+
 fn number(key: &str, value: u64) -> Value {
     json!({"key":key,"value":{"intValue":value.min(i64::MAX as u64).to_string()}})
 }
@@ -362,6 +471,89 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::Mutex;
+
+    #[test]
+    fn content_budget_bounds_replicated_spans_and_keeps_limits_utf8_safe() {
+        let exporter = Exporter::configured(Settings {
+            enabled: true,
+            include_content: true,
+            public_key: "fixture-public".into(),
+            secret_key: "fixture-secret".into(),
+            ..Settings::default()
+        })
+        .unwrap()
+        .unwrap();
+        let long = "正文。".repeat(5000);
+        let mut trace = Trace::new(
+            exporter,
+            (0..8)
+                .map(|id| (id.to_string(), Some(long.clone())))
+                .collect(),
+        );
+        trace.export_on_drop = false;
+        for _ in 0..12 {
+            let mut span = trace.span("manager.generation", "generation");
+            span.capture("langfuse.observation.input", &long);
+            span.capture("langfuse.observation.output", &long);
+        }
+        let payload = trace.payload();
+        let attributes = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["attributes"].as_array().unwrap())
+            .filter(|entry| {
+                matches!(
+                    entry["key"].as_str(),
+                    Some("langfuse.observation.input" | "langfuse.observation.output")
+                )
+            })
+            .map(|attribute| {
+                serde_json::from_str::<String>(attribute["value"]["stringValue"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            attributes
+                .iter()
+                .any(|value| value.ends_with("[truncated]"))
+        );
+        assert!(
+            attributes
+                .iter()
+                .all(|value| value.len() <= content::FIELD_LIMIT)
+        );
+        assert!(attributes.iter().map(String::len).sum::<usize>() <= content::BATCH_LIMIT);
+        assert!(trace.remaining_content < 64);
+    }
+
+    #[test]
+    fn protected_tool_path_suppresses_later_text_and_tool_arguments() {
+        let exporter = Exporter::configured(Settings {
+            enabled: true,
+            include_content: true,
+            public_key: "fixture-public".into(),
+            secret_key: "fixture-secret".into(),
+            ..Settings::default()
+        })
+        .unwrap()
+        .unwrap();
+        let mut trace = Trace::new(exporter, vec![("input".into(), None)]);
+        trace.export_on_drop = false;
+        trace
+            .span("read_file", "tool")
+            .tool_input("read_file", &json!({"path":"private/.env.production"}));
+        trace
+            .span("manager.generation", "generation")
+            .assistant(std::iter::once("unmarked short value"));
+        trace
+            .span("send_md", "tool")
+            .tool_input("send_md", &json!({"text":"unmarked short value"}));
+        let exported = trace.payload().to_string();
+        assert!(exported.contains("[redacted path]"));
+        assert!(!exported.contains(".env"));
+        assert!(!exported.contains("unmarked short value"));
+    }
 
     struct Log(Arc<Mutex<Vec<u8>>>);
 
@@ -403,6 +595,7 @@ mod tests {
                 let server =
                     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
                 let exporter = Exporter::configured(Settings {
+                    include_content: false,
                     enabled: true,
                     host,
                     public_key: public.clone(),

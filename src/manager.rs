@@ -2039,9 +2039,14 @@ if model_responded { recovered(&tx,&context)?; }tx.commit()?;Ok(())}).await
 async fn drive(app: Arc<App>, turn: Turn) -> Result<()> {
     let mut trace = if let Some(exporter) = &app.manager_telemetry {
         let run = turn.context.run.clone();
+        let includes_content = exporter.includes_content();
         match app.db.call(move |c| {
-            Ok(c.prepare("SELECT i.id FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id WHERE b.run_id=? AND i.kind='user' ORDER BY i.rowid LIMIT 64")?
-                .query_map([run], |row| row.get::<_, String>(0))?
+            Ok(c.prepare("SELECT i.id,CASE WHEN ? AND json_valid(i.payload) THEN
+                json_extract(i.payload,'$.user_input.body') ELSE NULL END
+                FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id
+                WHERE b.run_id=? AND i.kind='user' ORDER BY i.rowid LIMIT 64")?
+                .query_map(params![includes_content, run], |row|
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
         }).await {
             Ok(inputs) if !inputs.is_empty() => Some(crate::manager_telemetry::Trace::new(exporter.clone(), inputs)),
@@ -2148,9 +2153,12 @@ async fn drive_turn(
                     let mut span = trace
                         .as_deref_mut()
                         .map(|trace| trace.span(&call.name, "tool"));
+                    if let Some(span) = &mut span {
+                        span.tool_input(&call.name, &call.arguments);
+                    }
                     let value = tool(&app, &turn.context, call).await;
                     if let Some(span) = &mut span {
-                        span.finish(match value.as_ref() {
+                        span.tool_outcome(match value.as_ref() {
                             Ok(value) => tool_trace_outcome(value),
                             Err(_) => "failed",
                         });
@@ -2946,7 +2954,7 @@ mod tests {
                     "function":{"name":"read_file","arguments":"{\"path\":\"private-file.txt\"}"}
                 }]})
             } else {
-                json!({"role":"assistant","content":"private response body"})
+                json!({"role":"assistant","content":"private response body\nBearer fixture-model-secret"})
             };
             let finish = if message["tool_calls"].is_array() { "tool_calls" } else { "stop" };
             Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
@@ -2968,7 +2976,7 @@ mod tests {
         let public = uuid::Uuid::new_v4().simple().to_string();
         let secret = uuid::Uuid::new_v4().simple().to_string();
         let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{public}:{secret}")));
-        for mode in ["default", "disabled", "invalid", "stalled", "unreachable"] {
+        for mode in ["default", "disabled", "invalid", "stalled", "metadata_only", "content", "unreachable"] {
             let dir = tempfile::tempdir().unwrap();
             let store = dir.path().join("store");
             if mode != "default" {
@@ -2978,16 +2986,20 @@ mod tests {
                     "unreachable" => "http://127.0.0.1:0".into(),
                     _ => host.clone(),
                 };
-                crate::config::write_private(&store.join("langfuse.json"), &serde_json::to_vec(&json!({
+                let mut config = json!({
                     "enabled":mode!="disabled", "host":endpoint, "public_key":public, "secret_key":secret
-                })).unwrap()).unwrap();
+                });
+                if matches!(mode, "metadata_only" | "content") {
+                    config["include_content"] = json!(mode == "content");
+                }
+                crate::config::write_private(&store.join("langfuse.json"), &serde_json::to_vec(&config).unwrap()).unwrap();
             }
             let (app, project) = fixture_at(dir.path()).await;
-            assert_eq!(app.manager_telemetry.is_some(), matches!(mode, "stalled" | "unreachable"));
-            fs::write(Path::new(&project.path).join("private-file.txt"), "private file body").unwrap();
-            let messages = if mode == "stalled" { 2 } else { 1 };
+            assert_eq!(app.manager_telemetry.is_some(), matches!(mode, "stalled" | "metadata_only" | "content" | "unreachable"));
+            fs::write(Path::new(&project.path).join("private-file.txt"), "private file body fixture-tool-secret").unwrap();
+            let messages = if matches!(mode, "stalled" | "metadata_only" | "content") { 2 } else { 1 };
             for index in 0..messages {
-                ingest(&app, &project, &format!("om_private_{index}"), "private user message");
+                ingest(&app, &project, &format!("om_private_{index}"), "private user message\nsecret = fixture-user-secret");
             }
             let mut turn = app.db.sync(|c| {
                 work::sync_inbound(c)?;
@@ -3001,7 +3013,7 @@ mod tests {
                 "SELECT status FROM manager_runs WHERE id=?", [run], |row| row.get::<_,String>(0)
             )?)).unwrap(), "complete");
 
-            if mode != "stalled" {
+            if !matches!(mode, "stalled" | "metadata_only" | "content") {
                 assert!(tokio::time::timeout(Duration::from_millis(100), received.recv()).await.is_err());
                 continue;
             }
@@ -3039,9 +3051,25 @@ mod tests {
             }
             let export = payload.to_string();
             let debug = format!("{:?}", app.manager_telemetry);
-            for forbidden in [&*secret, &*public, "om_private", "private user message", "private response body", "private file body", "private-file.txt"] {
+            for forbidden in [&*secret, &*public, "om_private", "private file body", "fixture-user-secret", "fixture-model-secret", "fixture-tool-secret"] {
                 assert!(!export.contains(forbidden), "Sensitive data must not be exported");
                 assert!(!debug.contains(forbidden), "Sensitive data must not appear in Debug");
+            }
+            let attribute = |index: usize, key: &str| spans[index]["attributes"].as_array().unwrap()
+                .iter().find(|a| a["key"] == key).and_then(|a| a["value"]["stringValue"].as_str())
+                .map(|value| serde_json::from_str::<String>(value).unwrap());
+            if mode == "content" {
+                for index in [0, 1, 2] {
+                    assert!(attribute(index, "langfuse.observation.input").unwrap().contains("private user message"));
+                }
+                assert_eq!(attribute(3, "langfuse.observation.input").as_deref(), Some("private-file.txt"));
+                assert_eq!(attribute(3, "langfuse.observation.output").as_deref(), Some("ok"));
+                assert!(attribute(4, "langfuse.observation.output").unwrap().contains("private response body"));
+            } else {
+                assert!(!export.contains("langfuse.observation.input"));
+                assert!(!export.contains("langfuse.observation.output"));
+                assert!(!export.contains("private user message"));
+                assert!(!export.contains("private response body"));
             }
         }
         server.abort();

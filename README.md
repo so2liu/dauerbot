@@ -61,6 +61,7 @@ Manager tracing is disabled by default. To opt in, create a separate Langfuse pr
 ```json
 {
   "enabled": true,
+  "include_content": false,
   "host": "https://cloud.langfuse.com",
   "public_key": "<project public key>",
   "secret_key": "<project secret key>"
@@ -69,7 +70,7 @@ Manager tracing is disabled by default. To opt in, create a separate Langfuse pr
 
 Omit `host` to use the default. For a different region or self-hosted installation, use its HTTPS origin without the API path. Plain HTTP is restricted to loopback. The daemon reads the file at startup. The integration has no project view controls. Set `enabled` to false or remove the file to disable it on the next daemon start.
 
-Manager sends OTLP/HTTP JSON trace metadata using Langfuse Basic authentication. Each admitted user message has a pseudonymous trace with Manager attempts, generations and tool spans. The trace includes timings, the configured model name, available token counts, tool names and bounded outcome categories. Chat text, prompts, responses, tool arguments and outputs, workspace information and files are omitted. The exporter sends best-effort in the background with a three-second request deadline and bounded capacity. Export errors only produce local diagnostics.
+Manager sends OTLP/HTTP JSON trace metadata using Langfuse Basic authentication. Each admitted user message has a pseudonymous trace with Manager attempts, generations and tool spans. The trace includes timings, the configured model name, available token counts, tool names and bounded outcome categories. Content capture is off unless you set `include_content` to true. With consent to send conversation text to the configured host, this option includes bounded, redacted user messages, the conversational portion of model requests, assistant text, selected tool arguments, and outcome categories. System instructions, raw tool responses, file contents and media are excluded. Known credential patterns are redacted. Avoid pasting secrets, since arbitrary unmarked text cannot be reliably identified as a credential. The exporter sends best-effort in the background with a three-second request deadline and bounded capacity. Export errors only produce local diagnostics.
 
 ## Build and develop
 
