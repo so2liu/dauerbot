@@ -249,8 +249,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["instructions"],
         ),
         (
-            "Send a Feishu topic reply. Skip acknowledgements and routine progress. Use intent=result for a requested outcome, decision for action the user must take or progress for an explicitly requested interim update in an existing topic. Select source_event_id from trusted_sources when needed.",
-            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":{"type":"string"},"intent":{"type":"string","enum":["result","decision","progress"]},"source_event_id":{"type":"string"}}),
+            "Send a Feishu topic reply. Use intent=receipt for the immediate one-sentence acknowledgement of a new user message. Use intent=result for a requested outcome, decision for action the user must take or progress for an explicitly requested interim update in an existing topic. Select source_event_id from trusted_sources when needed.",
+            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":{"type":"string"},"intent":{"type":"string","enum":["receipt","result","decision","progress"]},"source_event_id":{"type":"string"}}),
             vec!["to", "text"],
         ),
         (
