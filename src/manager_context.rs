@@ -121,33 +121,42 @@ impl Drop for Guard {
     }
 }
 
+pub(crate) const SENSITIVE_FIELDS: &[&str] = &[
+    "apikey",
+    "token",
+    "accesstoken",
+    "refreshtoken",
+    "authorization",
+    "password",
+    "secret",
+    "clientsecret",
+    "appsecret",
+    "privatekey",
+    "mcptoken",
+    "credential",
+    "credentials",
+    "gatewaykey",
+    "providerkey",
+    "secretkey",
+    "headers",
+    "auth",
+    "imageurl",
+    "imagedata",
+    "imagebytes",
+    "publickey",
+    "cookie",
+    "accesskeyid",
+    "accesskey",
+    "secretaccesskey",
+    "sessionkey",
+    "sessionid",
+    "signingkey",
+    "tenantaccesstoken",
+];
+
 fn sensitive(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace(['-', '_', ' '], "");
-    matches!(
-        key.as_str(),
-        "apikey"
-            | "token"
-            | "accesstoken"
-            | "refreshtoken"
-            | "authorization"
-            | "password"
-            | "secret"
-            | "clientsecret"
-            | "appsecret"
-            | "privatekey"
-            | "mcptoken"
-            | "credential"
-            | "credentials"
-            | "gatewaykey"
-            | "providerkey"
-            | "secretkey"
-            | "headers"
-            | "auth"
-            | "base64"
-            | "imageurl"
-            | "imagedata"
-            | "imagebytes"
-    )
+    SENSITIVE_FIELDS.contains(&key.as_str())
 }
 struct RedactionBudget {
     remaining: usize,

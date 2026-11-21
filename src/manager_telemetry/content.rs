@@ -87,20 +87,9 @@ fn clean(text: &str) -> String {
             .split(|ch: char| !ch.is_ascii_alphanumeric())
             .any(|word| word == "bearer" || word == "basic");
         let credential_assignment = normalized.match_indices([':', '=']).any(|(end, _)| {
-            [
-                "apikey",
-                "token",
-                "secret",
-                "password",
-                "authorization",
-                "credentials",
-                "privatekey",
-                "publickey",
-                "cookie",
-                "accesskeyid",
-            ]
-            .iter()
-            .any(|field| normalized[..end].ends_with(field))
+            crate::manager_context::SENSITIVE_FIELDS
+                .iter()
+                .any(|field| normalized[..end].ends_with(field))
         });
         if sensitive_path(line) || credential_header || credential_assignment {
             // Explicit credential context can continue across YAML blocks,
@@ -233,6 +222,8 @@ mod tests {
             "Bearer fixture-short",
             "api_key = fixture-short",
             "app_secret=fixture-short",
+            "secret_key = \"fixture-short!\"",
+            "provider_key = \"short-provider!\"",
             "Token: fixture-short",
             "secret: \n fixture-multiline-value",
             "secret: fixture-short",
