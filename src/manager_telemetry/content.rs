@@ -101,7 +101,31 @@ fn clean(text: &str) -> String {
                 .iter()
                 .any(|field| normalized[..end].ends_with(field))
         });
-        if sensitive_path(line) || credential_header || credential_assignment {
+        let credential_command = lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|word| word == "sshpass")
+            || (lower.contains("curl")
+                && [
+                    " -u",
+                    "--user",
+                    "--proxy-user",
+                    "--oauth2-bearer",
+                    "--netrc",
+                ]
+                .iter()
+                .any(|flag| lower.contains(flag)));
+        let credential_url = lower.match_indices("://").any(|(start, _)| {
+            lower[start + 3..]
+                .split(['/', '?', '#', ' ', '\t', '\n', '"', '\''])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        });
+        if sensitive_path(line)
+            || credential_header
+            || credential_assignment
+            || credential_command
+            || credential_url
+        {
             // Explicit credential context can continue across YAML blocks,
             // quoted values, or pasted file contents on subsequent lines.
             // Omit the remainder instead of guessing where the value ends.
@@ -126,7 +150,7 @@ fn clean(text: &str) -> String {
             start = index + ch.len_utf8();
         }
     }
-    result
+    crate::manager_context::clean(&result).0
 }
 
 pub(super) fn bounded(text: &str, limit: usize) -> String {
@@ -254,6 +278,13 @@ mod tests {
             r#"{"config":"{\"pass\\u0077ord\":\"fixture-short!\"}"}"#,
         ] {
             assert!(!bounded(escaped, FIELD_LIMIT).contains("fixture-short!"));
+        }
+        for command in [
+            "sshpass -p 'fixture-short!' ssh fixture-host",
+            "curl --user account:fixture-short! https://fixture.invalid",
+            "git clone https://account:fixture-short!@fixture.invalid/repo",
+        ] {
+            assert!(!bounded(command, FIELD_LIMIT).contains("fixture-short!"));
         }
         let yaml = "ordinary text\npassword: |\n  first-part\n  second-part\nregular after secret";
         let redacted = bounded(yaml, FIELD_LIMIT);
