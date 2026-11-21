@@ -278,7 +278,7 @@ impl Trace {
             if let Some(body) = body {
                 for span in [&mut root, &mut admitted] {
                     span["attributes"].as_array_mut().expect("span attributes")
-                        .push(text("langfuse.observation.input", body));
+                        .push(observation_content("langfuse.observation.input", body));
                 }
             }
             std::iter::once(root).chain(std::iter::once(admitted).chain(self.spans.iter().cloned()).map(move |mut span| {
@@ -343,7 +343,7 @@ impl Span<'_> {
         let clean = content::bounded(value, budget);
         if !clean.is_empty() {
             self.trace.remaining_content -= clean.len();
-            self.attributes.push(text(key, &clean));
+            self.attributes.push(observation_content(key, &clean));
         }
     }
 
@@ -458,6 +458,10 @@ fn text(key: &str, value: &str) -> Value {
     json!({"key":key,"value":{"stringValue":value}})
 }
 
+fn observation_content(key: &str, redacted: &str) -> Value {
+    text(key, &json!(redacted).to_string())
+}
+
 fn number(key: &str, value: u64) -> Value {
     json!({"key":key,"value":{"intValue":value.min(i64::MAX as u64).to_string()}})
 }
@@ -504,7 +508,10 @@ mod tests {
                     Some("langfuse.observation.input" | "langfuse.observation.output")
                 )
             })
-            .map(|attribute| attribute["value"]["stringValue"].as_str().unwrap())
+            .map(|attribute| {
+                serde_json::from_str::<String>(attribute["value"]["stringValue"].as_str().unwrap())
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         assert!(
             attributes
@@ -516,7 +523,7 @@ mod tests {
                 .iter()
                 .all(|value| value.len() <= content::FIELD_LIMIT)
         );
-        assert!(attributes.iter().map(|value| value.len()).sum::<usize>() <= content::BATCH_LIMIT);
+        assert!(attributes.iter().map(String::len).sum::<usize>() <= content::BATCH_LIMIT);
         assert!(trace.remaining_content < 64);
     }
 

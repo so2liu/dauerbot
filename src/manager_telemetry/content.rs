@@ -80,7 +80,6 @@ fn clean(text: &str) -> String {
         return "[redacted private key material]".into();
     }
     let mut result = String::new();
-    let mut continuation = false;
     for line in text.split_inclusive('\n') {
         let lower = line.to_ascii_lowercase();
         let normalized = lower.replace(['_', '-', ' ', '\t', '"', '\''], "");
@@ -103,17 +102,12 @@ fn clean(text: &str) -> String {
             .iter()
             .any(|field| normalized[..end].ends_with(field))
         });
-        let protected_line =
-            continuation || sensitive_path(line) || credential_header || credential_assignment;
-        continuation = (credential_assignment
-            && normalized.trim_end().ends_with([':', '=', '|', '>']))
-            || (credential_header && lower.trim_end().ends_with("bearer"));
-        if protected_line {
-            result.push_str("[redacted credential-bearing line]");
-            if line.ends_with('\n') {
-                result.push('\n');
-            }
-            continue;
+        if sensitive_path(line) || credential_header || credential_assignment {
+            // Explicit credential context can continue across YAML blocks,
+            // quoted values, or pasted file contents on subsequent lines.
+            // Omit the remainder instead of guessing where the value ends.
+            result.push_str("[redacted credential-bearing text]");
+            break;
         }
         let mut start = 0;
         for (index, ch) in line
@@ -253,6 +247,10 @@ mod tests {
         ] {
             assert!(!bounded(secret, FIELD_LIMIT).contains(secret), "{secret}");
         }
+        let yaml = "ordinary text\npassword: |\n  first-part\n  second-part\nregular after secret";
+        let redacted = bounded(yaml, FIELD_LIMIT);
+        assert!(redacted.starts_with("ordinary text"));
+        assert!(!redacted.contains("first-part") && !redacted.contains("second-part"));
         let oversized = "消息正文。".repeat(FIELD_LIMIT);
         let output = bounded(&oversized, FIELD_LIMIT);
         assert!(output.starts_with("消息正文。"));

@@ -3056,13 +3056,14 @@ mod tests {
                 assert!(!debug.contains(forbidden), "Sensitive data must not appear in Debug");
             }
             let attribute = |index: usize, key: &str| spans[index]["attributes"].as_array().unwrap()
-                .iter().find(|a| a["key"] == key).and_then(|a| a["value"]["stringValue"].as_str());
+                .iter().find(|a| a["key"] == key).and_then(|a| a["value"]["stringValue"].as_str())
+                .map(|value| serde_json::from_str::<String>(value).unwrap());
             if mode == "content" {
                 for index in [0, 1, 2] {
                     assert!(attribute(index, "langfuse.observation.input").unwrap().contains("private user message"));
                 }
-                assert_eq!(attribute(3, "langfuse.observation.input"), Some("private-file.txt"));
-                assert_eq!(attribute(3, "langfuse.observation.output"), Some("ok"));
+                assert_eq!(attribute(3, "langfuse.observation.input").as_deref(), Some("private-file.txt"));
+                assert_eq!(attribute(3, "langfuse.observation.output").as_deref(), Some("ok"));
                 assert!(attribute(4, "langfuse.observation.output").unwrap().contains("private response body"));
             } else {
                 assert!(!export.contains("langfuse.observation.input"));
