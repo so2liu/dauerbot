@@ -140,6 +140,7 @@ pub(crate) const SENSITIVE_FIELDS: &[&str] = &[
     "secretkey",
     "headers",
     "auth",
+    "base64",
     "imageurl",
     "imagedata",
     "imagebytes",

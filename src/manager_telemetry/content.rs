@@ -258,6 +258,7 @@ mod tests {
             "app_secret=fixture-short",
             "secret_key = \"fixture-short!\"",
             "provider_key = \"short-provider!\"",
+            r#"{"base64":"aGVsbG8="}"#,
             "Token: fixture-short",
             "secret: \n fixture-multiline-value",
             "secret: fixture-short",
@@ -286,6 +287,11 @@ mod tests {
         ] {
             assert!(!bounded(command, FIELD_LIMIT).contains("fixture-short!"));
         }
+        assert!(
+            !crate::manager_context::clean(r#"{"base64":"aGVsbG8="}"#)
+                .0
+                .contains("aGVsbG8=")
+        );
         let yaml = "ordinary text\npassword: |\n  first-part\n  second-part\nregular after secret";
         let redacted = bounded(yaml, FIELD_LIMIT);
         assert!(redacted.starts_with("ordinary text"));
