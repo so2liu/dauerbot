@@ -203,7 +203,7 @@ pub fn set_mode(c: &Connection, project: &str, input: ModeInput) -> Result<Value
     public(c, project)
 }
 pub fn migrate_queued(c: &Connection) -> Result<()> {
-    let events = c.prepare("SELECT id FROM work_events WHERE status='queued' AND source!='management' ORDER BY rowid")?
+    let events = c.prepare("SELECT id FROM work_events WHERE status='queued' AND source NOT IN ('management','manager_worker') ORDER BY rowid")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for event in events {
@@ -225,7 +225,7 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
     let Some((project, source, raw)) = e else {
         return Ok(());
     };
-    if source == "management" {
+    if matches!(source.as_str(),"management"|"manager_worker") {
         return Ok(());
     }
     let payload: Value = serde_json::from_str(&raw)?;
@@ -307,13 +307,24 @@ fn intent(
     origin: Option<&str>,
     steer: bool,
 ) -> Result<String> {
+    intent_for_worker(c,p,id,instructions,origin,steer,None)
+}
+fn intent_for_worker(
+    c: &Connection,
+    p: &Project,
+    id: &str,
+    instructions: &str,
+    origin: Option<&str>,
+    steer: bool,
+    worker: Option<&Project>,
+) -> Result<String> {
     ensure!(
         !instructions.trim().is_empty() && instructions.len() <= 1048576,
         "Worker instructions must contain 1 to 1048576 bytes"
     );
     if let Some(previous) = c
         .query_row(
-            "SELECT id FROM work_events WHERE project_id=? AND source='management' AND source_id=?",
+            "SELECT id FROM work_events WHERE project_id=? AND source IN ('management','manager_worker') AND source_id=?",
             params![p.id, id],
             |r| r.get::<_, String>(0),
         )
@@ -323,12 +334,20 @@ fn intent(
     }
     let task = db::id();
     let event = db::id();
-    let transition = if steer {
+    let transition = if steer || worker.is_some() {
         None
     } else {
         crate::cli_switch::latest(c, &p.id)?.filter(crate::cli_switch::blocks_worker)
     };
     let mut payload = json!({"instructions":instructions,"origin_event_id":origin,"manager_effect_id":id,"steer":steer,"expected_agent":transition.as_ref().map(|r|r.target.as_str()).unwrap_or(&p.agent),"expected_native":if transition.is_some(){""}else{&p.native_session},"target_generation":if transition.is_none()&&p.terminal.is_some(){Some(&p.generation)}else{None},"transition_id":transition.as_ref().map(|r|&r.id)});
+    let source = if let Some(worker) = worker {
+        payload["expected_agent"] = json!(worker.agent);
+        payload["expected_native"] = json!(worker.native_session);
+        payload["target_generation"] = json!(worker.generation);
+        "manager_worker"
+    } else {
+        "management"
+    };
     if let Some(origin) = origin {
         let proposal: Option<String> = c.query_row(
             "SELECT json_extract(payload,'$.proposal_id') FROM work_events
@@ -341,7 +360,10 @@ fn intent(
         }
     }
     c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)",params![task,p.id,"Management delegation",instructions,db::now(),db::now()])?;
-    c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at) VALUES(?,?,?,'management',?,?,'queued',?,?)",params![event,p.id,task,id,payload.to_string(),db::now(),db::now()])?;
+    // A pre-seat daemon ignores worker_waiting. On rollback it must never
+    // route the native work back through Manager or the primary conversation.
+    let status = if worker.is_some() { "worker_waiting" } else { "queued" };
+    c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",params![event,p.id,task,source,id,payload.to_string(),status,db::now(),db::now()])?;
     Ok(event)
 }
 #[cfg(test)]
@@ -422,7 +444,7 @@ pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Resu
     Ok(true)
 }
 pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String> {
-    ensure!(event.source == "management", "Only manager delegations may reach the coding worker");
+    ensure!(matches!(event.source.as_str(),"management"|"manager_worker"), "Only manager delegations may reach the coding worker");
     ensure!(
         event.payload["expected_agent"] == p.agent
             && event.payload["target_generation"] == p.generation,
@@ -928,6 +950,25 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
    "write_file"=>{let a:WriteArgs=serde_json::from_value(call.arguments)?;write_file(Path::new(&p.path),a)},
    "delegate"|"steer_worker"=>{
     let a:DelegateArgs=serde_json::from_value(call.arguments)?;let steer=call.name=="steer_worker";
+    ensure!(!a.instructions.trim().is_empty() && a.instructions.len() <= 1048576,
+        "Worker instructions must contain 1 to 1048576 bytes");
+    // Establish that the requested discussion belongs to this batch before
+    // starting any additional native execution.
+    let context=ctx.clone();let chosen_source=a.source_event_id.clone();
+    let seat_origin = app.db.call(move|c| {
+        valid(c,&context)?;
+        select_origin(c,&context,chosen_source.as_deref())
+    }).await?;
+    let selected = match a.target_cli.as_deref() {
+        Some(target) => {
+            ensure!(!steer,"Choose target_cli on delegate; steer_worker is scoped to the primary conversation");
+            match crate::manager_workers::select(app,&p,target,seat_origin).await? {
+                crate::manager_workers::Selection::Ready(worker) => Some(*worker),
+                crate::manager_workers::Selection::Unavailable(result) => return Ok(result),
+            }
+        }
+        None => None,
+    };
     let context=ctx.clone();let request=effect.clone();app.db.call(move|c|{
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
       let origin=select_origin(&tx,&context,a.source_event_id.as_deref())?;
@@ -937,7 +978,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
           ensure!(!steer && a.target_cli.is_none(), "Approved proposal must use the current worker");
           ensure!(approved_origin(&tx, &p.id, &proposal.id)?, "Approved proposal authority changed");
           if let Some(existing) = tx.query_row(
-              &format!("SELECT e.id FROM work_events e WHERE e.project_id=? AND e.source='management'
+              &format!("SELECT e.id FROM work_events e WHERE e.project_id=? AND e.source IN ('management','manager_worker')
                AND json_extract(e.payload,'$.origin_event_id')=? AND NOT ({FAILED_BEFORE_SUBMISSION})
                ORDER BY e.rowid LIMIT 1"),
               params![p.id,proposal.id], |row| row.get::<_,String>(0)
@@ -949,21 +990,27 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       } else {
           &a.instructions
       };
-      if let Some(target) = &a.target_cli { crate::cli_switch::request(&tx,&p,target)?; }
-      let held=crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
-      // An explicit target participates in the ordinary cooperative handoff.
-      // Its instructions remain held for that successor, never sent to the old CLI.
-      let steer_current = steer && !(a.target_cli.is_some() && held);
-      ensure!(!steer_current||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
-      ensure!(!steer_current||!held,"Worker steering is held by a CLI transition");
-      let id=intent(&tx,&p,&request,instructions,origin.as_deref(),steer_current)?;
+      let independent = selected.as_ref().filter(|worker| worker.generation!=p.generation);
+      if let Some(worker) = independent {
+          let current=crate::manager_workers::authorize(&tx,&p,&worker.generation,true)?.project;
+          ensure!(current.terminal==worker.terminal && current.native_session==worker.native_session,
+              "The independent worker changed before assignment");
+      } else if let Some(worker) = &selected {
+          crate::manager_workers::controls(&tx,&p)?;
+          ensure!(p.generation==worker.generation && p.terminal==worker.terminal && p.native_session==worker.native_session
+              && p.ready && p.execution["mcp_registered"]==true,"The primary worker changed before assignment");
+      }
+      let held=independent.is_none() && crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
+      ensure!(!steer||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
+      ensure!(!steer||!held,"Worker steering is held by a CLI transition");
+      let id=intent_for_worker(&tx,&p,&request,instructions,origin.as_deref(),steer,independent)?;
       let event=work::event(&tx,&p.id,&id)?;tx.commit()?;
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
    },
    "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();let mut snapshot=app.db.call(move|c|{let current=valid(c,&authority)?;worker_snapshot(c,&current.id,&current.generation)}).await?;snapshot["agent"]=json!(p.agent);snapshot["generation"]=json!(p.generation);snapshot["native_session"]=json!(p.native_session);snapshot["ready"]=json!(p.ready);snapshot["paused"]=json!(p.paused);snapshot["mcp_registered"]=json!(p.execution["mcp_registered"]==true);snapshot["obsolete_executions"]=json!(obsolete);snapshot["input_effect_journal"]=journal;Ok(snapshot)},
-   "cli_send_keys"=>{drop(guard);let args:crate::manager_terminal::SendArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::send(app,ctx,args).await},
-   "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args).await},
+   "cli_send_keys"=>{drop(guard);let args:crate::manager_terminal::SendArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::send(app,ctx,args,&effect).await},
+   "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args,&effect).await},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
    "send_md"|"send_file"=>{
     let (to,text,anchor,path,intent,source)=if call.name=="send_md" {
@@ -1049,14 +1096,19 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
 }
 fn worker_snapshot(c: &Connection, project: &str, generation: &str) -> Result<Value> {
     let transition = crate::cli_switch::latest(c, project)?;
-    let delegations = c.prepare("SELECT e.id,e.status,r.status,e.error,json_extract(e.payload,'$.transition_id'),json_extract(e.payload,'$.expected_agent') FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source='management' ORDER BY e.rowid DESC LIMIT 24")?
+    let delegations = c.prepare("SELECT e.id,e.status,r.status,e.error,json_extract(e.payload,'$.transition_id'),json_extract(e.payload,'$.expected_agent'),json_extract(e.payload,'$.target_generation'),e.source FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source IN ('management','manager_worker') ORDER BY e.rowid DESC LIMIT 24")?
         .query_map([project],|r| {
-            let status: String = r.get(1)?;
-            let held = status == "queued" && transition.as_ref().is_some_and(|request| request.holds_input || request.phase == "recovery_exhausted");
-            Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":status,"held":held,"run_status":r.get::<_,Option<String>>(2)?,"error":r.get::<_,String>(3)?,"transition_id":r.get::<_,Option<String>>(4)?,"expected_agent":r.get::<_,Option<String>>(5)?}))
+            let mut status: String = r.get(1)?;
+            if status=="worker_waiting" {status="queued".into();}
+            let independent = r.get::<_, String>(7)? == "manager_worker";
+            let held = status == "queued" && transition.as_ref().is_some_and(|request|
+                request.holds_input || (!independent && request.phase == "recovery_exhausted"));
+            Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":status,"held":held,"run_status":r.get::<_,Option<String>>(2)?,"error":r.get::<_,String>(3)?,"transition_id":r.get::<_,Option<String>>(4)?,"expected_agent":r.get::<_,Option<String>>(5)?,"generation":r.get::<_,Option<String>>(6)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let work = work::snapshot(c, project)?;
+    let workers = crate::manager_workers::snapshot(c,&db::project_by_key(c,project)?)?;
     Ok(json!({
+        "workers":workers,
         "delegations":delegations,
         "cli_transition":transition,
         "last_failure":transition.as_ref().and_then(|r|r.source["last_failure"].as_str()),
@@ -1123,7 +1175,7 @@ fn repair_finished(c: &Connection, project: &str) -> Result<()> {
 }
 /// Durable observations contain receipts, never invented task-completion signals.
 fn observe(c: &Connection, project: &str) -> Result<()> {
-    let rows=c.prepare("SELECT id,status,content,attachment FROM messages WHERE project_id=? AND direction='out' AND status IN ('sent','failed','uncertain') AND json_extract(attachment,'$.manager_effect') IS NULL AND json_extract(attachment,'$.manager_notice') IS NULL AND json_extract(attachment,'$.autonomy_publication_revision') IS NULL AND created_at >= COALESCE((SELECT MIN(created_at) FROM work_events WHERE project_id=? AND source='management'),9223372036854775807) ORDER BY rowid DESC LIMIT 32")?.query_map(params![project,project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=c.prepare("SELECT id,status,content,attachment FROM messages WHERE project_id=? AND direction='out' AND status IN ('sent','failed','uncertain') AND json_extract(attachment,'$.manager_effect') IS NULL AND json_extract(attachment,'$.manager_notice') IS NULL AND json_extract(attachment,'$.autonomy_publication_revision') IS NULL AND created_at >= COALESCE((SELECT MIN(created_at) FROM work_events WHERE project_id=? AND source IN ('management','manager_worker')),9223372036854775807) ORDER BY rowid DESC LIMIT 32")?.query_map(params![project,project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, status, content, raw) in rows {
         let a: Value = serde_json::from_str(&raw)?;
         let anchor = a["resolved_reply_to_message_id"].as_str().or_else(|| a["reply_to_message_id"].as_str());
@@ -1140,11 +1192,11 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &id,
             &status,
             origin.as_deref(),
-            &json!({"kind":"worker_message","status":status,"already_delivered_to_user":status=="sent","content":content.chars().take(16000).collect::<String>(),"to":a["to"],"reply_to_message_id":anchor,"sent_message_id":a["sent_message_id"],"sent_chat_id":a["sent_chat_id"]}),
+            &json!({"kind":"worker_message","worker_generation":a["task_worker_generation"],"status":status,"already_delivered_to_user":status=="sent","content":content.chars().take(16000).collect::<String>(),"to":a["to"],"reply_to_message_id":anchor,"sent_message_id":a["sent_message_id"],"sent_chat_id":a["sent_chat_id"]}),
         )?;
     }
     let intents=c.prepare(&format!("SELECT e.id,e.error,json_extract(e.payload,'$.origin_event_id')
-        FROM work_events e WHERE e.project_id=? AND e.source='management' AND ({FAILED_BEFORE_SUBMISSION})
+        FROM work_events e WHERE e.project_id=? AND e.source IN ('management','manager_worker') AND ({FAILED_BEFORE_SUBMISSION})
         ORDER BY e.rowid DESC LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, error, origin) in intents {
         observation(
@@ -1157,8 +1209,8 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &json!({"event_id":id,"status":"definitely_not_submitted","error":error}),
         )?;
     }
-    let runs=c.prepare("SELECT r.id,r.status,r.error,json_extract(e.payload,'$.origin_event_id') FROM work_runs r JOIN work_events e ON e.id=r.event_id WHERE r.project_id=? AND e.source='management' AND r.status IN ('settled','completed','uncertain','failed','interrupted') ORDER BY r.rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, status, error, origin) in runs {
+    let runs=c.prepare("SELECT r.id,r.status,r.error,json_extract(e.payload,'$.origin_event_id'),r.event_id,r.generation FROM work_runs r JOIN work_events e ON e.id=r.event_id WHERE r.project_id=? AND e.source IN ('management','manager_worker') AND r.status IN ('settled','completed','uncertain','failed','interrupted') ORDER BY r.rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, status, error, origin, event, generation) in runs {
         observation(
             c,
             project,
@@ -1166,12 +1218,12 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &id,
             &status,
             origin.as_deref(),
-            &json!({"kind":"worker_run","run_id":id,"delivery_status":status,"error":error,"semantic_task_success":"unconfirmed"}),
+            &json!({"kind":"worker_run","run_id":id,"event_id":event,"worker_generation":generation,"delivery_status":status,"error":error,"semantic_task_success":"unconfirmed"}),
         )?;
     }
     Ok(())
 }
-fn observation(
+pub(crate) fn observation(
     c: &Connection,
     project: &str,
     source: &str,
@@ -1939,6 +1991,18 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
                     let value = tool(&app, &turn.context, call).await?;
                     results.push((occurrence, value));
                 }
+                if results.iter().all(|(_, result)| result["ignored_terminal_stop"] == true)
+                    && !results.is_empty()
+                {
+                    let Some(_permit) = app.service.gate.enter() else {
+                        return Ok(());
+                    };
+                    let context = turn.context.clone();
+                    app.db.call(move |c| finish_turn(c, &context,
+                        "Terminal observation stopped because the tool budget was exhausted."))
+                        .await?;
+                    return Ok(());
+                }
                 turn.checkpoint = manager_loop::supply_tool_results(turn.checkpoint, results)?;
                 checkpoint(&app, &turn.context, &turn.checkpoint, false).await?;
             }
@@ -1958,20 +2022,27 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
 fn finish_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
     let tx = c.unchecked_transaction()?;
     valid(&tx, context)?;
-    tx.execute(
-        "UPDATE manager_runs SET status='complete' WHERE id=?",
-        [&context.run],
-    )?;
-    tx.execute(
-        "INSERT OR REPLACE INTO manager_turn_notes(run_id,note) VALUES(?,?)",
-        params![context.run, note.chars().take(8000).collect::<String>()],
-    )?;
-    tx.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN(SELECT input_id FROM manager_input_claims WHERE run_id=?) AND status='processing'",[&context.run])?;
-    settle_inputs(&tx, &context.run)?;
+    close_turn(&tx, context, note)?;
     recovered(&tx, context)?;
     tx.commit()?;
     Ok(())
 }
+
+fn close_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
+    c.execute(
+        "UPDATE manager_runs SET status='complete' WHERE id=?",
+        [&context.run],
+    )?;
+    c.execute(
+        "INSERT OR REPLACE INTO manager_turn_notes(run_id,note) VALUES(?,?)",
+        params![context.run, note.chars().take(8000).collect::<String>()],
+    )?;
+    c.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN
+        (SELECT input_id FROM manager_input_claims WHERE run_id=?) AND status='processing'",
+        [&context.run])?;
+    settle_inputs(c, &context.run)
+}
+
 fn cancel_repair(c: &Connection, id: &str, reason: &str) -> Result<()> {
     if c.execute("UPDATE work_events SET status='cancelled',error=?,updated_at=? WHERE id=? AND status='queued'",params![reason,db::now(),id])?==1 {
         c.execute("UPDATE work_tasks SET status='cancelled',updated_at=? WHERE id=(SELECT task_id FROM work_events WHERE id=?)",params![db::now(),id])?;
@@ -2036,6 +2107,56 @@ fn failure_notice(error: &Failure, delay: i64, repair: bool, chinese: bool) -> S
         error.summary()
     )
 }
+// Record only host-known field names and result flags. Tool arguments and
+// results can contain arbitrary user data, credentials, or provider addresses.
+fn last_tool_summary(c: &Connection, run: &str) -> Result<Option<Value>> {
+    Ok(c.query_row(
+        "SELECT name, occurrence, status, arguments, result FROM manager_effects
+         WHERE run_id=? ORDER BY rowid DESC LIMIT 1",
+        [run],
+        |row| {
+            let args: Value = serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default();
+            let result: Value = serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
+            let fields = [
+                "generation",
+                "input_id",
+                "source_event_id",
+                "target_cli",
+                "reply_to_message_id",
+                "to",
+                "path",
+                "instructions",
+                "segments",
+            ]
+            .into_iter()
+            .filter(|key| args.get(*key).is_some())
+            .collect::<Vec<_>>();
+            let outcome = result["status"].as_str().filter(|value| {
+                matches!(
+                    *value,
+                    "sent"
+                        | "queued"
+                        | "held"
+                        | "submitted"
+                        | "uncertain"
+                        | "written"
+                        | "observation_stopped"
+                )
+            });
+            Ok(
+                json!({"tool":row.get::<_, String>(0)?, "occurrence":row.get::<_, String>(1)?,
+                "argument_fields":fields, "target_cli":args["target_cli"].as_str()
+                    .filter(|cli| matches!(*cli,"codex"|"claude"|"agy"|"pi")),
+                "segment_count":args["segments"].as_array().map(Vec::len),
+                "effect_status":row.get::<_, String>(2)?, "result_status":outcome,
+                "has_error":result["error"].as_str().is_some_and(|error| !error.is_empty()),
+                "has_dispatch_error":result["dispatch_error"].is_string()}),
+            )
+        },
+    )
+    .optional()?)
+}
+
 fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
     let tx = c.unchecked_transaction()?;
     let Ok(p) = valid(&tx, ctx) else {
@@ -2055,12 +2176,26 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
     } else {
         i64::MAX
     };
-    let diagnostic = json!({"incident_id":incident,"attempt":attempts,"kind":error.kind,"http_status":error.http_status,"retryable":error.retryable,"elapsed_ms":error.elapsed_ms,"output_tokens":error.output_tokens,"finish_reason":error.finish_reason,"failed_at":db::now(),"next_attempt_at":if error.retryable{Some(next_attempt)}else{None}}).to_string();
+    let exhausted = error.kind == "turn_budget_exhausted";
+    let mut diagnostic = json!({"incident_id":incident,"attempt":attempts,"kind":error.kind,"http_status":error.http_status,"retryable":error.retryable,"elapsed_ms":error.elapsed_ms,"output_tokens":error.output_tokens,"finish_reason":error.finish_reason,"failed_at":db::now(),"next_attempt_at":if error.retryable{Some(next_attempt)}else{None}});
+    if exhausted {
+        diagnostic["last_tool"] = json!(last_tool_summary(&tx, &ctx.run)?);
+    }
+    let diagnostic = diagnostic.to_string();
     tx.execute("INSERT INTO manager_failures(project_id,revision,incident_id,attempts,diagnostic,notified) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision,incident_id=excluded.incident_id,attempts=excluded.attempts,diagnostic=excluded.diagnostic,notified=excluded.notified,repair_probe=CASE WHEN manager_failures.incident_id=excluded.incident_id THEN manager_failures.repair_probe ELSE 0 END",params![ctx.project,ctx.revision,incident,attempts,diagnostic,notified])?;
     tx.execute(
         "UPDATE manager_runs SET error=json_set(CASE WHEN json_valid(error) THEN error ELSE '{}' END,'$.last_failure',json(?)) WHERE id=?",
         params![diagnostic, ctx.run],
     )?;
+    if exhausted {
+        // End this batch so its saved tool effects cannot be admitted a second
+        // time. Unclaimed inputs and outstanding delegations retain their state.
+        close_turn(&tx, ctx, error.summary())?;
+        tx.execute("UPDATE manager_config SET error='',next_attempt_at=? WHERE project_id=?",
+            params![next_attempt, ctx.project])?;
+        tx.commit()?;
+        return Ok(());
+    }
     tx.execute(
         "UPDATE manager_config SET error=?,next_attempt_at=? WHERE project_id=?",
         params![error.summary(), next_attempt, ctx.project],
@@ -2247,7 +2382,7 @@ pub fn settle_sources(c: &Connection) -> Result<()> {
     if !installed(c)? {
         return Ok(());
     }
-    c.execute("UPDATE work_events SET status='consumed',updated_at=? WHERE status='managed' AND id IN(SELECT origin_event_id FROM manager_inputs WHERE status IN ('consumed','transferred')) AND NOT EXISTS(SELECT 1 FROM work_events d WHERE d.source='management' AND json_extract(d.payload,'$.origin_event_id')=work_events.id AND d.status IN ('queued','submitting','submitted','uncertain'))",[db::now()])?;
+    c.execute("UPDATE work_events SET status='consumed',updated_at=? WHERE status='managed' AND id IN(SELECT origin_event_id FROM manager_inputs WHERE status IN ('consumed','transferred')) AND NOT EXISTS(SELECT 1 FROM work_events d WHERE d.source IN ('management','manager_worker') AND json_extract(d.payload,'$.origin_event_id')=work_events.id AND d.status IN ('queued','worker_waiting','submitting','submitted','uncertain'))",[db::now()])?;
     c.execute("UPDATE work_occurrences SET status='consumed' WHERE event_id IN(SELECT id FROM work_events WHERE status='consumed')",[])?;
     c.execute("UPDATE work_tasks SET status='consumed',updated_at=? WHERE id IN(SELECT task_id FROM work_events WHERE status='consumed')",[db::now()])?;
     Ok(())
@@ -2734,6 +2869,97 @@ mod tests {
             })
             .unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn manager_stops_ignored_terminal_observation_without_exhausting_model_turns() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn poll(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
+            let index = calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
+                "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
+                    {"id":format!("view-{index}"),"type":"function","function":{
+                        "name":"cli_view","arguments":json!({"generation":"g"}).to_string()
+                    }}
+                ]},"finish_reason":"tool_calls"}]
+            }))
+        }
+
+        let (dir, app, p) = fixture().await;
+        app.config.write().await.herdr_session = dir.path().to_string_lossy().into();
+        let socket = crate::herdr::socket_path(&app.config.read().await.clone()).unwrap();
+        let herdr = tokio::net::UnixListener::bind(socket).unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let reads = polls.clone();
+        let project_id = p.id.clone();
+        let herdr_server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = herdr.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let line = BufReader::new(read).lines().next_line().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "pane.get" => json!({"pane":{
+                        "pane_id":"pane","terminal_id":"terminal","workspace_id":"workspace",
+                        "tokens":{"hfb_owner":"dauerbot","hfb_project":project_id,
+                            "hfb_generation":"g","hfb_execution":"owned"}
+                    }}),
+                    "agent.get" => json!({"agent":{
+                        "pane_id":"pane","terminal_id":"terminal","workspace_id":"workspace","agent":"codex"
+                    }}),
+                    "pane.process_info" => json!({"process_info":{
+                        "foreground_processes":[{"name":"codex"}]
+                    }}),
+                    "pane.read" => {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        json!({"read":{"pane_id":"pane","text":"Stable terminal output"}})
+                    }
+                    method => panic!("Unexpected HERDR operation: {method}"),
+                };
+                let response = json!({"id":request["id"],"result":result}).to_string() + "\n";
+                write.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let router = Router::new().route("/v1/chat/completions", post(poll)).with_state(model_calls.clone());
+        let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        ingest(&app, &p, "om_terminal_stall", "Check the worker once");
+        let mut turn = app.db.sync(|c| {
+            c.execute("UPDATE projects SET generation='g',terminal='terminal',ready=1,execution=? WHERE id=?",
+                params![json!({"backend":"legacy","workspace_id":"workspace","pane_id":"pane",
+                    "terminal_id":"terminal","managed_name":"owned","generation":"g",
+                    "shell_pid":null,"launch_permit":"/tmp/fixture-only"}).to_string(), p.id])?;
+            work::sync_inbound(c)?;
+            Ok(claim(c, &p.id)?.unwrap())
+        }).unwrap();
+        turn.config.base_url = endpoint;
+        let run = turn.context.run.clone();
+        tokio::time::timeout(Duration::from_secs(10), drive(app.clone(), turn))
+            .await.unwrap().unwrap();
+        provider.abort();
+        herdr_server.abort();
+
+        assert_eq!(polls.load(Ordering::SeqCst), 4);
+        assert_eq!(model_calls.load(Ordering::SeqCst), 6);
+        app.db.sync(|c| {
+            let (status, error): (String, String) = c.query_row(
+                "SELECT status,error FROM manager_runs WHERE id=?", [&run],
+                |r| Ok((r.get(0)?, r.get(1)?)))?;
+            assert_eq!(status,"complete");
+            assert!(error.is_empty());
+            let stops: i64 = c.query_row(
+                "SELECT count(*) FROM manager_effects WHERE run_id=? AND json_extract(result,'$.reason')='terminal_output_unchanged'",
+                [&run], |r| r.get(0))?;
+            assert_eq!(stops, 3);
+            Ok(())
+        }).unwrap();
     }
 
     #[tokio::test]
@@ -3616,6 +3842,59 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn turn_budget_failure_releases_manager_without_replaying_effects() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_budget", "first input");
+        let run = app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            let turn = claim(c, &p.id)?.unwrap();
+            for (id, status) in [("delivered-effect", "complete"), ("uncertain-effect", "uncertain")] {
+                c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result)
+                    VALUES(?,?,?,'send_md',?,?,'{}')", params![id,turn.context.run,id,
+                        json!({"to":"oc_fixture","text":"sensitive-fixture"}).to_string(),status])?;
+            }
+            let error = Failure { kind:"turn_budget_exhausted".into(), retryable:true, ..Failure::internal() };
+            failure(c, &turn.context, &error)?;
+            assert!(valid(c, &turn.context).is_err());
+            let state = public(c, &p.id)?;
+            assert_eq!(state["status"], "ready");
+            assert_eq!(state["failure"]["kind"], "turn_budget_exhausted");
+            assert_eq!(state["failure"]["last_tool"]["tool"], "send_md");
+            assert_eq!(state["failure"]["last_tool"]["effect_status"], "uncertain");
+            assert!(!state.to_string().contains("sensitive-fixture"));
+            assert_eq!(c.query_row("SELECT status FROM manager_runs WHERE id=?",
+                [&turn.context.run], |row|row.get::<_,String>(0))?, "complete");
+            let committed = c.query_row("SELECT count(*) FROM manager_effects WHERE run_id=?",
+                [&turn.context.run], |row|row.get::<_,i64>(0))?;
+            assert_eq!(committed, 2);
+            assert!(claim(c, &p.id)?.is_none());
+            Ok(turn.context.run)
+        }).unwrap();
+        ingest(&app, &p, "om_budget_next", "second input");
+        app.db
+            .sync(|c| {
+                work::sync_inbound(c)?;
+                let next = claim(c, &p.id)?.unwrap();
+                assert_ne!(next.context.run, run);
+                assert_eq!(
+                    c.query_row("SELECT count(*) FROM manager_effects", [], |row| row
+                        .get::<_, i64>(0))?,
+                    2
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM manager_effects WHERE status='uncertain'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn failures_are_incident_scoped_backoff_survives_observations_and_valid_response_recovers()
      {
         let (_dir, app, p) = fixture().await;
@@ -4173,72 +4452,62 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
-    async fn explicit_cli_steer_waits_for_selected_generation_and_preserves_recovery() {
+    async fn task_worker_selection_does_not_request_a_project_transition() {
         let (_dir, app, p) = fixture().await;
         ingest(&app, &p, "om_target_cli", "Use agy for this task");
         let turn = app.db.sync(|c| { work::sync_inbound(c)?; Ok(claim(c, &p.id)?.unwrap()) }).unwrap();
-        let call = ToolCall { occurrence: "targeted-steer".into(), name: "steer_worker".into(),
+        let call = ToolCall { occurrence: "targeted-delegate".into(), name: "delegate".into(),
             arguments: json!({"instructions":"selected CLI assignment","target_cli":"agy"}) };
         let receipt = tool(&app, &turn.context, call.clone()).await.unwrap();
-        assert_eq!(receipt["status"], "held");
-        assert_eq!(receipt["worker_agent"], "agy");
-        assert_eq!(receipt["generation"], Value::Null);
+        assert_eq!(receipt["status"], "worker_unavailable");
+        assert_eq!(receipt["work_queued"], false);
         assert_eq!(tool(&app, &turn.context, call).await.unwrap(), receipt);
-        let transition = receipt["transition_id"].as_str().unwrap().to_owned();
-        let event_id = receipt["event_id"].as_str().unwrap().to_owned();
         app.db.sync(|c| {
             assert_eq!(db::project_by_key(c, &p.id)?.agent, "codex");
-            assert!(crate::cli_switch::holds_input(c, &p.id)?);
-            assert!(work::claim_next(c, &p.id, "old-generation", db::now())?.is_none());
-            c.execute("UPDATE cli_switch_requests SET phase='recovery_pending',error='Fixture target is not installed' WHERE id=?", [&transition])?;
-            assert!(work::claim_next(c, &p.id, "wrong-generation", db::now())?.is_none());
-            assert_eq!(work::event(c, &p.id, &event_id)?.status, "queued");
-            // A manager correction remains claimable while ordinary worker input is held.
-            Ok(())
-        }).unwrap();
-        ingest(&app, &p, "om_correct_during_switch", "Keep the input; report the unavailable CLI");
-        let correction = app.db.sync(|c| {work::sync_inbound(c)?;Ok(claim(c,&p.id)?.unwrap())}).unwrap();
-        assert!(prompt_context(&correction.checkpoint).unwrap().to_string().contains("report the unavailable CLI"));
-        assert!(app.db.sync(|c|crate::cli_switch::holds_input(c,&p.id)).unwrap());
-        app.db.sync(|c| {
-            c.execute("UPDATE projects SET agent='agy',generation='ready-agy',terminal='fixture-agy',ready=1,execution=? WHERE id=?",
-                params![json!({"mcp_registered":true,"cli_switch_request":transition}).to_string(),p.id])?;
-            c.execute("UPDATE cli_switch_requests SET phase='ready',holds_input=0,error='' WHERE id=?",[&transition])?;
-            let native = work::claim_next(c,&p.id,"ready-agy",db::now())?.unwrap();
-            assert_eq!(native.event_id,event_id);
-            assert_eq!(native.generation,"ready-agy");
-            let event=work::event(c,&p.id,&event_id)?;
-            assert_eq!(event.payload["expected_agent"],"agy");
-            assert_eq!(event.payload["target_generation"],"ready-agy");
-            assert_eq!(event.payload["steer"],false);
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM cli_switch_requests",[],|r|r.get::<_,i64>(0))?,1);
+            assert!(!crate::cli_switch::holds_input(c, &p.id)?);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM cli_switch_requests",[],|r|r.get::<_,i64>(0))?,0);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source IN ('management','manager_worker')",[],|r|r.get::<_,i64>(0))?,0);
             Ok(())
         }).unwrap();
     }
 
     #[tokio::test]
-    async fn cli_target_validation_and_legacy_steering_are_atomic() {
+    async fn independent_seats_claim_only_their_own_work_and_failure_is_fenced() {
         let (_dir, app, p) = fixture().await;
-        app.db.sync(|c| {c.execute("UPDATE projects SET generation='current-generation',terminal='current-pane',ready=1,execution=? WHERE id=?",params![json!({"api_protocol":7,"mcp_contract":1}).to_string(),p.id])?;Ok(())}).unwrap();
-        ingest(&app,&p,"om_legacy_cli","Keep current CLI unless explicitly requested");
-        let turn=app.db.sync(|c|{work::sync_inbound(c)?;Ok(claim(c,&p.id)?.unwrap())}).unwrap();
-        let old=tool(&app,&turn.context,ToolCall{occurrence:"legacy-steer".into(),name:"steer_worker".into(),arguments:json!({"instructions":"current CLI input"})}).await.unwrap();
-        assert_eq!(old["status"],"queued");assert_eq!(old["worker_agent"],"codex");assert_eq!(old["generation"],"current-generation");
-        for (n,args) in [json!({"instructions":"never fallback","target_cli":"not-a-cli"}),json!({"instructions":"","target_cli":"claude"})].into_iter().enumerate() {
-            let rejected=tool(&app,&turn.context,ToolCall{occurrence:format!("rejected-target-{n}"),name:"delegate".into(),arguments:args}).await.unwrap();
-            assert!(rejected["error"].is_string());
-        }
         app.db.sync(|c| {
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM cli_switch_requests",[],|r|r.get::<_,i64>(0))?,0);
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
-            let event=work::event(c,&p.id,old["event_id"].as_str().unwrap())?;assert_eq!(event.payload["steer"],true);
+            c.execute("UPDATE projects SET agent='agy',generation='primary' WHERE id=?",[&p.id])?;
+            let parent=db::project_by_key(c,&p.id)?;
+            let transition=crate::cli_switch::request(c,&parent,"codex")?.unwrap();
+            c.execute("UPDATE cli_switch_requests SET phase='recovery_exhausted',holds_input=0 WHERE id=?",[transition.id])?;
+            for (agent,generation) in [("codex","worker-one"),("claude","worker-two")] {
+                c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at) VALUES(?,?,?,'isolated','ready',?)",
+                    params![generation,parent.id,agent,db::now()])?;
+            }
+            let one=crate::manager_workers::seat(c,&parent,"worker-one")?.unwrap().project;
+            let two=crate::manager_workers::seat(c,&parent,"worker-two")?.unwrap().project;
+            let a=intent_for_worker(c,&parent,"effect-one","first task",None,false,Some(&one))?;
+            let b=intent_for_worker(c,&parent,"effect-two","second task",None,false,Some(&two))?;
+            let later=intent_for_worker(c,&parent,"effect-later","held by pause",None,false,Some(&one))?;
+            let workers=worker_snapshot(c,&parent.id,&parent.generation)?;
+            assert_eq!(workers["workers"].as_array().unwrap().len(),3);
+            assert!(work::claim_next(c,&parent.id,"primary",db::now())?.is_none());
+            c.execute("UPDATE cli_switch_requests SET holds_input=1 WHERE project_id=?",[&parent.id])?;
+            assert!(work::claim_worker(c,&parent.id,"worker-one",db::now())?.is_none());
+            c.execute("UPDATE cli_switch_requests SET holds_input=0 WHERE project_id=?",[&parent.id])?;
+            let first=work::claim_worker(c,&parent.id,"worker-one",db::now())?.unwrap();
+            assert_eq!(first.event_id,a);
+            let second=work::claim_worker(c,&parent.id,"worker-two",db::now())?.unwrap();
+            assert_eq!(second.event_id,b);
+            work::delivery(c,&first.id,"submitted","",db::now())?;
+            work::delivery(c,&second.id,"submitted","",db::now())?;
+            crate::manager_workers::fail(c,&parent.id,"worker-two","fixture outage")?;
+            assert_eq!(work::event(c,&parent.id,&b)?.status,"uncertain");
+            assert_eq!(work::event(c,&parent.id,&a)?.status,"submitted");
+            c.execute("UPDATE projects SET paused=1 WHERE id=?",[&parent.id])?;
+            assert!(work::claim_worker(c,&parent.id,"worker-one",db::now())?.is_none());
+            assert_eq!(work::event(c,&parent.id,&later)?.status,"worker_waiting");
             Ok(())
         }).unwrap();
-        let selected=tool(&app,&turn.context,ToolCall{occurrence:"select-claude".into(),name:"delegate".into(),arguments:json!({"instructions":"claude work","target_cli":"claude"})}).await.unwrap();
-        assert_eq!(selected["status"],"held");assert_eq!(selected["worker_agent"],"claude");
-        let conflict=tool(&app,&turn.context,ToolCall{occurrence:"conflicting-target".into(),name:"steer_worker".into(),arguments:json!({"instructions":"do not replace active switch","target_cli":"agy"})}).await.unwrap();
-        assert!(conflict["error"].as_str().unwrap().contains("handoff is already in progress"));
-        app.db.sync(|c| {assert_eq!(crate::cli_switch::latest(c,&p.id)?.unwrap().target,"claude");assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,2);Ok(())}).unwrap();
     }
 
     #[tokio::test]

@@ -147,17 +147,12 @@ fn authorize_generation(
     project: &str,
 ) -> anyhow::Result<()> {
     if let Some(authority) = authority {
-        let current: String = c.query_row(
-            "SELECT generation FROM projects WHERE id=?",
-            [project],
-            |row| row.get(0),
-        )?;
-        anyhow::ensure!(
-            authority.project == project
-                && !current.is_empty()
-                && equal(&authority.generation, &current),
-            "This Agent execution changed; reconnect before using its tools"
-        );
+        anyhow::ensure!(authority.project == project, "The project authority changed");
+        let parent = db::project_by_key(c,project)?;
+        anyhow::ensure!(!authority.generation.is_empty(),"Agent generation is missing");
+        if !equal(&authority.generation,&parent.generation) {
+            crate::manager_workers::authorize(c,&parent,&authority.generation,false)?;
+        }
     }
     Ok(())
 }
@@ -167,6 +162,13 @@ fn authorize_session(
     project: &str,
 ) -> anyhow::Result<()> {
     authorize_generation(c, authority, project)?;
+    if let Some(authority) = authority {
+        let parent = db::project_by_key(c,project)?;
+        if !equal(&authority.generation,&parent.generation) {
+            crate::manager_workers::authorize(c,&parent,&authority.generation,true)?;
+            return Ok(());
+        }
+    }
     if authority.is_some() && crate::repair_lane::current(c, project, true)?.is_none() {
         let registered:bool=c.query_row("SELECT ready=1 AND COALESCE(json_extract(execution,'$.mcp_registered'),0)=1 AND json_type(execution,'$.repair_lane') IS NULL FROM projects WHERE id=?",[project],|r|r.get(0))?;
         anyhow::ensure!(
@@ -223,6 +225,22 @@ async fn auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Resp
                 generation: p.generation,
             });
             return next.run(req).await;
+        }
+        if !generation.is_empty() && !equal(generation,&p.generation) {
+            let parent = p.clone();
+            let requested = generation.to_owned();
+            let candidate = app.db.call(move |c| {
+                crate::manager_workers::authorize(c,&parent,&requested,false)
+            }).await;
+            if let Ok(seat) = candidate
+                && equal(token,&seat.project.mcp_token)
+            {
+                req.extensions_mut().insert(SessionAuthority {
+                    project: p.id,
+                    generation: seat.project.generation,
+                });
+                return next.run(req).await;
+            }
         }
     }
     (
@@ -951,7 +969,13 @@ async fn outbox(
         .call(move |c| {
             let tx = c.unchecked_transaction()?;
             authorize_session(&tx, &authority, &p.id)?;
-            if authority.is_some()
+            let current = db::project_by_key(&tx,&p.id)?;
+            if let Some(seat) = authority.as_ref().filter(|a| a.generation!=current.generation) {
+                attachment["task_worker_generation"]=json!(seat.generation);
+                anyhow::ensure!(input.intent.as_deref()!=Some("progress"),
+                    "A task worker must return a final result; transient progress is not supported");
+            }
+            if authority.as_ref().is_some_and(|a| a.generation==current.generation)
                 && let Some(lane) = crate::repair_lane::current(&tx, &p.id, true)?
             {
                 attachment[crate::repair_lane::OUTBOX_KEY] = serde_json::to_value(lane)?;
@@ -1022,6 +1046,17 @@ async fn register(
     Json(input): Json<Registration>,
 ) -> ApiResult {
     let authority = authority(session);
+    let parent = app.db.project(&id).await?;
+    if input.generation != parent.generation {
+        if authority.as_ref().is_some_and(|a| a.project!=parent.id || a.generation!=input.generation) {
+            return Err(anyhow::anyhow!("Session identity does not match").into());
+        }
+        let generation = input.generation.clone();
+        let worker = app.db.call(move |c| {
+            Ok(crate::manager_workers::authorize(c,&parent,&generation,false)?.project)
+        }).await?;
+        return Ok(Json(crate::manager_workers::register(&app,worker,&input.terminal,input.mcp_contract).await?));
+    }
     let cfg = app.config.read().await.clone();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     // Reread every probe: the daemon may admit a repair-only role while this
@@ -1253,8 +1288,9 @@ async fn create_timer(
         .db
         .call(move |c| {
             authorize_session(c, &authority, &p.id)?;
+            let current = db::project_by_key(c,&p.id)?;
             anyhow::ensure!(
-                authority.is_none() || crate::repair_lane::current(c, &p.id, true)?.is_none(),
+                authority.as_ref().is_none_or(|a| a.generation!=current.generation) || crate::repair_lane::current(c, &p.id, true)?.is_none(),
                 "A repair-only Agent may not schedule work; restore the intended conversation first"
             );
             work::create_timer(c, &p.id, input, db::now())
@@ -1447,6 +1483,49 @@ mod repair_authority_tests {
             assert!(authorize_generation(c,&authority,&p.id).is_err());Ok(())
         }).unwrap();
     }
+    #[tokio::test]
+    async fn task_worker_credential_is_bound_to_its_generation_and_project_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().join("store"), crate::config::Config::default()).unwrap();
+        let p = app.db.create(ProjectInput {
+            name: "Task worker fixture".into(),
+            path: dir.path().to_string_lossy().into(),
+            agent: "agy".into(), chat_id: String::new(), native_session: String::new(),
+            extra_args: vec![],
+        }).await.unwrap();
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET generation='primary' WHERE id=?", [&p.id])?;
+            for (generation, agent, token) in [("first", "codex", "fixture-first"), ("second", "claude", "fixture-second")] {
+                c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at)
+                    VALUES(?,?,?,?,'ready',0)", rusqlite::params![generation,p.id,agent,token])?;
+            }
+            Ok(())
+        }).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let actor = app.clone();
+        let server = tokio::spawn(async move { axum::serve(listener, router(actor)).await.unwrap() });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let schedule = |generation| http.post(format!("http://{address}/api/projects/{}/timers", p.id))
+            .bearer_auth("fixture-first").header("x-hfb-generation",generation)
+            .json(&json!({"name":"fixture","prompt":"fixture","kind":"once","at":db::now()+60000}));
+        for generation in ["primary", "second"] {
+            assert_eq!(schedule(generation).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(schedule("first").send().await.unwrap().status().is_success());
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
+            Ok(())
+        }).unwrap();
+        assert!(!schedule("first").send().await.unwrap().status().is_success());
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET paused=0 WHERE id=?", [&p.id])?;
+            crate::manager_workers::closed(c, "first")
+        }).unwrap();
+        assert_eq!(schedule("first").send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn unregistered_native_credential_cannot_bypass_repair_admission_through_outbox() {
         let (_dir, app, p, _record) = crate::repair_lane::tests::fixture("codex").await;

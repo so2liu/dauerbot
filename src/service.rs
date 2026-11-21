@@ -1226,6 +1226,43 @@ mod tests {
     }
 
     #[test]
+    fn manager_worker_migration_preserves_primary_identity_and_activation_fingerprints() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("bridge.sqlite3");
+        let cfg = Config::default();
+        let db = Db::open(&path)?;
+        db.sync(|c| {
+            c.execute("INSERT INTO projects(id,name,path,agent,generation,created_at,mcp_token,native_session)
+                VALUES('project','fixture','','agy','primary',0,'fixture-token','primary-native')", [])?;
+            c.execute("DROP TABLE manager_workers", [])?;
+            Ok(())
+        })?;
+        drop(db);
+        let previous = fingerprint(&path, &cfg)?;
+        let ordered = fingerprint_with_order(&path, &cfg, true)?;
+        for _ in 0..2 {
+            let db = Db::open_handover(&path)?;
+            db.sync(|c| {
+                let schema = c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+                assert_eq!(schema, 7);
+                let primary = crate::db::project_by_key(c, "project")?;
+                assert_eq!(primary.generation, "primary");
+                assert_eq!(primary.native_session, "primary-native");
+                c.execute("INSERT OR IGNORE INTO manager_workers
+                    (generation,project_id,agent,token,state,created_at)
+                    VALUES('extra','project','codex','worker-fixture','starting',0)", [])?;
+                assert_eq!(c.query_row("SELECT count(*) FROM manager_workers", [],
+                    |row| row.get::<_, i64>(0))?, 1);
+                Ok(())
+            })?;
+            assert_eq!(fingerprint(&path, &cfg)?, previous);
+            assert_eq!(fingerprint_with_order(&path, &cfg, true)?, ordered);
+        }
+        assert_eq!(api::PROTOCOL, 7);
+        Ok(())
+    }
+
+    #[test]
     fn autonomy_migration_preserves_activation_fingerprints_and_schema_version() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("bridge.sqlite3");

@@ -400,6 +400,7 @@ impl Db {
             migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         }
         crate::manager::migrate(&migration, recover)?;
+        crate::manager_workers::migrate(&migration)?;
         crate::work::migrate(&migration)?;
         crate::autonomy::migrate(&migration)?;
         crate::manager::migrate_queued(&migration)?;

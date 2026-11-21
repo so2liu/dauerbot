@@ -85,7 +85,11 @@ impl Roots {
         let mut locations = integrations(data)?;
         db.sync(|c| {
             let mut stmt =
-                c.prepare("SELECT id,path,generation,terminal,execution,extra_args FROM projects")?;
+                c.prepare("SELECT id,path,generation,terminal,execution,extra_args FROM projects
+                    UNION ALL
+                    SELECT p.id,p.path,w.generation,json_extract(w.execution,'$.terminal_id'),w.execution,'[]'
+                    FROM manager_workers w JOIN projects p ON p.id=w.project_id
+                    WHERE w.state!='closed' AND json_type(w.execution)='object'")?;
             let mut rows = stmt.query([])?;
             let mut count = 0;
             while let Some(row) = rows.next()? {

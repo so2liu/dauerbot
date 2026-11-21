@@ -13,7 +13,7 @@ pub(crate) fn origin(
     attachment: &mut Value,
 ) -> Result<()> {
     let event = crate::work::event(c, project, event)?;
-    let id = if event.source == "management" {
+    let id = if matches!(event.source.as_str(),"management"|"manager_worker") {
         event.payload["origin_event_id"]
             .as_str()
             .unwrap_or(&event.id)

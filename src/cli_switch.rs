@@ -386,13 +386,144 @@ fn recovery_budget_spent(request: &Request) -> bool {
 fn suspend_recovery(c: &Connection, id: &str) -> Result<bool> {
     let reason = "CLI recovery timed out. Pending work is preserved. Retry recovery or stop the current execution before choosing a different CLI.";
     let changed = c.execute(
-        "UPDATE cli_switch_requests SET phase='recovery_exhausted',holds_input=0,error=?,next_attempt_at=0 WHERE id=? AND holds_input=1",
+        "UPDATE cli_switch_requests SET phase='recovery_exhausted',holds_input=0,error=?,next_attempt_at=0,
+         source=CASE WHEN phase IN ('uncertain','recovery_stopping')
+           THEN json_set(source,'$.exhausted_during_stop',json('true')) ELSE source END
+         WHERE id=? AND holds_input=1",
         params![reason, id],
     )?;
     if changed == 1 {
         notify_manager(c, id, "recovery_exhausted", reason)?;
     }
     Ok(changed == 1)
+}
+
+/// Reconcile an exhausted, user-selected CLI transition from fresh daemon
+/// observation. This never sends input or closes either execution.
+fn repair_exhausted(
+    c: &Connection,
+    p: &Project,
+    r: &Request,
+    record: Option<&Value>,
+) -> Result<bool> {
+    let tx = c.unchecked_transaction()?;
+    let current = db::project_by_key(&tx, &p.id)?;
+    let now = db::now();
+    if !latest(&tx, &p.id)?.is_some_and(|latest| {
+        latest.id == r.id
+            && latest.phase == "recovery_exhausted"
+            && latest.target == r.target
+            && latest.generation == r.generation
+            && latest.recovery_generation == r.recovery_generation
+            && latest.source == r.source
+            && latest.next_attempt_at <= now
+    }) || current.generation != p.generation
+        || current.agent != p.agent
+        || current.terminal != p.terminal
+        || current.terminal_pid != p.terminal_pid
+        || current.native_session != p.native_session
+        || current.execution != p.execution
+        || current.ready != p.ready
+        || current.paused
+        || App::update_required(&current)
+        || work::has_takeover(&tx, &p.id, &p.generation)?
+    {
+        return Ok(false);
+    }
+    let live = record.filter(|v| {
+        p.terminal.is_some()
+            && p.ready
+            && p.execution["mcp_registered"] == true
+            && v["state"] == "live"
+            && crate::repair_lane::descriptor(p).is_none()
+    });
+    let selected_ready = live.is_some_and(|v| {
+        p.agent == r.target
+            && p.execution["cli_switch_request"] == r.id
+            && target_selection_matches(r, &p.execution)
+            && target_native_matches(r, &p.execution, &p.native_session)
+            && matches!(
+                v["status"]["state"].as_str(),
+                Some("idle" | "done" | "working")
+            )
+            && herdr::check_identity(p, v).is_ok()
+    });
+    let source_restored = live.is_some_and(|v| {
+        r.intent == "cli"
+            && p.agent != r.target
+            && r.source["agent"] == p.agent
+            && (r.generation == p.generation || r.recovery_generation == p.generation)
+            && !p.native_session.is_empty()
+            && r.source["native_session"]
+                .as_str()
+                .is_some_and(|id| herdr::same_native_session(&p.agent, id, &p.native_session))
+            && v["native_session"]["value"]
+                .as_str()
+                .is_some_and(|id| herdr::same_native_session(&p.agent, id, &p.native_session))
+            && r.source["exhausted_during_stop"] != true
+            && r.source["uncertain_stops"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+            && herdr::foreground_quiescent(p, v)
+    });
+    let (new_phase, reason, delay) = if selected_ready {
+        (
+            "ready",
+            "Verified that the selected CLI and its MCP are serving the exhausted request.",
+            0,
+        )
+    } else if source_restored {
+        (
+            "cancelled",
+            "The CLI switch failed. Verified the original native conversation remains ready. Unsubmitted work addressed to the selected CLI was rejected.",
+            0,
+        )
+    } else {
+        (
+            "recovery_exhausted",
+            "No exact ready target or quiescent original execution could be verified. Pending work and the delivery lock were preserved.",
+            30_000,
+        )
+    };
+    let evidence =
+        json!({"phase":new_phase,"diagnostic":reason,"generation":p.generation,"observed_at":now});
+    tx.execute(
+        "UPDATE cli_switch_requests SET phase=?,phase_started_at=CASE WHEN phase!=? THEN ? ELSE phase_started_at END,
+         holds_input=CASE WHEN ?=0 THEN 0 ELSE holds_input END,
+         error=CASE WHEN ?='ready' THEN '' ELSE ? END,next_attempt_at=?,
+         source=json_set(source,'$.daemon_repair',json(?),
+           '$.daemon_repair_attempts',COALESCE(json_extract(source,'$.daemon_repair_attempts'),0)+1)
+         WHERE id=? AND phase='recovery_exhausted'",
+        params![new_phase,new_phase,now,delay,new_phase,reason,if delay==0 {0} else {now+delay},evidence.to_string(),r.id],
+    )?;
+    if source_restored {
+        // These intents were tied to the abandoned target. Other queued work
+        // and all existing receipts/runs remain as they were.
+        let ids = tx
+            .prepare(
+                "SELECT e.id FROM work_events e WHERE e.project_id=? AND e.source='management'
+             AND e.status='queued' AND e.received_at IS NULL
+             AND json_extract(e.payload,'$.transition_id')=?
+             AND NOT EXISTS(SELECT 1 FROM work_runs w WHERE w.event_id=e.id)",
+            )?
+            .query_map(params![p.id, r.id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in ids {
+            tx.execute(
+                "UPDATE work_events SET status='failed',error='Selected CLI switch was cancelled before submission',updated_at=? WHERE id=?",
+                params![now,id],
+            )?;
+            tx.execute(
+                "UPDATE work_tasks SET status='failed',updated_at=? WHERE id=(SELECT task_id FROM work_events WHERE id=?)",
+                params![now,id],
+            )?;
+        }
+    }
+    if delay == 0 || r.source["daemon_repair"]["diagnostic"] != reason {
+        notify_manager(&tx, &r.id, new_phase, reason)?;
+    }
+    tx.commit()?;
+    Ok(delay == 0)
 }
 
 pub fn proof(r: &Request, text: Option<&str>, sequence: Option<i64>) -> bool {
@@ -847,16 +978,47 @@ impl App {
             return Ok(false);
         };
         if r.phase == "recovery_exhausted" {
-            self.set_phase(
-                p,
-                if p.paused {
-                    "paused"
+            let id = p.id.clone();
+            let generation = p.generation.clone();
+            let takeover = self
+                .db
+                .call(move |c| work::has_takeover(c, &id, &generation))
+                .await?;
+            if p.paused || takeover || Self::update_required(p) {
+                self.set_phase(
+                    p,
+                    if p.paused {
+                        "paused"
+                    } else if takeover {
+                        "taken_over"
+                    } else {
+                        "update_required"
+                    },
+                    Value::Null,
+                )
+                .await;
+                return Ok(true);
+            }
+            if db::now() >= r.next_attempt_at {
+                let observed = if let Some(record) = record {
+                    Some(record.clone())
+                } else if p.terminal.is_some() {
+                    let cfg = self.config.read().await.clone();
+                    herdr::observe(&cfg, p).await.ok()
                 } else {
-                    "needs_attention"
-                },
-                record.cloned().unwrap_or(Value::Null),
-            )
-            .await;
+                    None
+                };
+                let current = p.clone();
+                if self
+                    .db
+                    .call(move |c| repair_exhausted(c, &current, &r, observed.as_ref()))
+                    .await?
+                {
+                    self.notify.notify_one();
+                    return Ok(true);
+                }
+            }
+            self.set_phase(p, "needs_attention", Value::Null).await;
             return Ok(true);
         }
         if !active(&r) {
@@ -2122,6 +2284,117 @@ mod tests {
     fn requested(c: &Connection, p: &Project) -> Result<Request> {
         c.execute("UPDATE cli_switch_requests SET phase='requested',nonce='fresh',baseline='old',sequence=10,revision=? WHERE project_id=?",params![revision(c,&p.id)?,p.id])?;
         Ok(latest(c, &p.id)?.unwrap())
+    }
+    #[tokio::test]
+    async fn daemon_settles_exhausted_switch_only_after_verifying_exact_live_source() {
+        let (_dir, app, p) = fixture().await;
+        app.db
+            .sync(|c| {
+                c.execute(
+                    "UPDATE projects SET execution=json_object(
+                'api_protocol',7,'mcp_contract',1,'mcp_registered',json('true'),
+                'backend','legacy','workspace_id','workspace','pane_id','old-pane',
+                'terminal_id','old-pane','managed_name','managed','generation','old-gen',
+                'launch_permit','/private/fixture/launch') WHERE id=?",
+                    [&p.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let p = app.db.project(&p.id).await.unwrap();
+        let (request_id, delegate, uncertain) = app
+            .db
+            .sync(|c| {
+                let original = request(c, &p, "agy")?.unwrap();
+                let delegate = crate::manager::test_delegate(c, &p.id, "held-delegate", None)?;
+                let uncertain = crate::manager::test_delegate(c, &p.id, "unknown-delivery", None)?;
+                c.execute(
+                    "UPDATE work_events SET status='uncertain' WHERE id=?",
+                    [&uncertain],
+                )?;
+                c.execute(
+                    "INSERT INTO manager_inputs(id,project_id,kind,payload,status,created_at)
+                VALUES('ordinary-input',?,'feishu','{}','queued',0)",
+                    [&p.id],
+                )?;
+                record_failure(
+                    c,
+                    &original.id,
+                    "The original CLI did not respond to its handoff",
+                )?;
+                assert!(suspend_recovery(c, &original.id)?);
+                assert!(request(c, &p, "pi").is_err());
+                Ok((original.id, delegate, uncertain))
+            })
+            .unwrap();
+        let exact = json!({
+            "state":"live","status":{"state":"idle"},"foreground":{"name":"codex"},
+            "execution":p.execution,"pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace",
+            "agent":{"agent":"codex","pane_id":"old-pane","terminal_id":"old-pane","workspace_id":"workspace"},
+            "native_session":{"value":"old-native"},
+            "tokens":{"hfb_owner":"dauerbot","hfb_project":p.id,"hfb_generation":"old-gen","hfb_execution":"managed"},
+            "children":{"state":"quiescent"},"processes":[{"name":"codex","argv":["codex"]}]
+        });
+        let mut changed = exact.clone();
+        changed["native_session"]["value"] = json!("a-different-conversation");
+        assert!(
+            app.advance_cli_switch(&p, None, Some(&changed))
+                .await
+                .unwrap()
+        );
+        app.db
+            .sync(|c| {
+                let request = latest(c, &p.id)?.unwrap();
+                assert_eq!(request.phase, "recovery_exhausted");
+                assert!(blocks_worker(&request));
+                assert_eq!(request.source["daemon_repair_attempts"], 1);
+                assert_eq!(work::event(c, &p.id, &delegate)?.status, "queued");
+                assert_eq!(work::event(c, &p.id, &uncertain)?.status, "uncertain");
+                c.execute(
+                    "UPDATE cli_switch_requests SET next_attempt_at=0 WHERE id=?",
+                    [&request_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            app.advance_cli_switch(&p, None, Some(&exact))
+                .await
+                .unwrap()
+        );
+        app.db
+            .sync(|c| {
+                let cancelled = latest(c, &p.id)?.unwrap();
+                assert_eq!(cancelled.id, request_id);
+                assert_eq!(cancelled.phase, "cancelled");
+                assert_eq!(
+                    cancelled.source["last_failure"],
+                    "The original CLI did not respond to its handoff"
+                );
+                assert_eq!(cancelled.source["daemon_repair_attempts"], 2);
+                assert!(!blocks_worker(&cancelled));
+                let failed = work::event(c, &p.id, &delegate)?;
+                assert_eq!(failed.status, "failed");
+                assert_eq!(
+                    failed.error,
+                    "Selected CLI switch was cancelled before submission"
+                );
+                assert_eq!(work::event(c, &p.id, &uncertain)?.status, "uncertain");
+                let pending: String = c.query_row(
+                    "SELECT status FROM manager_inputs WHERE id='ordinary-input'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(pending, "queued");
+                let current = db::project_by_key(c, &p.id)?;
+                assert_eq!(current.native_session, p.native_session);
+                assert_eq!(current.terminal, p.terminal);
+                let next = request(c, &current, "pi")?.unwrap();
+                assert_eq!(next.target, "pi");
+                assert!(next.holds_input);
+                Ok(())
+            })
+            .unwrap();
     }
     #[tokio::test]
     async fn migration_holds_outstanding_transitions_but_not_historical_settled_failures() {
