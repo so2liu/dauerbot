@@ -175,6 +175,7 @@ async fn retry_waiting(app: &App) -> Result<()> {
             .is_some();
     }
     if changed {
+        app.quote_notify.notify_one();
         app.notify.notify_one();
     }
     Ok(())

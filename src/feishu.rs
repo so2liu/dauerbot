@@ -732,7 +732,7 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
         if model_command {
             attachment["daemon_control"] = json!("model");
         }
-        app.db.ingest_routed_bot(
+        let inserted = app.db.ingest_routed_bot(
             &binding.project_id,
             &binding.app_id,
             &chat,
@@ -748,9 +748,233 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
                 state["error"] = json!("");
             }
         }
+        if inserted.is_some() && attachment["source"]["parent_id"].is_string() {
+            app.quote_notify.notify_one();
+        }
         app.notify.notify_one();
     }
     Ok(())
+}
+
+const QUOTE_LIMIT: usize = 3072;
+
+fn quote(
+    parent: &str,
+    sender: Option<&str>,
+    kind: Option<&str>,
+    body: &str,
+    reason: Option<&str>,
+) -> Value {
+    let mut end = body.len().min(QUOTE_LIMIT);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    json!({
+        "message_id": parent,
+        "sender": sender,
+        "msg_type": kind,
+        "body": &body[..end],
+        "preview_truncated": end < body.len(),
+        "status": if reason.is_some() { "unavailable" } else { "ok" },
+        "reason": reason,
+        "trust": "untrusted_quote",
+    })
+}
+
+pub(crate) fn cached_quote(
+    c: &rusqlite::Connection,
+    project: &str,
+    bot: &str,
+    chat: &str,
+    parent: &str,
+) -> Result<Option<Value>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, String, String)> = c.query_row(
+        "SELECT content,attachment,direction FROM messages
+         WHERE project_id=?1 AND json_extract(attachment,'$.bot_app_id')=?3 AND (
+           (direction='in' AND source_id=?2 AND json_extract(attachment,'$.source.chat_id')=?4)
+           OR (direction='out' AND status='sent' AND json_extract(attachment,'$.sent_message_id')=?2
+               AND json_extract(attachment,'$.sent_chat_id')=?4))
+         ORDER BY direction LIMIT 1",
+        rusqlite::params![project,parent,bot,chat],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).optional()?;
+    Ok(row.map(|(body, raw, direction)| {
+        let attachment: Value = serde_json::from_str(&raw).unwrap_or_default();
+        if direction == "out" {
+            let (kind, body) = if let Some(path) = attachment["path"].as_str() {
+                ("file", format!("[file] {}", Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or_default()))
+            } else if attachment["interactive_card"].is_object() {
+                ("interactive", "[interactive card]".into())
+            } else {
+                ("post", body)
+            };
+            return quote(parent, Some(bot), Some(kind), &body, None);
+        }
+        let source = &attachment["source"];
+        quote(
+            parent,
+            source["sender"]["open_id"].as_str(),
+            source["message_type"].as_str(),
+            &body,
+            None,
+        )
+    }))
+}
+
+fn remote_quote(
+    item: &Value,
+    parent: &str,
+    chat: &str,
+) -> std::result::Result<Value, &'static str> {
+    if item["message_id"] != parent || item["chat_id"] != chat {
+        return Err("source_mismatch");
+    }
+    if item["deleted"] == true {
+        return Err("deleted");
+    }
+    let sender = item["sender"]["id"].as_str().ok_or("invalid_response")?;
+    let kind = item["msg_type"].as_str().ok_or("invalid_response")?;
+    let content: Value =
+        serde_json::from_str(item["body"]["content"].as_str().ok_or("invalid_response")?)
+            .map_err(|_| "invalid_response")?;
+    let body = match kind {
+        "text" => content["text"]
+            .as_str()
+            .ok_or("invalid_response")?
+            .to_owned(),
+        "post" => {
+            let post = post_document(&content);
+            let mut body = post["title"].as_str().unwrap_or_default().to_owned();
+            body.push('\n');
+            collect_post(&post["content"], &mut body, &mut Vec::new());
+            body.trim().replace("[image]", "[image] image.png")
+        }
+        "image" => "[image] image.png".into(),
+        "file" | "audio" | "video" | "media" | "sticker" => {
+            format!(
+                "[{kind}] {}",
+                content["file_name"].as_str().unwrap_or_default()
+            )
+        }
+        _ => return Err("unsupported_message_type"),
+    };
+    Ok(quote(parent, Some(sender), Some(kind), &body, None))
+}
+
+async fn fetch_quote(
+    app: &App,
+    message: &db::Message,
+    parent: &str,
+    chat: &str,
+    bot: &str,
+) -> std::result::Result<Value, &'static str> {
+    let binding = app
+        .db
+        .bot(&message.project_id)
+        .await
+        .map_err(|_| "binding_unavailable")?;
+    if binding.app_id != bot {
+        return Err("binding_unavailable");
+    }
+    let token = token(app, &binding)
+        .await
+        .map_err(|_| "authentication_failed")?;
+    let base = app.config.read().await.feishu_base.clone();
+    let mut url = reqwest::Url::parse(&format!("{base}/open-apis/im/v1/messages/"))
+        .map_err(|_| "invalid_endpoint")?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid_endpoint")?
+        .pop_if_empty()
+        .push(parent);
+    let mut response = app
+        .http
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|_| "network_error")?;
+    match response.status().as_u16() {
+        401 | 403 => return Err("permission_denied"),
+        404 | 410 => return Err("not_found"),
+        _ if !response.status().is_success() => return Err("request_failed"),
+        _ => {}
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "network_error")? {
+        if bytes.len() + chunk.len() > 256 * 1024 {
+            return Err("response_too_large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let result: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_response")?;
+    if result["code"].as_i64() != Some(0) {
+        return Err("api_rejected");
+    }
+    let items = result["data"]["items"]
+        .as_array()
+        .ok_or("invalid_response")?;
+    match items.as_slice() {
+        [item] => remote_quote(item, parent, chat),
+        [] => Err("not_found"),
+        _ => Err("invalid_response"),
+    }
+}
+
+pub(crate) async fn prepare_quote(app: &App) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let id: Option<String> = app.db.call(|c| {
+        Ok(c.query_row("SELECT id FROM messages WHERE direction='in' AND json_extract(attachment,'$.quote_pending')=1 ORDER BY rowid LIMIT 1", [], |r| r.get(0)).optional()?)
+    }).await?;
+    let Some(id) = id else { return Ok(false) };
+    let message = app.db.message(&id).await?;
+    let source = &message.attachment["source"];
+    let parent = source["parent_id"].as_str().unwrap_or_default();
+    let chat = source["chat_id"].as_str().unwrap_or_default();
+    let bot = message.attachment["bot_app_id"]
+        .as_str()
+        .unwrap_or_default();
+    let result =
+        if !parent.starts_with("om_")
+            || parent.len() > 128
+            || !parent.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            || chat.is_empty()
+            || bot.is_empty()
+            || parent == message.source_id
+        {
+            Err("invalid_source")
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_quote(app, &message, parent, chat, bot),
+            )
+            .await
+            .unwrap_or(Err("timeout"))
+        };
+    let result = result.unwrap_or_else(|reason| quote(parent, None, None, "", Some(reason)));
+    app.db.call(move |c| {
+        c.execute("UPDATE messages SET attachment=json_remove(json_set(attachment,'$.quoted_message',json(?)),'$.quote_pending') WHERE id=? AND json_extract(attachment,'$.quote_pending')=1", rusqlite::params![result.to_string(),id])?;
+        Ok(())
+    }).await?;
+    Ok(true)
+}
+
+// Parent lookups do not share the attachment queue or gate message delivery.
+pub async fn quote_worker(app: Arc<App>) {
+    while !app.shutdown.is_cancelled() {
+        if let Some(_permit) = app.service.gate.enter() {
+            match prepare_quote(&app).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => tracing::warn!("Incoming quote preparation failed"),
+            }
+        }
+        tokio::select! {
+            _ = app.shutdown.cancelled() => break,
+            _ = app.quote_notify.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+    }
 }
 
 pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {

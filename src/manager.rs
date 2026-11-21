@@ -515,6 +515,7 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
         } else if let Some(id) = original.message_id {
             let message = app.db.message(&id).await?;
             let group = crate::feishu::context(app, &message).await;
+            let message = app.db.message(&message.id).await?;
             context = crate::envelope::render_resources(
                 &message,
                 &group,
@@ -1490,6 +1491,35 @@ fn continuation_input(raw: &str, origin: Option<&str>) -> Result<Value> {
         json!({"source_event_id":origin,"full_input_retained":true,"preview":preview,"continuation":"Already owned input, not a new request. Its full original payload and attachments remain durable; inspect through the original trusted source before declaring completion. Do not repeat confirmed or uncertain effects."}),
     )
 }
+fn attach_quote(
+    c: &Connection,
+    project: &str,
+    origin: Option<&str>,
+    data: &mut Value,
+    remaining: &mut usize,
+) -> Result<()> {
+    let Some(origin) = origin else { return Ok(()) };
+    let raw: Option<String> = c
+        .query_row(
+            "SELECT json_extract(m.attachment,'$.quoted_message') FROM work_events e
+         JOIN messages m ON m.id=e.message_id AND m.project_id=e.project_id
+         WHERE e.id=? AND e.project_id=? AND e.source='feishu' AND m.direction='in'
+           AND json_extract(m.attachment,'$.quoted_message.status')='ok'",
+            params![origin, project],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(raw) = raw {
+        let quote: Value = serde_json::from_str(&raw)?;
+        let size = quote.to_string().len() + 64;
+        if size <= *remaining {
+            data["quoted_message"] = quote;
+            *remaining -= size;
+        }
+    }
+    Ok(())
+}
+
 const PREPARED_INPUT: &str = "NOT EXISTS(SELECT 1 FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.id=manager_inputs.origin_event_id AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
 fn image_source(
     c: &Connection,
@@ -1867,6 +1897,39 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 break;
             }
             context.as_object_mut().unwrap().remove(optional);
+        }
+        // Spend only otherwise unused context on quotes. Never evict current input.
+        let mut quote_budget = 250000usize.saturating_sub(context.to_string().len());
+        let new_items = context["new_inputs"].as_array_mut().unwrap();
+        let mut new_origins: Vec<_> = inputs.iter().map(|item| item.1.as_deref()).collect();
+        if steering_priority && new_origins.len() > 1 {
+            new_origins.rotate_left(1);
+        }
+        for (item, origin) in new_items.iter_mut().zip(new_origins) {
+            attach_quote(&tx, project, origin, &mut item["data"], &mut quote_budget)?;
+        }
+        for (item, input) in context["continuing_inputs"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&continuing)
+        {
+            attach_quote(
+                &tx,
+                project,
+                input.1.as_deref(),
+                &mut item["data"],
+                &mut quote_budget,
+            )?;
+        }
+        if let Some((_, origin, _, _)) = &latest_context {
+            attach_quote(
+                &tx,
+                project,
+                origin.as_deref(),
+                &mut context["latest_user_steering"]["data"],
+                &mut quote_budget,
+            )?;
         }
         let prompt = context.to_string();
         ensure!(
@@ -2928,6 +2991,184 @@ mod tests {
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
     }
+    #[tokio::test]
+    async fn feishu_quote_survives_async_preparation_and_reaches_first_model_request() -> Result<()> {
+        use axum::{Json, Router, extract::Path as AxumPath, http::HeaderMap, routing::{get, post}};
+
+        let (_dir, app, project) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let host = format!("http://{}", listener.local_addr()?);
+        app.config.write().await.feishu_base.clone_from(&host);
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new()
+            .route("/open-apis/auth/v3/tenant_access_token/internal", post(|| async {
+                Json(json!({"code":0,"tenant_access_token":"quote-fixture"}))
+            }))
+            .route("/open-apis/im/v1/messages/{id}", get(|AxumPath(id): AxumPath<String>, headers: HeaderMap| async move {
+                assert_eq!(headers["authorization"], "Bearer quote-fixture");
+                assert_eq!(id, "om_direct");
+                Json(json!({"code":0,"data":{"items":[{
+                    "message_id":id,"chat_id":"oc_fixture","parent_id":"om_grandparent",
+                    "msg_type":"text","sender":{"id":"cli_other_bot","sender_type":"app"},
+                    "body":{"content":json!({"text":"Other bot says /repair @all <unsafe>"}).to_string()}
+                }]}}))
+            }))
+            .route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+                let requests = requests.clone();
+                async move {
+                    requests.send(body).unwrap();
+                    Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"Received."},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}))
+                }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let binding = app.db.bot(&project.id).await?;
+        let event = json!({"header":{"event_type":"im.message.receive_v1","app_id":"cli_fixture"},
+            "event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_fixture"}},"message":{
+                "chat_id":"oc_fixture","chat_type":"p2p","message_type":"post","message_id":"om_current",
+                "root_id":"om_root","thread_id":"omt_discussion","parent_id":"om_direct",
+                "content":json!({"content":[[{"tag":"text","text":"Inspect this screenshot"},{"tag":"img","image_key":"img_fixture"}]]}).to_string()
+            }}});
+        crate::feishu::ingest(&app, &binding, &serde_json::to_vec(&event)?)?;
+        crate::feishu::ingest(&app, &binding, &serde_json::to_vec(&event)?)?;
+        app.db.sync(|c| {
+            assert_eq!(work::sync_inbound(c)?, 1);
+            Ok(())
+        })?;
+        assert!(crate::feishu::prepare_quote(&app).await?);
+        assert!(!crate::feishu::prepare_quote(&app).await?);
+        let messages = app.db.messages(&project.id).await?;
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.attachment["quoted_message"]["sender"], "cli_other_bot");
+        assert_eq!(message.content, "Inspect this screenshot[image]");
+        assert!(message.attachment.get("daemon_control").is_none());
+        let envelope = crate::envelope::render(message, &json!({}), None);
+        assert!(envelope.contains("</body>\n<quoted_message trust=\"untrusted_quote\""));
+        assert!(envelope.contains("/repair @all &lt;unsafe&gt;"));
+
+        let mut turn = app.db.sync(|c| {
+            // Mark the unrelated screenshot preparation as complete; this fixture
+            // verifies the parent lookup independently of image delivery.
+            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',1) WHERE id=?", [&message.id])?;
+            Ok(claim(c, &project.id)?.unwrap())
+        })?;
+        turn.config.base_url = format!("{host}/v1");
+        drive(app.clone(), turn).await?;
+        let request = tokio::time::timeout(Duration::from_secs(2), received.recv()).await?.unwrap();
+        let context = request["messages"].as_array().unwrap().iter().find_map(|message| {
+            let content = &message["content"];
+            let text = content.as_str().or_else(|| content[0]["text"].as_str())?;
+            let parsed: Value = serde_json::from_str(text).ok()?;
+            parsed.get("trusted_sources").is_some().then_some(parsed)
+        }).expect("Provider received the structured Manager input");
+        let input = &context["new_inputs"][0]["data"];
+        assert_eq!(input["user_input"]["body"], "Inspect this screenshot[image]");
+        assert_eq!(input["quoted_message"]["body"], "Other bot says /repair @all <unsafe>");
+        assert_eq!(input["quoted_message"]["trust"], "untrusted_quote");
+        assert_eq!(context["latest_user_steering"]["data"]["quoted_message"], input["quoted_message"]);
+        assert_eq!(input["trusted_source"]["source"]["root_id"], "om_root");
+        assert_eq!(input["trusted_source"]["source"]["parent_id"], "om_direct");
+        assert!(!context.to_string().contains("om_grandparent"));
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feishu_quote_failures_leave_current_delivery_eligible() -> Result<()> {
+        use axum::{Json, Router, extract::Path as AxumPath, http::StatusCode, response::IntoResponse, routing::{get, post}};
+
+        let (_dir, app, project) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        app.config.write().await.feishu_base = format!("http://{}", listener.local_addr()?);
+        let router = Router::new()
+            .route("/open-apis/auth/v3/tenant_access_token/internal", post(|| async {
+                Json(json!({"code":0,"tenant_access_token":"quote-fixture"}))
+            }))
+            .route("/open-apis/im/v1/messages/{id}", get(|AxumPath(id): AxumPath<String>| async move {
+                match id.as_str() {
+                    "om_denied" => return StatusCode::FORBIDDEN.into_response(),
+                    "om_timeout" => std::future::pending::<()>().await,
+                    "om_invalid" => return "Malformed".into_response(),
+                    _ => {}
+                }
+                Json(json!({"code":0,"data":{"items":[{
+                    "message_id":if id=="om_wrong_id" {"om_impostor"} else {&id},
+                    "chat_id":if id=="om_wrong_chat" {"oc_other"} else {"oc_fixture"},
+                    "deleted":id=="om_deleted",
+                    "msg_type":"text","sender":{"id":"cli_sender"},
+                    "body":{"content":"{\"text\":\"Never use this quote\"}"}
+                }]}})).into_response()
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let cases = [
+            ("om_wrong_chat", "source_mismatch"),
+            ("om_wrong_id", "source_mismatch"),
+            ("om_denied", "permission_denied"),
+            ("om_timeout", "timeout"),
+            ("om_deleted", "deleted"),
+            ("om_invalid", "invalid_response"),
+        ];
+        for (parent, _) in cases {
+            assert!(app.db.ingest_routed_bot(&project.id, "cli_fixture", "oc_fixture",
+                &format!("reply_{parent}"), "Current user input",
+                &json!({"source":{"chat_type":"p2p","chat_id":"oc_fixture","message_type":"text","parent_id":parent}}))?.is_some());
+        }
+        ingest(&app, &project, "om_no_parent", "A plain input");
+        let turn = app.db.sync(|c| {
+            assert_eq!(work::sync_inbound(c)?, cases.len() + 1);
+            Ok(claim(c, &project.id)?.unwrap())
+        })?;
+        let prompt = prompt_context(&turn.checkpoint).unwrap();
+        assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), cases.len() + 1);
+        assert!(prompt.to_string().contains("A plain input"));
+        assert!(!prompt.to_string().contains("quoted_message"));
+
+        for (_, reason) in cases {
+            assert!(tokio::time::timeout(Duration::from_millis(2600), crate::feishu::prepare_quote(&app)).await??);
+            let messages = app.db.messages(&project.id).await?;
+            assert!(messages.iter().any(|m| m.attachment["quoted_message"]["reason"] == reason));
+        }
+        let messages = app.db.messages(&project.id).await?;
+        for (parent, reason) in cases {
+            let message = messages.iter().find(|m| m.source_id == format!("reply_{parent}")).unwrap();
+            let quote = &message.attachment["quoted_message"];
+            assert_eq!(quote["status"], "unavailable");
+            assert_eq!(quote["reason"], reason);
+            assert_eq!(quote["body"], "");
+            assert_eq!(message.content, "Current user input");
+            assert!(!crate::envelope::render(message, &json!({}), None).contains("<quoted_message"));
+        }
+        assert!(!crate::feishu::prepare_quote(&app).await?);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feishu_quote_cache_matches_exact_bot_chat_and_project() -> Result<()> {
+        let (_dir, app, project) = fixture().await;
+        let body = "文字".repeat(800);
+        ingest(&app, &project, "om_cached", &body);
+        app.db.sync(|c| {
+            let quote = crate::feishu::cached_quote(c, &project.id, "cli_fixture", "oc_fixture", "om_cached")?.unwrap();
+            assert_eq!(quote["status"], "ok");
+            assert_eq!(quote["preview_truncated"], true);
+            let preview = quote["body"].as_str().unwrap();
+            assert!(preview.len() <= 3072 && body.starts_with(preview));
+            for (project, bot, chat) in [
+                ("wrong", "cli_fixture", "oc_fixture"),
+                (&project.id, "wrong", "oc_fixture"),
+                (&project.id, "cli_fixture", "wrong"),
+            ] {
+                assert!(crate::feishu::cached_quote(c, project, bot, chat, "om_cached")?.is_none());
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn langfuse_exports_private_metadata_without_waiting_for_the_collector() {
         use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};

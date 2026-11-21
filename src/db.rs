@@ -300,6 +300,22 @@ fn ingest_message(
             });
         }
     }
+    if routed
+        && let Some(parent) = attachment["source"]["parent_id"]
+            .as_str()
+            .filter(|parent| !parent.is_empty())
+    {
+        let cached = if parent == source {
+            None
+        } else {
+            crate::feishu::cached_quote(&tx, project, app_id, chat, parent)?
+        };
+        if let Some(quote) = cached {
+            attachment["quoted_message"] = quote;
+        } else {
+            attachment["quote_pending"] = serde_json::json!(true);
+        }
+    }
     let key = id();
     let inserted=tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",params![key,project,source,content,attachment.to_string(),now(),now()])?;
     if inserted == 1 && attachment["daemon_control"] == "model" {

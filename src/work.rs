@@ -444,7 +444,12 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
             };
             c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at)
               VALUES(?,?,?,?,?,?,?)",params![id,project,content.chars().take(100).collect::<String>(),content,task_state,created,updated])?;
-            let context: Value = serde_json::from_str(&attachment).unwrap_or(Value::Null);
+            let mut context: Value = serde_json::from_str(&attachment).unwrap_or(Value::Null);
+            if let Some(fields) = context.as_object_mut() {
+                // Quotes are read from the original message at claim or render time.
+                fields.remove("quoted_message");
+                fields.remove("quote_pending");
+            }
             let payload = json!({"content":content,"attachment":context,"legacy_status":status});
             let kind = if source.starts_with("local-") {
                 "local"
