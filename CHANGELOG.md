@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.12 — 2026-11-21
+
+### Fixed
+
+- Remove telemetry length cutoffs for eligible Manager conversation text sent to Langfuse. Keep credential filtering and omit structured input that cannot be safely inspected. Content export remains opt-in. (#166)
+
 ## 0.6.11 — 2026-11-21
 
 ### Added
