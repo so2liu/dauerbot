@@ -792,6 +792,12 @@ fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
 // Treat a clear singular assignment in the trusted source as a routing
 // constraint. Ambiguous or multi-CLI prose still goes through the Manager.
 fn named_cli(text: &str) -> Option<String> {
+    let normalized = text.to_ascii_lowercase();
+    let words = normalized.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+    let known = ["codex", "claude", "pi", "agy", "custom"];
+    if known.iter().filter(|cli| words.clone().any(|word| word == **cli)).count() > 1 {
+        return None;
+    }
     let mut targets = text.split(['。', '！', '；', ';', '，', ',', '\n']).filter_map(|part| {
         let part = part.trim_start();
         let part = if part.starts_with('@') {
@@ -804,7 +810,7 @@ fn named_cli(text: &str) -> Option<String> {
         let target = ["使用", "用", "让", "use ", "ask "]
             .into_iter().find_map(|prefix| part.strip_prefix(prefix))?.trim_start();
         let name = target.split(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch,'_'|'-'|'/')).next()?;
-        ["codex", "claude", "pi", "agy", "custom"].contains(&name).then(|| name.to_owned())
+        known.contains(&name).then(|| name.to_owned())
     });
     let first = targets.next()?;
     targets.all(|target| target == first).then_some(first)
@@ -2489,6 +2495,7 @@ mod tests {
         assert_eq!(named_cli("不要用 agy"), None);
         assert_eq!(named_cli("有没有 codex"), None);
         assert_eq!(named_cli("用 codex 修复，用 claude 复核"), None);
+        assert_eq!(named_cli("Use codex for the fix and have claude review it"), None);
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, Project) {
