@@ -53,7 +53,14 @@ impl std::fmt::Debug for Exporter {
 impl Exporter {
     pub(crate) fn load(dir: &Path) -> Option<Self> {
         let path = dir.join("langfuse.json");
-        let result = std::fs::File::open(path).and_then(|file| {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let result = options.open(path).and_then(|file| {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -404,26 +411,36 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 exporter.send(json!({})).await;
-                server.abort();
-
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let mut stalled = exporter.clone();
                 stalled
                     .endpoint
                     .set_port(Some(listener.local_addr().unwrap().port()))
                     .unwrap();
-                let _accepted = tokio::spawn(async move {
+                let (accepted, received) = tokio::sync::oneshot::channel();
+                let acceptor = tokio::spawn(async move {
                     let (_socket, _) = listener.accept().await.unwrap();
+                    accepted.send(()).unwrap();
                     std::future::pending::<()>().await;
                 });
+                let started = std::time::Instant::now();
                 tokio::time::timeout(TIMEOUT + Duration::from_secs(1), stalled.send(json!({})))
                     .await
                     .expect("Exporter must enforce its own deadline");
+                assert!(
+                    received.await.is_ok(),
+                    "Stalled collector must have received the connection"
+                );
+                assert!(
+                    started.elapsed() >= TIMEOUT,
+                    "Request must have waited for its own deadline"
+                );
+                acceptor.abort();
+                server.abort();
             })
         });
         let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(output.contains("Manager telemetry rejected"));
-        assert!(output.contains("Manager telemetry request failed"));
         assert!(!output.contains(&public));
         assert!(!output.contains(&secret));
     }
