@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.13 — 2026-11-22
+
+### Added
+
+- Include the quoted parent of a Feishu reply in the Agent context. A bounded background lookup reads the direct parent and marks its content as untrusted reference data. Failed lookups report the reference as unavailable and let delivery continue. The current message and the inputs used for admission remain separate from the quote. (#170)
+
+### Fixed
+
+- Prevent Manager telemetry from panicking when a historical tool call has no path argument. (#169)
+
 ## 0.6.12 — 2026-11-21
 
 ### Fixed
