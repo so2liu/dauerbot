@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.8 — 2026-11-21
+
+### Changed
+
+- New projects use the built-in Manager when the shared provider is configured. It can assign separate tasks to different terminal CLI workers, inspect the detected CLIs, and honor an explicit per-task CLI choice. New workers need no Dauerbot MCP registration. (#157)
+- Existing projects keep their execution mode. Native compatibility remains available for projects created without a configured Manager provider. API protocol 7 and the native three-tool MCP interface are unchanged.
+
+### Fixed
+
+- Bound Manager terminal polling and keep the project available after a turn budget is exhausted. Add supervised recovery for exhausted CLI transitions while preserving pending and uncertain work. (#156)
+
 ## 0.6.7 — 2026-11-20
 
 ### Added
