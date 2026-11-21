@@ -36,7 +36,17 @@ pub(crate) fn installed(c: &Connection) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
+pub(crate) fn uses_manager(c: &Connection, project: &str) -> Result<bool> {
+    if !installed(c)? {
+        return Ok(false);
+    }
+    Ok(!c.query_row("SELECT EXISTS(SELECT 1 FROM standalone_projects WHERE project_id=?)",
+        [project], |row|row.get::<_,bool>(0))?)
+}
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
+    c.execute_batch("CREATE TABLE IF NOT EXISTS standalone_projects(
+        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
+    )")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_config(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,mode TEXT NOT NULL DEFAULT 'manager',base_url TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',api_key TEXT NOT NULL DEFAULT '',revision INTEGER NOT NULL DEFAULT 0,input_revision INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '',next_attempt_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manager_mode_requests(project_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(project_id,request_id)); CREATE TABLE IF NOT EXISTS manager_inputs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,origin_event_id TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_runs(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,input_revision INTEGER NOT NULL,origin_event_id TEXT,checkpoint TEXT NOT NULL,status TEXT NOT NULL,owner TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS manager_effects(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,occurrence TEXT NOT NULL,name TEXT NOT NULL,arguments TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT 'null',UNIQUE(run_id,occurrence)); CREATE TABLE IF NOT EXISTS manager_run_inputs(run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE,input_id TEXT NOT NULL REFERENCES manager_inputs(id),PRIMARY KEY(run_id,input_id)); CREATE TABLE IF NOT EXISTS manager_turn_notes(run_id TEXT PRIMARY KEY REFERENCES manager_runs(id) ON DELETE CASCADE,note TEXT NOT NULL); CREATE TABLE IF NOT EXISTS manager_observations(project_id TEXT NOT NULL,source TEXT NOT NULL,source_id TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(project_id,source,source_id));")?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_failures(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,revision INTEGER NOT NULL,incident_id TEXT NOT NULL,attempts INTEGER NOT NULL,diagnostic TEXT NOT NULL,notified INTEGER NOT NULL DEFAULT 0,repair_probe INTEGER NOT NULL DEFAULT 0);")?;
     if !c
@@ -136,6 +146,9 @@ pub fn public_provider(c: &Connection) -> Result<Value> {
 }
 pub fn public(c: &Connection, project: &str) -> Result<Value> {
     let mut public = public_provider(c)?;
+    if !uses_manager(c, project)? {
+        return Ok(json!({"mode":"native","status":"native","configured":false}));
+    }
     public["mode"] = json!("manager");
     let (paused, revision, error, active): (bool, i64, String, bool) = c.query_row(
         "SELECT p.paused, m.revision, m.error,
@@ -196,6 +209,29 @@ pub fn save_provider(c: &Connection, input: ConfigInput) -> Result<Value> {
     Ok(result)
 }
 pub fn set_mode(c: &Connection, project: &str, input: ModeInput) -> Result<Value> {
+    if input.mode == "automatic" {
+        let tx = c.unchecked_transaction()?;
+        let p = db::project_by_key(&tx, project)?;
+        ensure!(public_provider(&tx)?["configured"] == true, "Configure the shared Manager first");
+        ensure!(p.terminal.is_none() && !crate::cli_switch::holds_input(&tx,project)?,
+            "Stop or finish the old execution before migrating this project");
+        let pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM work_events
+            WHERE project_id=? AND (status IN ('submitting','submitted','uncertain')
+            OR (source='management' AND status='queued')))",
+            [project], |row|row.get(0))?;
+        ensure!(!pending, "Resolve outstanding old execution effects before migrating");
+        tx.execute("DELETE FROM standalone_projects WHERE project_id=?", [project])?;
+        tx.execute("UPDATE projects SET agent='auto' WHERE id=?", [project])?;
+        let queued = tx.prepare("SELECT id FROM work_events WHERE project_id=? AND status='queued'")?
+            .query_map([project], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for event in queued {
+            route_event(&tx, &event)?;
+        }
+        let result=public(&tx,project)?;
+        tx.commit()?;
+        return Ok(result);
+    }
     if input.mode == "native" {
         bail!("Single-agent mode has been removed; all projects use manager/worker mode.");
     }
@@ -225,7 +261,7 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
     let Some((project, source, raw)) = e else {
         return Ok(());
     };
-    if matches!(source.as_str(),"management"|"manager_worker") {
+    if matches!(source.as_str(),"management"|"manager_worker") || !uses_manager(c,&project)? {
         return Ok(());
     }
     let payload: Value = serde_json::from_str(&raw)?;
@@ -393,7 +429,7 @@ fn approved_origin(c: &Connection, project: &str, origin: &str) -> Result<bool> 
 /// Called inside the ordinary native claim transaction, after readiness checks.
 pub fn bind_event(c: &Connection, event: &work::Event, generation: &str) -> Result<bool> {
     if event.source != "management" {
-        return Ok(!installed(c)?);
+        return Ok(!uses_manager(c, &event.project_id)?);
     }
     let p = db::project_by_key(c, &event.project_id)?;
     if event.payload["proposal_id"].is_string()
@@ -473,6 +509,9 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
                 field("to"),
                 field("anchor"),
             );
+            if crate::manager_workers::is_plain(p) {
+                context = format!("<approved_proposal trust=\"daemon_metadata\" proposal_id=\"{}\" source_event_id=\"{}\"/>", field("proposal_id"), crate::envelope::escape(&original.id));
+            }
         } else if let Some(id) = original.message_id {
             let message = app.db.message(&id).await?;
             let group = crate::feishu::context(app, &message).await;
@@ -513,6 +552,8 @@ struct DelegateArgs {
     instructions: String,
     source_event_id: Option<String>,
     target_cli: Option<String>,
+    #[serde(default)]
+    generation: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -750,6 +791,33 @@ fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
         json!({"path":args.path,"sha256":format!("{:x}",Sha256::digest(args.content.as_bytes())),"status":"written"}),
     )
 }
+// Treat a clear singular assignment in the trusted source as a routing
+// constraint. Ambiguous or multi-CLI prose still goes through the Manager.
+fn named_cli(text: &str) -> Option<String> {
+    let normalized = text.to_ascii_lowercase();
+    let words = normalized.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+    let known = ["codex", "claude", "pi", "agy", "custom"];
+    if known.iter().filter(|cli| words.clone().any(|word| word == **cli)).count() > 1 {
+        return None;
+    }
+    let mut targets = text.split(['。', '！', '；', ';', '，', ',', '\n']).filter_map(|part| {
+        let part = part.trim_start();
+        let part = if part.starts_with('@') {
+            part.split_once(char::is_whitespace)?.1.trim_start()
+        } else {
+            part
+        };
+        let part = part.to_ascii_lowercase();
+        let part = part.strip_prefix('请').unwrap_or(&part).trim_start();
+        let target = ["使用", "用", "让", "use ", "ask "]
+            .into_iter().find_map(|prefix| part.strip_prefix(prefix))?.trim_start();
+        let name = target.split(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch,'_'|'-'|'/')).next()?;
+        known.contains(&name).then(|| name.to_owned())
+    });
+    let first = targets.next()?;
+    targets.all(|target| target == first).then_some(first)
+}
+
 fn select_origin(c: &Connection, ctx: &Context, requested: Option<&str>) -> Result<Option<String>> {
     let origins=c.prepare("SELECT DISTINCT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id IS NOT NULL")?.query_map([&ctx.run],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     if let Some(requested) = requested {
@@ -955,19 +1023,54 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     // Establish that the requested discussion belongs to this batch before
     // starting any additional native execution.
     let context=ctx.clone();let chosen_source=a.source_event_id.clone();
-    let seat_origin = app.db.call(move|c| {
+    let (seat_origin, requested_cli) = app.db.call(move|c| {
         valid(c,&context)?;
-        select_origin(c,&context,chosen_source.as_deref())
+        let origin=select_origin(c,&context,chosen_source.as_deref())?;
+        let text=origin.as_deref().map(|id| c.query_row(
+            "SELECT m.content FROM work_events e JOIN messages m ON m.id=e.message_id
+             WHERE e.id=? AND e.project_id=? AND m.direction='in'",
+            params![id,context.project], |row| row.get::<_,String>(0)).optional())
+            .transpose()?.flatten();
+        Ok((origin,text.as_deref().and_then(named_cli)))
     }).await?;
-    let selected = match a.target_cli.as_deref() {
-        Some(target) => {
-            ensure!(!steer,"Choose target_cli on delegate; steer_worker is scoped to the primary conversation");
-            match crate::manager_workers::select(app,&p,target,seat_origin).await? {
-                crate::manager_workers::Selection::Ready(worker) => Some(*worker),
-                crate::manager_workers::Selection::Unavailable(result) => return Ok(result),
-            }
+    if steer && (p.agent=="auto" || a.generation.is_some()) {
+        ensure!(a.target_cli.is_none(),"Choose an existing generation for steering, not a new CLI");
+        let generation = a.generation.context("Choose the running worker generation from worker_status")?;
+        let context=ctx.clone();
+        let target=generation.clone();
+        let task_run = app.db.call(move|c| {
+            let parent=valid(c,&context)?;
+            crate::manager_workers::authorize(c,&parent,&target,true)?;
+            c.query_row("SELECT id FROM work_runs
+                WHERE project_id=? AND generation=? AND status IN ('submitted','running')
+                ORDER BY rowid DESC LIMIT 1", params![parent.id,target], |row|row.get::<_,String>(0))
+                .optional()?.context("No active task is running on the selected worker")
+        }).await?;
+        drop(guard);
+        return crate::manager_terminal::send(app,ctx,crate::manager_terminal::SendArgs {
+            generation,
+            task_run:Some(task_run),
+            segments: vec![
+                crate::herdr::terminal_control::Segment::Text { text: a.instructions },
+                crate::herdr::terminal_control::Segment::Key { key:"enter".into() },
+            ],
+        },&effect).await;
+    }
+    ensure!(a.generation.is_none(),"Choose a CLI with target_cli when delegating a new task");
+    let target_cli = requested_cli.as_deref().or(a.target_cli.as_deref());
+    let selected = if a.target_cli.is_some() || (!steer && (requested_cli.is_some() || p.agent=="auto")) {
+        ensure!(!steer,"Choose target_cli on delegate; steer_worker is scoped to the legacy primary conversation");
+        match crate::manager_workers::select(app,&p,target_cli.unwrap_or(""),seat_origin).await? {
+            crate::manager_workers::Selection::Ready(worker) => Some(*worker),
+            crate::manager_workers::Selection::Unavailable(mut result) => {
+                if result["catalog"].is_null() {
+                    result["catalog"]=crate::manager_workers::catalog(&p).await;
+                }
+                return Ok(result);
+            },
         }
-        None => None,
+    } else {
+        None
     };
     let context=ctx.clone();let request=effect.clone();app.db.call(move|c|{
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
@@ -1008,10 +1111,24 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
     }).await
    },
-   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();let mut snapshot=app.db.call(move|c|{let current=valid(c,&authority)?;worker_snapshot(c,&current.id,&current.generation)}).await?;snapshot["agent"]=json!(p.agent);snapshot["generation"]=json!(p.generation);snapshot["native_session"]=json!(p.native_session);snapshot["ready"]=json!(p.ready);snapshot["paused"]=json!(p.paused);snapshot["mcp_registered"]=json!(p.execution["mcp_registered"]==true);snapshot["obsolete_executions"]=json!(obsolete);snapshot["input_effect_journal"]=journal;Ok(snapshot)},
+   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();let mut snapshot=app.db.call(move|c|{let current=valid(c,&authority)?;worker_snapshot(c,&current.id,&current.generation)}).await?;snapshot["agent"]=json!(p.agent);snapshot["generation"]=json!(p.generation);snapshot["native_session"]=json!(p.native_session);snapshot["ready"]=json!(p.ready);snapshot["paused"]=json!(p.paused);snapshot["mcp_registered"]=json!(p.execution["mcp_registered"]==true);snapshot["available_clis"]=crate::manager_workers::catalog(&p).await;snapshot["obsolete_executions"]=json!(obsolete);snapshot["input_effect_journal"]=journal;Ok(snapshot)},
    "cli_send_keys"=>{drop(guard);let args:crate::manager_terminal::SendArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::send(app,ctx,args,&effect).await},
    "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args,&effect).await},
    "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
+   "schedule_run"=>{
+    let mut input:work::TimerInput=serde_json::from_value(call.arguments)?;
+    ensure!(matches!(input.purpose.as_str(),"user"|"internal"),"Choose user or internal schedule purpose");
+    if let Some(to)=input.to.as_deref() { crate::feishu::recipient_type(to)?; }
+    input.request_id=Some(effect.clone());
+    let context=ctx.clone();
+    app.db.call(move|c|{
+      let tx=c.unchecked_transaction()?;
+      valid(&tx,&context)?;
+      let timer=work::create_timer(&tx,&context.project,input,db::now())?;
+      tx.commit()?;
+      Ok(json!(timer))
+    }).await
+   },
    "send_md"|"send_file"=>{
     let (to,text,anchor,path,intent,source)=if call.name=="send_md" {
         let a:MessageArgs=serde_json::from_value(call.arguments)?;
@@ -1124,7 +1241,7 @@ pub(crate) fn observe_cli_transition(
     state: &str,
     error: &str,
 ) -> Result<()> {
-    if installed(c)? {
+    if uses_manager(c,project)? {
         observation(
             c,
             project,
@@ -1142,7 +1259,7 @@ pub(crate) fn observe_cli_transition(
     worker_changed(c, project)
 }
 pub fn worker_changed(c: &Connection, project: &str) -> Result<()> {
-    if !installed(c)? {
+    if !uses_manager(c,project)? {
         return Ok(());
     }
     observe(c, project)?;
@@ -1209,16 +1326,20 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &json!({"event_id":id,"status":"definitely_not_submitted","error":error}),
         )?;
     }
-    let runs=c.prepare("SELECT r.id,r.status,r.error,json_extract(e.payload,'$.origin_event_id'),r.event_id,r.generation FROM work_runs r JOIN work_events e ON e.id=r.event_id WHERE r.project_id=? AND e.source IN ('management','manager_worker') AND r.status IN ('settled','completed','uncertain','failed','interrupted') ORDER BY r.rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, status, error, origin, event, generation) in runs {
+    let runs=c.prepare("SELECT r.id,r.status,r.error,json_extract(e.payload,'$.origin_event_id'),r.event_id,r.generation,json_extract(e.payload,'$.worker_result') FROM work_runs r JOIN work_events e ON e.id=r.event_id WHERE r.project_id=? AND e.source IN ('management','manager_worker') AND r.status IN ('settled','completed','uncertain','failed','interrupted') ORDER BY r.rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, status, error, origin, event, generation, result) in runs {
+        let result: Value = result.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .filter(|result| result["run_id"] == id).unwrap_or(Value::Null);
+        let stamp = result["status"].as_str().map_or_else(|| status.clone(),
+            |report_status| format!("{status}:{report_status}"));
         observation(
             c,
             project,
             "worker_run",
             &id,
-            &status,
+            &stamp,
             origin.as_deref(),
-            &json!({"kind":"worker_run","run_id":id,"event_id":event,"worker_generation":generation,"delivery_status":status,"error":error,"semantic_task_success":"unconfirmed"}),
+            &json!({"kind":"worker_run","run_id":id,"event_id":event,"worker_generation":generation,"delivery_status":status,"error":error,"worker_report":result,"semantic_task_success":"unconfirmed"}),
         )?;
     }
     Ok(())
@@ -2200,7 +2321,10 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
         "UPDATE manager_config SET error=?,next_attempt_at=? WHERE project_id=?",
         params![error.summary(), next_attempt, ctx.project],
     )?;
-    if !error.retryable || attempts >= 3 {
+    // The legacy worker repair tool path is unavailable in automatic mode.
+    // Keep the incident and input without manufacturing a primary-pane job.
+    let repair = p.agent != "auto" && (!error.retryable || attempts >= 3);
+    if repair {
         let repair_id = format!("manager-repair-{incident}");
         let instructions = format!(
             "<management_repair trust=\"daemon_metadata\" incident_id=\"{incident}\" revision=\"{}\">Repair only this project's management service. Sanitized diagnostic: {}. Verify the current manager failure still has this incident and revision before making changes. Diagnose the configured provider request or management loop; preserve queued user input and all effect receipts. Do not process or forward the user's ordinary tasks, replay uncertain effects, change native CLI login/global settings, or replace the selected provider without explicit authority. Use the existing project control path and report verified recovery or the concrete remaining cause. This is one bounded repair assignment, not authorization for recurring retries.</management_repair>",
@@ -2247,7 +2371,7 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
             (_, true) => "请在设置里选择可用的管理模型。",
             (_, false) => " Choose an available management model in Settings.",
         };
-        let message = failure_notice(error, delay, true, chinese) + action;
+        let message = failure_notice(error, delay, repair, chinese) + action;
         let mut attachment = json!({"to":to,"discussion_intent":"decision","manager_notice":true,
             "manager_incident":incident,"manager_revision":ctx.revision});
         if let Err(error) = crate::discussion::origin(&tx, &ctx.project, &origin, &binding.app_id, to, false, &mut attachment) {
@@ -2392,6 +2516,17 @@ pub fn settle_sources(c: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::{config::Config, db::ProjectInput};
+    #[test]
+    fn clear_user_cli_assignments_are_preserved() {
+        assert_eq!(named_cli("请用 Claude 跑这项"), Some("claude".into()));
+        assert_eq!(named_cli("@bot 让 agy 做这个"), Some("agy".into()));
+        assert_eq!(named_cli("Use pi for this"), Some("pi".into()));
+        assert_eq!(named_cli("不要用 agy"), None);
+        assert_eq!(named_cli("有没有 codex"), None);
+        assert_eq!(named_cli("用 codex 修复，用 claude 复核"), None);
+        assert_eq!(named_cli("Use codex for the fix and have claude review it"), None);
+    }
+
     async fn fixture() -> (tempfile::TempDir, Arc<App>, Project) {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(dir.path().join("store"), Config::default()).unwrap();
@@ -3842,6 +3977,26 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn automatic_project_provider_failure_keeps_input_without_legacy_repair() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_automatic_provider", "process this later");
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET agent='auto' WHERE id=?", [&p.id])?;
+            work::sync_inbound(c)?;
+            let turn = claim(c,&p.id)?.unwrap();
+            failure(c,&turn.context,&Failure {
+                kind:"authorization".into(), http_status:Some(401), ..Failure::internal()
+            })?;
+            assert_eq!(public(c,&p.id)?["status"],"unavailable");
+            assert_eq!(c.query_row("SELECT count(*) FROM manager_inputs WHERE status='processing'",[],
+                |row|row.get::<_,i64>(0))?,1);
+            assert_eq!(c.query_row("SELECT count(*) FROM work_events WHERE source IN ('management','manager_worker')",[],
+                |row|row.get::<_,i64>(0))?,0);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
     async fn turn_budget_failure_releases_manager_without_replaying_effects() {
         let (_dir, app, p) = fixture().await;
         ingest(&app, &p, "om_budget", "first input");
@@ -4489,7 +4644,7 @@ mod tests {
             let b=intent_for_worker(c,&parent,"effect-two","second task",None,false,Some(&two))?;
             let later=intent_for_worker(c,&parent,"effect-later","held by pause",None,false,Some(&one))?;
             let workers=worker_snapshot(c,&parent.id,&parent.generation)?;
-            assert_eq!(workers["workers"].as_array().unwrap().len(),3);
+            assert_eq!(workers["workers"].as_array().unwrap().len(),2);
             assert!(work::claim_next(c,&parent.id,"primary",db::now())?.is_none());
             c.execute("UPDATE cli_switch_requests SET holds_input=1 WHERE project_id=?",[&parent.id])?;
             assert!(work::claim_worker(c,&parent.id,"worker-one",db::now())?.is_none());

@@ -233,6 +233,7 @@ async fn auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Resp
                 crate::manager_workers::authorize(c,&parent,&requested,false)
             }).await;
             if let Ok(seat) = candidate
+                && !seat.project.mcp_token.is_empty()
                 && equal(token,&seat.project.mcp_token)
             {
                 req.extensions_mut().insert(SessionAuthority {
@@ -498,8 +499,26 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
     let manager_provider = app.db.call(crate::manager::public_provider).await?;
     for p in projects {
         let id = p.id.clone();
-        let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
+        let current = p.clone();
+        let (snapshot, worker_terminal) = app.db.call(move |c| {
+            let mut snapshot = work::snapshot(c, &id)?;
+            let mut terminal = Value::Null;
+            if current.agent == "auto" {
+                let worker = crate::manager_workers::diagnostic_worker(c, &current)?;
+                if let Some(address) = worker.terminal {
+                    terminal = json!({"terminal":address,"generation":worker.generation});
+                    snapshot.lease = c.query_row(
+                        "SELECT active,updated_at FROM work_leases WHERE project_id=? AND generation=?",
+                        rusqlite::params![id,worker.generation],
+                        |row| Ok(work::Lease {project_id:id.clone(),generation:worker.generation.clone(),
+                            active:row.get(0)?,updated_at:row.get(1)?}),
+                    ).optional()?;
+                }
+            }
+            Ok((snapshot, terminal))
+        }).await?;
         let mut record = json!(p);
+        record["worker_terminal"] = worker_terminal;
         let manager_project = p.id.clone();
         let manager = app
             .db
@@ -611,7 +630,7 @@ async fn check_bot(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiRe
     ))
 }
 async fn create_project(State(app): State<Arc<App>>, Json(input): Json<ProjectInput>) -> ApiResult {
-    let p = app.db.create(input).await?;
+    let p = app.db.create_from_api(input).await?;
 
     Ok(Json(serde_json::to_value(p).unwrap()))
 }
@@ -1394,6 +1413,34 @@ async fn resolve_event(
 #[cfg(test)]
 mod manager_context_tests {
     use super::*;
+    #[tokio::test]
+    async fn new_projects_use_automatic_workers_only_when_manager_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().join("store"), crate::config::Config::default()).unwrap();
+        let input = |name| ProjectInput { name, agent:"agy".into(),
+            path:dir.path().to_string_lossy().into(), chat_id:String::new(),
+            native_session:String::new(), extra_args:vec![] };
+        let standalone = app.db.create_from_api(input("Standalone fixture".into())).await.unwrap();
+        app.db.sync(|c| {
+            assert!(!crate::manager::uses_manager(c,&standalone.id)?);
+            assert_eq!(standalone.agent,"agy");
+            crate::manager::save_provider(c, crate::manager::ConfigInput {
+                base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(),
+                api_key:Some("fixture-not-a-credential".into()), clear_api_key:false,
+                expected_revision:0, supports_images:None,
+            })?;
+            Ok(())
+        }).unwrap();
+        let automatic = app.db.create_from_api(input("Automatic fixture".into())).await.unwrap();
+        app.db.sync(|c| {
+            assert!(crate::manager::uses_manager(c,&automatic.id)?);
+            assert_eq!(automatic.agent,"auto");
+            assert!(!crate::manager::uses_manager(c,&standalone.id)?);
+            assert!(automatic.terminal.is_none());
+            Ok(())
+        }).unwrap();
+    }
+
     #[tokio::test]
     async fn context_endpoint_requires_admin_and_does_not_mutate_store_or_database() {
         let dir = tempfile::tempdir().unwrap();

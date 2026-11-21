@@ -382,7 +382,8 @@ impl Desktop {
                             && self.state["projects"].as_array().is_some_and(|projects| {
                                 projects.iter().any(|project| {
                                     project["id"] == self.selected
-                                        && project["generation"] == descriptor.generation
+                                        && terminal_identity(project).is_some_and(|(generation, terminal)|
+                                            generation == descriptor.generation && terminal == descriptor.terminal_id)
                                 })
                             })
                         {
@@ -643,17 +644,10 @@ impl Desktop {
         let project = self.state["projects"]
             .as_array()
             .and_then(|items| items.iter().find(|p| p["id"] == self.selected));
-        let key = project
-            .map(|p| {
-                format!(
-                    "{}/{}/{}",
-                    self.selected,
-                    p["generation"].as_str().unwrap_or(""),
-                    p["terminal"].as_str().unwrap_or("")
-                )
-            })
+        let terminal = project.and_then(terminal_identity);
+        let has_terminal = terminal.is_some();
+        let key = terminal.map(|(generation, terminal)| format!("{}/{generation}/{terminal}", self.selected))
             .unwrap_or_default();
-        let has_terminal = project.is_some_and(|p| p["terminal"].as_str().is_some());
         if key != self.terminal_key {
             self.release_terminal();
             self.terminal_key = key;
@@ -998,7 +992,7 @@ impl Desktop {
         let status = self.state["runtime"]["bots"][&selected].clone();
         div().flex().flex_col().gap_4()
             .child(self.title("FEISHU BOT", "Connect this project's bot", "Every project has its own bot. Direct messages, bot mentions and verified topic replies reach its project."))
-            .child(choices)
+            .when(self.state["manager_provider"]["configured"] != true, |view| view.child(choices))
             .child(self.field("App ID", &self.app_id))
             .child(self.field("App Secret", &self.secret))
             .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.tr("The secret stays masked. Leave it blank to keep this bot's saved secret. A new App ID needs its own secret. Credentials are stored privately on this Mac.")))
@@ -1077,7 +1071,7 @@ impl Desktop {
             );
         }
         div().flex().flex_col().gap_4()
-            .child(self.title("ADD PROJECT", "Add project", "One bot belongs to one project. The manager receives direct and group messages and delegates coding to the CLI you select."))
+            .child(self.title("ADD PROJECT", "Add project", "One bot belongs to one project. Manager projects automatically find installed worker CLIs."))
             .when(self.state["manager_provider"]["configured"] == false, |view| {
                 view.child(self.btn("project-provider-setup", "Configure the shared manager in Settings", |this, _, _| this.go(8), cx))
             })
@@ -1094,7 +1088,7 @@ impl Desktop {
                 let path = if manual.trim().is_empty() { this.picked_path.clone() } else { manual };
                 let name = this.name.read(cx).value().to_string();
                 if name.trim().is_empty() { this.notice = "Enter a project name".into(); this.error = true; return; }
-                let agent = ["codex","claude","pi","agy"][this.agent];
+                let agent = if this.state["manager_provider"]["configured"] == true { "auto" } else { ["codex","claude","pi","agy"][this.agent] };
                 this.api("POST", "/projects".into(), Some(json!({"name":name,"path":path,"agent":agent,"chat_id":""})), "Project created. Connect its bot or continue locally.");
             }, cx).primary())
             .into_any_element()
@@ -1288,38 +1282,47 @@ impl Desktop {
                         })),
                     ),
             );
-            body = body.child(
-                div()
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.tr("Coding CLI")),
-            );
-            let mut agents = div().flex().flex_wrap().gap_2();
-            for (index, agent) in ["codex", "claude", "pi", "agy"].into_iter().enumerate() {
-                let project_id = id.clone();
-                agents = agents.child(
-                    Button::new(("agent", index))
-                        .child(control_label(agent_name(agent)))
-                        .selected(project["agent"] == agent)
-                        .disabled(
-                            self.busy
-                                || project["paused"] == true
-                                || project["lifecycle"] == "taken_over"
-                                || project["agent"] == agent,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.release_terminal();
-                            this.api(
-                                "POST",
-                                format!("/projects/{project_id}/agent/transition"),
-                                Some(json!({"agent":agent})),
-                                "CLI handoff requested. The project binding is preserved.",
-                            );
-                            cx.notify();
-                        })),
+            if project["agent"] != "auto" {
+                body = body.child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(self.tr("Coding CLI")),
                 );
+                let mut agents = div().flex().flex_wrap().gap_2();
+                for (index, agent) in ["codex", "claude", "pi", "agy"].into_iter().enumerate() {
+                    let project_id = id.clone();
+                    agents = agents.child(
+                        Button::new(("agent", index))
+                            .child(control_label(agent_name(agent)))
+                            .selected(project["agent"] == agent)
+                            .disabled(
+                                self.busy
+                                    || project["paused"] == true
+                                    || project["lifecycle"] == "taken_over"
+                                    || project["agent"] == agent,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.release_terminal();
+                                this.api(
+                                    "POST",
+                                    format!("/projects/{project_id}/agent/transition"),
+                                    Some(json!({"agent":agent})),
+                                    "CLI handoff requested. The project binding is preserved.",
+                                );
+                                cx.notify();
+                            })),
+                    );
+                }
+                body = body.child(agents);
+                if self.state["manager_provider"]["configured"] == true && project["terminal"].is_null() {
+                    let project_id = id.clone();
+                    body = body.child(self.btn("automatic-workers", "Use automatic workers", move |this, _, _| {
+                        this.api("POST", format!("/projects/{project_id}/agent/mode"),
+                            Some(json!({"mode":"automatic"})), "Automatic workers enabled.");
+                    }, cx));
+                }
             }
-            body = body.child(agents);
             if let Some(model) = project["model"]
                 .as_str()
                 .filter(|s| !s.is_empty())
@@ -3037,8 +3040,14 @@ fn connection_status(status: &str) -> &str {
         other => other,
     }
 }
+fn terminal_identity(project: &Value) -> Option<(&str, &str)> {
+    let execution = if project["agent"] == "auto" { &project["worker_terminal"] } else { project };
+    Some((execution["generation"].as_str()?, execution["terminal"].as_str()?))
+}
+
 fn agent_name(agent: &str) -> &'static str {
     match agent {
+        "auto" => "Automatic workers",
         "codex" => "Codex",
         "claude" => "Claude Code",
         "pi" => "Pi",

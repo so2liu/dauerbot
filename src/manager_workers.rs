@@ -4,7 +4,13 @@ use crate::{App, adapter, config, db, db::Project, herdr, manager, mcp, models, 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::io::AsyncReadExt;
 
 const PREFLIGHT_RETRY_MS: i64 = 30_000;
 
@@ -12,7 +18,7 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS manager_workers(
             generation TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-            agent TEXT NOT NULL, token TEXT NOT NULL, state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
+            agent TEXT NOT NULL, token TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
             execution TEXT NOT NULL DEFAULT 'null', native_session TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL, origin_event_id TEXT
         );
@@ -49,7 +55,9 @@ pub(crate) fn seat(c: &Connection, parent: &Project, generation: &str) -> Result
     p.ready = state == "ready";
     p.execution = execution;
     p.native_session = native_session;
-    p.extra_args.clear();
+    if p.agent != "custom" {
+        p.extra_args.clear();
+    }
     Ok(Some(Seat {
         project: p,
         state,
@@ -83,13 +91,46 @@ pub(crate) fn authorize(
         "The manager worker is unavailable"
     );
     ensure!(
-        !App::update_required(&seat.project),
+        is_plain(&seat.project) || !App::update_required(&seat.project),
         "The worker requires a compatible daemon"
     );
     if registered {
         controls(c, parent)?;
     }
     Ok(seat)
+}
+
+pub(crate) fn is_plain(p: &Project) -> bool {
+    p.mcp_token.is_empty()
+}
+
+pub(crate) fn diagnostic_worker(c: &Connection, p: &Project) -> Result<Project> {
+    let generation = c
+        .query_row(
+            "SELECT w.generation FROM manager_workers w
+         LEFT JOIN work_leases l ON l.project_id=w.project_id AND l.generation=w.generation
+         WHERE w.project_id=? AND w.state IN ('starting','ready','unavailable')
+           AND json_type(w.execution,'$.terminal_id')='text'
+         ORDER BY COALESCE(l.active,0) DESC,
+                  CASE w.state WHEN 'unavailable' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
+                  w.rowid DESC LIMIT 1",
+            [&p.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(generation
+        .as_deref()
+        .map(|g| seat(c, p, g))
+        .transpose()?
+        .flatten()
+        .map_or_else(|| p.clone(), |seat| seat.project))
+}
+
+pub(crate) fn ready_worker(c: &Connection, p: &Project) -> Result<Project> {
+    Ok(active(c, p)?
+        .into_iter()
+        .find(|seat| seat.project.ready && seat.project.terminal.is_some())
+        .map_or_else(|| p.clone(), |seat| seat.project))
 }
 
 fn active(c: &Connection, p: &Project) -> Result<Vec<Seat>> {
@@ -102,19 +143,42 @@ fn active(c: &Connection, p: &Project) -> Result<Vec<Seat>> {
 }
 
 pub(crate) fn snapshot(c: &Connection, p: &Project) -> Result<Value> {
-    let mut workers = vec![json!({
-        "role":"primary","agent":p.agent,"generation":p.generation,
-        "terminal_id":p.terminal,"native_session":p.native_session,"ready":p.ready,
-        "mcp_registered":p.execution["mcp_registered"]==true
-    })];
+    let mut workers = Vec::new();
+    if p.terminal.is_some() {
+        workers.push(json!({
+            "role":"legacy_primary","agent":p.agent,"generation":p.generation,
+            "terminal_id":p.terminal,"native_session":p.native_session,"ready":p.ready,
+            "mcp_registered":p.execution["mcp_registered"]==true
+        }));
+    }
     let generations = c.prepare("SELECT generation FROM manager_workers WHERE project_id=? ORDER BY created_at DESC LIMIT 12")?
         .query_map([&p.id], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for generation in generations {
         let s = seat(c, p, &generation)?.context("Manager worker disappeared")?;
         let worker = s.project;
+        let tasks = c.prepare(
+            "SELECT e.id,e.status,e.error,(SELECT id FROM work_runs r WHERE r.event_id=e.id ORDER BY rowid DESC LIMIT 1),
+                    json_extract(e.payload,'$.worker_result')
+             FROM work_events e WHERE e.project_id=? AND e.source='manager_worker'
+               AND json_extract(e.payload,'$.target_generation')=? ORDER BY e.rowid DESC LIMIT 8"
+        )?.query_map(params![p.id,generation], |r| {
+            let run: Option<String> = r.get(3)?;
+            let result = r.get::<_,Option<String>>(4)?
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).map(|result| {
+                    json!({"status":result["status"],"reported_status":result["reported_status"],
+                        "summary":result["summary"].as_str().map(|text| text.chars().take(320).collect::<String>()),
+                        "semantic_task_success":result["semantic_task_success"]})
+                });
+            let path = if is_plain(&worker) { run.as_deref().and_then(|run|
+                crate::worker_task::result_path(Path::new(&worker.path), &p.id, &generation, run).ok())
+            } else { None };
+            Ok(json!({"event_id":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,
+                "reason":r.get::<_,String>(2)?,"run_id":run,"result_file":path,"result":result}))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
         workers.push(json!({"role":"task_worker","agent":worker.agent,"generation":generation,
             "terminal_id":worker.terminal,"native_session":worker.native_session,"ready":worker.ready,
-            "mcp_registered":worker.ready,"status":s.state,"reason":s.error}));
+            "mcp_registered":worker.execution["mcp_registered"]==true,"status":s.state,"reason":s.error,
+            "tasks":tasks}));
     }
     Ok(json!(workers))
 }
@@ -130,8 +194,103 @@ fn unavailable(target: &str, reason: &str) -> Selection {
     )
 }
 
-/// A first request starts a seat only. Work is admitted after the native CLI
-/// has proved its identity and registered its own generation-scoped companion.
+fn starting(target: &str, generation: &str) -> Selection {
+    Selection::Unavailable(json!({"status":"worker_unavailable","target_cli":target,
+        "reason":"Starting the independent native session; check worker_status before retrying",
+        "work_queued":false,"starting":true,"generation":generation}))
+}
+
+const CLI_NAMES: [&str; 5] = ["codex", "claude", "pi", "agy", "custom"];
+
+fn custom_configured(p: &Project) -> bool {
+    matches!(p.agent.as_str(), "custom" | "auto") && !p.extra_args.is_empty()
+}
+
+fn candidate(p: &Project, agent: &str) -> Project {
+    let mut candidate = p.clone();
+    candidate.agent = agent.into();
+    if agent != "custom" || !custom_configured(p) {
+        candidate.extra_args.clear();
+    }
+    candidate
+}
+
+pub(crate) async fn catalog(p: &Project) -> Value {
+    let mut checks = tokio::task::JoinSet::new();
+    for agent in CLI_NAMES {
+        let candidate = candidate(p, agent);
+        checks.spawn(async move { (agent, adapter::plain_worker_available(&candidate).await) });
+    }
+    let mut installed = Vec::new();
+    while let Some(result) = checks.join_next().await {
+        if let Ok((agent, true)) = result {
+            installed.push(agent);
+        }
+    }
+    json!(CLI_NAMES.map(|agent| {
+        let available = installed.contains(&agent);
+        let reason = if available {
+            None
+        } else if agent == "custom" && !custom_configured(p) {
+            Some("No custom command is configured for this project")
+        } else {
+            Some("Command is missing or failed its bounded executable check")
+        };
+        json!({"agent":agent,"available":available,"reason":reason})
+    }))
+}
+
+fn current_seat(c: &Connection, parent: &Project, target: &str) -> Result<Option<Seat>> {
+    // The daemon releases a launch permit only after saving the execution.
+    // A failed preflight without that evidence can be replaced after cooldown.
+    let generation = c
+        .query_row(
+            "SELECT w.generation FROM manager_workers w
+         WHERE w.project_id=? AND w.agent=? AND w.state!='closed'
+           AND (w.token='' OR w.state IN ('starting','ready'))
+           AND NOT (w.state='unavailable' AND w.execution='null' AND w.native_session=''
+             AND w.created_at<=?
+             AND NOT EXISTS(SELECT 1 FROM work_executions e WHERE e.generation=w.generation))
+         ORDER BY w.rowid DESC LIMIT 1",
+            params![parent.id, target, db::now() - PREFLIGHT_RETRY_MS],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    generation
+        .map(|g| seat(c, parent, &g))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn installed_candidates(
+    c: &Connection,
+    p: &Project,
+    choices: &Value,
+) -> Result<Vec<(&'static str, Option<Seat>)>> {
+    controls(c, p)?;
+    let available = choices
+        .as_array()
+        .context("Worker catalog is unavailable")?;
+    let mut candidates = Vec::new();
+    for name in CLI_NAMES {
+        if available
+            .iter()
+            .any(|entry| entry["agent"] == name && entry["available"] == true)
+        {
+            let current = current_seat(c, p, name)?;
+            if current
+                .as_ref()
+                .is_none_or(|seat| is_plain(&seat.project) && seat.state != "unavailable")
+            {
+                candidates.push((name, current));
+            }
+        }
+    }
+    candidates.sort_by_key(|(name, _)| *name != p.agent);
+    Ok(candidates)
+}
+
+/// Start or select a task execution independently of the legacy project pane.
 pub(crate) async fn select(
     app: &Arc<App>,
     p: &Project,
@@ -139,100 +298,97 @@ pub(crate) async fn select(
     origin: Option<String>,
 ) -> Result<Selection> {
     ensure!(
-        ["codex", "claude", "pi", "agy"].contains(&target),
-        "Unsupported target CLI; choose codex, claude, pi, or agy"
+        target.is_empty() || ["codex", "claude", "pi", "agy", "custom"].contains(&target),
+        "Unsupported target CLI; choose codex, claude, pi, agy, or the configured custom CLI"
     );
-    let parent = p.clone();
-    let target_key = target.to_owned();
-    let current = app
-        .db
-        .call(move |c| {
-            controls(c, &parent)?;
-            // No launch permit is released before the execution is committed.
-            // A failed preflight with no recorded execution can be replaced after
-            // a short cooldown, leaving the old generation and diagnostic intact.
-            let generation = c
-                .query_row(
-                    "SELECT w.generation FROM manager_workers w
-             WHERE w.project_id=? AND w.agent=? AND w.state!='closed'
-               AND NOT (w.state='unavailable' AND w.execution='null' AND w.native_session=''
-                 AND w.created_at<=?
-                 AND NOT EXISTS(SELECT 1 FROM work_executions e WHERE e.generation=w.generation))
-             ORDER BY w.rowid DESC LIMIT 1",
-                    params![parent.id, target_key, db::now() - PREFLIGHT_RETRY_MS],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?;
-            generation
-                .map(|g| seat(c, &parent, &g))
-                .transpose()
-                .map(Option::flatten)
-        })
-        .await?;
-    if target == p.agent {
+    let automatic = target.is_empty();
+    let target = if automatic {
+        let choices = catalog(p).await;
         let parent = p.clone();
-        let usable = app
+        let observed_choices = choices.clone();
+        let candidates = app
+            .db
+            .call(move |c| installed_candidates(c, &parent, &observed_choices))
+            .await?;
+        let cfg = app.config.read().await.clone();
+        let mut next = None;
+        for (name, current) in candidates {
+            match current {
+                Some(seat) if seat.state == "ready" => {
+                    if available(&cfg, &seat.project).await {
+                        return Ok(Selection::Ready(Box::new(seat.project)));
+                    }
+                }
+                Some(seat) if seat.state == "starting" => {
+                    return Ok(starting(name, &seat.project.generation));
+                }
+                None if next.is_none() => {
+                    next = Some(name);
+                }
+                _ => {}
+            }
+        }
+        let Some(next) = next else {
+            return Ok(Selection::Unavailable(
+                json!({"status":"worker_unavailable",
+                "reason":"No installed worker currently accepts assignments","work_queued":false,"catalog":choices}),
+            ));
+        };
+        next
+    } else {
+        let parent = p.clone();
+        let target_key = target.to_owned();
+        let current = app
             .db
             .call(move |c| {
-                Ok(!crate::cli_switch::latest(c, &parent.id)?
-                    .as_ref()
-                    .is_some_and(crate::cli_switch::blocks_worker))
+                controls(c, &parent)?;
+                current_seat(c, &parent, &target_key)
             })
             .await?;
-        if !usable || App::update_required(p) || !p.ready || p.execution["mcp_registered"] != true {
-            return Ok(unavailable(
-                target,
-                "The selected native conversation is not ready for work",
-            ));
+        if let Some(current) = current {
+            if !is_plain(&current.project) {
+                return Ok(unavailable(
+                    target,
+                    "An active legacy worker owns this CLI slot; preserve it or stop it before creating a plain worker",
+                ));
+            }
+            return Ok(match current.state.as_str() {
+                "ready" if available(&app.config.read().await.clone(), &current.project).await => {
+                    Selection::Ready(Box::new(current.project))
+                }
+                "ready" => unavailable(target, "The worker's native session is not available"),
+                "starting" => starting(target, &current.project.generation),
+                _ => unavailable(target, &current.error),
+            });
         }
-        let cfg = app.config.read().await.clone();
-        return Ok(if available(&cfg, p).await {
-            Selection::Ready(Box::new(p.clone()))
-        } else {
-            unavailable(target, "The selected native conversation is not available")
-        });
-    }
-    if !matches!(target, "codex" | "claude") {
-        return Ok(unavailable(
-            target,
-            "This CLI currently supports the project's selected native conversation only",
+        target
+    };
+
+    let mut worker = candidate(p, target);
+    if !automatic && !adapter::plain_worker_available(&worker).await {
+        return Ok(Selection::Unavailable(
+            json!({"status":"worker_unavailable","target_cli":target,
+            "reason":"Worker command unavailable; choose an installed CLI","work_queued":false,
+            "catalog":catalog(p).await}),
         ));
     }
-    if let Some(current) = current {
-        return Ok(match current.state.as_str() {
-            "ready" if available(&app.config.read().await.clone(), &current.project).await => {
-                Selection::Ready(Box::new(current.project))
-            }
-            "ready" => unavailable(target, "The worker's native session is not available"),
-            "starting" => unavailable(
-                target,
-                "Starting the independent native session; check worker_status before retrying",
-            ),
-            _ => unavailable(target, &current.error),
-        });
-    }
-
     let generation = db::id();
-    let token = db::id();
     let project_id = p.id.clone();
     let agent = target.to_owned();
     let generation_key = generation.clone();
-    let credential = token.clone();
     app.db.call(move |c| {
-        c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at,origin_event_id) VALUES(?,?,?,?,'starting',?,?)",
-            params![generation_key,project_id,agent,credential,db::now(),origin])?;
+        c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at,origin_event_id) VALUES(?,?,?,'','starting',?,?)",
+            params![generation_key,project_id,agent,db::now(),origin])?;
         Ok(())
     }).await?;
-    let mut worker = p.clone();
     worker.name = format!("{} · {}", p.name, target);
     worker.agent = target.into();
-    worker.mcp_token = token;
-    worker.generation = generation;
+    worker.mcp_token.clear();
+    worker.generation = generation.clone();
     worker.native_session.clear();
     worker.terminal = None;
     worker.terminal_pid = None;
     worker.ready = false;
-    worker.extra_args.clear();
     worker.execution = Value::Null;
     let app = Arc::clone(app);
     tokio::spawn(async move {
@@ -259,10 +415,7 @@ pub(crate) async fn select(
                 .await;
         }
     });
-    Ok(unavailable(
-        target,
-        "Starting the independent native session; check worker_status before retrying",
-    ))
+    Ok(starting(target, &generation))
 }
 
 async fn observe(cfg: &config::Config, p: &Project) -> Result<Value> {
@@ -271,15 +424,118 @@ async fn observe(cfg: &config::Config, p: &Project) -> Result<Value> {
         .context("Worker observation exceeded the time budget")?
 }
 
-async fn available(cfg: &config::Config, p: &Project) -> bool {
-    observe(cfg, p).await.is_ok_and(|r| {
-        r["state"] == "live"
-            && matches!(
-                r["status"]["state"].as_str(),
-                Some("idle" | "done" | "working")
-            )
-            && herdr::check_identity(p, &r).is_ok()
+async fn resolve_program(worker: &Project, program: &str) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 || path.is_absolute() {
+        return Path::new(&worker.path).join(path).canonicalize().ok();
+    }
+    // Resolve the same login-shell PATH used by the native worker. The
+    // bounded output stays internal and may contain shell startup messages.
+    let command = herdr::login_shell_args(vec!["/usr/bin/which".into(), program.into()]);
+    let mut child = tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&worker.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let output = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut buf = Vec::new();
+        child
+            .stdout
+            .take()?
+            .take(8193)
+            .read_to_end(&mut buf)
+            .await
+            .ok()?;
+        if buf.len() > 8192 || !child.wait().await.ok()?.success() {
+            return None;
+        }
+        String::from_utf8(buf).ok()
     })
+    .await
+    .ok()??;
+    output
+        .lines()
+        .rev()
+        .map(Path::new)
+        .find(|entry| {
+            entry.is_absolute() && entry.file_name().and_then(|name| name.to_str()) == Some(program)
+        })?
+        .canonicalize()
+        .ok()
+}
+
+/// An unhooked worker can prove terminal ownership and a foreground CLI
+/// without a provider hook, agent ID, or MCP connection.
+pub(crate) fn check_plain_target(p: &Project, record: &Value) -> Result<()> {
+    herdr::check_pane_ownership(p, record)?;
+    let expected = p.execution["worker_program"]
+        .as_str()
+        .context("Worker program identity is missing")?;
+    let matches = |program: &str| {
+        program == expected
+            || (!expected.contains('/')
+                && Path::new(program)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(expected))
+    };
+    let foreground = &record["foreground"];
+    let resolved = p.execution["worker_program_resolved"]
+        .as_str()
+        .map(Path::new);
+    let argv0 = foreground["argv"][0]
+        .as_str()
+        .or_else(|| foreground["argv0"].as_str());
+    let program_name = argv0.and_then(|arg| Path::new(arg).file_name()?.to_str());
+    let interpreted = matches!(
+        program_name,
+        Some(
+            "node"
+                | "nodejs"
+                | "bun"
+                | "deno"
+                | "python"
+                | "python3"
+                | "ruby"
+                | "bash"
+                | "sh"
+                | "zsh"
+        )
+    );
+    let uses_script = interpreted
+        && resolved.is_some_and(|known| {
+            foreground["argv"][1].as_str().is_some_and(|script| {
+                Path::new(&p.path)
+                    .join(script)
+                    .canonicalize()
+                    .is_ok_and(|path| path == known)
+            })
+        });
+    ensure!(
+        foreground["name"].as_str().is_some_and(matches)
+            || argv0.is_some_and(matches)
+            || uses_script,
+        "The expected CLI is not in the owned terminal foreground"
+    );
+    herdr::check_native_resume(p, record)?;
+    ensure!(
+        !matches!(
+            record["status"]["state"].as_str(),
+            Some("blocked" | "error")
+        ),
+        "Worker terminal needs attention"
+    );
+    Ok(())
+}
+
+async fn available(cfg: &config::Config, p: &Project) -> bool {
+    observe(cfg, p)
+        .await
+        .is_ok_and(|r| check_plain_target(p, &r).is_ok())
 }
 
 async fn launch(app: &App, mut p: Project) -> Result<()> {
@@ -297,50 +553,18 @@ async fn launch(app: &App, mut p: Project) -> Result<()> {
         })
         .await?;
     let cfg = app.config.read().await.clone();
-    let session_dir = app.dir.join("sessions").join(&p.id).join(&p.generation);
-    config::private_dir(&session_dir)?;
-    let credentials = json!({"url":cfg.url(),"project":p.id,"token":p.mcp_token,
-        "generation":p.generation,"mcp_contract":mcp::CONTRACT});
-    config::write_private(
-        &session_dir.join("credentials.json"),
-        &serde_json::to_vec(&credentials)?,
-    )?;
-    let companion = app.companion()?;
-    let entry = json!({"command":companion,"args":["mcp","--credentials",session_dir.join("credentials.json")]});
-    let mcp_file = session_dir.join("mcp.json");
-    config::write_private(
-        &mcp_file,
-        &serde_json::to_vec(&json!({"mcpServers":{"herdr_feishu":entry}}))?,
-    )?;
-    herdr::ensure_server(&cfg).await?;
-    let integration = herdr::integration_status(&cfg, &p.agent).await?;
-    ensure!(
-        integration["state"] == "current",
-        "The native integration is unavailable"
-    );
     let id = p.id.clone();
     let agent = p.agent.clone();
     let selection = app.db.call(move |c| models::load(c, &id, &agent)).await?;
-    let mut argv = adapter::launch_args_with_selection(
-        &p,
-        &mcp_file,
-        &entry,
-        "Wait for an explicit Dauerbot task. Work only on the assigned scope and coordinate shared workspace changes with the Manager. Use trusted event metadata for task identity and the discussion anchor. Use only the supplied project MCP tools to report results; preserve the original discussion anchor and request ID for a retry, and review uncertain effects before attempting any new send.",
-        false,
-        selection.as_ref(),
-    )?;
-    if p.agent == "claude" {
-        argv.splice(1..1, ["--session-id".into(), p.generation.clone()]);
-    }
-    p.execution = herdr::prepare_execution(&cfg, &p, &argv, &p.generation).await?;
+    let argv = adapter::plain_worker_args(&p, selection.as_ref())?;
+    let resolved = resolve_program(&p, &argv[0]).await;
+    p.execution = herdr::prepare_plain_worker(&cfg, &p, &argv, &p.generation).await?;
     p.execution["api_protocol"] = json!(crate::api::PROTOCOL);
-    p.execution["mcp_contract"] = json!(mcp::CONTRACT);
-    p.execution["companion"] = json!(companion);
+    p.execution["plain_worker"] = json!(true);
+    p.execution["worker_program"] = json!(argv[0]);
+    p.execution["worker_program_resolved"] = json!(resolved);
     p.terminal = p.execution["terminal_id"].as_str().map(str::to_owned);
     p.terminal_pid = p.execution["shell_pid"].as_i64();
-    if p.agent == "claude" {
-        p.execution["intended_native_session"] = json!(p.generation);
-    }
     let saved = p.clone();
     app.db.call(move |c| {
         let tx = c.unchecked_transaction()?;
@@ -360,6 +584,7 @@ pub(crate) async fn register(
     pane: &str,
     contract: Option<u64>,
 ) -> Result<Value> {
+    ensure!(!is_plain(&worker), "Plain workers have no MCP registration");
     ensure!(
         worker.execution["pane_id"] == pane,
         "Worker pane identity does not match"
@@ -444,14 +669,47 @@ pub(crate) fn fail(c: &Connection, project: &str, generation: &str, reason: &str
 
 pub(crate) async fn reconcile(app: &Arc<App>, parent: &Project) -> Result<()> {
     let p = parent.clone();
-    let seats = app.db.call(move |c| active(c, &p)).await?;
+    let seats = app.db.call(move |c| {
+        let mut seats = active(c,&p)?;
+        let unavailable = c.prepare("SELECT w.generation FROM manager_workers w
+            WHERE w.project_id=? AND w.token='' AND w.state='unavailable'
+               AND EXISTS(SELECT 1 FROM work_runs r JOIN work_events e ON e.id=r.event_id
+                   WHERE r.project_id=w.project_id AND r.generation=w.generation AND e.source='manager_worker'
+                     AND r.status IN ('submitted','running','settled','failed','uncertain')
+                     AND (json_extract(e.payload,'$.worker_result.run_id') IS NOT r.id
+                       OR json_extract(e.payload,'$.worker_result.status')='result_missing'))")?
+          .query_map([&p.id], |row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for generation in unavailable {
+            if let Some(seat) = seat(c,&p,&generation)? {
+                seats.push(seat);
+            }
+        }
+        Ok(seats)
+    }).await?;
     let cfg = app.config.read().await.clone();
+    let mut tasks = tokio::task::JoinSet::new();
     for s in seats {
-        let worker = s.project;
-        // Errors in one seat must never suppress the other seat or the primary.
-        if let Err(error) = reconcile_one(app, &cfg, parent, &worker, &s.state, s.created_at).await
-        {
-            tracing::warn!(generation=%worker.generation, "Worker reconciliation failed: {error}");
+        let app = Arc::clone(app);
+        let cfg = cfg.clone();
+        let parent = parent.clone();
+        tasks.spawn(async move {
+            let worker = s.project;
+            // Project controls are held by the caller. Each owned seat is
+            // observed independently so one unavailable transport cannot
+            // delay dispatch into a different verified terminal.
+            let result = if s.state == "unavailable" {
+                crate::worker_task::collect(&app,&cfg,&worker,None).await
+            } else {
+                reconcile_one(&app, &cfg, &parent, &worker, &s.state, s.created_at).await
+            };
+            if let Err(error) = result {
+                tracing::warn!(generation=%worker.generation, "Worker reconciliation failed: {error}");
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!("Worker reconciliation task stopped: {error}");
         }
     }
     Ok(())
@@ -469,11 +727,17 @@ async fn reconcile_one(
         match observe(cfg, worker).await {
             Ok(value) => Some(value),
             Err(_) if state == "starting" && db::now() - created > 90_000 => None,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if is_plain(worker) && state == "ready" {
+                    crate::worker_task::collect(app, cfg, worker, None).await?;
+                }
+                return Err(error);
+            }
         }
     } else {
         None
     };
+    let plain = is_plain(worker);
     let status = record
         .as_ref()
         .and_then(|r| r["status"]["state"].as_str())
@@ -483,11 +747,16 @@ async fn reconcile_one(
     } else if matches!(status, "blocked" | "error") {
         Some("Independent worker needs native login, permission, or runtime attention")
     } else if state == "starting" && db::now() - created > 90_000 {
-        Some("Independent worker did not establish native and MCP readiness")
+        Some("Independent worker did not establish terminal readiness")
     } else if state == "ready"
-        && record
-            .as_ref()
-            .is_some_and(|r| herdr::check_identity(worker, r).is_err())
+        && record.as_ref().is_some_and(|r| {
+            if plain {
+                herdr::check_pane_ownership(worker, r).is_err()
+                    || herdr::check_native_resume(worker, r).is_err()
+            } else {
+                herdr::check_identity(worker, r).is_err()
+            }
+        })
     {
         Some("Independent worker native identity changed")
     } else {
@@ -496,29 +765,93 @@ async fn reconcile_one(
     let id = worker.id.clone();
     let generation = worker.generation.clone();
     if let Some(reason) = failure {
-        return app
-            .db
+        app.db
             .call(move |c| fail(c, &id, &generation, reason))
-            .await;
-    }
-    if state != "ready" || !matches!(status, "idle" | "done") {
+            .await?;
+        if plain && state == "ready" {
+            crate::worker_task::collect(app, cfg, worker, None).await?;
+        }
         return Ok(());
     }
-    let sequence = record.as_ref().and_then(|r| r["state_change_seq"].as_i64());
+    let Some(record) = record.as_ref() else {
+        return Ok(());
+    };
+    let mut worker = worker.clone();
+    if plain && state == "ready" {
+        crate::worker_task::collect(app, cfg, &worker, Some(record)).await?;
+    }
+    if plain && check_plain_target(&worker, record).is_err() {
+        return Ok(());
+    }
+    if plain && state == "starting" {
+        let native = record["native_session"]["value"]
+            .as_str()
+            .unwrap_or_default();
+        if !native.is_empty() {
+            worker.native_session = native.into();
+            worker.execution["intended_native_session"] = json!(native);
+        }
+        let fresh = worker.clone();
+        app.db.call(move |c| ready_plain(c, &fresh)).await?;
+        worker.ready = true;
+        app.notify.notify_one();
+    }
+    if !worker.ready || !matches!(status, "" | "unknown" | "idle" | "done") {
+        return Ok(());
+    }
+    if !plain && !matches!(status, "idle" | "done") {
+        return Ok(());
+    }
+    let sequence = record["state_change_seq"].as_i64();
     let parent = parent.clone();
+    if !plain {
+        let collect_id = id.clone();
+        let collect_generation = generation.clone();
+        app.db
+            .call(move |c| {
+                work::observe_idle(c, &collect_id, &collect_generation, sequence, db::now())
+            })
+            .await?;
+    }
     let run = app
         .db
         .call(move |c| {
-            work::observe_idle(c, &id, &generation, sequence, db::now())?;
-            if controls(c, &parent).is_err() || App::update_required(&parent) {
+            if controls(c, &parent).is_err() || (!plain && App::update_required(&parent)) {
                 return Ok(None);
             }
             work::claim_worker(c, &id, &generation, db::now())
         })
         .await?;
     if let Some(run) = run {
-        app.deliver_run(worker, &run).await?;
+        if plain {
+            crate::worker_task::dispatch(app, cfg, &worker, &run).await?;
+        } else {
+            app.deliver_run(&worker, &run).await?;
+        }
     }
+    Ok(())
+}
+
+fn ready_plain(c: &Connection, p: &Project) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    ensure!(
+        tx.execute(
+            "UPDATE manager_workers SET state='ready',native_session=?,execution=?
+         WHERE project_id=? AND generation=? AND token='' AND state='starting'",
+            params![
+                p.native_session,
+                p.execution.to_string(),
+                p.id,
+                p.generation
+            ],
+        )? == 1,
+        "Worker changed before proving terminal readiness"
+    );
+    if !p.native_session.is_empty() {
+        work::set_native_session(&tx, &p.id, &p.generation, &p.native_session, db::now())?;
+    }
+    observation(&tx, &p.id, &p.generation, "ready", "")?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -586,7 +919,11 @@ pub(crate) async fn stop_all(app: &App, p: &Project) -> Result<()> {
 pub(crate) fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
     if let Some(generation) = attachment["task_worker_generation"].as_str() {
         let parent = db::project_by_key(c, project)?;
-        authorize(c, &parent, generation, true)?;
+        let worker = authorize(c, &parent, generation, true)?;
+        ensure!(
+            !is_plain(&worker.project),
+            "Plain workers have no MCP access"
+        );
     }
     Ok(())
 }
@@ -601,7 +938,65 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn task_worker_launches_an_exact_independent_pane_and_registers() {
+    async fn attention_needed_worker_remains_visible_without_authorizing_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().join("store"), config::Config::default()).unwrap();
+        let p = app
+            .db
+            .create(db::ProjectInput {
+                name: "Diagnostic fixture".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "auto".into(),
+                chat_id: String::new(),
+                native_session: String::new(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,error,execution,created_at)
+                VALUES('blocked',?,'pi','','unavailable','Native login required',json_object('terminal_id','diagnostic'),0)", [&p.id])?;
+            let diagnostic = diagnostic_worker(c,&p)?;
+            assert_eq!(diagnostic.generation,"blocked");
+            assert_eq!(diagnostic.terminal.as_deref(),Some("diagnostic"));
+            assert_ne!(ready_worker(c,&p)?.generation,"blocked");
+            assert!(authorize(c,&p,"blocked",true).is_err());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_worker_candidates_skip_installed_but_fenced_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().join("store"), config::Config::default()).unwrap();
+        let p = app
+            .db
+            .create(db::ProjectInput {
+                name: "Catalog fixture".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "agy".into(),
+                chat_id: String::new(),
+                native_session: String::new(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        let catalog = json!([{"agent":"agy","available":true},{"agent":"pi","available":true},
+            {"agent":"codex","available":false}]);
+        app.db.sync(|c| {
+            let initial = installed_candidates(c,&p,&catalog)?;
+            assert_eq!(initial.first().unwrap().0,"agy");
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,error,created_at)
+                VALUES('agy-failed',?,'agy','','unavailable','Login required',?)",params![p.id,db::now()])?;
+            let remaining = installed_candidates(c,&p,&catalog)?;
+            assert_eq!(remaining.iter().map(|(cli,_)| *cli).collect::<Vec<_>>(),["pi"]);
+            assert_eq!(current_seat(c,&p,"agy")?.unwrap().error,"Login required");
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_worker_launches_and_verifies_plain_foreground_without_mcp() {
         let fixture = tempfile::tempdir_in("/tmp").unwrap();
         let runtime = fixture.path().join("herdr");
         fs::write(&runtime, "#!/bin/sh\nprintf 'herdr 0.9.5\\n'\n").unwrap();
@@ -612,6 +1007,7 @@ mod tests {
             ..config::Config::default()
         };
         let listener = UnixListener::bind(herdr::socket_path(&cfg).unwrap()).unwrap();
+        let worker_program = runtime.clone();
         let server = tokio::spawn(async move {
             let mut tokens = Value::Null;
             loop {
@@ -628,13 +1024,16 @@ mod tests {
                 let params = &req["params"];
                 let result = match req["method"].as_str().unwrap() {
                     "ping" => json!({"protocol":22,"version":"0.9.5"}),
-                    "integration.list" => {
-                        json!({"integrations":[{"target":"claude","state":"current"}]})
-                    }
                     "workspace.create" => {
                         json!({"workspace":{"workspace_id":"w1"},"root_pane":{"pane_id":"w1:p1","terminal_id":"root","workspace_id":"w1"}})
                     }
-                    "layout.apply" => json!({"layout":{"root":{"pane_id":"w1:p2"}}}),
+                    "layout.apply" => {
+                        let request = params.to_string();
+                        assert!(!request.contains("mcp_servers"));
+                        assert!(!request.contains("--mcp-config"));
+                        assert!(!request.contains("credentials.json"));
+                        json!({"layout":{"root":{"pane_id":"w1:p2"}}})
+                    }
                     "pane.get" if params["pane_id"] == "w1:p1" => {
                         json!({"pane":{"pane_id":"w1:p1","workspace_id":"w1","terminal_id":"root"}})
                     }
@@ -646,10 +1045,10 @@ mod tests {
                         json!({})
                     }
                     "pane.process_info" => {
-                        json!({"process_info":{"shell_pid":8420,"foreground_processes":[{"name":"claude","argv":["claude"]}]}})
+                        json!({"process_info":{"shell_pid":8420,"foreground_processes":[{"name":"sh","argv":["/bin/sh",worker_program]}]}})
                     }
                     "agent.get" => {
-                        json!({"agent":{"agent":"claude","agent_status":"idle","pane_id":"w1:p2","terminal_id":"worker-terminal","workspace_id":"w1","agent_session":{"value":tokens["hfb_generation"]}}})
+                        json!({"agent":{"pane_id":"w1:p2","terminal_id":"worker-terminal","workspace_id":"w1"}})
                     }
                     "pane.close" if params["pane_id"] == "w1:p1" => json!({}),
                     other => panic!("Unexpected fixture method {other}"),
@@ -663,33 +1062,25 @@ mod tests {
             }
         });
         let app = App::new(fixture.path().join("store"), cfg).unwrap();
-        let retained = crate::companion::pin(
-            &app.dir,
-            &runtime,
-            crate::update::CURRENT,
-            crate::api::PROTOCOL,
-        )
-        .unwrap();
-        assert!(app.companion.set(retained).is_ok());
         let parent = app
             .db
             .create(db::ProjectInput {
                 name: "Independent launch fixture".into(),
                 path: fixture.path().to_string_lossy().into(),
-                agent: "agy".into(),
+                agent: "auto".into(),
                 chat_id: String::new(),
                 native_session: String::new(),
-                extra_args: vec![],
+                extra_args: vec![runtime.to_string_lossy().into_owned()],
             })
             .await
             .unwrap();
         app.db.sync(|c| {
             c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,error,created_at)
-                VALUES('failed-preflight',?,'claude','fixture-old','unavailable','Integration missing',?)",
+                VALUES('failed-preflight',?,'custom','','unavailable','Integration missing',?)",
                 params![parent.id,db::now()])?;
             Ok(())
         }).unwrap();
-        assert!(matches!(select(&app,&parent,"claude",None).await.unwrap(),
+        assert!(matches!(select(&app,&parent,"custom",None).await.unwrap(),
             Selection::Unavailable(result) if result["reason"] == "Integration missing"));
         app.db
             .sync(|c| {
@@ -702,7 +1093,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(select(&app,&parent,"claude",None).await.unwrap(), Selection::Unavailable(result) if result["work_queued"]==false)
+            matches!(select(&app,&parent,"custom",None).await.unwrap(), Selection::Unavailable(result) if result["work_queued"]==false)
         );
         let launched = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -726,18 +1117,13 @@ mod tests {
         .expect("the independent generation should release its launch gate");
         assert_eq!(launched.terminal_pid, Some(8420));
         assert!(
-            register(&app, launched.clone(), "w9:p9", Some(mcp::CONTRACT))
+            register(&app, launched.clone(), "w1:p2", Some(mcp::CONTRACT))
                 .await
                 .is_err()
         );
-        assert_eq!(
-            register(&app, launched.clone(), "w1:p2", Some(mcp::CONTRACT))
-                .await
-                .unwrap()["ok"],
-            true
-        );
+        reconcile(&app, &parent).await.unwrap();
         assert!(
-            matches!(select(&app,&parent,"claude",None).await.unwrap(), Selection::Ready(worker) if worker.generation==launched.generation)
+            matches!(select(&app,&parent,"custom",None).await.unwrap(), Selection::Ready(worker) if worker.generation==launched.generation)
         );
         app.db.sync(|c| {
             assert_ne!(db::project_by_key(c,&parent.id)?.generation,launched.generation);

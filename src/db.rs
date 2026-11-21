@@ -450,6 +450,12 @@ impl Db {
         .await
     }
     pub async fn create(&self, input: ProjectInput) -> Result<Project> {
+        self.create_project(input, false).await
+    }
+    pub(crate) async fn create_from_api(&self, input: ProjectInput) -> Result<Project> {
+        self.create_project(input, true).await
+    }
+    async fn create_project(&self, mut input: ProjectInput, choose_mode: bool) -> Result<Project> {
         validate(&input)?;
         let requested = input.path.clone();
         let name = input.name.clone();
@@ -468,9 +474,21 @@ impl Db {
         let out = key.clone();
         self.call(move |c| {
             let tx = c.unchecked_transaction()?;
+            let legacy_custom = input.agent == "custom" && input.extra_args.iter().any(|arg|
+                arg.contains("{bridge_exe}") || arg.contains("{credentials}"));
+            let automatic_default = choose_mode && !legacy_custom;
+            let native = automatic_default && crate::manager::public_provider(&tx)?["configured"] != true;
+            if automatic_default && !native {
+                input.agent = "auto".into();
+            } else if native && input.agent == "auto" {
+                input.agent = default_agent();
+            }
             tx.execute("INSERT INTO projects(id,name,path,agent,chat_id,native_session,extra_args,created_at,mcp_token) VALUES(?,?,?,?,?,?,?,?,?)",
             params![key,input.name.trim(),path.to_string_lossy(),input.agent,input.chat_id.trim(),input.native_session,serde_json::to_string(&input.extra_args)?,now(),id()])?;
             tx.execute("INSERT INTO manager_config(project_id,mode) VALUES(?,'manager')", [&key])?;
+            if native {
+                tx.execute("INSERT INTO standalone_projects(project_id) VALUES(?)", [&key])?;
+            }
             crate::conversation::primary(&tx, &key, input.chat_id.trim(), "")?;
             tx.commit()?;
             Ok(())
@@ -480,6 +498,9 @@ impl Db {
     pub async fn update(&self, key: &str, input: ProjectInput) -> Result<Project> {
         validate(&input)?;
         let p = self.project(key).await?;
+        if (p.agent == "auto") != (input.agent == "auto") {
+            bail!("Use the execution mode control to change an automatic worker project");
+        }
         let path = std::fs::canonicalize(&input.path)?;
         if !path.is_dir() {
             bail!("Project path must be a directory");
@@ -735,7 +756,7 @@ fn validate(p: &ProjectInput) -> Result<()> {
     if p.name.trim().is_empty() || p.name.len() > 120 {
         bail!("Project name must contain 1 to 120 characters");
     }
-    if !["codex", "claude", "pi", "agy", "custom"].contains(&p.agent.as_str()) {
+    if !["codex", "claude", "pi", "agy", "custom", "auto"].contains(&p.agent.as_str()) {
         bail!("Unsupported agent");
     }
     if p.agent == "custom" && p.extra_args.is_empty() {

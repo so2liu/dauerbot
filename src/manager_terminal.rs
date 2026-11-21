@@ -10,12 +10,16 @@ use std::{sync::Arc, time::Duration};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SendArgs {
+    #[serde(default)]
     pub generation: String,
     pub segments: Vec<herdr::terminal_control::Segment>,
+    #[serde(skip)]
+    pub task_run: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ViewArgs {
+    #[serde(default)]
     pub generation: String,
 }
 
@@ -58,21 +62,27 @@ impl TerminalHistory {
         let mut statement = c.prepare(
             "SELECT name,status,json_extract(result,'$.status'),json_extract(result,'$.reason'),
                 json_extract(result,'$.message'),json_extract(result,'$.screen_fingerprint'),
-                json_extract(result,'$.unchanged_polls'),json_extract(result,'$.generation'),
+                json_extract(result,'$.unchanged_polls'),COALESCE(NULLIF(json_extract(result,'$.generation'),''),NULLIF(json_extract(arguments,'$.generation'),'')),
                 occurrence,json_extract(result,'$.ignored_attempt')
-             FROM manager_effects WHERE run_id=? AND id!=? AND name IN ('cli_view','cli_send_keys')
+             FROM manager_effects WHERE run_id=? AND id!=? AND name IN ('cli_view','cli_send_keys','steer_worker')
              ORDER BY rowid DESC LIMIT ?",
         )?;
         let mut rows = statement.query(rusqlite::params![run, effect, MAX_TERMINAL_CALLS])?;
         while let Some(row) = rows.next()? {
             let name: String = row.get(0)?;
             let status: String = row.get(1)?;
+            let same_generation = row
+                .get::<_, Option<String>>(7)?
+                .as_deref()
+                .is_none_or(|previous| previous == generation);
             history.calls += 1;
-            if name == "cli_send_keys" {
+            if matches!(name.as_str(), "cli_send_keys" | "steer_worker") {
                 history.inputs += 1;
-                history.uncertain_input |= matches!(status.as_str(), "submitting" | "uncertain");
+                history.uncertain_input |=
+                    same_generation && matches!(status.as_str(), "submitting" | "uncertain");
             }
-            if history.stopped.is_none()
+            if same_generation
+                && history.stopped.is_none()
                 && row.get::<_, Option<String>>(2)?.as_deref() == Some("observation_stopped")
             {
                 let reason: String = row.get(3)?;
@@ -154,12 +164,15 @@ async fn history(
 
 fn current(c: &Connection, authority: &manager::Context, generation: &str) -> Result<Project> {
     let project = manager::valid(c, authority)?;
+    let project = if generation.is_empty() && project.agent == "auto" {
+        crate::manager_workers::ready_worker(c, &project)?
+    } else if generation.is_empty() || project.generation == generation {
+        project
+    } else {
+        crate::manager_workers::authorize(c, &project, generation, true)?.project
+    };
     ensure!(
-        !generation.is_empty() && project.generation == generation,
-        "The native generation changed; inspect current worker status"
-    );
-    ensure!(
-        project.ready && project.terminal.is_some(),
+        project.ready && project.terminal.is_some() && !project.generation.is_empty(),
         "The current CLI is not ready"
     );
     ensure!(
@@ -185,7 +198,7 @@ async fn project(
         .call(move |c| {
             let project = current(c, &authority, &generation)?;
             ensure!(
-                !input || !input_held(c, &project.id)?,
+                !input || !input_held(c, &project.id, &project.generation)?,
                 "CLI input is held by a transition; wait for supervised recovery"
             );
             Ok(project)
@@ -193,10 +206,18 @@ async fn project(
         .await
 }
 
-fn input_held(c: &Connection, project: &str) -> Result<bool> {
+fn input_held(c: &Connection, project: &str, generation: &str) -> Result<bool> {
+    let primary = db::project_by_key(c, project)?.generation == generation;
     Ok(crate::cli_switch::latest(c, project)?
         .as_ref()
-        .is_some_and(crate::cli_switch::blocks_worker))
+        .is_some_and(|request| {
+            request.holds_input || (primary && crate::cli_switch::blocks_worker(request))
+        }))
+}
+
+fn with_generation(mut value: Value, generation: &str) -> Value {
+    value["generation"] = json!(generation);
+    value
 }
 
 /// The caller releases its broad project lock before invoking this operation.
@@ -204,29 +225,37 @@ fn input_held(c: &Connection, project: &str) -> Result<bool> {
 pub(crate) async fn send(
     app: &Arc<App>,
     authority: &manager::Context,
-    args: SendArgs,
+    mut args: SendArgs,
     effect: &str,
 ) -> Result<Value> {
+    if args.generation.is_empty() {
+        args.generation = project(app, authority, "", false).await?.generation;
+    }
+    let denial = |reason, message| with_generation(stopped(reason, message), &args.generation);
     let history = history(app, authority, effect, &args.generation).await?;
     if let Some(denied) = history.stop() {
-        return Ok(denied);
+        return Ok(with_generation(denied, &args.generation));
     }
     if history.uncertain_input {
-        return Ok(stopped(
+        return Ok(denial(
             "terminal_input_uncertain",
             "Previous terminal input may already have been submitted. Inspect existing evidence and do not replay it.",
         ));
     }
     if history.inputs >= MAX_INPUT_CALLS {
-        return Ok(stopped(
+        return Ok(denial(
             "terminal_input_budget_exhausted",
             "Terminal input budget exhausted for this turn. Use a different strategy.",
         ));
     }
     let project_id = authority.project.clone();
-    let blocked = app.db.call(move |c| input_held(c, &project_id)).await?;
+    let target = args.generation.clone();
+    let blocked = app
+        .db
+        .call(move |c| input_held(c, &project_id, &target))
+        .await?;
     if blocked {
-        return Ok(stopped(
+        return Ok(denial(
             "terminal_input_held",
             "Terminal input is held by a CLI transition. Use worker_status to inspect recovery instead of retrying keys.",
         ));
@@ -309,6 +338,34 @@ where
                 ));
             }
         };
+        if let Some(run) = &args.task_run {
+            let project_id = fresh.id.clone();
+            let generation = fresh.generation.clone();
+            let run = run.clone();
+            let active = app
+                .db
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?
+                    AND generation=? AND id=? AND status IN ('submitted','running'))",
+                        rusqlite::params![project_id, generation, run],
+                        |row| row.get::<_, bool>(0),
+                    )?)
+                })
+                .await?;
+            if !active {
+                if confirmed == 0 {
+                    anyhow::bail!(
+                        "The selected worker task finished before steering was submitted"
+                    );
+                }
+                return Ok(uncertain(
+                    &initial,
+                    confirmed,
+                    "The selected worker task changed after part of the correction",
+                ));
+            }
+        }
         if fresh.terminal != initial.terminal || fresh.native_session != initial.native_session {
             return Ok(uncertain(&initial, confirmed, "The bound terminal changed"));
         }
@@ -356,7 +413,7 @@ pub(crate) async fn view(
 async fn view_with<O, OF>(
     app: &Arc<App>,
     authority: &manager::Context,
-    args: ViewArgs,
+    mut args: ViewArgs,
     effect: &str,
     observe: O,
 ) -> Result<Value>
@@ -364,9 +421,12 @@ where
     O: FnOnce(Project) -> OF,
     OF: std::future::Future<Output = Result<Value>>,
 {
+    if args.generation.is_empty() {
+        args.generation = project(app, authority, "", false).await?.generation;
+    }
     let history = history(app, authority, effect, &args.generation).await?;
     if let Some(denied) = history.stop() {
-        return Ok(denied);
+        return Ok(with_generation(denied, &args.generation));
     }
     let initial = project(app, authority, &args.generation, false).await?;
     let screen = tokio::time::timeout(Duration::from_secs(3), observe(initial.clone()))
@@ -380,13 +440,18 @@ where
         fresh.terminal == initial.terminal && fresh.native_session == initial.native_session,
         "The bound terminal changed during inspection"
     );
-    Ok(history.observe(screen))
+    Ok(with_generation(history.observe(screen), &args.generation))
 }
 
 #[cfg(test)]
 mod tests {
     use super::current;
-    use crate::{App, config::Config, db::ProjectInput, manager};
+    use crate::{
+        App,
+        config::Config,
+        db::{self, ProjectInput},
+        manager, work,
+    };
 
     #[tokio::test]
     async fn repeated_unchanged_terminal_views_stop_before_using_the_turn_budget() {
@@ -501,6 +566,7 @@ mod tests {
             &app,
             &authority,
             super::SendArgs {
+                task_run: None,
                 generation: "g".into(),
                 segments: vec![crate::herdr::terminal_control::Segment::Key {
                     key: "enter".into(),
@@ -520,7 +586,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        for control in ["pause", "takeover", "stop"] {
+        for control in ["pause", "takeover", "stop", "settle"] {
             let dir = tempfile::tempdir().unwrap();
             let app = App::new(dir.path().join("store"), Config::default()).unwrap();
             let p = app
@@ -546,6 +612,21 @@ mod tests {
                 c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&p.id])?;
                 Ok(())
             }).unwrap();
+            let scoped_run = if control == "settle" {
+                Some(
+                    app.db
+                        .sync(|c| {
+                            manager::test_delegate(c, &p.id, "scoped", None)?;
+                            let run = work::claim_next(c, &p.id, "g", db::now())?.unwrap();
+                            work::delivery(c, &run.id, "submitted", "", db::now())?;
+                            Ok(run.id)
+                        })
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let task_run = scoped_run.clone();
             let (entered, waiting) = tokio::sync::oneshot::channel();
             let (resume, blocked) = tokio::sync::oneshot::channel();
             let calls = Arc::new(AtomicUsize::new(0));
@@ -558,6 +639,7 @@ mod tests {
                     &worker,
                     &context,
                     super::SendArgs {
+                        task_run,
                         generation: "g".into(),
                         segments: vec![crate::herdr::terminal_control::Segment::Key {
                             key: "enter".into(),
@@ -596,6 +678,13 @@ mod tests {
                         crate::work::set_takeover(c, &p.id, "g", true, crate::db::now()).map(|_| ())
                     }
                     "stop" => crate::cli_switch::stopped(c, &p.id, "g"),
+                    "settle" => {
+                        c.execute(
+                            "UPDATE work_runs SET status='settled' WHERE id=?",
+                            [scoped_run.as_deref().unwrap()],
+                        )?;
+                        Ok(())
+                    }
                     _ => unreachable!(),
                 })
                 .unwrap();
@@ -640,6 +729,13 @@ mod tests {
             c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&project.id])?;
             assert!(current(c,&ctx,"g").is_ok());
             assert!(current(c,&ctx,"other").is_err());
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,state,created_at,native_session,execution,token)
+                VALUES('task',?,'pi','ready',0,'native-task',json_object('terminal_id','task-pane'),'')", [&project.id])?;
+            let worker = current(c,&ctx,"task")?;
+            assert_eq!(worker.agent, "pi");
+            assert_eq!(worker.native_session, "native-task");
+            assert_eq!(current(c,&ctx,"")?.generation, "g");
+
             c.execute("UPDATE projects SET paused=1 WHERE id=?", [&project.id])?;
             assert!(current(c,&ctx,"g").is_err());
             c.execute("UPDATE projects SET paused=0,ready=0 WHERE id=?", [&project.id])?;
@@ -647,9 +743,11 @@ mod tests {
             c.execute("UPDATE projects SET ready=1 WHERE id=?", [&project.id])?;
             crate::work::set_takeover(c,&project.id,"g",true,crate::db::now())?;
             assert!(current(c,&ctx,"g").is_err());
+            assert!(current(c,&ctx,"task").is_err());
             crate::work::set_takeover(c,&project.id,"g",false,crate::db::now())?;
             c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input) VALUES('switch',?,'codex','recovery_pending','g',0,1)", [&project.id])?;
             assert!(current(c,&ctx,"g").is_err());
+            assert!(current(c,&ctx,"task").is_err());
             c.execute("UPDATE cli_switch_requests SET holds_input=0 WHERE id='switch'", [])?;
             assert!(current(c,&ctx,"g").is_ok());
             c.execute("UPDATE manager_config SET input_revision=1 WHERE project_id=?", [&project.id])?;

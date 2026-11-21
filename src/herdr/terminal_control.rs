@@ -127,10 +127,18 @@ pub fn input_params(pane: &str, segment: &Segment) -> Result<Value> {
     })
 }
 
+fn check_terminal_target(project: &Project, observed: &Value) -> Result<()> {
+    if crate::manager_workers::is_plain(project) {
+        crate::manager_workers::check_plain_target(project, observed)
+    } else {
+        check_identity(project, observed)
+    }
+}
+
 /// Inspect immutable execution identity without admitting any input.
 pub async fn inspect_input(config: &Config, project: &Project) -> Result<Value> {
     let observed = observe(config, project).await?;
-    check_identity(project, &observed)?;
+    check_terminal_target(project, &observed)?;
     Ok(observed)
 }
 
@@ -142,7 +150,7 @@ pub async fn submit_observed(
     observed: &Value,
     segment: &Segment,
 ) -> Result<()> {
-    check_identity(project, observed)?;
+    check_terminal_target(project, observed)?;
     let execution = ExecutionRef::from_project(project)?;
     rpc(
         config,
@@ -164,12 +172,12 @@ pub async fn submit(config: &Config, project: &Project, segment: &Segment) -> Re
 /// It does not expose cursor/column geometry, so those fields stay null.
 pub async fn screen(config: &Config, project: &Project) -> Result<Value> {
     let observed = observe(config, project).await?;
-    check_identity(project, &observed)?;
+    check_terminal_target(project, &observed)?;
     let execution = ExecutionRef::from_project(project)?;
     let raw = rpc(config, "pane.read", json!({"pane_id":execution.pane_id,"source":"visible","strip_ansi":true,"lines":MAX_SCREEN_LINES})).await?;
     // Verify immutable ownership again before returning a reusable pane address's text.
     let after = observe(config, project).await?;
-    check_identity(project, &after)?;
+    check_terminal_target(project, &after)?;
     let read = raw.get("read").unwrap_or(&raw);
     ensure!(
         read.get("pane_id").is_none_or(|p| p == &execution.pane_id),

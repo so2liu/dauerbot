@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_CHECKPOINT: usize = 2 * 1024 * 1024;
 const MAX_CONTENT: usize = 256 * 1024;
-const TOOLS: [&str; 10] = [
+const TOOLS: [&str; 11] = [
     "read_file",
     "write_file",
     "delegate",
@@ -31,6 +31,7 @@ const TOOLS: [&str; 10] = [
     "close_agent",
     "cli_send_keys",
     "cli_view",
+    "schedule_run",
 ];
 
 /// Only host-controlled diagnostics cross into durable state or user notices.
@@ -233,18 +234,18 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["path", "content"],
         ),
         (
-            "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only. An unavailable or starting worker returns worker_unavailable and queues no work. Use worker_status to inspect independent workers. Omit target_cli for the project’s selected conversation. Select source_event_id from trusted_sources when multiple discussions are present.",
-            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy"]}}),
+            "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only. An unavailable or starting worker returns worker_unavailable and queues no work. Use worker_status to inspect independent workers. Use the requested CLI when the user names one; never silently substitute. Omit target_cli to detect a default in automatic projects. Select source_event_id from trusted_sources when multiple discussions are present.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy","custom"]}}),
             vec!["instructions"],
         ),
         (
-            "Observe this project's native workers and generation-scoped delegated work receipts. For an owned continuing input, provide input_id to inspect the full durable effect ancestry, not only recent history. Page using after_effect and detail_offset; recorded confirmed or uncertain effects must not be replayed.",
+            "Observe available CLIs, native workers, result files and generation-scoped work receipts. For an owned continuing input, provide input_id to inspect the full durable effect ancestry, not only recent history. Page using after_effect and detail_offset; recorded confirmed or uncertain effects must not be replayed.",
             json!({"input_id":{"type":"string"},"after_effect":{"type":"integer","minimum":0},"detail_offset":{"type":"integer","minimum":0,"maximum":262144}}),
             vec![],
         ),
         (
-            "Steer this project's selected native coding worker. Use delegate with target_cli to assign separate work to a task worker. Select source_event_id from trusted_sources when multiple discussions are present.",
-            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"}}),
+            "Steer an active task on its exact worker generation from worker_status. Legacy primary-conversation steering can omit generation. Use delegate with target_cli for separate new work.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"generation":{"type":"string"}}),
             vec!["instructions"],
         ),
         (
@@ -265,12 +266,17 @@ fn definitions() -> Vec<ToolDefinition> {
         (
             "Send an ordered, compact text/key sequence, with each segment exactly {text: string} or {key: string} to the current project's owned CLI. Use generation from worker_status. Text is UTF-8 with LF unchanged; keys are separate segments. Text never implies a key. Keys: enter, tab, esc, backspace, delete, up/down/left/right, home/end, pageup/pagedown, space; ctrl/alt/shift modifiers and modified letters, for example alt+m. Unknown keys fail before sending. Use cli_view to inspect results; a submitted sequence does not prove task completion. Do not repeat uncertain input.",
             json!({"generation":{"type":"string"},"segments":{"type":"array","minItems":1,"maxItems":32,"items":{"oneOf":[{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false},{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}]}}}),
-            vec!["generation", "segments"],
+            vec!["segments"],
         ),
         (
             "Read the current project's owned CLI visible rendered text. This does not send keys, resize, or take over its terminal. Known credential-like lines are redacted. Missing cursor/viewport metadata is explicit; internal execution identifiers are diagnostic, not user-facing task results.",
             json!({"generation":{"type":"string"}}),
-            vec!["generation"],
+            vec![],
+        ),
+        (
+            "Create a project schedule. Use user for work explicitly requested by the user; internal for your own follow-up checks.",
+            json!({"name":{"type":"string"},"prompt":{"type":"string"},"kind":{"type":"string","enum":["once","interval","cron"]},"at":{"type":"string"},"interval_seconds":{"type":"integer"},"cron":{"type":"string"},"timezone":{"type":"string"},"to":{"type":"string"},"purpose":{"type":"string","enum":["user","internal"]}}),
+            vec!["name","prompt","kind","purpose"],
         ),
     ];
     TOOLS.into_iter().zip(schemas).map(|(name,(description,properties,required))|ToolDefinition::new(name.try_into().expect("static tool name"),description,json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}))).collect()

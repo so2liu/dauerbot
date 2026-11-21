@@ -599,7 +599,7 @@ fn claim(
         // Production stores always install it before reconciling work.
         let source = if independent {
             "status='worker_waiting' AND source='manager_worker' AND json_extract(payload,'$.target_generation')=?2"
-        } else if crate::manager::installed(c)? {
+        } else if crate::manager::uses_manager(c, project)? {
             "status='queued' AND source='management'"
         } else {
             "status='queued' AND source!='manager_worker'"

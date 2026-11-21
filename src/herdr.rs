@@ -519,10 +519,36 @@ pub async fn prepare_execution(
     generation: &str,
 ) -> Result<Value> {
     ensure_server(config).await?;
-    if argv.is_empty() {
-        bail!("The Agent launch plan is empty");
-    }
+    ensure!(!argv.is_empty(), "The Agent launch plan is empty");
     let argv = compatible_launch_args(config, p, argv).await?;
+    let argv = execution_args(config, p.agent != "custom", argv)?;
+    prepare_gated_execution(config, p, argv, generation).await
+}
+
+/// Establish the PTY identity without adding legacy CLI compatibility flags
+/// or writing any native CLI or MCP settings.
+pub(crate) async fn prepare_plain_worker(
+    config: &Config,
+    p: &Project,
+    argv: &[String],
+    generation: &str,
+) -> Result<Value> {
+    ensure!(!argv.is_empty(), "The Agent launch plan is empty");
+    ensure_server(config).await?;
+    let argv = if p.agent == "custom" {
+        argv.to_vec()
+    } else {
+        login_shell_args(argv.to_vec())
+    };
+    prepare_gated_execution(config, p, argv, generation).await
+}
+
+async fn prepare_gated_execution(
+    config: &Config,
+    p: &Project,
+    argv: Vec<String>,
+    generation: &str,
+) -> Result<Value> {
     let permit_root = if config.herdr_config.is_empty() {
         socket_path(config)?
             .parent()
@@ -557,7 +583,7 @@ pub async fn prepare_execution(
         "dauerbot-launch".into(),
         permit.to_string_lossy().into_owned(),
     ];
-    command.extend(execution_args(config, p.agent != "custom", argv.to_vec())?);
+    command.extend(argv);
     let result: Result<Value> = async {
     // Add a command tab rather than replacing the initial tab: a user may have
     // split or added a pane since workspace.create returned.
@@ -691,7 +717,7 @@ async fn cleanup_preparation(config: &Config, workspace: &Value, permit: &Path) 
     Ok(())
 }
 
-/// Save the execution before releasing this gate. No Agent can call MCP earlier.
+/// Save the execution before releasing this gate so the host can verify its identity.
 pub async fn launch_execution(_config: &Config, p: &Project, _argv: &[String]) -> Result<()> {
     let execution = ExecutionRef::from_project(p)?;
     crate::config::write_private(&execution.launch_permit, p.generation.as_bytes())?;
@@ -1350,10 +1376,11 @@ pub async fn screen(config: &Config, p: &Project, lines: u32) -> Result<String> 
 
 pub async fn terminal_descriptor(config: &Config, p: &Project) -> Result<Value> {
     let record = observe(config, p).await?;
-    match check_execution_identity(p, &record) {
-        Ok(()) => {}
-        Err(error) if error.is::<SessionStarting>() => {}
-        Err(error) => return Err(error),
+    if crate::manager_workers::is_plain(p) {
+        check_pane_ownership(p, &record)?;
+        check_native_resume(p, &record)?;
+    } else {
+        check_execution_identity(p, &record)?;
     }
     let execution = ExecutionRef::from_project(p)?;
     let mut public_execution = serde_json::to_value(&execution)?;
