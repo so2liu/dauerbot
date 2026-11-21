@@ -156,8 +156,9 @@ pub(super) fn model_name(text: &str) -> String {
 pub(super) fn has_protected_tool(request: &CompletionRequest) -> bool {
     request.chat_history.iter().any(|message| match message {
         Message::Assistant(message) => message.content.iter().any(|item| match item {
-            AssistantContent::ToolCall(call) => call.function.arguments["path"]
-                .as_str()
+            AssistantContent::ToolCall(call) => call.function.arguments
+                .get("path")
+                .and_then(Value::as_str)
                 .is_some_and(sensitive_path),
             _ => false,
         }),
@@ -302,5 +303,29 @@ mod tests {
             clean(&text),
             "[omitted: structured credential inspection failed]"
         );
+    }
+
+    #[test]
+    fn tool_history_can_omit_path_without_bypassing_protected_paths() {
+        use rig_core::message::ToolName;
+        use serde_json::json;
+
+        let call = |name: &str, arguments| {
+            Message::from(AssistantContent::tool_call(
+                "call",
+                ToolName::new(name).unwrap(),
+                arguments,
+            ))
+        };
+        let mut request: CompletionRequest = serde_json::from_value(json!({
+            "chat_history": [],
+            "documents": [],
+            "tools": []
+        }))
+        .unwrap();
+        request.chat_history.push(call("send_md", json!({"text":"Reply"})));
+        assert!(!has_protected_tool(&request));
+        request.chat_history.push(call("read_file", json!({"path":"private/.env"})));
+        assert!(has_protected_tool(&request));
     }
 }
