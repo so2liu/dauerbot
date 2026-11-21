@@ -417,7 +417,7 @@ mod tests {
                     .endpoint
                     .set_port(Some(listener.local_addr().unwrap().port()))
                     .unwrap();
-                let (accepted, received) = tokio::sync::oneshot::channel();
+                let (accepted, mut received) = tokio::sync::oneshot::channel();
                 let acceptor = tokio::spawn(async move {
                     let (_socket, _) = listener.accept().await.unwrap();
                     accepted.send(()).unwrap();
@@ -428,7 +428,7 @@ mod tests {
                     .await
                     .expect("Exporter must enforce its own deadline");
                 assert!(
-                    received.await.is_ok(),
+                    received.try_recv().is_ok(),
                     "Stalled collector must have received the connection"
                 );
                 assert!(
