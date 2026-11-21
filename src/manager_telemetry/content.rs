@@ -291,4 +291,16 @@ mod tests {
                 || clean(&structured).ends_with("[redacted credential-bearing text]")
         );
     }
+
+    #[test]
+    fn malformed_large_structured_text_fails_closed() {
+        let text = format!(
+            r#"{{"pass\u0077ord":"fixture-hidden!"{}"#,
+            " ".repeat(300_000)
+        );
+        assert_eq!(
+            clean(&text),
+            "[omitted: structured credential inspection failed]"
+        );
+    }
 }

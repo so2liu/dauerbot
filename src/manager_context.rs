@@ -330,10 +330,25 @@ fn inspect_text(text: &str, depth: usize, budget: &mut RedactionBudget) -> Strin
     {
         return budget.omit();
     }
+    if budget.remaining.is_none() && looks_like_json(text) {
+        // A malformed or over-nested document can conceal credential field
+        // names in escapes. Do not fall back to scanning its encoded spelling.
+        budget.changed = true;
+        return "[omitted: structured credential inspection failed]".into();
+    }
     let (text, changed) = redact_text(text);
     budget.changed |= changed;
     text
 }
+fn looks_like_json(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with('{')
+        || (text.starts_with('"') && text.contains('\\'))
+        || text
+            .strip_prefix('[')
+            .is_some_and(|tail| tail.trim_start().starts_with(['{', '[', '"', ']']))
+}
+
 struct Builder {
     blocks: Vec<Value>,
     remaining: usize,
