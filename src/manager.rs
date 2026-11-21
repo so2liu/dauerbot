@@ -3766,8 +3766,15 @@ mod tests {
         // These are the explicitly requested policy invariants, not an LLM quality test.
         for policy in [
             "立刻独立调用一次 send_md",
-            "intent=receipt",
-            "在原会话回一句话",
+            "使用 intent=receipt 和可信消息锚点",
+            "在原会话回一句话，确认收到，并说明已开始的具体工作",
+            "如果还没开始实际工作，就如实说还没开始动，并点明下一步要做什么，不得假装已经开始",
+            "用 intent=result、intent=progress 或 intent=decision 回复时，先说明已开始的具体工作和当前做到哪一步",
+            "遵守下文的内部机制保密规则",
+            "Do not volunteer worker, subagent, delegate, Codex, AGY or CLI orchestration details",
+            "or expose event IDs, generation, session or receipt identifiers",
+            "不得发提问式解锁消息",
+            "遵守明确的静默要求、暂停和 Stop",
             "不得等任务结束再确认",
             "不得把确认和最终结果合并",
             "第一条回复禁止写成长解释",
