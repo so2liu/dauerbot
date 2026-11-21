@@ -23,6 +23,7 @@ pub mod manager;
 mod manager_close;
 pub mod manager_context;
 pub mod manager_loop;
+mod manager_telemetry;
 mod manager_terminal;
 mod manager_workers;
 mod worker_task;
@@ -76,6 +77,7 @@ pub struct App {
     pub notify: Notify,
     pub settings_tx: watch::Sender<u64>,
     pub shutdown: CancellationToken,
+    pub(crate) manager_telemetry: Option<manager_telemetry::Exporter>,
     pub manager_context: Arc<manager_context::Store>,
     project_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     outbound_lock: Mutex<()>,
@@ -107,6 +109,7 @@ impl App {
         }
         let (settings_tx, _) = watch::channel(0);
         Ok(Arc::new(Self {
+            manager_telemetry: manager_telemetry::Exporter::load(&dir),
             service: service::Service::new(&dir),
             dir,
             db,
