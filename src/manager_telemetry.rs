@@ -377,7 +377,7 @@ impl Span<'_> {
     }
 
     pub(crate) fn tool_input(&mut self, name: &str, arguments: &Value) {
-        if !self.trace.exporter.includes_content() {
+        if !self.trace.exporter.includes_content() || self.trace.protected_tool_seen {
             return;
         }
         match name {
@@ -518,6 +518,34 @@ mod tests {
         );
         assert!(attributes.iter().map(|value| value.len()).sum::<usize>() <= content::BATCH_LIMIT);
         assert!(trace.remaining_content < 64);
+    }
+
+    #[test]
+    fn protected_tool_path_suppresses_later_text_and_tool_arguments() {
+        let exporter = Exporter::configured(Settings {
+            enabled: true,
+            include_content: true,
+            public_key: "fixture-public".into(),
+            secret_key: "fixture-secret".into(),
+            ..Settings::default()
+        })
+        .unwrap()
+        .unwrap();
+        let mut trace = Trace::new(exporter, vec![("input".into(), None)]);
+        trace.export_on_drop = false;
+        trace
+            .span("read_file", "tool")
+            .tool_input("read_file", &json!({"path":"private/.env.production"}));
+        trace
+            .span("manager.generation", "generation")
+            .assistant(std::iter::once("unmarked short value"));
+        trace
+            .span("send_md", "tool")
+            .tool_input("send_md", &json!({"text":"unmarked short value"}));
+        let exported = trace.payload().to_string();
+        assert!(exported.contains("[redacted path]"));
+        assert!(!exported.contains(".env"));
+        assert!(!exported.contains("unmarked short value"));
     }
 
     struct Log(Arc<Mutex<Vec<u8>>>);
