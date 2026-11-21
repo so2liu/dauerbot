@@ -466,6 +466,19 @@ pub(crate) async fn collect(
                     params![now,candidate.event])?;
             }
             if changed == 1 {
+                // Publish the changed attempt directly, even when enough
+                // newer runs exist to hide it from the recent inventory.
+                let event = work::event(&tx, &project, &candidate.event)?;
+                let run = work::run(&tx, &project, &candidate.run)?;
+                let report_status = result["status"].as_str().unwrap_or("result_missing");
+                let stamp = format!("{}:{report_status}", run.status);
+                manager::observation(
+                    &tx, &project, "worker_run", &run.id, &stamp,
+                    event.payload["origin_event_id"].as_str(),
+                    &json!({"kind":"worker_run","run_id":run.id,"event_id":event.id,
+                        "worker_generation":run.generation,"delivery_status":run.status,
+                        "error":run.error,"worker_report":result,"semantic_task_success":"unconfirmed"}),
+                )?;
                 manager::worker_changed(&tx, &project)?;
             }
             tx.commit()?;
@@ -645,7 +658,7 @@ mv "$2.new" "$2"
         app.db.sync(|c| {
             c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at,execution)
                 VALUES(?,?,'pi','','unavailable',0,'{}')", params![worker.generation,worker.id])?;
-            for index in 0..13 {
+            for index in 0..34 {
                 let event = format!("late-event-{index}");
                 let run = format!("late-run-{index}");
                 c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
@@ -657,6 +670,7 @@ mv "$2.new" "$2"
             }
             assert_eq!(pending_results(c,&worker)?.len(),12);
             assert_eq!(pending_results(c,&worker)?[0].run,"late-run-12");
+            assert_eq!(pending_results(c,&worker)?[0].run,"late-run-24");
             assert_eq!(pending_results(c,&worker)?[0].run,"late-run-0");
             Ok(())
         }).unwrap();
@@ -670,13 +684,25 @@ mv "$2.new" "$2"
         fs::create_dir_all(oldest.parent().unwrap()).unwrap();
         fs::copy(&result, &oldest).unwrap();
         let parent = app.db.project(&worker.id).await.unwrap();
-        manager_workers::reconcile(&app, &parent).await.unwrap();
-        manager_workers::reconcile(&app, &parent).await.unwrap();
+        for _ in 0..3 {
+            manager_workers::reconcile(&app, &parent).await.unwrap();
+        }
         app.db
             .sync(|c| {
                 let oldest = work::event(c, &worker.id, "late-event-0")?;
                 assert_eq!(oldest.status, "uncertain");
                 assert_eq!(oldest.payload["worker_result"]["status"], "reported");
+                let reported: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM manager_inputs
+                     WHERE project_id=? AND json_extract(payload,'$.run_id')='late-run-0'
+                       AND json_extract(payload,'$.worker_report.status')='reported')",
+                    [&worker.id],
+                    |row| row.get(0),
+                )?;
+                assert!(
+                    reported,
+                    "An old attempt must notify Manager when its file arrives"
+                );
                 assert!(manager_workers::authorize(c, &parent, &worker.generation, true).is_err());
                 Ok(())
             })
