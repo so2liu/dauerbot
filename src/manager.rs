@@ -2998,8 +2998,10 @@ mod tests {
             assert_eq!(app.manager_telemetry.is_some(), matches!(mode, "stalled" | "metadata_only" | "content" | "unreachable"));
             fs::write(Path::new(&project.path).join("private-file.txt"), "private file body fixture-tool-secret").unwrap();
             let messages = if matches!(mode, "stalled" | "metadata_only" | "content") { 2 } else { 1 };
+            let input = format!("private user message\n{}\nUSER-TAIL\nsecret = fixture-user-secret",
+                "长正文样例。".repeat(if mode == "content" { 700 } else { 1 }));
             for index in 0..messages {
-                ingest(&app, &project, &format!("om_private_{index}"), "private user message\nsecret = fixture-user-secret");
+                ingest(&app, &project, &format!("om_private_{index}"), &input);
             }
             let mut turn = app.db.sync(|c| {
                 work::sync_inbound(c)?;
@@ -3060,7 +3062,9 @@ mod tests {
                 .map(|value| serde_json::from_str::<String>(value).unwrap());
             if mode == "content" {
                 for index in [0, 1, 2] {
-                    assert!(attribute(index, "langfuse.observation.input").unwrap().contains("private user message"));
+                    let body = attribute(index, "langfuse.observation.input").unwrap();
+                    assert!(body.contains("private user message"));
+                    assert!(body.contains("USER-TAIL"));
                 }
                 assert_eq!(attribute(3, "langfuse.observation.input").as_deref(), Some("private-file.txt"));
                 assert_eq!(attribute(3, "langfuse.observation.output").as_deref(), Some("ok"));

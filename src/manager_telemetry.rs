@@ -201,7 +201,6 @@ fn trace_id(input: &str) -> String {
 pub(crate) struct Trace {
     exporter: Exporter,
     inputs: Vec<(String, Option<String>)>,
-    remaining_content: usize,
     protected_tool_seen: bool,
     started: u128,
     ended: u128,
@@ -214,19 +213,13 @@ pub(crate) struct Trace {
 
 impl Trace {
     pub(crate) fn new(exporter: Exporter, mut inputs: Vec<(String, Option<String>)>) -> Self {
-        // Shared spans are replicated for every input. Budget before replication
-        // so a large batch cannot multiply the aggregate content without bound.
-        let share = content::BATCH_LIMIT / inputs.len().max(1);
-        let mut reserved = 0;
         for (_, body) in &mut inputs {
-            if let Some(raw) = body.take().filter(|_| exporter.includes_content()) {
-                let clean = content::bounded(&raw, (share / 4).min(content::FIELD_LIMIT));
-                reserved = reserved.max(clean.len() * 2);
-                *body = Some(clean);
-            }
+            *body = body
+                .take()
+                .filter(|_| exporter.includes_content())
+                .map(|raw| content::clean(&raw));
         }
         Self {
-            remaining_content: share.saturating_sub(reserved),
             protected_tool_seen: false,
             exporter,
             inputs,
@@ -309,7 +302,6 @@ impl Drop for Trace {
         };
         let trace = Self {
             exporter: self.exporter.clone(),
-            remaining_content: 0,
             protected_tool_seen: false,
             inputs: std::mem::take(&mut self.inputs),
             root: std::mem::take(&mut self.root),
@@ -336,19 +328,17 @@ pub(crate) struct Span<'a> {
 
 impl Span<'_> {
     fn capture(&mut self, key: &str, value: &str) {
-        if !self.trace.exporter.includes_content() || self.trace.remaining_content == 0 {
+        if !self.trace.exporter.includes_content() {
             return;
         }
-        let budget = self.trace.remaining_content.min(content::FIELD_LIMIT);
-        let clean = content::bounded(value, budget);
+        let clean = content::clean(value);
         if !clean.is_empty() {
-            self.trace.remaining_content -= clean.len();
             self.attributes.push(observation_content(key, &clean));
         }
     }
 
     pub(crate) fn request(&mut self, request: &rig_core::completion::CompletionRequest) {
-        if !self.trace.exporter.includes_content() || self.trace.remaining_content == 0 {
+        if !self.trace.exporter.includes_content() {
             return;
         }
         // A subsequent model call could quote an unmarked value from a
@@ -363,14 +353,11 @@ impl Span<'_> {
     }
 
     pub(crate) fn assistant(&mut self, output: impl Iterator<Item = impl AsRef<str>>) {
-        if !self.trace.exporter.includes_content()
-            || self.trace.protected_tool_seen
-            || self.trace.remaining_content == 0
-        {
+        if !self.trace.exporter.includes_content() || self.trace.protected_tool_seen {
             return;
         }
         let mut projected = String::new();
-        for part in output.take(32) {
+        for part in output {
             content::append(&mut projected, "assistant", Some(part.as_ref()));
         }
         self.capture("langfuse.observation.output", &projected);
@@ -413,7 +400,7 @@ impl Span<'_> {
 
     pub(crate) fn model(&mut self, model: &str) {
         self.attributes
-            .push(text("gen_ai.request.model", &content::bounded(model, 256)));
+            .push(text("gen_ai.request.model", &content::model_name(model)));
     }
 
     pub(crate) fn response(&mut self, usage: rig_core::completion::Usage) {
@@ -473,7 +460,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn content_budget_bounds_replicated_spans_and_keeps_limits_utf8_safe() {
+    fn long_content_reaches_each_trace_without_truncation() {
         let exporter = Exporter::configured(Settings {
             enabled: true,
             include_content: true,
@@ -483,48 +470,50 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        let long = "正文。".repeat(5000);
+        let user = format!("USER-BEGIN\n{}\nUSER-END", "用户正文。".repeat(10000));
+        let reply = format!("REPLY-BEGIN\n{}\nREPLY-END", "助手正文。".repeat(10000));
         let mut trace = Trace::new(
             exporter,
-            (0..8)
-                .map(|id| (id.to_string(), Some(long.clone())))
-                .collect(),
+            vec![
+                ("one".into(), Some(user.clone())),
+                ("two".into(), Some(user.clone())),
+            ],
         );
         trace.export_on_drop = false;
-        for _ in 0..12 {
-            let mut span = trace.span("manager.generation", "generation");
-            span.capture("langfuse.observation.input", &long);
-            span.capture("langfuse.observation.output", &long);
-        }
+        trace
+            .span("manager.generation", "generation")
+            .assistant(std::iter::once(&reply));
         let payload = trace.payload();
-        let attributes = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|s| s["attributes"].as_array().unwrap())
-            .filter(|entry| {
-                matches!(
-                    entry["key"].as_str(),
-                    Some("langfuse.observation.input" | "langfuse.observation.output")
-                )
-            })
-            .map(|attribute| {
-                serde_json::from_str::<String>(attribute["value"]["stringValue"].as_str().unwrap())
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            attributes
+            .unwrap();
+        assert_eq!(spans.len(), 6);
+        for group in spans.chunks_exact(3) {
+            for span in &group[..2] {
+                let attributes = span["attributes"].as_array().unwrap();
+                let entry = attributes
+                    .iter()
+                    .find(|attribute| attribute["key"] == "langfuse.observation.input")
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<String>(entry["value"]["stringValue"].as_str().unwrap())
+                        .unwrap(),
+                    user
+                );
+            }
+            let entry = group[2]["attributes"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .any(|value| value.ends_with("[truncated]"))
-        );
-        assert!(
-            attributes
-                .iter()
-                .all(|value| value.len() <= content::FIELD_LIMIT)
-        );
-        assert!(attributes.iter().map(String::len).sum::<usize>() <= content::BATCH_LIMIT);
-        assert!(trace.remaining_content < 64);
+                .find(|attribute| attribute["key"] == "langfuse.observation.output")
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<String>(entry["value"]["stringValue"].as_str().unwrap())
+                    .unwrap(),
+                format!("assistant: {reply}\n")
+            );
+        }
+        assert!(!payload.to_string().contains("[truncated]"));
     }
 
     #[test]

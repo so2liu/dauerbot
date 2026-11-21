@@ -160,18 +160,21 @@ fn sensitive(key: &str) -> bool {
     SENSITIVE_FIELDS.contains(&key.as_str())
 }
 struct RedactionBudget {
-    remaining: usize,
+    remaining: Option<usize>,
     changed: bool,
 }
 impl RedactionBudget {
     fn reserve(&mut self, bytes: usize) -> bool {
-        match self.remaining.checked_sub(bytes) {
+        let Some(remaining) = self.remaining else {
+            return true;
+        };
+        match remaining.checked_sub(bytes) {
             Some(left) => {
-                self.remaining = left;
+                self.remaining = Some(left);
                 true
             }
             None => {
-                self.remaining = 0;
+                self.remaining = Some(0);
                 self.changed = true;
                 false
             }
@@ -188,7 +191,8 @@ struct DiagnosticWriter<'a> {
 }
 impl std::io::Write for DiagnosticWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.bytes.len().saturating_add(bytes.len()) > MAX_STRUCTURED_BYTES
+        if (self.budget.remaining.is_some()
+            && self.bytes.len().saturating_add(bytes.len()) > MAX_STRUCTURED_BYTES)
             || !self.budget.reserve(bytes.len())
         {
             return Err(std::io::Error::other("Diagnostic inspection limit"));
@@ -288,8 +292,16 @@ fn redact_text(text: &str) -> (String, bool) {
     (output, changed)
 }
 pub(crate) fn clean(text: &str) -> (String, bool) {
+    clean_with_budget(text, Some(MAX_REDACTION_WORK_BYTES))
+}
+
+pub(crate) fn clean_for_export(text: &str) -> String {
+    clean_with_budget(text, None).0
+}
+
+fn clean_with_budget(text: &str, remaining: Option<usize>) -> (String, bool) {
     let mut budget = RedactionBudget {
-        remaining: MAX_REDACTION_WORK_BYTES,
+        remaining,
         changed: false,
     };
     let text = inspect_text(text, 0, &mut budget);
@@ -299,7 +311,7 @@ fn inspect_text(text: &str, depth: usize, budget: &mut RedactionBudget) -> Strin
     if depth >= MAX_REDACTION_DEPTH || !budget.reserve(text.len()) {
         return budget.omit();
     }
-    if text.len() <= MAX_STRUCTURED_BYTES
+    if (budget.remaining.is_none() || text.len() <= MAX_STRUCTURED_BYTES)
         && let Ok(mut value) = serde_json::from_str::<Value>(text)
     {
         redact_json(&mut value, depth + 1, budget);
@@ -312,13 +324,31 @@ fn inspect_text(text: &str, depth: usize, budget: &mut RedactionBudget) -> Strin
         }
         return String::from_utf8(writer.bytes).unwrap_or_else(|_| budget.omit());
     }
-    if text.len() > MAX_STRUCTURED_BYTES && text.trim_start().starts_with(['{', '[', '"']) {
+    if budget.remaining.is_some()
+        && text.len() > MAX_STRUCTURED_BYTES
+        && text.trim_start().starts_with(['{', '[', '"'])
+    {
         return budget.omit();
+    }
+    if budget.remaining.is_none() && looks_like_json(text) {
+        // A malformed or over-nested document can conceal credential field
+        // names in escapes. Do not fall back to scanning its encoded spelling.
+        budget.changed = true;
+        return "[omitted: structured credential inspection failed]".into();
     }
     let (text, changed) = redact_text(text);
     budget.changed |= changed;
     text
 }
+fn looks_like_json(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with('{')
+        || (text.starts_with('"') && text.contains('\\'))
+        || text
+            .strip_prefix('[')
+            .is_some_and(|tail| tail.trim_start().starts_with(['{', '[', '"', ']']))
+}
+
 struct Builder {
     blocks: Vec<Value>,
     remaining: usize,
@@ -499,7 +529,7 @@ mod tests {
         assert!(cleaned.contains(INSPECTION_LIMIT));
         assert!(!cleaned.contains("fixture-deep-secret"));
         let mut budget = RedactionBudget {
-            remaining: 4,
+            remaining: Some(4),
             changed: false,
         };
         assert_eq!(
@@ -507,9 +537,9 @@ mod tests {
             INSPECTION_LIMIT
         );
         assert!(budget.changed);
-        assert_eq!(budget.remaining, 0);
+        assert_eq!(budget.remaining, Some(0));
         let mut writer_budget = RedactionBudget {
-            remaining: 2,
+            remaining: Some(2),
             changed: false,
         };
         let mut writer = DiagnosticWriter {
