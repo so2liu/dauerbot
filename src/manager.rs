@@ -2295,7 +2295,10 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
         "UPDATE manager_config SET error=?,next_attempt_at=? WHERE project_id=?",
         params![error.summary(), next_attempt, ctx.project],
     )?;
-    if !error.retryable || attempts >= 3 {
+    // The legacy worker repair tool path is unavailable in automatic mode.
+    // Keep the incident and input without manufacturing a primary-pane job.
+    let repair = p.agent != "auto" && (!error.retryable || attempts >= 3);
+    if repair {
         let repair_id = format!("manager-repair-{incident}");
         let instructions = format!(
             "<management_repair trust=\"daemon_metadata\" incident_id=\"{incident}\" revision=\"{}\">Repair only this project's management service. Sanitized diagnostic: {}. Verify the current manager failure still has this incident and revision before making changes. Diagnose the configured provider request or management loop; preserve queued user input and all effect receipts. Do not process or forward the user's ordinary tasks, replay uncertain effects, change native CLI login/global settings, or replace the selected provider without explicit authority. Use the existing project control path and report verified recovery or the concrete remaining cause. This is one bounded repair assignment, not authorization for recurring retries.</management_repair>",
@@ -2342,7 +2345,7 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
             (_, true) => "请在设置里选择可用的管理模型。",
             (_, false) => " Choose an available management model in Settings.",
         };
-        let message = failure_notice(error, delay, true, chinese) + action;
+        let message = failure_notice(error, delay, repair, chinese) + action;
         let mut attachment = json!({"to":to,"discussion_intent":"decision","manager_notice":true,
             "manager_incident":incident,"manager_revision":ctx.revision});
         if let Err(error) = crate::discussion::origin(&tx, &ctx.project, &origin, &binding.app_id, to, false, &mut attachment) {
@@ -3947,6 +3950,26 @@ mod tests {
             })
             .unwrap();
     }
+    #[tokio::test]
+    async fn automatic_project_provider_failure_keeps_input_without_legacy_repair() {
+        let (_dir, app, p) = fixture().await;
+        ingest(&app, &p, "om_automatic_provider", "process this later");
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET agent='auto' WHERE id=?", [&p.id])?;
+            work::sync_inbound(c)?;
+            let turn = claim(c,&p.id)?.unwrap();
+            failure(c,&turn.context,&Failure {
+                kind:"authorization".into(), http_status:Some(401), ..Failure::internal()
+            })?;
+            assert_eq!(public(c,&p.id)?["status"],"unavailable");
+            assert_eq!(c.query_row("SELECT count(*) FROM manager_inputs WHERE status='processing'",[],
+                |row|row.get::<_,i64>(0))?,1);
+            assert_eq!(c.query_row("SELECT count(*) FROM work_events WHERE source IN ('management','manager_worker')",[],
+                |row|row.get::<_,i64>(0))?,0);
+            Ok(())
+        }).unwrap();
+    }
+
     #[tokio::test]
     async fn turn_budget_failure_releases_manager_without_replaying_effects() {
         let (_dir, app, p) = fixture().await;
