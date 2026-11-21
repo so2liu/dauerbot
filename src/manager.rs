@@ -552,6 +552,8 @@ struct DelegateArgs {
     instructions: String,
     source_event_id: Option<String>,
     target_cli: Option<String>,
+    #[serde(default)]
+    generation: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1031,6 +1033,30 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
             .transpose()?.flatten();
         Ok((origin,text.as_deref().and_then(named_cli)))
     }).await?;
+    if steer && (p.agent=="auto" || a.generation.is_some()) {
+        ensure!(a.target_cli.is_none(),"Choose an existing generation for steering, not a new CLI");
+        let generation = a.generation.context("Choose the running worker generation from worker_status")?;
+        let context=ctx.clone();
+        let target=generation.clone();
+        let task_run = app.db.call(move|c| {
+            let parent=valid(c,&context)?;
+            crate::manager_workers::authorize(c,&parent,&target,true)?;
+            c.query_row("SELECT id FROM work_runs
+                WHERE project_id=? AND generation=? AND status IN ('submitted','running')
+                ORDER BY rowid DESC LIMIT 1", params![parent.id,target], |row|row.get::<_,String>(0))
+                .optional()?.context("No active task is running on the selected worker")
+        }).await?;
+        drop(guard);
+        return crate::manager_terminal::send(app,ctx,crate::manager_terminal::SendArgs {
+            generation,
+            task_run:Some(task_run),
+            segments: vec![
+                crate::herdr::terminal_control::Segment::Text { text: a.instructions },
+                crate::herdr::terminal_control::Segment::Key { key:"enter".into() },
+            ],
+        },&effect).await;
+    }
+    ensure!(a.generation.is_none(),"Choose a CLI with target_cli when delegating a new task");
     let target_cli = requested_cli.as_deref().or(a.target_cli.as_deref());
     let selected = if a.target_cli.is_some() || (!steer && (requested_cli.is_some() || p.agent=="auto")) {
         ensure!(!steer,"Choose target_cli on delegate; steer_worker is scoped to the legacy primary conversation");

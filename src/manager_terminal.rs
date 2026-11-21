@@ -13,6 +13,8 @@ pub(crate) struct SendArgs {
     #[serde(default)]
     pub generation: String,
     pub segments: Vec<herdr::terminal_control::Segment>,
+    #[serde(skip)]
+    pub task_run: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,7 +64,7 @@ impl TerminalHistory {
                 json_extract(result,'$.message'),json_extract(result,'$.screen_fingerprint'),
                 json_extract(result,'$.unchanged_polls'),COALESCE(NULLIF(json_extract(result,'$.generation'),''),NULLIF(json_extract(arguments,'$.generation'),'')),
                 occurrence,json_extract(result,'$.ignored_attempt')
-             FROM manager_effects WHERE run_id=? AND id!=? AND name IN ('cli_view','cli_send_keys')
+             FROM manager_effects WHERE run_id=? AND id!=? AND name IN ('cli_view','cli_send_keys','steer_worker')
              ORDER BY rowid DESC LIMIT ?",
         )?;
         let mut rows = statement.query(rusqlite::params![run, effect, MAX_TERMINAL_CALLS])?;
@@ -74,7 +76,7 @@ impl TerminalHistory {
                 .as_deref()
                 .is_none_or(|previous| previous == generation);
             history.calls += 1;
-            if name == "cli_send_keys" {
+            if matches!(name.as_str(), "cli_send_keys" | "steer_worker") {
                 history.inputs += 1;
                 history.uncertain_input |=
                     same_generation && matches!(status.as_str(), "submitting" | "uncertain");
@@ -336,6 +338,34 @@ where
                 ));
             }
         };
+        if let Some(run) = &args.task_run {
+            let project_id = fresh.id.clone();
+            let generation = fresh.generation.clone();
+            let run = run.clone();
+            let active = app
+                .db
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?
+                    AND generation=? AND id=? AND status IN ('submitted','running'))",
+                        rusqlite::params![project_id, generation, run],
+                        |row| row.get::<_, bool>(0),
+                    )?)
+                })
+                .await?;
+            if !active {
+                if confirmed == 0 {
+                    anyhow::bail!(
+                        "The selected worker task finished before steering was submitted"
+                    );
+                }
+                return Ok(uncertain(
+                    &initial,
+                    confirmed,
+                    "The selected worker task changed after part of the correction",
+                ));
+            }
+        }
         if fresh.terminal != initial.terminal || fresh.native_session != initial.native_session {
             return Ok(uncertain(&initial, confirmed, "The bound terminal changed"));
         }
@@ -416,7 +446,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::current;
-    use crate::{App, config::Config, db::ProjectInput, manager};
+    use crate::{
+        App,
+        config::Config,
+        db::{self, ProjectInput},
+        manager, work,
+    };
 
     #[tokio::test]
     async fn repeated_unchanged_terminal_views_stop_before_using_the_turn_budget() {
@@ -531,6 +566,7 @@ mod tests {
             &app,
             &authority,
             super::SendArgs {
+                task_run: None,
                 generation: "g".into(),
                 segments: vec![crate::herdr::terminal_control::Segment::Key {
                     key: "enter".into(),
@@ -550,7 +586,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        for control in ["pause", "takeover", "stop"] {
+        for control in ["pause", "takeover", "stop", "settle"] {
             let dir = tempfile::tempdir().unwrap();
             let app = App::new(dir.path().join("store"), Config::default()).unwrap();
             let p = app
@@ -576,6 +612,21 @@ mod tests {
                 c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&p.id])?;
                 Ok(())
             }).unwrap();
+            let scoped_run = if control == "settle" {
+                Some(
+                    app.db
+                        .sync(|c| {
+                            manager::test_delegate(c, &p.id, "scoped", None)?;
+                            let run = work::claim_next(c, &p.id, "g", db::now())?.unwrap();
+                            work::delivery(c, &run.id, "submitted", "", db::now())?;
+                            Ok(run.id)
+                        })
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let task_run = scoped_run.clone();
             let (entered, waiting) = tokio::sync::oneshot::channel();
             let (resume, blocked) = tokio::sync::oneshot::channel();
             let calls = Arc::new(AtomicUsize::new(0));
@@ -588,6 +639,7 @@ mod tests {
                     &worker,
                     &context,
                     super::SendArgs {
+                        task_run,
                         generation: "g".into(),
                         segments: vec![crate::herdr::terminal_control::Segment::Key {
                             key: "enter".into(),
@@ -626,6 +678,13 @@ mod tests {
                         crate::work::set_takeover(c, &p.id, "g", true, crate::db::now()).map(|_| ())
                     }
                     "stop" => crate::cli_switch::stopped(c, &p.id, "g"),
+                    "settle" => {
+                        c.execute(
+                            "UPDATE work_runs SET status='settled' WHERE id=?",
+                            [scoped_run.as_deref().unwrap()],
+                        )?;
+                        Ok(())
+                    }
                     _ => unreachable!(),
                 })
                 .unwrap();

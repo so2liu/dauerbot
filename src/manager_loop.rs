@@ -244,8 +244,8 @@ fn definitions() -> Vec<ToolDefinition> {
             vec![],
         ),
         (
-            "Steer this project's selected native coding worker. Use delegate with target_cli to assign separate work to a task worker. Select source_event_id from trusted_sources when multiple discussions are present.",
-            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"}}),
+            "Steer an active task on its exact worker generation from worker_status. Legacy primary-conversation steering can omit generation. Use delegate with target_cli for separate new work.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"generation":{"type":"string"}}),
             vec!["instructions"],
         ),
         (
