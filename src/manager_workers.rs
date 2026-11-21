@@ -6,6 +6,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
+const PREFLIGHT_RETRY_MS: i64 = 30_000;
+
 pub(crate) fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS manager_workers(
@@ -142,12 +144,31 @@ pub(crate) async fn select(
     );
     let parent = p.clone();
     let target_key = target.to_owned();
-    let current = app.db.call(move |c| {
-        controls(c,&parent)?;
-        let generation = c.query_row("SELECT generation FROM manager_workers WHERE project_id=? AND agent=? AND state!='closed' ORDER BY rowid DESC LIMIT 1",
-            params![parent.id,target_key], |r| r.get::<_,String>(0)).optional()?;
-        generation.map(|g| seat(c,&parent,&g)).transpose().map(Option::flatten)
-    }).await?;
+    let current = app
+        .db
+        .call(move |c| {
+            controls(c, &parent)?;
+            // No launch permit is released before the execution is committed.
+            // A failed preflight with no recorded execution can be replaced after
+            // a short cooldown, leaving the old generation and diagnostic intact.
+            let generation = c
+                .query_row(
+                    "SELECT w.generation FROM manager_workers w
+             WHERE w.project_id=? AND w.agent=? AND w.state!='closed'
+               AND NOT (w.state='unavailable' AND w.execution='null' AND w.native_session=''
+                 AND w.created_at<=?
+                 AND NOT EXISTS(SELECT 1 FROM work_executions e WHERE e.generation=w.generation))
+             ORDER BY w.rowid DESC LIMIT 1",
+                    params![parent.id, target_key, db::now() - PREFLIGHT_RETRY_MS],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            generation
+                .map(|g| seat(c, &parent, &g))
+                .transpose()
+                .map(Option::flatten)
+        })
+        .await?;
     if target == p.agent {
         let parent = p.clone();
         let usable = app
@@ -662,6 +683,24 @@ mod tests {
             })
             .await
             .unwrap();
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,error,created_at)
+                VALUES('failed-preflight',?,'claude','fixture-old','unavailable','Integration missing',?)",
+                params![parent.id,db::now()])?;
+            Ok(())
+        }).unwrap();
+        assert!(matches!(select(&app,&parent,"claude",None).await.unwrap(),
+            Selection::Unavailable(result) if result["reason"] == "Integration missing"));
+        app.db
+            .sync(|c| {
+                assert!(active(c, &parent)?.is_empty());
+                c.execute(
+                    "UPDATE manager_workers SET created_at=? WHERE generation='failed-preflight'",
+                    [db::now() - PREFLIGHT_RETRY_MS],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         assert!(
             matches!(select(&app,&parent,"claude",None).await.unwrap(), Selection::Unavailable(result) if result["work_queued"]==false)
         );
@@ -702,6 +741,7 @@ mod tests {
         );
         app.db.sync(|c| {
             assert_ne!(db::project_by_key(c,&parent.id)?.generation,launched.generation);
+            assert_eq!(seat(c,&parent,"failed-preflight")?.unwrap().error,"Integration missing");
             assert!(crate::cli_switch::latest(c,&parent.id)?.is_none());
             assert!(work::snapshot(c,&parent.id)?.execution.is_none());
             assert_eq!(c.query_row("SELECT count(*) FROM manager_inputs WHERE project_id=? AND json_extract(payload,'$.kind')='worker_seat'",[&parent.id],|r|r.get::<_,i64>(0))?,1);
