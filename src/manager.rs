@@ -2036,12 +2036,45 @@ async fn checkpoint(app: &App, ctx: &Context, value: &Value, model_responded: bo
     app.db.call(move|c|{let tx=c.unchecked_transaction()?;valid(&tx,&context)?;ensure!(tx.execute("UPDATE manager_runs SET checkpoint=? WHERE id=? AND owner=? AND status='working'",params![value,context.run,owner()])?==1,"Management turn ownership changed");if let Some(correction)=correction {tx.execute("UPDATE manager_runs SET error=json_set(CASE WHEN json_valid(error) THEN error ELSE '{}' END,'$.last_correction',json(?)) WHERE id=?",params![correction,context.run])?;}
 if model_responded { recovered(&tx,&context)?; }tx.commit()?;Ok(())}).await
 }
-async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
+async fn drive(app: Arc<App>, turn: Turn) -> Result<()> {
+    let mut trace = if let Some(exporter) = &app.manager_telemetry {
+        let run = turn.context.run.clone();
+        match app.db.call(move |c| {
+            Ok(c.prepare("SELECT i.id FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id WHERE b.run_id=? AND i.kind='user' ORDER BY i.rowid LIMIT 64")?
+                .query_map([run], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        }).await {
+            Ok(inputs) if !inputs.is_empty() => Some(crate::manager_telemetry::Trace::new(exporter.clone(), inputs)),
+            Ok(_) => None,
+            Err(_) => {
+                tracing::warn!("Manager telemetry input lookup failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let result = drive_turn(app, turn, trace.as_mut()).await;
+    if let Some(trace) = &mut trace {
+        trace.finish(match &result {
+            Ok(outcome) => outcome,
+            Err(error) if error.downcast_ref::<Failure>().is_some() => "model_failure",
+            Err(_) => "turn_interrupted_or_failed",
+        });
+    }
+    result.map(|_| ())
+}
+
+async fn drive_turn(
+    app: Arc<App>,
+    mut turn: Turn,
+    mut trace: Option<&mut crate::manager_telemetry::Trace>,
+) -> Result<&'static str> {
     loop {
         // A completed iteration has checkpointed both the provider response and
         // every tool result. Yield only here, never by cancelling live model I/O.
         if app.service.manager_gate.is_closed() {
-            return Ok(());
+            return Ok("yielded");
         }
         ensure!(
             current(&app, &turn.context).await,
@@ -2072,14 +2105,14 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
                         }
                         if app.service.manager_gate.is_closed() {
                             tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, "Debug echo interrupted by service handover");
-                            return Ok(());
+                            return Ok("yielded");
                         }
                     }
                 }
             }
             // Revalidate after Feishu I/O, which may overlap new steering.
             if app.service.manager_gate.is_closed() {
-                return Ok(());
+                return Ok("yielded");
             }
             ensure!(
                 current(&app, &turn.context).await,
@@ -2087,19 +2120,22 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
             );
         }
         let cancel = CancellationToken::new();
-        let model = manager_loop::advance_observed(
-            &turn.config,
-            turn.checkpoint.clone(),
-            cancel.clone(),
-            Some(crate::manager_context::Observer {
-                store: app.manager_context.clone(),
-                project: turn.context.project.clone(),
-                run: turn.context.run.clone(),
-            }),
-        );
-        tokio::pin!(model);
-        let step = loop {
-            tokio::select! {result=&mut model=>break result?,_=tokio::time::sleep(Duration::from_millis(100))=>{if app.shutdown.is_cancelled()||!current(&app,&turn.context).await{cancel.cancel();bail!("Management turn superseded");}}}
+        let step = {
+            let model = manager_loop::advance_observed(
+                &turn.config,
+                turn.checkpoint.clone(),
+                cancel.clone(),
+                Some(crate::manager_context::Observer {
+                    store: app.manager_context.clone(),
+                    project: turn.context.project.clone(),
+                    run: turn.context.run.clone(),
+                }),
+                trace.as_deref_mut(),
+            );
+            tokio::pin!(model);
+            loop {
+                tokio::select! {result=&mut model=>break result?,_=tokio::time::sleep(Duration::from_millis(100))=>{if app.shutdown.is_cancelled()||!current(&app,&turn.context).await{cancel.cancel();bail!("Management turn superseded");}}}
+            }
         };
         checkpoint(&app, &turn.context, &step.checkpoint, step.model_responded).await?;
         turn.checkpoint = step.checkpoint;
@@ -2109,20 +2145,30 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
                 let mut results = Vec::new();
                 for call in calls {
                     let occurrence = call.occurrence.clone();
-                    let value = tool(&app, &turn.context, call).await?;
+                    let mut span = trace
+                        .as_deref_mut()
+                        .map(|trace| trace.span(&call.name, "tool"));
+                    let value = tool(&app, &turn.context, call).await;
+                    if let Some(span) = &mut span {
+                        span.finish(match value.as_ref() {
+                            Ok(value) => tool_trace_outcome(value),
+                            Err(_) => "failed",
+                        });
+                    }
+                    let value = value?;
                     results.push((occurrence, value));
                 }
                 if results.iter().all(|(_, result)| result["ignored_terminal_stop"] == true)
                     && !results.is_empty()
                 {
                     let Some(_permit) = app.service.gate.enter() else {
-                        return Ok(());
+                        return Ok("yielded");
                     };
                     let context = turn.context.clone();
                     app.db.call(move |c| finish_turn(c, &context,
                         "Terminal observation stopped because the tool budget was exhausted."))
                         .await?;
-                    return Ok(());
+                    return Ok("tool_budget_exhausted");
                 }
                 turn.checkpoint = manager_loop::supply_tool_results(turn.checkpoint, results)?;
                 checkpoint(&app, &turn.context, &turn.checkpoint, false).await?;
@@ -2130,16 +2176,30 @@ async fn drive(app: Arc<App>, mut turn: Turn) -> Result<()> {
             LoopAction::Done(note) => {
                 let context = turn.context.clone();
                 let Some(_permit) = app.service.gate.enter() else {
-                    return Ok(());
+                    return Ok("yielded");
                 };
                 app.db
                     .call(move |c| finish_turn(c, &context, &note))
                     .await?;
-                return Ok(());
+                return Ok("complete");
             }
         }
     }
 }
+fn tool_trace_outcome(value: &Value) -> &'static str {
+    if value["ignored_terminal_stop"] == true {
+        return "ignored_terminal_stop";
+    }
+    match value["status"].as_str() {
+        Some("uncertain") => "uncertain",
+        Some("held") => "held",
+        Some("queued" | "pending") => "queued",
+        Some("failed" | "rejected" | "unavailable" | "worker_unavailable" | "observation_stopped") => "failed",
+        _ if !value["error"].is_null() && value["error"] != "" => "failed",
+        _ => "ok",
+    }
+}
+
 fn finish_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
     let tx = c.unchecked_transaction()?;
     valid(&tx, context)?;
@@ -2529,8 +2589,13 @@ mod tests {
 
     async fn fixture() -> (tempfile::TempDir, Arc<App>, Project) {
         let dir = tempfile::tempdir().unwrap();
-        let app = App::new(dir.path().join("store"), Config::default()).unwrap();
-        let path = dir.path().join("workspace");
+        let (app, project) = fixture_at(dir.path()).await;
+        (dir, app, project)
+    }
+
+    async fn fixture_at(dir: &Path) -> (Arc<App>, Project) {
+        let app = App::new(dir.join("store"), Config::default()).unwrap();
+        let path = dir.join("workspace");
         fs::create_dir(&path).unwrap();
         let p = app
             .db
@@ -2561,7 +2626,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        (dir, app, p)
+        (app, p)
     }
     #[tokio::test]
     async fn proposal_turn_is_scoped_and_delegates_the_approved_instructions_exactly_once() -> Result<()> {
@@ -2855,6 +2920,133 @@ mod tests {
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
     }
+    #[tokio::test]
+    async fn langfuse_exports_private_metadata_without_waiting_for_the_collector() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use base64::Engine;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct Collector {
+            requests: tokio::sync::mpsc::UnboundedSender<(HeaderMap, Value)>,
+            model_calls: Arc<AtomicUsize>,
+        }
+        async fn collect(
+            State(state): State<Collector>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            state.requests.send((headers, body)).unwrap();
+            std::future::pending().await
+        }
+        async fn complete(State(state): State<Collector>) -> Json<Value> {
+            let message = if state.model_calls.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+                json!({"role":"assistant","content":null,"tool_calls":[{
+                    "id":"call_fixture","type":"function",
+                    "function":{"name":"read_file","arguments":"{\"path\":\"private-file.txt\"}"}
+                }]})
+            } else {
+                json!({"role":"assistant","content":"private response body"})
+            };
+            let finish = if message["tool_calls"].is_array() { "tool_calls" } else { "stop" };
+            Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
+                "choices":[{"index":0,"message":message,"finish_reason":finish}],
+                "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let state = Collector { requests, model_calls: Arc::new(AtomicUsize::new(0)) };
+        let router = Router::new()
+            .route("/api/public/otel/v1/traces", post(collect))
+            .route("/v1/chat/completions", post(complete))
+            .with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        // Generate throwaway auth material at runtime. The fixture never uses a real key.
+        let public = uuid::Uuid::new_v4().simple().to_string();
+        let secret = uuid::Uuid::new_v4().simple().to_string();
+        let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{public}:{secret}")));
+        for mode in ["default", "disabled", "invalid", "stalled", "unreachable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = dir.path().join("store");
+            if mode != "default" {
+                crate::config::private_dir(&store).unwrap();
+                let endpoint = match mode {
+                    "invalid" => format!("{host}/invalid"),
+                    "unreachable" => "http://127.0.0.1:0".into(),
+                    _ => host.clone(),
+                };
+                crate::config::write_private(&store.join("langfuse.json"), &serde_json::to_vec(&json!({
+                    "enabled":mode!="disabled", "host":endpoint, "public_key":public, "secret_key":secret
+                })).unwrap()).unwrap();
+            }
+            let (app, project) = fixture_at(dir.path()).await;
+            assert_eq!(app.manager_telemetry.is_some(), matches!(mode, "stalled" | "unreachable"));
+            fs::write(Path::new(&project.path).join("private-file.txt"), "private file body").unwrap();
+            let messages = if mode == "stalled" { 2 } else { 1 };
+            for index in 0..messages {
+                ingest(&app, &project, &format!("om_private_{index}"), "private user message");
+            }
+            let mut turn = app.db.sync(|c| {
+                work::sync_inbound(c)?;
+                Ok(claim(c, &project.id)?.unwrap())
+            }).unwrap();
+            turn.config.base_url = format!("{host}/v1");
+            let run = turn.context.run.clone();
+            tokio::time::timeout(Duration::from_secs(2), drive(app.clone(), turn))
+                .await.expect("Manager must not wait for telemetry").unwrap();
+            assert_eq!(app.db.sync(|c| Ok(c.query_row(
+                "SELECT status FROM manager_runs WHERE id=?", [run], |row| row.get::<_,String>(0)
+            )?)).unwrap(), "complete");
+
+            if mode != "stalled" {
+                assert!(tokio::time::timeout(Duration::from_millis(100), received.recv()).await.is_err());
+                continue;
+            }
+            let (headers, payload) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await.unwrap().unwrap();
+            assert!(headers["authorization"] == auth.as_str(), "Expected Basic authentication");
+            assert_eq!(headers["content-type"], "application/json");
+            let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
+            assert_eq!(spans.len(), 10);
+            let mut traces = HashSet::new();
+            for group in spans.chunks_exact(5) {
+                assert_eq!(group[0]["name"], "manager.interaction");
+                assert_eq!(group[0]["status"]["code"], 1);
+                let trace = group[0]["traceId"].as_str().unwrap();
+                assert_eq!(trace.len(), 32);
+                assert!(traces.insert(trace));
+                for span in &group[1..] {
+                    assert_eq!(span["traceId"], trace);
+                    assert_eq!(span["parentSpanId"], group[0]["spanId"]);
+                    assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
+                    assert_eq!(span["status"]["code"], 1);
+                    let timestamp = |key: &str| span[key].as_str().unwrap().parse::<u128>().unwrap();
+                    assert!(timestamp("endTimeUnixNano") >= timestamp("startTimeUnixNano"));
+                }
+                assert_eq!(group[1]["name"], "manager.user_input");
+                assert_eq!(group[2]["name"], "manager.generation");
+                assert_eq!(group[3]["name"], "read_file");
+                assert_eq!(group[4]["name"], "manager.generation");
+                assert!(group[2]["attributes"].as_array().unwrap().contains(&json!({
+                    "key":"gen_ai.usage.input_tokens","value":{"intValue":"3"}
+                })));
+                assert!(group[2]["attributes"].as_array().unwrap().contains(&json!({
+                    "key":"gen_ai.request.model","value":{"stringValue":"fixture-manager"}
+                })));
+            }
+            let export = payload.to_string();
+            let debug = format!("{:?}", app.manager_telemetry);
+            for forbidden in [&*secret, &*public, "om_private", "private user message", "private response body", "private file body", "private-file.txt"] {
+                assert!(!export.contains(forbidden), "Sensitive data must not be exported");
+                assert!(!debug.contains(forbidden), "Sensitive data must not appear in Debug");
+            }
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn debug_replies_echo_first_prompt_before_provider_without_outbox_records() {
         use axum::{

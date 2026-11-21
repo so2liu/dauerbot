@@ -54,6 +54,23 @@ open "dist/Dauerbot.app" --args --data-dir /absolute/path/to/private-data
 
 Each data directory derives its own dedicated HERDR session. App-managed runtime copies live under `runtime/herdr/0.9.5/<signed-payload-sha256>/herdr` in that directory. Installation uses a process lock and atomic rename, preserves older runtime paths across app updates/moves, and does not edit shell profiles or global PATH. Each Agent execution receives the resolved runtime directory in its own PATH after login-shell startup. Missing or corrupt owned copies are repaired from the verified bundle; symlink targets are rejected. User-owned executables and configuration files are never replaced. Normal schema upgrades preserve existing projects, credentials, native history references, messages and explicit pauses. Product execution uses only legacy herdr 0.9.5.
 
+## Advanced Manager observability
+
+Manager tracing is disabled by default. To opt in, create a separate Langfuse project and save a private `langfuse.json` in Dauerbot's data directory (file mode `0600` and data directory mode `0700` on Unix). Use the Langfuse project keys, independently of the Manager provider login.
+
+```json
+{
+  "enabled": true,
+  "host": "https://cloud.langfuse.com",
+  "public_key": "<project public key>",
+  "secret_key": "<project secret key>"
+}
+```
+
+Omit `host` to use the default. For a different region or self-hosted installation, use its HTTPS origin without the API path. Plain HTTP is restricted to loopback. The daemon reads the file at startup. The integration has no project view controls. Set `enabled` to false or remove the file to disable it on the next daemon start.
+
+Manager sends OTLP/HTTP JSON trace metadata using Langfuse Basic authentication. Each admitted user message has a pseudonymous trace with Manager attempts, generations and tool spans. The trace includes timings, the configured model name, available token counts, tool names and bounded outcome categories. Chat text, prompts, responses, tool arguments and outputs, workspace information and files are omitted. The exporter sends best-effort in the background with a three-second request deadline and bounded capacity. Export errors only produce local diagnostics.
+
 ## Build and develop
 
 Install Rust 1.95 or newer and Xcode on macOS. The dependency lockfiles define the exact Rust dependencies. The execution and terminal-stream adapter targets legacy HERDR 0.9.5 / protocol 22. The terminal component uses a licensed Rust fork of gpui-terminal with the Alacritty emulator. See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and lifecycle contracts.

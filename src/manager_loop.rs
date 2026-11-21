@@ -487,7 +487,7 @@ pub async fn advance(
     checkpoint: Value,
     cancellation: CancellationToken,
 ) -> Result<LoopStep> {
-    advance_observed(config, checkpoint, cancellation, None).await
+    advance_observed(config, checkpoint, cancellation, None, None).await
 }
 /// Diagnostics observe prepared logical content only; they cannot affect admission.
 pub(crate) async fn advance_observed(
@@ -495,6 +495,7 @@ pub(crate) async fn advance_observed(
     checkpoint: Value,
     cancellation: CancellationToken,
     observer: Option<crate::manager_context::Observer>,
+    trace: Option<&mut crate::manager_telemetry::Trace>,
 ) -> Result<LoopStep> {
     let mut state = decode(checkpoint)?;
     ensure!(!cancellation.is_cancelled(), "Manager turn cancelled");
@@ -543,6 +544,11 @@ pub(crate) async fn advance_observed(
         .with_base_url(&config.base_url)
         .client();
     let model = client.chat(&config.model);
+    let mut generation = trace.map(|trace| {
+        let mut span = trace.span("manager.generation", "generation");
+        span.model(&config.model);
+        span
+    });
     let started = Instant::now();
     let response = tokio::select! {
         biased;
@@ -551,6 +557,7 @@ pub(crate) async fn advance_observed(
             Ok(Ok(response))=>response,
             Ok(Err(error))=>{
                 if let Some(observation) = &mut observation { observation.finish("failed"); }
+                if let Some(span) = &mut generation { span.finish("provider_error"); }
                 let error=Failure::provider(error).elapsed(started);
                 if error.kind=="invalid_response" && !state.correction_used {
                     return corrected(&mut state,error);
@@ -559,10 +566,15 @@ pub(crate) async fn advance_observed(
             },
             Err(_)=>{
                 if let Some(observation) = &mut observation { observation.finish("failed"); }
+                if let Some(span) = &mut generation { span.finish("timeout"); }
                 return Err(Failure::timeout().elapsed(started).into());
             },
         }
     };
+    if let Some(span) = &mut generation {
+        span.response(response.usage);
+        span.finish("invalid_response");
+    }
     if let Some(observation) = &mut observation {
         observation.finish("provider_responded");
     }
@@ -610,6 +622,9 @@ pub(crate) async fn advance_observed(
         .run
         .next_step()
         .map_err(|error| Failure::advance(error, || anyhow::anyhow!("Manager run could not advance")))?;
+    if let Some(span) = &mut generation {
+        span.finish(if response.error.is_some() || response.aborted.is_some() { "provider_error" } else { "ok" });
+    }
     step(state, true)
 }
 fn corrected(state: &mut Checkpoint, error: Failure) -> Result<LoopStep> {
@@ -1038,6 +1053,7 @@ mod tests {
                 .unwrap(),
                 CancellationToken::new(),
                 observation,
+                None,
             )
             .await
         });
@@ -1063,6 +1079,7 @@ mod tests {
             begin("user".into(), "system".into()).unwrap(),
             CancellationToken::new(),
             observer(),
+            None,
         )
         .await
         .unwrap();
@@ -1078,6 +1095,7 @@ mod tests {
             begin("user".into(), "system".into()).unwrap(),
             CancellationToken::new(),
             observer(),
+            None,
         )
         .await;
         let view = store.view("fixture-project");
