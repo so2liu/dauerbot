@@ -75,6 +75,7 @@ pub struct App {
     pub token: Mutex<HashMap<String, feishu::TokenCache>>,
     pub runtime: RwLock<Runtime>,
     pub notify: Notify,
+    pub(crate) quote_notify: Notify,
     pub settings_tx: watch::Sender<u64>,
     pub shutdown: CancellationToken,
     pub(crate) manager_telemetry: Option<manager_telemetry::Exporter>,
@@ -120,6 +121,7 @@ impl App {
             token: Mutex::new(HashMap::new()),
             runtime: RwLock::new(Runtime::default()),
             notify: Notify::new(),
+            quote_notify: Notify::new(),
             settings_tx,
             shutdown: CancellationToken::new(),
             manager_context: Arc::new(manager_context::Store::default()),
@@ -1382,6 +1384,7 @@ impl App {
         } else if let Some(message) = &event.message_id {
             let message = self.db.message(message).await?;
             let context = feishu::context(self, &message).await;
+            let message = self.db.message(&message.id).await?;
             Ok(envelope::render_resources(&message, &context,
                 message.attachment["resources"].as_array().map(Vec::as_slice).unwrap_or_default()))
         } else {
@@ -1446,6 +1449,7 @@ impl App {
     pub fn workers_with_ingress(self: &Arc<Self>, warm: Option<feishu::WarmIngress>) {
         tokio::spawn(model_control::run(self.clone()));
         tokio::spawn(feishu::resource_worker(self.clone()));
+        tokio::spawn(feishu::quote_worker(self.clone()));
         tokio::spawn(group_ingress::run(self.clone()));
         let manager_app = self.clone();
         tokio::spawn(manager::run(manager_app));
