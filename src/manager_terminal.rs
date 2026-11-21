@@ -10,12 +10,14 @@ use std::{sync::Arc, time::Duration};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SendArgs {
+    #[serde(default)]
     pub generation: String,
     pub segments: Vec<herdr::terminal_control::Segment>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ViewArgs {
+    #[serde(default)]
     pub generation: String,
 }
 
@@ -154,12 +156,15 @@ async fn history(
 
 fn current(c: &Connection, authority: &manager::Context, generation: &str) -> Result<Project> {
     let project = manager::valid(c, authority)?;
+    let project = if generation.is_empty() && project.agent == "auto" {
+        crate::manager_workers::diagnostic_worker(c, &project)?
+    } else if generation.is_empty() || project.generation == generation {
+        project
+    } else {
+        crate::manager_workers::authorize(c, &project, generation, true)?.project
+    };
     ensure!(
-        !generation.is_empty() && project.generation == generation,
-        "The native generation changed; inspect current worker status"
-    );
-    ensure!(
-        project.ready && project.terminal.is_some(),
+        project.ready && project.terminal.is_some() && !project.generation.is_empty(),
         "The current CLI is not ready"
     );
     ensure!(
@@ -204,9 +209,12 @@ fn input_held(c: &Connection, project: &str) -> Result<bool> {
 pub(crate) async fn send(
     app: &Arc<App>,
     authority: &manager::Context,
-    args: SendArgs,
+    mut args: SendArgs,
     effect: &str,
 ) -> Result<Value> {
+    if args.generation.is_empty() {
+        args.generation = project(app, authority, "", false).await?.generation;
+    }
     let history = history(app, authority, effect, &args.generation).await?;
     if let Some(denied) = history.stop() {
         return Ok(denied);
@@ -356,7 +364,7 @@ pub(crate) async fn view(
 async fn view_with<O, OF>(
     app: &Arc<App>,
     authority: &manager::Context,
-    args: ViewArgs,
+    mut args: ViewArgs,
     effect: &str,
     observe: O,
 ) -> Result<Value>
@@ -364,6 +372,9 @@ where
     O: FnOnce(Project) -> OF,
     OF: std::future::Future<Output = Result<Value>>,
 {
+    if args.generation.is_empty() {
+        args.generation = project(app, authority, "", false).await?.generation;
+    }
     let history = history(app, authority, effect, &args.generation).await?;
     if let Some(denied) = history.stop() {
         return Ok(denied);
@@ -640,6 +651,13 @@ mod tests {
             c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&project.id])?;
             assert!(current(c,&ctx,"g").is_ok());
             assert!(current(c,&ctx,"other").is_err());
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,state,created_at,native_session,execution,token)
+                VALUES('task',?,'pi','ready',0,'native-task',json_object('terminal_id','task-pane'),'')", [&project.id])?;
+            let worker = current(c,&ctx,"task")?;
+            assert_eq!(worker.agent, "pi");
+            assert_eq!(worker.native_session, "native-task");
+            assert_eq!(current(c,&ctx,"")?.generation, "g");
+
             c.execute("UPDATE projects SET paused=1 WHERE id=?", [&project.id])?;
             assert!(current(c,&ctx,"g").is_err());
             c.execute("UPDATE projects SET paused=0,ready=0 WHERE id=?", [&project.id])?;
@@ -647,9 +665,11 @@ mod tests {
             c.execute("UPDATE projects SET ready=1 WHERE id=?", [&project.id])?;
             crate::work::set_takeover(c,&project.id,"g",true,crate::db::now())?;
             assert!(current(c,&ctx,"g").is_err());
+            assert!(current(c,&ctx,"task").is_err());
             crate::work::set_takeover(c,&project.id,"g",false,crate::db::now())?;
             c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input) VALUES('switch',?,'codex','recovery_pending','g',0,1)", [&project.id])?;
             assert!(current(c,&ctx,"g").is_err());
+            assert!(current(c,&ctx,"task").is_err());
             c.execute("UPDATE cli_switch_requests SET holds_input=0 WHERE id='switch'", [])?;
             assert!(current(c,&ctx,"g").is_ok());
             c.execute("UPDATE manager_config SET input_revision=1 WHERE project_id=?", [&project.id])?;

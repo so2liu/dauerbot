@@ -1234,7 +1234,7 @@ mod tests {
         db.sync(|c| {
             c.execute("INSERT INTO projects(id,name,path,agent,generation,created_at,mcp_token,native_session)
                 VALUES('project','fixture','','agy','primary',0,'fixture-token','primary-native')", [])?;
-            c.execute("DROP TABLE manager_workers", [])?;
+            c.execute_batch("DROP TABLE manager_workers; DROP TABLE standalone_projects;")?;
             Ok(())
         })?;
         drop(db);
@@ -1248,6 +1248,7 @@ mod tests {
                 let primary = crate::db::project_by_key(c, "project")?;
                 assert_eq!(primary.generation, "primary");
                 assert_eq!(primary.native_session, "primary-native");
+                assert!(crate::manager::uses_manager(c, "project")?);
                 c.execute("INSERT OR IGNORE INTO manager_workers
                     (generation,project_id,agent,token,state,created_at)
                     VALUES('extra','project','codex','worker-fixture','starting',0)", [])?;

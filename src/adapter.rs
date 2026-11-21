@@ -2,7 +2,7 @@
 use crate::db::Project;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{path::Path, process::Stdio, time::Duration};
 
 pub fn launch_args(
     p: &Project,
@@ -106,6 +106,116 @@ pub fn launch_args_with_selection(
     Ok(argv)
 }
 
+/// Launch an interactive task worker with native defaults and no bridge tools.
+pub(crate) fn plain_worker_args(
+    p: &Project,
+    selection: Option<&crate::models::Selection>,
+) -> Result<Vec<String>> {
+    let mut argv = match p.agent.as_str() {
+        "codex" | "claude" | "pi" | "agy" => vec![p.agent.clone()],
+        "custom" => {
+            let (program, args) = p
+                .extra_args
+                .split_first()
+                .context("Custom task workers require a configured executable")?;
+            anyhow::ensure!(
+                !program.trim().is_empty() && !legacy_placeholder(program),
+                "The custom worker executable cannot depend on bridge placeholders"
+            );
+            let mut argv = vec![program.clone()];
+            argv.extend(plain_extra_args(args));
+            return Ok(argv);
+        }
+        _ => bail!("Unsupported agent"),
+    };
+    argv.extend(plain_extra_args(&crate::models::extra_args(
+        &p.agent,
+        &p.extra_args,
+        selection,
+    )?));
+    if let Some(selection) = selection {
+        argv.extend(crate::models::selection_args(&p.agent, selection)?);
+    }
+    Ok(argv)
+}
+
+/// Verify native CLI availability without inspecting or changing login state.
+/// The version command runs through the login shell used for native launches.
+pub(crate) async fn plain_worker_available(p: &Project) -> bool {
+    let Ok(argv) = plain_worker_args(p, None) else {
+        return false;
+    };
+    if p.agent == "custom" {
+        let program = Path::new(&argv[0]);
+        let executable = |path: &Path| {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        };
+        if program.components().count() > 1 || program.is_absolute() {
+            return executable(&Path::new(&p.path).join(program));
+        }
+        return std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path)
+                .any(|directory| executable(&Path::new(&p.path).join(directory).join(program)))
+        });
+    }
+    let shell = crate::herdr::login_shell_args(vec![argv[0].clone(), "--version".into()]);
+    let mut command = tokio::process::Command::new(&shell[0]);
+    command
+        .args(&shell[1..])
+        .current_dir(&p.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(3), command.status())
+        .await
+        .is_ok_and(|result| result.is_ok_and(|status| status.success()))
+}
+
+fn legacy_placeholder(arg: &str) -> bool {
+    [
+        "{mcp_config}",
+        "{credentials}",
+        "{bridge_exe}",
+        "{instructions}",
+        "{native_session}",
+    ]
+    .iter()
+    .any(|placeholder| arg.contains(placeholder))
+}
+
+fn plain_extra_args(args: &[String]) -> Vec<String> {
+    let mut filtered = Vec::new();
+    let mut input = args.iter().peekable();
+    while let Some(arg) = input.next() {
+        if arg == "--mcp-config" {
+            input.next();
+            continue;
+        }
+        // Legacy templates may use an application-specific flag followed by a
+        // host value. Drop the pair, leaving unrelated custom args intact.
+        if arg.starts_with('-')
+            && !arg.contains('=')
+            && input.peek().is_some_and(|next| {
+                !next.starts_with('-')
+                    && (legacy_placeholder(next) || next.contains("mcp_servers."))
+            })
+        {
+            input.next();
+            continue;
+        }
+        if !legacy_placeholder(arg)
+            && !arg.contains("mcp_servers.")
+            && !arg.starts_with("--mcp-config=")
+        {
+            filtered.push(arg.clone());
+        }
+    }
+    filtered
+}
+
 /// Only edit our own named server. Invalid/unrelated configuration is preserved.
 pub fn merge_mcp(path: &Path, entry: &Value) -> Result<()> {
     let mut cfg: Value = if path.exists() {
@@ -141,4 +251,51 @@ pub fn merge_mcp(path: &Path, entry: &Value) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     crate::config::write_private(path, &serde_json::to_vec_pretty(&cfg)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_worker_plans_keep_valid_native_args_without_legacy_injection() {
+        let mut project: Project = serde_json::from_value(json!({
+            "id":"fixture","name":"fixture","path":"/","agent":"codex","chat_id":"",
+            "paused":false,"terminal":null,"terminal_pid":null,"generation":"",
+            "ready":false,"execution":null,"native_session":"","extra_args":[],
+            "created_at":0,"mcp_token":"fixture"
+        }))
+        .unwrap();
+        for agent in ["codex", "claude", "pi", "agy"] {
+            project.agent = agent.into();
+            assert_eq!(plain_worker_args(&project, None).unwrap(), [agent]);
+        }
+        project.agent = "custom".into();
+        project.extra_args = [
+            "/usr/bin/true",
+            "--work",
+            "ordinary",
+            "--mcp-config",
+            "{mcp_config}",
+            "--bridge-mode={bridge_exe}",
+            "-c",
+            "mcp_servers.herdr_feishu.args=[]",
+            "--native-id",
+            "{native_session}",
+            "--another",
+            "argument",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            plain_worker_args(&project, None).unwrap(),
+            [
+                "/usr/bin/true",
+                "--work",
+                "ordinary",
+                "--another",
+                "argument"
+            ]
+        );
+    }
 }

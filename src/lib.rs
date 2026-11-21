@@ -25,6 +25,7 @@ pub mod manager_context;
 pub mod manager_loop;
 mod manager_terminal;
 mod manager_workers;
+mod worker_task;
 pub mod mcp;
 pub mod model_control;
 pub mod models;
@@ -171,10 +172,25 @@ impl App {
         let p = self.db.project(key).await?;
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
+        if p.agent == "auto" {
+            if resume {
+                bail!("Automatic projects resume their task workers through Manager");
+            }
+            match manager_workers::select(self, &p, "", None).await? {
+                manager_workers::Selection::Ready(_) => {}
+                manager_workers::Selection::Unavailable(info) => {
+                    if info["starting"] != true {
+                        bail!("{}", info["reason"].as_str().unwrap_or("No worker is available"));
+                    }
+                }
+            }
+            return Ok(p);
+        }
         self.start_inner(&p.id, resume).await
     }
     async fn start_inner(&self, key: &str, resume: bool) -> Result<Project> {
         let mut p = self.db.project(key).await?;
+        anyhow::ensure!(p.agent != "auto", "Automatic projects launch task workers through Manager");
         anyhow::ensure!(
             !Self::update_required(&p),
             "update_required: Recover this Agent after the service update. Its native session and queued messages are preserved."
@@ -350,6 +366,11 @@ impl App {
     }
     pub async fn show(&self, key: &str) -> Result<Value> {
         let p = self.db.project(key).await?;
+        let p = if p.agent == "auto" {
+            self.db.call(move |c| manager_workers::diagnostic_worker(c, &p)).await?
+        } else {
+            p
+        };
         let cfg = self.config.read().await.clone();
         herdr::terminal_descriptor(&cfg, &p).await
     }
@@ -389,6 +410,7 @@ impl App {
             bail!("Choose Codex, Claude Code, Pi, or Antigravity")
         }
         let p = self.db.project(key).await?;
+        anyhow::ensure!(p.agent != "auto", "Automatic projects choose a CLI per task");
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
         let p = self.db.project(&p.id).await?;
@@ -776,6 +798,9 @@ impl App {
         };
         let mut p = self.db.project(key).await?;
         manager_workers::reconcile(self,&p).await?;
+        if p.agent == "auto" {
+            return Ok(());
+        }
         if self.advance_cli_switch(&p, None, None).await? {
             return Ok(());
         }
@@ -1338,7 +1363,16 @@ impl App {
             .db
             .call(move |c| work::event(c, &id, &event_id))
             .await?;
-        let body_result = manager::body(self, p, &event).await;
+        let body_result = if matches!(event.source.as_str(), "management" | "manager_worker") {
+            manager::body(self, p, &event).await
+        } else if let Some(message) = &event.message_id {
+            let message = self.db.message(message).await?;
+            let context = feishu::context(self, &message).await;
+            Ok(envelope::render_resources(&message, &context,
+                message.attachment["resources"].as_array().map(Vec::as_slice).unwrap_or_default()))
+        } else {
+            envelope::scheduled_body(&event.payload).map_err(Into::into)
+        };
         let body = match body_result {
             Ok(body) => body,
             Err(error) => {

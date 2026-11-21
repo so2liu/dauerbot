@@ -440,6 +440,11 @@ impl Language {
                 "请先使用 Dauerbot 0.4.1 迁移此旧版数据目录，再进行升级。"
             }
             "01  Choose a project" => "01  选择项目",
+            "One bot belongs to one project. Manager projects automatically find installed worker CLIs." =>
+                "每个项目绑定一个机器人。管理智能体项目会自动检测本机可用的 worker CLI。",
+            "Automatic workers" => "自动 worker",
+            "Use automatic workers" => "使用自动 worker",
+            "Automatic workers enabled." => "已启用自动 worker。",
             "Choose a project folder and an installed Agent CLI." => {
                 "选择项目文件夹和已安装的智能体 CLI。"
             }

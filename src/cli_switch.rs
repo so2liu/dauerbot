@@ -732,6 +732,7 @@ async fn artifact(p: &Project) -> Result<Option<String>> {
 /// Accept a native CLI selection while the caller owns the project lock and
 /// transaction. This shares the ordinary UI handoff and delivery-lock path.
 pub(crate) fn request(c: &Connection, p: &Project, target: &str) -> Result<Option<Request>> {
+    ensure!(p.agent != "auto", "Automatic projects choose a CLI for each task");
     ensure!(
         ["codex", "claude", "pi", "agy"].contains(&target),
         "Unsupported target CLI; choose codex, claude, pi, or agy"
