@@ -1376,10 +1376,11 @@ pub async fn screen(config: &Config, p: &Project, lines: u32) -> Result<String> 
 
 pub async fn terminal_descriptor(config: &Config, p: &Project) -> Result<Value> {
     let record = observe(config, p).await?;
-    match check_execution_identity(p, &record) {
-        Ok(()) => {}
-        Err(error) if error.is::<SessionStarting>() => {}
-        Err(error) => return Err(error),
+    if crate::manager_workers::is_plain(p) {
+        check_pane_ownership(p, &record)?;
+        check_native_resume(p, &record)?;
+    } else {
+        check_execution_identity(p, &record)?;
     }
     let execution = ExecutionRef::from_project(p)?;
     let mut public_execution = serde_json::to_value(&execution)?;

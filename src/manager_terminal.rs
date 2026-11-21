@@ -163,7 +163,7 @@ async fn history(
 fn current(c: &Connection, authority: &manager::Context, generation: &str) -> Result<Project> {
     let project = manager::valid(c, authority)?;
     let project = if generation.is_empty() && project.agent == "auto" {
-        crate::manager_workers::diagnostic_worker(c, &project)?
+        crate::manager_workers::ready_worker(c, &project)?
     } else if generation.is_empty() || project.generation == generation {
         project
     } else {

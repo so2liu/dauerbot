@@ -105,10 +105,32 @@ pub(crate) fn is_plain(p: &Project) -> bool {
 }
 
 pub(crate) fn diagnostic_worker(c: &Connection, p: &Project) -> Result<Project> {
+    let generation = c
+        .query_row(
+            "SELECT w.generation FROM manager_workers w
+         LEFT JOIN work_leases l ON l.project_id=w.project_id AND l.generation=w.generation
+         WHERE w.project_id=? AND w.state IN ('starting','ready','unavailable')
+           AND json_type(w.execution,'$.terminal_id')='text'
+         ORDER BY COALESCE(l.active,0) DESC,
+                  CASE w.state WHEN 'unavailable' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
+                  w.rowid DESC LIMIT 1",
+            [&p.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(generation
+        .as_deref()
+        .map(|g| seat(c, p, g))
+        .transpose()?
+        .flatten()
+        .map_or_else(|| p.clone(), |seat| seat.project))
+}
+
+pub(crate) fn ready_worker(c: &Connection, p: &Project) -> Result<Project> {
     Ok(active(c, p)?
         .into_iter()
-        .find(|s| s.project.ready && s.project.terminal.is_some())
-        .map_or_else(|| p.clone(), |s| s.project))
+        .find(|seat| seat.project.ready && seat.project.terminal.is_some())
+        .map_or_else(|| p.clone(), |seat| seat.project))
 }
 
 fn active(c: &Connection, p: &Project) -> Result<Vec<Seat>> {
@@ -895,6 +917,34 @@ mod tests {
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
+
+    #[tokio::test]
+    async fn attention_needed_worker_remains_visible_without_authorizing_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().join("store"), config::Config::default()).unwrap();
+        let p = app
+            .db
+            .create(db::ProjectInput {
+                name: "Diagnostic fixture".into(),
+                path: dir.path().to_string_lossy().into(),
+                agent: "auto".into(),
+                chat_id: String::new(),
+                native_session: String::new(),
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,error,execution,created_at)
+                VALUES('blocked',?,'pi','','unavailable','Native login required',json_object('terminal_id','diagnostic'),0)", [&p.id])?;
+            let diagnostic = diagnostic_worker(c,&p)?;
+            assert_eq!(diagnostic.generation,"blocked");
+            assert_eq!(diagnostic.terminal.as_deref(),Some("diagnostic"));
+            assert_ne!(ready_worker(c,&p)?.generation,"blocked");
+            assert!(authorize(c,&p,"blocked",true).is_err());
+            Ok(())
+        }).unwrap();
+    }
 
     #[tokio::test]
     async fn default_worker_candidates_skip_installed_but_fenced_generations() {

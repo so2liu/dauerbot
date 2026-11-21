@@ -659,7 +659,7 @@ impl App {
         self.db.call(move |c| {
             let seat = manager_workers::seat(c, &p, &generation)?
                 .context("This execution changed; reconnect the terminal")?;
-            anyhow::ensure!(seat.project.terminal.is_some(), "This worker has no terminal");
+            anyhow::ensure!(seat.state != "closed" && seat.project.terminal.is_some(), "This worker has no terminal");
             Ok(seat.project)
         }).await
     }
@@ -672,8 +672,8 @@ impl App {
             let cfg = self.config.read().await.clone();
             let record = herdr::observe(&cfg, &p).await?;
             if manager_workers::is_plain(&p) {
-                anyhow::ensure!(p.ready && !p.paused, "This worker is not available for control");
-                manager_workers::check_plain_target(&p, &record)?;
+                herdr::check_pane_ownership(&p, &record)?;
+                herdr::check_native_resume(&p, &record)?;
             } else {
                 repair_lane::check_identity(&p, &record)?;
             }
