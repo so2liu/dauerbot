@@ -686,7 +686,12 @@ async fn reconcile_one(
         match observe(cfg, worker).await {
             Ok(value) => Some(value),
             Err(_) if state == "starting" && db::now() - created > 90_000 => None,
-            Err(error) => return Err(error),
+            Err(error) => {
+                if is_plain(worker) && state == "ready" {
+                    crate::worker_task::collect(app, cfg, worker, None).await?;
+                }
+                return Err(error);
+            }
         }
     } else {
         None

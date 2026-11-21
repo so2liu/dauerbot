@@ -60,7 +60,7 @@ impl TerminalHistory {
         let mut statement = c.prepare(
             "SELECT name,status,json_extract(result,'$.status'),json_extract(result,'$.reason'),
                 json_extract(result,'$.message'),json_extract(result,'$.screen_fingerprint'),
-                json_extract(result,'$.unchanged_polls'),json_extract(result,'$.generation'),
+                json_extract(result,'$.unchanged_polls'),COALESCE(NULLIF(json_extract(result,'$.generation'),''),NULLIF(json_extract(arguments,'$.generation'),'')),
                 occurrence,json_extract(result,'$.ignored_attempt')
              FROM manager_effects WHERE run_id=? AND id!=? AND name IN ('cli_view','cli_send_keys')
              ORDER BY rowid DESC LIMIT ?",
@@ -69,12 +69,18 @@ impl TerminalHistory {
         while let Some(row) = rows.next()? {
             let name: String = row.get(0)?;
             let status: String = row.get(1)?;
+            let same_generation = row
+                .get::<_, Option<String>>(7)?
+                .as_deref()
+                .is_none_or(|previous| previous == generation);
             history.calls += 1;
             if name == "cli_send_keys" {
                 history.inputs += 1;
-                history.uncertain_input |= matches!(status.as_str(), "submitting" | "uncertain");
+                history.uncertain_input |=
+                    same_generation && matches!(status.as_str(), "submitting" | "uncertain");
             }
-            if history.stopped.is_none()
+            if same_generation
+                && history.stopped.is_none()
                 && row.get::<_, Option<String>>(2)?.as_deref() == Some("observation_stopped")
             {
                 let reason: String = row.get(3)?;
@@ -190,7 +196,7 @@ async fn project(
         .call(move |c| {
             let project = current(c, &authority, &generation)?;
             ensure!(
-                !input || !input_held(c, &project.id)?,
+                !input || !input_held(c, &project.id, &project.generation)?,
                 "CLI input is held by a transition; wait for supervised recovery"
             );
             Ok(project)
@@ -198,10 +204,18 @@ async fn project(
         .await
 }
 
-fn input_held(c: &Connection, project: &str) -> Result<bool> {
+fn input_held(c: &Connection, project: &str, generation: &str) -> Result<bool> {
+    let primary = db::project_by_key(c, project)?.generation == generation;
     Ok(crate::cli_switch::latest(c, project)?
         .as_ref()
-        .is_some_and(crate::cli_switch::blocks_worker))
+        .is_some_and(|request| {
+            request.holds_input || (primary && crate::cli_switch::blocks_worker(request))
+        }))
+}
+
+fn with_generation(mut value: Value, generation: &str) -> Value {
+    value["generation"] = json!(generation);
+    value
 }
 
 /// The caller releases its broad project lock before invoking this operation.
@@ -215,26 +229,31 @@ pub(crate) async fn send(
     if args.generation.is_empty() {
         args.generation = project(app, authority, "", false).await?.generation;
     }
+    let denial = |reason, message| with_generation(stopped(reason, message), &args.generation);
     let history = history(app, authority, effect, &args.generation).await?;
     if let Some(denied) = history.stop() {
-        return Ok(denied);
+        return Ok(with_generation(denied, &args.generation));
     }
     if history.uncertain_input {
-        return Ok(stopped(
+        return Ok(denial(
             "terminal_input_uncertain",
             "Previous terminal input may already have been submitted. Inspect existing evidence and do not replay it.",
         ));
     }
     if history.inputs >= MAX_INPUT_CALLS {
-        return Ok(stopped(
+        return Ok(denial(
             "terminal_input_budget_exhausted",
             "Terminal input budget exhausted for this turn. Use a different strategy.",
         ));
     }
     let project_id = authority.project.clone();
-    let blocked = app.db.call(move |c| input_held(c, &project_id)).await?;
+    let target = args.generation.clone();
+    let blocked = app
+        .db
+        .call(move |c| input_held(c, &project_id, &target))
+        .await?;
     if blocked {
-        return Ok(stopped(
+        return Ok(denial(
             "terminal_input_held",
             "Terminal input is held by a CLI transition. Use worker_status to inspect recovery instead of retrying keys.",
         ));
@@ -377,7 +396,7 @@ where
     }
     let history = history(app, authority, effect, &args.generation).await?;
     if let Some(denied) = history.stop() {
-        return Ok(denied);
+        return Ok(with_generation(denied, &args.generation));
     }
     let initial = project(app, authority, &args.generation, false).await?;
     let screen = tokio::time::timeout(Duration::from_secs(3), observe(initial.clone()))
@@ -391,7 +410,7 @@ where
         fresh.terminal == initial.terminal && fresh.native_session == initial.native_session,
         "The bound terminal changed during inspection"
     );
-    Ok(history.observe(screen))
+    Ok(with_generation(history.observe(screen), &args.generation))
 }
 
 #[cfg(test)]

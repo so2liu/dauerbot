@@ -499,8 +499,26 @@ async fn state(State(app): State<Arc<App>>) -> ApiResult {
     let manager_provider = app.db.call(crate::manager::public_provider).await?;
     for p in projects {
         let id = p.id.clone();
-        let snapshot = app.db.call(move |c| work::snapshot(c, &id)).await?;
+        let current = p.clone();
+        let (snapshot, worker_terminal) = app.db.call(move |c| {
+            let mut snapshot = work::snapshot(c, &id)?;
+            let mut terminal = Value::Null;
+            if current.agent == "auto" {
+                let worker = crate::manager_workers::diagnostic_worker(c, &current)?;
+                if let Some(address) = worker.terminal {
+                    terminal = json!({"terminal":address,"generation":worker.generation});
+                    snapshot.lease = c.query_row(
+                        "SELECT active,updated_at FROM work_leases WHERE project_id=? AND generation=?",
+                        rusqlite::params![id,worker.generation],
+                        |row| Ok(work::Lease {project_id:id.clone(),generation:worker.generation.clone(),
+                            active:row.get(0)?,updated_at:row.get(1)?}),
+                    ).optional()?;
+                }
+            }
+            Ok((snapshot, terminal))
+        }).await?;
         let mut record = json!(p);
+        record["worker_terminal"] = worker_terminal;
         let manager_project = p.id.clone();
         let manager = app
             .db

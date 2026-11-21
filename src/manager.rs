@@ -1298,7 +1298,8 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
     for (id, status, error, origin, event, generation, result) in runs {
         let result: Value = result.as_deref().and_then(|raw| serde_json::from_str::<Value>(raw).ok())
             .filter(|result| result["run_id"] == id).unwrap_or(Value::Null);
-        let stamp = if result.is_null() { status.clone() } else { format!("{status}:result") };
+        let stamp = result["status"].as_str().map_or_else(|| status.clone(),
+            |report_status| format!("{status}:{report_status}"));
         observation(
             c,
             project,

@@ -309,19 +309,23 @@ struct Candidate {
     status: String,
     updated_at: i64,
     seq: Option<i64>,
+    missing_report: bool,
 }
 
 fn pending_results(c: &Connection, worker: &Project) -> Result<Vec<Candidate>> {
     Ok(c.prepare(
-        "SELECT r.id,r.event_id,r.status,r.updated_at,r.native_seq FROM work_runs r
+        "SELECT r.id,r.event_id,r.status,r.updated_at,r.native_seq,
+                COALESCE(json_extract(e.payload,'$.worker_result.run_id')=r.id AND
+                json_extract(e.payload,'$.worker_result.status')='result_missing',0) FROM work_runs r
          JOIN work_events e ON e.id=r.event_id
          WHERE r.project_id=? AND r.generation=? AND e.source='manager_worker'
            AND r.status IN ('submitted','running','settled','failed','uncertain')
-           AND json_extract(e.payload,'$.worker_result.run_id') IS NOT r.id
+           AND (json_extract(e.payload,'$.worker_result.run_id') IS NOT r.id
+                OR json_extract(e.payload,'$.worker_result.status')='result_missing')
            AND NOT EXISTS(SELECT 1 FROM work_runs newer WHERE newer.event_id=e.id AND newer.rowid>r.rowid)
          ORDER BY r.rowid DESC LIMIT 12",
     )?.query_map(params![worker.id, worker.generation], |r| Ok(Candidate {
-        run: r.get(0)?, event: r.get(1)?, status: r.get(2)?, updated_at: r.get(3)?, seq: r.get(4)?,
+        run: r.get(0)?, event: r.get(1)?, status: r.get(2)?, updated_at: r.get(3)?, seq: r.get(4)?, missing_report: r.get(5)?,
     }))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -330,11 +334,12 @@ fn can_release(observed: Option<&Value>, seq: Option<i64>, reported: bool) -> bo
         return false;
     };
     match record["status"]["state"].as_str() {
-        Some("idle" | "done") => seq.is_none_or(|old| {
-            record["state_change_seq"]
+        Some("idle" | "done") => match seq {
+            Some(old) => record["state_change_seq"]
                 .as_i64()
-                .is_some_and(|new| old < new)
-        }),
+                .is_some_and(|new| old < new),
+            None => reported,
+        },
         // A plain CLI without integration hooks can complete through its file
         // contract. A known working or blocked process never gains this route.
         None | Some("unknown") => seq.is_none() && reported,
@@ -360,6 +365,9 @@ pub(crate) async fn collect(
     for candidate in candidates {
         let now = db::now();
         let report = read_result(Path::new(&worker.path), worker, &candidate.run);
+        if candidate.missing_report && report.is_none() {
+            continue;
+        }
         let released = now - candidate.updated_at >= 2_000
             && can_release(observed, candidate.seq, report.is_some());
         let awaiting = matches!(candidate.status.as_str(), "submitted" | "running");
@@ -406,7 +414,8 @@ pub(crate) async fn collect(
             let tx = c.unchecked_transaction()?;
             let changed = tx.execute(
                 "UPDATE work_events SET payload=json_set(payload,'$.worker_result',json(?))
-                 WHERE project_id=? AND id=? AND json_extract(payload,'$.worker_result.run_id') IS NOT ?
+                 WHERE project_id=? AND id=? AND (json_extract(payload,'$.worker_result.run_id') IS NOT ?
+                     OR json_extract(payload,'$.worker_result.status')='result_missing')
                    AND (SELECT id FROM work_runs WHERE event_id=work_events.id ORDER BY rowid DESC LIMIT 1)=?",
                 params![result.to_string(),project,candidate.event,candidate.run,candidate.run],
             )?;
@@ -568,8 +577,24 @@ mv "$2.new" "$2"
                 .status,
             "submitted"
         );
+        let result = result_path(
+            Path::new(&worker.path),
+            &worker.id,
+            &worker.generation,
+            "run",
+        )
+        .unwrap();
+        let late = result.with_file_name("result-fixture-delayed.md");
+        std::fs::rename(&result, &late).unwrap();
         seq.store(6, Ordering::SeqCst);
         let observed = herdr::observe(&cfg, &worker).await.unwrap();
+        collect(&app, &cfg, &worker, Some(&observed)).await.unwrap();
+        let event = app
+            .db
+            .sync(|c| work::event(c, &worker.id, "event"))
+            .unwrap();
+        assert_eq!(event.payload["worker_result"]["status"], "result_missing");
+        std::fs::rename(&late, &result).unwrap();
         collect(&app, &cfg, &worker, Some(&observed)).await.unwrap();
         let event = app
             .db
@@ -589,6 +614,11 @@ mv "$2.new" "$2"
         std::os::unix::fs::symlink(dir.path(), dir.path().join(".dauerbot")).unwrap();
         assert!(open_task_dir(dir.path(), "project", "worker", "attempt", true).is_err());
         assert!(parse_result("Status: success\n").is_none());
+        assert!(!can_release(
+            Some(&json!({"status":{"state":"idle"}})),
+            None,
+            false
+        ));
         assert!(!can_release(
             Some(&json!({"status":{"state":"idle"},"state_change_seq":4})),
             Some(4),

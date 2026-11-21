@@ -382,7 +382,8 @@ impl Desktop {
                             && self.state["projects"].as_array().is_some_and(|projects| {
                                 projects.iter().any(|project| {
                                     project["id"] == self.selected
-                                        && project["generation"] == descriptor.generation
+                                        && terminal_identity(project).is_some_and(|(generation, terminal)|
+                                            generation == descriptor.generation && terminal == descriptor.terminal_id)
                                 })
                             })
                         {
@@ -643,17 +644,10 @@ impl Desktop {
         let project = self.state["projects"]
             .as_array()
             .and_then(|items| items.iter().find(|p| p["id"] == self.selected));
-        let key = project
-            .map(|p| {
-                format!(
-                    "{}/{}/{}",
-                    self.selected,
-                    p["generation"].as_str().unwrap_or(""),
-                    p["terminal"].as_str().unwrap_or("")
-                )
-            })
+        let terminal = project.and_then(terminal_identity);
+        let has_terminal = terminal.is_some();
+        let key = terminal.map(|(generation, terminal)| format!("{}/{generation}/{terminal}", self.selected))
             .unwrap_or_default();
-        let has_terminal = project.is_some_and(|p| p["terminal"].as_str().is_some());
         if key != self.terminal_key {
             self.release_terminal();
             self.terminal_key = key;
@@ -3046,6 +3040,11 @@ fn connection_status(status: &str) -> &str {
         other => other,
     }
 }
+fn terminal_identity(project: &Value) -> Option<(&str, &str)> {
+    let execution = if project["agent"] == "auto" { &project["worker_terminal"] } else { project };
+    Some((execution["generation"].as_str()?, execution["terminal"].as_str()?))
+}
+
 fn agent_name(agent: &str) -> &'static str {
     match agent {
         "auto" => "Automatic workers",

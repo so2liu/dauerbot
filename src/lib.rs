@@ -651,18 +651,32 @@ impl App {
 
         Ok(())
     }
+    async fn terminal_control_target(&self, p: Project, generation: &str) -> Result<Project> {
+        if p.generation == generation && p.terminal.is_some() {
+            return Ok(p);
+        }
+        let generation = generation.to_owned();
+        self.db.call(move |c| {
+            let seat = manager_workers::seat(c, &p, &generation)?
+                .context("This execution changed; reconnect the terminal")?;
+            anyhow::ensure!(seat.project.terminal.is_some(), "This worker has no terminal");
+            Ok(seat.project)
+        }).await
+    }
     pub async fn takeover(&self, key: &str, generation: &str, active: bool) -> Result<Value> {
         let p = self.db.project(key).await?;
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
-        let p = self.db.project(&p.id).await?;
-        if p.generation != generation || p.terminal.is_none() {
-            bail!("This execution changed; reconnect the terminal")
-        }
+        let p = self.terminal_control_target(self.db.project(&p.id).await?, generation).await?;
         if active {
             let cfg = self.config.read().await.clone();
             let record = herdr::observe(&cfg, &p).await?;
-            repair_lane::check_identity(&p, &record)?;
+            if manager_workers::is_plain(&p) {
+                anyhow::ensure!(p.ready && !p.paused, "This worker is not available for control");
+                manager_workers::check_plain_target(&p, &record)?;
+            } else {
+                repair_lane::check_identity(&p, &record)?;
+            }
         }
         let id = p.id.clone();
         let generation_id = generation.to_owned();
@@ -677,10 +691,7 @@ impl App {
         let p = self.db.project(key).await?;
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
-        let p = self.db.project(&p.id).await?;
-        if p.generation != generation || p.terminal.is_none() {
-            bail!("This execution changed; reconnect the terminal")
-        }
+        let p = self.terminal_control_target(self.db.project(&p.id).await?, generation).await?;
         let id = p.id;
         let generation = generation.to_owned();
         self.db
