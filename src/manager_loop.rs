@@ -547,6 +547,7 @@ pub(crate) async fn advance_observed(
     let mut generation = trace.map(|trace| {
         let mut span = trace.span("manager.generation", "generation");
         span.model(&config.model);
+        span.request(&request);
         span
     });
     let started = Instant::now();
@@ -573,6 +574,10 @@ pub(crate) async fn advance_observed(
     };
     if let Some(span) = &mut generation {
         span.response(response.usage);
+        span.assistant(response.choice.iter().filter_map(|part| match part {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        }));
         span.finish("invalid_response");
     }
     if let Some(observation) = &mut observation {
