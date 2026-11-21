@@ -390,8 +390,8 @@ const RESOURCE_ELIGIBLE: &str = "EXISTS(
                 AND i.status IN ('queued','processing')
             )) OR EXISTS(
                 SELECT 1 FROM work_events d
-                WHERE d.project_id=e.project_id AND d.source='management'
-                AND d.status='queued' AND json_extract(d.payload,'$.origin_event_id')=e.id
+                WHERE d.project_id=e.project_id AND d.source IN ('management','manager_worker')
+                AND d.status IN ('queued','worker_waiting') AND json_extract(d.payload,'$.origin_event_id')=e.id
             )
         )
     ))

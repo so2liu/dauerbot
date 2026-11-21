@@ -24,6 +24,7 @@ mod manager_close;
 pub mod manager_context;
 pub mod manager_loop;
 mod manager_terminal;
+mod manager_workers;
 pub mod mcp;
 pub mod model_control;
 pub mod models;
@@ -363,6 +364,7 @@ impl App {
         self.stop_inner_mode(p, true).await
     }
     async fn stop_inner_mode(&self, p: &Project, cancel_intake: bool) -> Result<()> {
+        let worker_stop = if cancel_intake {manager_workers::stop_all(self, p).await} else {Ok(())};
         if p.terminal.is_some() {
             let cfg = self.config.read().await.clone();
             herdr::stop(&cfg, p).await?;
@@ -372,7 +374,7 @@ impl App {
         self.db
             .call(move |c| cli_switch::stopped_mode(c, &id, &generation_id, cancel_intake))
             .await?;
-        Ok(())
+        worker_stop
     }
     pub async fn switch_agent(self: &Arc<Self>, key: &str, agent: &str) -> Result<Project> {
         self.switch_agent_mode(key, agent, false).await
@@ -561,6 +563,7 @@ impl App {
             }
             let publication=repair_lane::validate_outbox(&tx,&message.project_id,&message.attachment)
                 .and_then(|_|manager::validate_outbox(&tx,&message.project_id,&message.attachment))
+                .and_then(|_|manager_workers::validate_outbox(&tx,&message.project_id,&message.attachment))
                 .and_then(|_|autonomy_feishu::validate_publication(&tx,&message.project_id,&message.attachment));
             match publication {
                 Ok(true) => {}
@@ -772,6 +775,7 @@ impl App {
             return Ok(());
         };
         let mut p = self.db.project(key).await?;
+        manager_workers::reconcile(self,&p).await?;
         if self.advance_cli_switch(&p, None, None).await? {
             return Ok(());
         }
@@ -796,7 +800,7 @@ impl App {
             .db
             .call(move |c| {
                 Ok(c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued')",
+            "SELECT EXISTS(SELECT 1 FROM work_events WHERE project_id=? AND status='queued' AND source!='manager_worker')",
             [&project_id], |r| r.get::<_,bool>(0),
         )?)
             })

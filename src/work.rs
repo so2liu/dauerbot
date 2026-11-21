@@ -546,7 +546,7 @@ pub fn claim_next(
     generation: &str,
     now: i64,
 ) -> Result<Option<Run>> {
-    claim(c, project, generation, now, false)
+    claim(c, project, generation, now, false, false)
 }
 
 /// Conversation input steers the live Agent even while earlier work is unfinished.
@@ -557,7 +557,11 @@ pub fn claim_steering(
     generation: &str,
     now: i64,
 ) -> Result<Option<Run>> {
-    claim(c, project, generation, now, true)
+    claim(c, project, generation, now, true, false)
+}
+
+pub(crate) fn claim_worker(c: &Connection, project: &str, generation: &str, now: i64) -> Result<Option<Run>> {
+    claim(c,project,generation,now,false,true)
 }
 
 fn claim(
@@ -566,27 +570,45 @@ fn claim(
     generation: &str,
     now: i64,
     steering_only: bool,
+    independent: bool,
 ) -> Result<Option<Run>> {
     transaction(c, |c| {
+        if independent {
+            let parent = crate::db::project_by_key(c,project)?;
+            if crate::manager_workers::authorize(c,&parent,generation,true).is_err() {
+                return Ok(None);
+            }
+            let in_flight: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=? AND generation=? AND status IN ('submitting','submitted','running','uncertain'))",
+                params![project,generation],|r|r.get(0))?;
+            if in_flight {
+                return Ok(None);
+            }
+        }
         if has_takeover(c, project, generation)?
             || crate::cli_switch::latest(c, project)?
-                .as_ref().is_some_and(crate::cli_switch::blocks_worker)
+                .as_ref().is_some_and(|request| {
+                    request.holds_input || (!independent && crate::cli_switch::blocks_worker(request))
+                })
         {
             return Ok(None);
         }
         // Resource preparation runs independently of project reconciliation.
         // Skip only those messages; later steering must not wait for a download.
-        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=COALESCE(work_events.message_id,(SELECT origin.message_id FROM work_events origin WHERE work_events.source='management' AND origin.id=json_extract(work_events.payload,'$.origin_event_id'))) AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
+        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=COALESCE(work_events.message_id,(SELECT origin.message_id FROM work_events origin WHERE work_events.source IN ('management','manager_worker') AND origin.id=json_extract(work_events.payload,'$.origin_event_id'))) AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
         // A minimal delivery-journal fixture can omit the manager schema.
         // Production stores always install it before reconciling work.
-        let source = if crate::manager::installed(c)? {
-            "source='management'"
+        let source = if independent {
+            "status='worker_waiting' AND source='manager_worker' AND json_extract(payload,'$.target_generation')=?2"
+        } else if crate::manager::installed(c)? {
+            "status='queued' AND source='management'"
         } else {
-            "1=1"
+            "status='queued' AND source!='manager_worker'"
         };
+        let parameters = [project,generation];
+        let parameters = rusqlite::params_from_iter(&parameters[..if independent {2} else {1}]);
         let message = c.query_row(
-            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND (message_id IS NOT NULL OR source='management') AND {source} AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
-            [project], event_row,
+            &format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND (message_id IS NOT NULL OR source IN ('management','manager_worker')) AND {source} AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
+            parameters.clone(), event_row,
         ).optional()?;
         let next = if message.is_some() {
             message
@@ -594,11 +616,11 @@ fn claim(
             if steering_only {
                 return Ok(None);
             }
-            c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND status='queued' AND {source} AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
-              [project],event_row).optional()?
+            c.query_row(&format!("SELECT {EVENT} FROM work_events WHERE project_id=? AND {source} AND {prepared} ORDER BY created_at,rowid LIMIT 1"),
+              parameters,event_row).optional()?
         };
         let Some(event) = next else { return Ok(None) };
-        if !crate::manager::bind_event(c, &event, generation)? {
+        if !independent && !crate::manager::bind_event(c, &event, generation)? {
             return Ok(None);
         }
         let id = crate::db::id();
@@ -643,7 +665,7 @@ pub fn delivery(c: &Connection, run_id: &str, status: &str, error: &str, now: i6
         };
         c.execute("UPDATE work_runs SET status=?,error=?,updated_at=?,finished_at=CASE WHEN ? IN ('interrupted','failed') THEN ? ELSE finished_at END WHERE id=?",
           params![run_status,error,now,run_status,now,run_id])?;
-        c.execute("UPDATE work_events SET status=?,error=?,updated_at=? WHERE id=? AND status!='acknowledged'",params![status,error,now,event])?;
+        c.execute("UPDATE work_events SET status=CASE WHEN ?1='queued' AND source='manager_worker' THEN 'worker_waiting' ELSE ?1 END,error=?2,updated_at=?3 WHERE id=?4 AND status!='acknowledged'",params![status,error,now,event])?;
         c.execute("UPDATE messages SET status=?,error=?,updated_at=? WHERE id=(SELECT message_id FROM work_events WHERE id=?) AND status!='acknowledged'",
           params![status,error,now,event])?;
         c.execute(
@@ -1338,11 +1360,16 @@ pub fn resolve_event(
     transaction(c, |c| {
         let current = event(c, project, id)?;
         ensure!(
-            ["uncertain", "failed", "queued", "submitted", "acknowledged"]
+            ["uncertain", "failed", "queued", "worker_waiting", "submitted", "acknowledged"]
                 .contains(&current.status.as_str()),
             "This event cannot be resolved"
         );
-        let status = if retry { "queued" } else { "dismissed" };
+                if retry && current.source=="manager_worker" {
+            let parent = crate::db::project_by_key(c,project)?;
+            let generation = current.payload["target_generation"].as_str().context("Missing task worker generation")?;
+            crate::manager_workers::authorize(c,&parent,generation,true)?;
+        }
+        let status = if !retry { "dismissed" } else if current.source=="manager_worker" { "worker_waiting" } else { "queued" };
         c.execute(
             "UPDATE work_events SET status=?,error='',updated_at=? WHERE id=?",
             params![status, now, id],
@@ -1376,8 +1403,18 @@ pub fn snapshot(c: &Connection, project: &str) -> Result<WorkState> {
         ))?
         .query_map([project], run_row)?
         .collect::<rusqlite::Result<_>>()?;
-    let execution=c.query_row(&format!("SELECT {EXECUTION} FROM work_executions WHERE project_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1"),
-      [project],execution_row).optional()?;
+    let seats: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='manager_workers')",
+        [], |row| row.get(0)
+    )?;
+    let primary_scope = if seats {
+        "AND generation NOT IN (SELECT generation FROM manager_workers WHERE project_id=?1)"
+    } else {
+        ""
+    };
+    let execution=c.query_row(&format!("SELECT {EXECUTION} FROM work_executions WHERE project_id=?1 {primary_scope}
+        AND generation=COALESCE((SELECT NULLIF(generation,'') FROM projects WHERE id=?1),generation)
+        ORDER BY created_at DESC,rowid DESC LIMIT 1"), [project],execution_row).optional()?;
     let lease = if let Some(execution) = &execution {
         c.query_row("SELECT project_id,generation,active,updated_at FROM work_leases WHERE project_id=? AND generation=?",
           params![project,execution.generation],lease_row).optional()?

@@ -52,7 +52,7 @@ WITH source AS (
 ), delegated AS MATERIALIZED (
     SELECT e.id,e.project_id,e.status,e.created_at,
            json_extract(e.payload,'$.origin_event_id') AS origin
-    FROM work_events e WHERE e.source='management'
+    FROM work_events e WHERE e.source IN ('management','manager_worker')
       AND (:project IS NULL OR e.project_id=:project)
 ), event_links AS (
     SELECT c.id AS item_id,e.id,e.status,e.created_at,e.project_id
@@ -71,8 +71,8 @@ WITH source AS (
         MAX(e.status!='dismissed' AND
             (e.status IN ('submitting','submitted') OR COALESCE(r.status IN ('submitting','submitted','running'),0))) AS active,
         MAX(e.status='dismissed') AS dismissed,
-        MAX(e.status='queued' AND e.created_at<:now-120000) AS stale_queue,
-        MAX(e.status='queued') AS queued,
+        MAX(e.status IN ('queued','worker_waiting') AND e.created_at<:now-120000) AS stale_queue,
+        MAX(e.status IN ('queued','worker_waiting')) AS queued,
         MAX(e.status IN ('delivered','completed','consumed','transferred','cancelled','dismissed') OR
             COALESCE(r.status IN ('settled','completed'),0)) AS ended,
         MIN(CASE WHEN r.started_at>=e.created_at THEN r.started_at-e.created_at END) AS queue_ms
@@ -175,7 +175,8 @@ WITH source AS (
         NOT(COALESCE(w.active OR w.queued,0) OR COALESCE(i.active,0) OR COALESCE(r.active,0))
           AND (COALESCE(w.ended,0) OR COALESCE(i.ended,0) OR COALESCE(r.ended,0)) AS ended,
         EXISTS(SELECT 1 FROM active_projects a WHERE a.project_id=c.project_id) AS project_working,
-        EXISTS(SELECT 1 FROM manager_failures f WHERE f.project_id=c.project_id) AS project_failed,
+        EXISTS(SELECT 1 FROM manager_failures f WHERE f.project_id=c.project_id
+            AND COALESCE(json_extract(f.diagnostic,'$.kind'),'')!='turn_budget_exhausted') AS project_failed,
         EXISTS(SELECT 1 FROM work_leases l WHERE l.project_id=c.project_id AND l.generation=c.generation AND l.active=1) AS takeover,
         EXISTS(SELECT 1 FROM cli_switch_requests s WHERE s.project_id=c.project_id AND s.holds_input=1) AS switching,
         COALESCE(o.reply_count,0) AS reply_count, COALESCE(o.receipt_count,0) AS receipt_count,

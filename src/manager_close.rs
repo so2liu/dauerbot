@@ -49,11 +49,13 @@ fn guard(c: &Connection, p: &Project, generation: &str, terminal: &str) -> Resul
         "Execution is not finished"
     );
     let bound: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM projects WHERE generation=? OR terminal=?)",
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE generation=?1 OR terminal=?2)
+            OR EXISTS(SELECT 1 FROM manager_workers WHERE state IN ('starting','ready')
+              AND (generation=?1 OR json_extract(execution,'$.terminal_id')=?2))",
         params![generation, terminal],
         |r| r.get(0),
     )?;
-    ensure!(!bound, "A current project still binds this execution");
+    ensure!(!bound, "A current project or task worker still binds this execution");
     ensure!(
         !p.paused && !work::has_takeover(c, &p.id, &p.generation)?,
         "Management is paused or under user takeover"
@@ -62,7 +64,7 @@ fn guard(c: &Connection, p: &Project, generation: &str, terminal: &str) -> Resul
         !crate::cli_switch::latest(c, &p.id)?.is_some_and(|r| r.holds_input),
         "A CLI transition still owns execution delivery"
     );
-    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND (finished_at IS NULL OR status NOT IN ('settled','completed','cancelled','interrupted','failed'))) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR json_extract(payload,'$.target_generation') IS NULL)) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status IN ('queued','processing') AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
+    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND (finished_at IS NULL OR status NOT IN ('settled','completed','cancelled','interrupted','failed'))) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','worker_waiting','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR json_extract(payload,'$.target_generation') IS NULL)) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status IN ('queued','processing') AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
     ensure!(
         !active,
         "Pending or uncertain work still refers to this execution"
@@ -221,7 +223,16 @@ pub(crate) async fn close(
     let result = json!({"status":status,"evidence":evidence,"dispatch_acknowledged":acknowledged,"verified_absent":absent});
     let id = effect.to_owned();
     let saved = result.clone();
-    app.db.call(move |c| audit(c, &id, status, &saved)).await?;
+    let generation = args.generation;
+    app.db.call(move |c| {
+        let tx = c.unchecked_transaction()?;
+        if absent {
+            crate::manager_workers::closed(&tx,&generation)?;
+        }
+        audit(&tx,&id,status,&saved)?;
+        tx.commit()?;
+        Ok(())
+    }).await?;
     Ok(result)
 }
 
@@ -352,6 +363,19 @@ mod tests {
         let event = crate::manager::test_delegate(c, &p.id, "delivery-fixture", None)?;
         c.execute("UPDATE work_events SET payload=json_set(payload,'$.target_generation',?) WHERE id=?", params![OLD,event])?;
         work::event(c, &p.id, &event)
+    }
+    #[tokio::test]
+    async fn a_task_worker_binding_protects_even_an_old_execution_record() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c| {
+            guard(c, &p, OLD, "old-terminal")?;
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at)
+                VALUES(?,?,'codex','fixture','ready',0)", params![OLD,p.id])?;
+            assert!(guard(c, &p, OLD, "old-terminal").unwrap_err().to_string().contains("task worker"));
+            crate::manager_workers::closed(c, OLD)?;
+            guard(c, &p, OLD, "old-terminal")?;
+            Ok(())
+        }).unwrap();
     }
     #[tokio::test]
     async fn resolved_delivery_attempts_allow_close_but_active_and_uncertain_work_do_not() {

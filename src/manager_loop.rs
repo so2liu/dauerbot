@@ -1,7 +1,9 @@
 //! IO-free Rig checkpoints plus one explicitly configured provider call.
 //! The host owns durable admission, revisions, tool effects and uncertainty.
 use anyhow::{Result, bail, ensure};
-use rig_agent::run::{AgentRun, AgentRunStep, InvalidToolCallAction, ModelTurn, ModelTurnOutcome};
+use rig_agent::run::{
+    AgentRun, AgentRunStep, InvalidToolCallAction, ModelTurn, ModelTurnOutcome, PromptError,
+};
 use rig_core::{
     completion::{CompletionRequest, FinishReason, ToolDefinition},
     error::{ErrorKind, ProviderError},
@@ -54,6 +56,7 @@ impl Failure {
             "context_rejected" => "The management request exceeded the context limit",
             "request_rejected" => "The management provider rejected the request",
             "invalid_response" => "The management response was incomplete or invalid",
+            "turn_budget_exhausted" => "The management turn reached its model-call budget",
             "context_preparation" => "The management context could not be prepared",
             _ => "The management run could not continue",
         }
@@ -77,6 +80,17 @@ impl Failure {
             output_tokens: None,
             finish_reason: None,
         }
+    }
+    fn advance(error: PromptError, fallback: impl FnOnce() -> anyhow::Error) -> anyhow::Error {
+        if matches!(error, PromptError::MaxTurns { .. }) {
+            return Self {
+                kind: "turn_budget_exhausted".into(),
+                retryable: true,
+                ..Self::internal()
+            }
+            .into();
+        }
+        fallback()
     }
     fn invalid_response() -> Self {
         Self {
@@ -219,18 +233,18 @@ fn definitions() -> Vec<ToolDefinition> {
             vec!["path", "content"],
         ),
         (
-            "Delegate coding to this project's native CLI worker; returns a durable receipt. Optional target_cli selects a supported CLI through the ordinary cooperative handoff; held is not delivery and readiness failures remain visible in worker_status. Omit it to keep the current selection. Select source_event_id from trusted_sources when multiple discussions are present.",
+            "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only. An unavailable or starting worker returns worker_unavailable and queues no work. Use worker_status to inspect independent workers. Omit target_cli for the project’s selected conversation. Select source_event_id from trusted_sources when multiple discussions are present.",
             json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy"]}}),
             vec!["instructions"],
         ),
         (
-            "Observe this project's native worker and delegated work receipts. For an owned continuing input, provide input_id to inspect the full durable effect ancestry, not only recent history. Page using after_effect and detail_offset; recorded confirmed or uncertain effects must not be replayed.",
+            "Observe this project's native workers and generation-scoped delegated work receipts. For an owned continuing input, provide input_id to inspect the full durable effect ancestry, not only recent history. Page using after_effect and detail_offset; recorded confirmed or uncertain effects must not be replayed.",
             json!({"input_id":{"type":"string"},"after_effect":{"type":"integer","minimum":0},"detail_offset":{"type":"integer","minimum":0,"maximum":262144}}),
             vec![],
         ),
         (
-            "Steer this project's native coding worker. Optional target_cli selects a supported CLI; if it differs, instructions wait behind the cooperative handoff for the selected successor instead of reaching the old worker. Omit it for current-worker steering. Select source_event_id from trusted_sources when multiple discussions are present.",
-            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy"]}}),
+            "Steer this project's selected native coding worker. Use delegate with target_cli to assign separate work to a task worker. Select source_event_id from trusted_sources when multiple discussions are present.",
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"}}),
             vec!["instructions"],
         ),
         (
@@ -580,14 +594,16 @@ pub(crate) async fn advance_observed(
         state.pending = state
             .run
             .next_step()
-            .map_err(|_| Failure::invalid_response().elapsed(started))?;
+            .map_err(|error| {
+                Failure::advance(error, || Failure::invalid_response().elapsed(started).into())
+            })?;
         return corrected(&mut state, error);
     }
     state.correction_used = false;
     state.pending = state
         .run
         .next_step()
-        .map_err(|_| anyhow::anyhow!("Manager run could not advance"))?;
+        .map_err(|error| Failure::advance(error, || anyhow::anyhow!("Manager run could not advance")))?;
     step(state, true)
 }
 fn corrected(state: &mut Checkpoint, error: Failure) -> Result<LoopStep> {
@@ -638,7 +654,7 @@ pub fn supply_tool_results(checkpoint: Value, results: Vec<(String, Value)>) -> 
     state.pending = state
         .run
         .next_step()
-        .map_err(|_| anyhow::anyhow!("Manager run could not continue"))?;
+        .map_err(|error| Failure::advance(error, || anyhow::anyhow!("Manager run could not advance")))?;
     encode(&state)
 }
 
@@ -749,6 +765,34 @@ mod tests {
     fn answer(content: Value, calls: Value) -> Value {
         json!({"id":"fixture-response","object":"chat.completion","created":1,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":content,"tool_calls":calls},"finish_reason":if calls.is_array(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})
     }
+    #[tokio::test]
+    async fn reports_the_real_model_turn_limit_as_a_recoverable_boundary() {
+        let calls = json!([{"id":"inspect","type":"function","function":{"name":"worker_status","arguments":"{}"}}]);
+        let (config, f, server) = fixture(vec![answer(Value::Null, calls); 32], false).await;
+        let mut checkpoint = begin("First input".into(), "Inspect the worker.".into()).unwrap();
+        for turn in 1..=32 {
+            let step = advance(&config, checkpoint, CancellationToken::new())
+                .await
+                .unwrap();
+            let LoopAction::Tools(calls) = step.action else {
+                panic!("expected tool call")
+            };
+            let next = supply_tool_results(
+                step.checkpoint,
+                vec![(calls[0].occurrence.clone(), json!({"ready":true}))],
+            );
+            if turn == 32 {
+                let error = next.unwrap_err().downcast::<Failure>().unwrap();
+                assert_eq!(error.kind, "turn_budget_exhausted");
+                assert!(error.retryable);
+                break;
+            }
+            checkpoint = next.unwrap();
+        }
+        assert_eq!(f.requests.load(Ordering::SeqCst), 32);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn declared_images_reach_initial_and_followup_wire_without_checkpoint_pixels() {
         use crate::multimodal::{ImageRef, fixture_resource};
