@@ -669,7 +669,23 @@ pub(crate) fn fail(c: &Connection, project: &str, generation: &str, reason: &str
 
 pub(crate) async fn reconcile(app: &Arc<App>, parent: &Project) -> Result<()> {
     let p = parent.clone();
-    let seats = app.db.call(move |c| active(c, &p)).await?;
+    let seats = app.db.call(move |c| {
+        let mut seats = active(c,&p)?;
+        let unavailable = c.prepare("SELECT w.generation FROM manager_workers w
+            WHERE w.project_id=? AND w.token='' AND w.state='unavailable'
+               AND EXISTS(SELECT 1 FROM work_runs r JOIN work_events e ON e.id=r.event_id
+                   WHERE r.project_id=w.project_id AND r.generation=w.generation AND e.source='manager_worker'
+                     AND r.status IN ('submitted','running','settled','failed','uncertain')
+                     AND (json_extract(e.payload,'$.worker_result.run_id') IS NOT r.id
+                       OR json_extract(e.payload,'$.worker_result.status')='result_missing'))")?
+          .query_map([&p.id], |row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for generation in unavailable {
+            if let Some(seat) = seat(c,&p,&generation)? {
+                seats.push(seat);
+            }
+        }
+        Ok(seats)
+    }).await?;
     let cfg = app.config.read().await.clone();
     let mut tasks = tokio::task::JoinSet::new();
     for s in seats {
@@ -681,9 +697,12 @@ pub(crate) async fn reconcile(app: &Arc<App>, parent: &Project) -> Result<()> {
             // Project controls are held by the caller. Each owned seat is
             // observed independently so one unavailable transport cannot
             // delay dispatch into a different verified terminal.
-            if let Err(error) =
+            let result = if s.state == "unavailable" {
+                crate::worker_task::collect(&app,&cfg,&worker,None).await
+            } else {
                 reconcile_one(&app, &cfg, &parent, &worker, &s.state, s.created_at).await
-            {
+            };
+            if let Err(error) = result {
                 tracing::warn!(generation=%worker.generation, "Worker reconciliation failed: {error}");
             }
         });

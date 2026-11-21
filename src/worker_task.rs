@@ -310,23 +310,60 @@ struct Candidate {
     updated_at: i64,
     seq: Option<i64>,
     missing_report: bool,
+    row: i64,
 }
 
 fn pending_results(c: &Connection, worker: &Project) -> Result<Vec<Candidate>> {
-    Ok(c.prepare(
+    use rusqlite::OptionalExtension;
+    let cursor: i64 = c
+        .query_row(
+            "SELECT COALESCE(json_extract(execution,'$.result_cursor'),0)
+         FROM manager_workers WHERE project_id=? AND generation=?",
+            params![worker.id, worker.generation],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let mut statement = c.prepare(
         "SELECT r.id,r.event_id,r.status,r.updated_at,r.native_seq,
                 COALESCE(json_extract(e.payload,'$.worker_result.run_id')=r.id AND
-                json_extract(e.payload,'$.worker_result.status')='result_missing',0) FROM work_runs r
+                json_extract(e.payload,'$.worker_result.status')='result_missing',0), r.rowid FROM work_runs r
          JOIN work_events e ON e.id=r.event_id
-         WHERE r.project_id=? AND r.generation=? AND e.source='manager_worker'
+         WHERE r.project_id=? AND r.generation=? AND r.rowid>? AND e.source='manager_worker'
            AND r.status IN ('submitted','running','settled','failed','uncertain')
            AND (json_extract(e.payload,'$.worker_result.run_id') IS NOT r.id
                 OR json_extract(e.payload,'$.worker_result.status')='result_missing')
            AND NOT EXISTS(SELECT 1 FROM work_runs newer WHERE newer.event_id=e.id AND newer.rowid>r.rowid)
-         ORDER BY r.rowid DESC LIMIT 12",
-    )?.query_map(params![worker.id, worker.generation], |r| Ok(Candidate {
-        run: r.get(0)?, event: r.get(1)?, status: r.get(2)?, updated_at: r.get(3)?, seq: r.get(4)?, missing_report: r.get(5)?,
-    }))?.collect::<rusqlite::Result<Vec<_>>>()?)
+         ORDER BY r.rowid LIMIT 12",
+    )?;
+    let mut page = |after| {
+        statement
+            .query_map(params![worker.id, worker.generation, after], |r| {
+                Ok(Candidate {
+                    run: r.get(0)?,
+                    event: r.get(1)?,
+                    status: r.get(2)?,
+                    updated_at: r.get(3)?,
+                    seq: r.get(4)?,
+                    missing_report: r.get(5)?,
+                    row: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    };
+    let mut candidates = page(cursor)?;
+    if candidates.is_empty() && cursor != 0 {
+        candidates = page(0)?;
+    }
+    let next = candidates.last().map_or(0, |candidate| candidate.row);
+    if next != cursor {
+        c.execute(
+            "UPDATE manager_workers SET execution=json_set(execution,'$.result_cursor',?)
+            WHERE project_id=? AND generation=?",
+            params![next, worker.id, worker.generation],
+        )?;
+    }
+    Ok(candidates)
 }
 
 fn can_release(observed: Option<&Value>, seq: Option<i64>, reported: bool) -> bool {
@@ -605,6 +642,45 @@ mv "$2.new" "$2"
         assert_eq!(reported["reported_status"], "success");
         assert_eq!(reported["semantic_task_success"], "unconfirmed");
         assert_eq!(reported["terminal_excerpt"], "Fixture result written");
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at,execution)
+                VALUES(?,?,'pi','','unavailable',0,'{}')", params![worker.generation,worker.id])?;
+            for index in 0..13 {
+                let event = format!("late-event-{index}");
+                let run = format!("late-run-{index}");
+                c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
+                    SELECT ?,project_id,task_id,'manager_worker',?,?,'uncertain',0,0 FROM work_events WHERE id='event'",
+                    params![event,event,json!({"worker_result":{"run_id":run,"status":"result_missing"}}).to_string()])?;
+                c.execute("INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at)
+                    SELECT ?,project_id,task_id,id,?,'uncertain',0,0 FROM work_events WHERE id=?",
+                    params![run,worker.generation,event])?;
+            }
+            assert_eq!(pending_results(c,&worker)?.len(),12);
+            assert_eq!(pending_results(c,&worker)?[0].run,"late-run-12");
+            assert_eq!(pending_results(c,&worker)?[0].run,"late-run-0");
+            Ok(())
+        }).unwrap();
+        let oldest = result_path(
+            Path::new(&worker.path),
+            &worker.id,
+            &worker.generation,
+            "late-run-0",
+        )
+        .unwrap();
+        fs::create_dir_all(oldest.parent().unwrap()).unwrap();
+        fs::copy(&result, &oldest).unwrap();
+        let parent = app.db.project(&worker.id).await.unwrap();
+        manager_workers::reconcile(&app, &parent).await.unwrap();
+        manager_workers::reconcile(&app, &parent).await.unwrap();
+        app.db
+            .sync(|c| {
+                let oldest = work::event(c, &worker.id, "late-event-0")?;
+                assert_eq!(oldest.status, "uncertain");
+                assert_eq!(oldest.payload["worker_result"]["status"], "reported");
+                assert!(manager_workers::authorize(c, &parent, &worker.generation, true).is_err());
+                Ok(())
+            })
+            .unwrap();
         server.abort();
     }
 
