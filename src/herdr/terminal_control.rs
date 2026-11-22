@@ -5,8 +5,6 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const MAX_SEGMENTS: usize = 32;
-pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_SCREEN_BYTES: usize = 32 * 1024;
 pub const MAX_SCREEN_LINES: usize = 200;
 
@@ -44,11 +42,7 @@ impl<'de> Deserialize<'de> for Segment {
 
 /// Parse every segment before submitting any input. Strings never imply keys.
 pub fn validate(segments: &[Segment]) -> Result<()> {
-    ensure!(
-        !segments.is_empty() && segments.len() <= MAX_SEGMENTS,
-        "Provide between 1 and 32 input segments"
-    );
-    let mut bytes = 0usize;
+    ensure!(!segments.is_empty(), "Provide at least one input segment");
     for segment in segments {
         match segment {
             Segment::Text { text } => {
@@ -59,18 +53,12 @@ pub fn validate(segments: &[Segment]) -> Result<()> {
                         .any(|c| c.is_control() && !matches!(c, '\n' | '\t')),
                     "Text contains a terminal control character; use an explicit key segment"
                 );
-                bytes = bytes.saturating_add(text.len());
             }
             Segment::Key { key } => {
                 canonical_key(key)?;
-                bytes = bytes.saturating_add(key.len());
             }
         }
     }
-    ensure!(
-        bytes <= MAX_INPUT_BYTES,
-        "Input sequence exceeds 16384 bytes"
-    );
     Ok(())
 }
 

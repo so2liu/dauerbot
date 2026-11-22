@@ -10,7 +10,10 @@ pub(super) async fn read(workspace: &Path) -> io::Result<(String, String)> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             tokio::fs::metadata(workspace).await?;
-            return Ok(("missing".into(), "Workspace AGENTS.md is absent.".into()));
+            return Ok((
+                "missing".into(),
+                "<project_memory path=\"AGENTS.md\" status=\"absent\"/>".into(),
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -48,8 +51,8 @@ pub(super) async fn read(workspace: &Path) -> io::Result<(String, String)> {
     Ok((
         digest,
         format!(
-            "Current workspace AGENTS.md:\n{}",
-            String::from_utf8_lossy(&bytes)
+            "<project_memory path=\"AGENTS.md\">{}</project_memory>",
+            crate::xml(&String::from_utf8_lossy(&bytes))
         ),
     ))
 }

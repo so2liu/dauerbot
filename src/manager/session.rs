@@ -31,6 +31,14 @@ pub(super) fn migrate(c: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS manager_session_channel ON manager_session_messages(project_id,channel_id,seq);",
     )?;
+    let has_message_seq: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('manager_ingested_inputs') WHERE name='message_seq')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_message_seq {
+        c.execute("ALTER TABLE manager_ingested_inputs ADD COLUMN message_seq INTEGER", [])?;
+    }
     Ok(())
 }
 
