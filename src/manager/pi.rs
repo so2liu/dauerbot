@@ -111,13 +111,16 @@ async fn tool_request(mut stream: UnixStream, app: &Arc<App>, ctx: &Context) -> 
     let result = if TOOLS.contains(&call.name.as_str())
         && !call.occurrence.is_empty()
         && call.occurrence.len() <= 512
-        && !app.service.manager_gate.is_closed()
     {
         tool(app, ctx, call).await?
     } else {
         json!({"error":"Tool is outside the active Manager allowlist"})
     };
-    stream.write_all(&serde_json::to_vec(&result)?).await?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        stream.write_all(&serde_json::to_vec(&result)?),
+    )
+    .await??;
     stream.shutdown().await?;
     Ok(())
 }
@@ -227,7 +230,12 @@ async fn run(
     config: &ProviderConfig,
     turn: &mut Turn,
 ) -> Result<&'static str> {
+    if app.service.manager_gate.is_closed() {
+        return Ok("yielded");
+    }
     ensure!(!turn.started, "Interrupted Pi run requires recovery");
+    // This RPC transcript has no resumable checkpoint. The actor's existing
+    // manager permit keeps normal handover waiting until this run settles.
     let temporary = tempfile::Builder::new()
         .prefix("dbpi")
         .permissions(Permissions::from_mode(0o700))
@@ -271,10 +279,7 @@ async fn rpc(
             && model["api"] == "openai-completions",
         "Pi did not select the configured Manager provider"
     );
-    ensure!(
-        current(app, ctx).await && !app.service.manager_gate.is_closed(),
-        "Management turn superseded"
-    );
+    ensure!(current(app, ctx).await, "Management turn superseded");
     let request = json!({"type":"prompt","message":turn.prompt,"images":images});
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -290,7 +295,6 @@ async fn rpc(
         tokio::select! {
             _ = &mut deadline => bail!("Pi Manager deadline exceeded"),
             _ = tick.tick() => {
-                if app.service.manager_gate.is_closed() { return Ok("yielded"); }
                 ensure!(!app.shutdown.is_cancelled() && current(app, ctx).await, "Management turn superseded");
             }
             socket = listener.accept() => {
@@ -489,7 +493,7 @@ mod tests {
                 .iter()
                 .find(|part| part["role"] == "tool" && part["tool_call_id"] == "call_bash")
                 .context("Missing rejection from Pi")?;
-            assert!(forbidden_result["content"].to_string().contains("bash"));
+            assert_eq!(forbidden_result["content"], "Tool bash not found");
             assert!(
                 requests[2]["messages"]
                     .to_string()
