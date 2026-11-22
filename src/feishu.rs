@@ -123,64 +123,136 @@ pub(crate) fn ensure_card(card: &Value) -> Result<()> {
     Ok(())
 }
 
-pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendReceipt> {
+#[derive(Debug)]
+pub enum SendError {
+    Precondition(anyhow::Error),
+    Rejected(anyhow::Error),
+    Uncertain(anyhow::Error),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Precondition(error) | Self::Rejected(error) | Self::Uncertain(error) => {
+                std::fmt::Display::fmt(error, f)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
+async fn send_json(
+    request: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+) -> std::result::Result<Value, SendError> {
+    let response = request.await.map_err(|error| {
+        if error.is_builder() {
+            SendError::Precondition(error.without_url().into())
+        } else {
+            SendError::Uncertain(error.without_url().into())
+        }
+    })?;
+    let status = response.status();
+    if status.is_client_error() && status.as_u16() != 408 {
+        let value = response.json::<Value>().await.unwrap_or_default();
+        let message = value["msg"].as_str().unwrap_or("Request rejected");
+        return Err(SendError::Rejected(anyhow::anyhow!(
+            "Feishu API {status}: {message}"
+        )));
+    }
+    if !status.is_success() {
+        return Err(SendError::Uncertain(anyhow::anyhow!("Feishu API {status}")));
+    }
+    let value: Value = response
+        .json()
+        .await
+        .context("Feishu response is not JSON")
+        .map_err(SendError::Uncertain)?;
+    match value["code"].as_i64() {
+        Some(0) => Ok(value),
+        Some(code) => Err(SendError::Rejected(anyhow::anyhow!(
+            "Feishu API {status} / code {code}: {}",
+            value["msg"].as_str().unwrap_or("Request rejected")
+        ))),
+        None => Err(SendError::Uncertain(anyhow::anyhow!(
+            "Feishu response is missing its result code"
+        ))),
+    }
+}
+
+pub async fn send(
+    app: &App,
+    p: &db::Project,
+    m: &db::Message,
+) -> std::result::Result<SendReceipt, SendError> {
     let cfg = app.config.read().await.clone();
-    let binding = app.db.bot(&m.project_id).await?;
+    let binding = app
+        .db
+        .bot(&m.project_id)
+        .await
+        .map_err(SendError::Precondition)?;
     if m.attachment["bot_app_id"]
         .as_str()
         .is_some_and(|id| id != binding.app_id)
     {
-        bail!(
+        return Err(SendError::Precondition(anyhow::anyhow!(
             "This message belongs to the previous bot; review it before sending with a different bot"
-        );
+        )));
     }
-    let token = token(app, &binding).await?;
     let to = m.attachment["to"].as_str().unwrap_or(&p.chat_id);
-    let receive_id_type = recipient_type(to)?;
+    let receive_id_type = recipient_type(to).map_err(SendError::Precondition)?;
+    let token = token(app, &binding).await.map_err(SendError::Precondition)?;
     let (kind, content) = if let Some(card) = m.attachment.get("interactive_card") {
-        ensure_card(card)?;
+        ensure_card(card).map_err(SendError::Precondition)?;
         ("interactive", card.clone())
     } else if let Some(path) = m.attachment["path"].as_str() {
-        let path = if m.attachment["manager_effect"].is_string() {
-            manager_file(p, Path::new(path))?
-        } else {
-            allowed_file(p, Path::new(path), &app.dir)?
-        };
-        let metadata = tokio::fs::metadata(&path).await?;
-        if metadata.len() == 0 || metadata.len() > MAX_FILE {
-            bail!("File size must be greater than 0 and at most 100 MB");
+        let form = async {
+            let path = if m.attachment["manager_effect"].is_string() {
+                manager_file(p, Path::new(path))?
+            } else {
+                allowed_file(p, Path::new(path), &app.dir)?
+            };
+            let metadata = tokio::fs::metadata(&path).await?;
+            if metadata.len() == 0 || metadata.len() > MAX_FILE {
+                bail!("File size must be greater than 0 and at most 100 MB");
+            }
+            let file = tokio::fs::File::open(&path).await?;
+            let filename = path
+                .file_name()
+                .context("File name is invalid")?
+                .to_string_lossy()
+                .into_owned();
+            let part = reqwest::multipart::Part::stream_with_length(
+                reqwest::Body::wrap_stream(ReaderStream::new(file)),
+                metadata.len(),
+            )
+            .file_name(filename.clone());
+            Ok::<_, anyhow::Error>(
+                reqwest::multipart::Form::new()
+                    .text("file_type", "stream")
+                    .text("file_name", filename)
+                    .part("file", part),
+            )
         }
-        let file = tokio::fs::File::open(&path).await?;
-        let filename = path
-            .file_name()
-            .context("File name is invalid")?
-            .to_string_lossy()
-            .into_owned();
-        let part = reqwest::multipart::Part::stream_with_length(
-            reqwest::Body::wrap_stream(ReaderStream::new(file)),
-            metadata.len(),
-        )
-        .file_name(filename.clone());
-        let form = reqwest::multipart::Form::new()
-            .text("file_type", "stream")
-            .text("file_name", filename)
-            .part("file", part);
-        let v = api_json(
+        .await
+        .map_err(SendError::Precondition)?;
+        let v = send_json(
             app.http
                 .post(format!("{}/open-apis/im/v1/files", cfg.feishu_base))
                 .bearer_auth(&token)
                 .multipart(form)
-                .send()
-                .await?,
+                .send(),
         )
         .await?;
         (
             "file",
-            json!({"file_key":v["data"]["file_key"].as_str().context("Missing file_key in the response")?}),
+            json!({"file_key":v["data"]["file_key"].as_str().context("Missing file_key in the response").map_err(SendError::Uncertain)?}),
         )
     } else {
         if m.content.len() > 24_000 {
-            bail!("Markdown exceeds 24000 bytes; send it as a file");
+            return Err(SendError::Precondition(anyhow::anyhow!(
+                "Markdown exceeds 24000 bytes; send it as a file"
+            )));
         }
         let mut paragraph = Vec::new();
         if let Some(mention) = m.attachment["discussion_mention"].as_str()
@@ -194,21 +266,20 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
     let Some(anchor) = m.attachment["reply_to_message_id"].as_str() else {
         let body =
             json!({"receive_id":to,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
-        let value = api_json(
+        let value = send_json(
             app.http
                 .post(format!("{}/open-apis/im/v1/messages", cfg.feishu_base))
                 .query(&[("receive_id_type", receive_id_type)])
                 .bearer_auth(&token)
                 .json(&body)
-                .send()
-                .await?,
+                .send(),
         )
         .await?;
-        return SendReceipt::from_response(&value);
+        return SendReceipt::from_response(&value).map_err(SendError::Uncertain);
     };
     let body =
         json!({"msg_type":kind,"content":content.to_string(),"uuid":m.id,"reply_in_thread":true});
-    let v = api_json(
+    let v = send_json(
         app.http
             .post(format!(
                 "{}/open-apis/im/v1/messages/{anchor}/reply",
@@ -216,11 +287,10 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
             ))
             .bearer_auth(token)
             .json(&body)
-            .send()
-            .await?,
+            .send(),
     )
     .await?;
-    let receipt = SendReceipt::from_response(&v)?;
+    let receipt = SendReceipt::from_response(&v).map_err(SendError::Uncertain)?;
     if receipt.thread_id.is_empty() {
         // Acceptance without a topic is a platform/protocol mismatch, not a
         // safe retry or an invitation to send an ordinary message.
@@ -230,10 +300,10 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
             c.execute("UPDATE messages SET attachment=json_set(attachment,'$.sent_message_id',?),updated_at=? WHERE id=?",
                 rusqlite::params![sent,db::now(),id])?;
             Ok(())
-        }).await?;
-        bail!(
+        }).await.map_err(SendError::Uncertain)?;
+        return Err(SendError::Uncertain(anyhow::anyhow!(
             "Topic reply was accepted without thread_id; verify the recorded message before retrying"
-        );
+        )));
     }
     Ok(receipt)
 }
@@ -1568,8 +1638,12 @@ fn scoped_group(attachment: &Value) -> Option<(&str, &str)> {
 }
 
 fn current_group_cache(value: &Value, chat: &str, app_id: &str) -> bool {
-    value["chat_id"] == chat && value["app_id"] == app_id
-        && value["fetched_at"].as_i64().is_some_and(|t| (0..300_000).contains(&db::now().saturating_sub(t)))
+    value["members_status"] != "unavailable"
+        && value["chat_id"] == chat
+        && value["app_id"] == app_id
+        && value["fetched_at"]
+            .as_i64()
+            .is_some_and(|t| (0..300_000).contains(&db::now().saturating_sub(t)))
 }
 
 fn group_sender(mut value: Value, attachment: &Value) -> Value {
@@ -1644,6 +1718,9 @@ pub async fn context(app: &App, m: &db::Message) -> Value {
     value["chat_id"] = json!(chat);
     value["app_id"] = json!(app_id);
     value["fetched_at"] = json!(db::now());
+    if value["members_status"] == "unavailable" {
+        return group_sender(value, &m.attachment);
+    }
     let stored = app.db.sync(|c| Ok(c.execute(
         "UPDATE conversations SET context=?1,name=CASE WHEN ?2='' THEN name ELSE ?2 END
          WHERE project_id=?3 AND chat_id=?4 AND EXISTS(

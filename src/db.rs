@@ -344,7 +344,7 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_mode(path, true)
     }
-    /// A drained ownership transfer has no abandoned effects to reclassify.
+    /// Open only after journal authorization and predecessor drain.
     pub fn open_handover(path: &Path) -> Result<Self> {
         Self::open_mode(path, false)
     }
@@ -409,13 +409,15 @@ impl Db {
             )?;
         }
         crate::conversation::migrate(&migration)?;
-        crate::discussion::migrate(&migration, recover)?;
+        // Even a drained v7 predecessor may have abandoned Manager effects
+        // and preparation locks that its commit did not recover.
+        crate::discussion::migrate(&migration, true)?;
         crate::bot::migrate(&migration)?;
         crate::group_ingress::migrate(&migration)?;
         if recover {
             migration.execute("UPDATE messages SET status='uncertain',error='The service exited during this operation; verify the result before retrying manually',updated_at=? WHERE status IN ('submitting','sending')", [now()])?;
         }
-        crate::manager::migrate(&migration, recover)?;
+        crate::manager::migrate(&migration, true)?;
         crate::manager_workers::migrate(&migration)?;
         crate::work::migrate(&migration)?;
         crate::autonomy::migrate(&migration)?;
@@ -424,7 +426,7 @@ impl Db {
         crate::cli_switch::migrate(&migration, recover)?;
         crate::models::migrate(&migration)?;
         crate::model_control::migrate(&migration, recover)?;
-        crate::feishu::recover_resource_preparation(&migration, recover)?;
+        crate::feishu::recover_resource_preparation(&migration, true)?;
         migration.pragma_update(None, "user_version", 7)?;
         migration.commit()?;
         Ok(Self(Arc::new(Mutex::new(conn))))

@@ -1214,7 +1214,17 @@ async fn recover_message(app: &App, m: db::Message, retry: bool) -> anyhow::Resu
             }
             c.execute(
                 "UPDATE messages SET status=?,error='',updated_at=? WHERE id=?",
-                rusqlite::params![if retry { "pending" } else { "dismissed" }, db::now(), m.id],
+                rusqlite::params![
+                    if !retry {
+                        "dismissed"
+                    } else if m.direction == "in" {
+                        "queued"
+                    } else {
+                        "pending"
+                    },
+                    db::now(),
+                    m.id
+                ],
             )?;
             tx.commit()?;
             Ok(())

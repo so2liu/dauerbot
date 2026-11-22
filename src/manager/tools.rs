@@ -89,7 +89,7 @@ async fn perform(
     channel: &str,
 ) -> Result<Value> {
     let lock = app.project_lock(&ctx.project).await;
-    let guard = lock.lock().await;
+    let guard = lock.clone().lock_owned().await;
     let context = ctx.clone();
     let approved_proposal = app
         .db
@@ -102,11 +102,23 @@ async fn perform(
     match call.name.as_str() {
         "read_file" => {
             let a: FileArgs = serde_json::from_value(call.arguments)?;
-            read_file(Path::new(&p.path), a)
+            drop(guard);
+            tokio::task::spawn_blocking(move || read_file(Path::new(&p.path), a)).await?
         }
         "write_file" => {
             let a: WriteArgs = serde_json::from_value(call.arguments)?;
-            write_file(Path::new(&p.path), a)
+            let db = app.db.clone();
+            let context = ctx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                write_file_checked(Path::new(&p.path), a, |mutate| {
+                    db.sync(|c| {
+                        valid(c, &context)?;
+                        mutate()
+                    })
+                })
+            })
+            .await?
         }
         "delegate" | "steer_worker" => {
             let a: DelegateArgs = serde_json::from_value(call.arguments)?;
@@ -166,6 +178,7 @@ async fn perform(
                 "Choose a CLI with target_cli when delegating a new task"
             );
             let target_cli = a.target_cli.as_deref();
+            drop(guard);
             let selected = if a.target_cli.is_some() || (!steer && p.agent == "auto") {
                 ensure!(
                     !steer,
@@ -183,6 +196,7 @@ async fn perform(
             } else {
                 None
             };
+            let _guard = lock.lock().await;
             let context = ctx.clone();
             let request = effect.to_owned();
             let origin_channel = channel.to_owned();

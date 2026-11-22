@@ -15,7 +15,6 @@ struct DebugReply {
 struct Turn {
     context: Context,
     config: ProviderConfig,
-    ingress_seq: i64,
     debug: Option<DebugReply>,
 }
 
@@ -27,8 +26,7 @@ fn claim(
 ) -> Result<Option<Turn>> {
     let tx = c.unchecked_transaction()?;
     let p = db::project_by_key(&tx, project)?;
-    if p.paused || !uses_manager(&tx, project)? || work::has_takeover(&tx, project, &p.generation)?
-    {
+    if p.paused || !uses_manager(&tx, project)? || work::has_project_takeover(&tx, project)? {
         return Ok(None);
     }
     let provider = tx.query_row(
@@ -51,11 +49,13 @@ fn claim(
     else {
         return Ok(None);
     };
+    // Take newly prepared steering ahead of a proposal or an already claimed
+    // batch, so the same queued input cannot interrupt every retry.
     let mut inputs = tx
         .prepare(&format!(
             "SELECT id,origin_event_id,kind,payload FROM manager_inputs
          WHERE project_id=? AND channel_id=? AND status IN ('queued','processing') AND {}
-         ORDER BY rowid LIMIT 32",
+         ORDER BY (status='queued' AND signal='steer') DESC, rowid LIMIT 32",
             prepared_input(),
         ))?
         .query_map(params![project, channel_id], |r| {
@@ -70,11 +70,6 @@ fn claim(
     if inputs.is_empty() {
         return Ok(None);
     }
-    let ingress_seq = tx.query_row(
-        "SELECT COALESCE(MAX(rowid),0) FROM manager_inputs WHERE project_id=? AND channel_id=?",
-        params![project, channel_id],
-        |row| row.get::<_, i64>(0),
-    )?;
     if inputs[0].2 == "proposal" {
         inputs.truncate(1);
     } else if let Some(index) = inputs.iter().position(|input| input.2 == "proposal") {
@@ -125,7 +120,6 @@ fn claim(
             revision,
             input_revision,
         },
-        ingress_seq,
         debug,
         config: ProviderConfig {
             base_url,
@@ -183,7 +177,7 @@ enum Interrupt {
     Closed,
 }
 
-async fn interruption(app: &App, context: &Context, channel: &str, ingress_seq: i64) -> Interrupt {
+async fn interruption(app: &App, context: &Context, channel: &str) -> Interrupt {
     loop {
         tokio::select! {
             _ = app.shutdown.cancelled() => return Interrupt::Closed,
@@ -200,8 +194,8 @@ async fn interruption(app: &App, context: &Context, channel: &str, ingress_seq: 
             }
             Ok(c.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=? AND channel_id=?
-                 AND rowid>? AND status='queued' AND signal='steer' AND {})", prepared_input()),
-                params![context.project, channel, ingress_seq], |row| row.get::<_, bool>(0),
+                 AND status='queued' AND signal='steer' AND {})", prepared_input()),
+                params![context.project, channel], |row| row.get::<_, bool>(0),
             )?.then_some(Interrupt::Steer))
         }).await;
         match status {
@@ -240,7 +234,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         );
         tokio::select! {
             biased;
-            _ = interruption(&app, context, channel, turn.ingress_seq) => return Ok(()),
+            _ = interruption(&app, context, channel) => return Ok(()),
             result = echo => {
                 if result.is_err() {
                     tracing::warn!("Manager input debug reply failed");
@@ -384,13 +378,13 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                 .max_tokens((limit / 8).min(4096));
             let response = tokio::select! {
                 biased;
-                _ = interruption(&app, context, channel, turn.ingress_seq) => return Ok(()),
+                _ = interruption(&app, context, channel) => return Ok(()),
                 result = llm::call(&turn.config, request, None) => result?,
             };
             let summary = rig_core::transcript::assistant_text_from_choice(&response.choice);
             ensure!(
                 !summary.trim().is_empty(),
-                "Manager compaction returned no summary"
+                Failure::invalid_response()
             );
             let cutoff = history[cut - 1].seq;
             let run = context.clone();
@@ -423,7 +417,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         });
         let response = tokio::select! {
             biased;
-            _ = interruption(&app, context, channel, turn.ingress_seq) => return Ok(()),
+            _ = interruption(&app, context, channel) => return Ok(()),
             result = llm::call(&turn.config, request, Some(&cache_key)) => match result {
                 Err(error) if error.kind == "context_rejected" && !recover_overflow && compactions < 4 => {
                     recover_overflow = true;
@@ -463,11 +457,9 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                         FinishReason::Length | FinishReason::ContentFilter | FinishReason::Other(_)
                     )
                 ),
-            "Incomplete Manager response"
+            Failure::invalid_response()
         );
-        let Some(assistant) = response.message() else {
-            bail!("Incomplete Manager response");
-        };
+        let assistant = response.message().ok_or_else(Failure::invalid_response)?;
         let calls = match &assistant {
             Message::Assistant(message) => message.tool_calls().cloned().collect::<Vec<_>>(),
             _ => Vec::new(),
@@ -476,10 +468,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
             .iter()
             .map(|call| &call.id)
             .collect::<std::collections::BTreeSet<_>>();
-        ensure!(
-            ids.len() == calls.len(),
-            "Manager response repeated a tool call ID"
-        );
+        ensure!(ids.len() == calls.len(), Failure::invalid_response());
         let mut results = Vec::with_capacity(calls.len());
         let mut interrupted = false;
         let mut detached = None;
@@ -524,7 +513,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                 tokio::select! {
                     biased;
                     result = &mut task => result??,
-                    interrupt = interruption(&app, context, channel, turn.ingress_seq) => {
+                    interrupt = interruption(&app, context, channel) => {
                         if matches!(interrupt, Interrupt::Closed) {
                             return Ok(());
                         }
@@ -676,14 +665,7 @@ async fn run_channel(app: Arc<App>, project: &str, channel: &str) -> Result<()> 
         {
             if let Err(error) = result {
                 let error = error.downcast::<Failure>().unwrap_or_else(|_| Failure::internal());
-                if matches!(error.kind.as_str(), "authorization" | "model_unavailable" | "provider_unavailable" | "transport" | "rate_limited") {
-                    failure(c, &context, &error)?;
-                } else {
-                    c.execute("UPDATE manager_channels SET retry_at=? WHERE project_id=? AND channel_id=?",
-                        params![db::now()+30_000,context.project,key])?;
-                }
-                c.execute("UPDATE manager_runs SET status='failed',error=? WHERE id=? AND status='working'",
-                    params![serde_json::to_string(&error)?,context.run])?;
+                failure(c, &context, &error)?;
             } else {
                 c.execute("UPDATE manager_runs SET checkpoint=json_set(checkpoint,'$.actor_done',1) WHERE id=? AND status='working'", [&context.run])?;
                 tools::settle_detached_run(c, &context.run)?;
@@ -787,6 +769,62 @@ mod tests {
             )
             .unwrap();
         app.db.sync(|c| work::sync_inbound(c).map(|_| ())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_steer_interrupts_even_when_queued_before_claim() {
+        let (_dir, app, project, _requests, _server) = fixture().await;
+        ingest(&app, &project, "oc_a", "om_first", "first");
+        ingest(&app, &project, "oc_a", "om_attachment", "attachment");
+        let channel = "feishu:cli_fixture:oc_a";
+        let turn = app.db.sync(|c| {
+            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.file_key','file') WHERE source_id='om_attachment'", [])?;
+            Ok(claim(c, &project.id, channel, None)?.unwrap())
+        }).unwrap();
+        let mut interrupt = Box::pin(interruption(&app, &turn.context, channel));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut interrupt)
+                .await
+                .is_err()
+        );
+        app.db.sync(|c| {
+            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',1) WHERE source_id='om_attachment'", [])?;
+            Ok(())
+        }).unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), interrupt)
+                .await
+                .unwrap(),
+            Interrupt::Steer
+        ));
+    }
+
+    #[tokio::test]
+    async fn automatic_worker_takeover_fences_admission_until_release_or_retirement() {
+        let (_dir, app, project, _requests, _server) = fixture().await;
+        ingest(&app, &project, "oc_a", "om_first", "first");
+        let channel = "feishu:cli_fixture:oc_a";
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET agent='auto',generation='',terminal=NULL WHERE id=?", [&project.id])?;
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,state,created_at,token) VALUES('worker',?,'codex','ready',0,'fixture')", [&project.id])?;
+            work::begin_execution(c, &project.id, "worker", 1)?;
+            let turn = claim(c, &project.id, channel, None)?.unwrap();
+            work::set_takeover(c, &project.id, "worker", true, 2)?;
+            assert!(valid(c, &turn.context).is_err());
+            assert!(claim(c, &project.id, channel, None)?.is_none());
+            work::set_takeover(c, &project.id, "worker", false, 3)?;
+            valid(c, &turn.context)?;
+            work::set_takeover(c, &project.id, "worker", true, 4)?;
+            work::finish_execution(c, &project.id, "worker", "exited", "", 5)?;
+            assert!(!work::has_takeover(c, &project.id, "worker")?);
+            assert!(claim(c, &project.id, channel, None)?.is_some());
+            // A historical binding must not fence its replacement even if an
+            // old client left an active lease behind.
+            crate::manager_workers::closed(c, "worker")?;
+            work::set_takeover(c, &project.id, "worker", true, 6)?;
+            crate::manager_workers::controls(c, &db::project_by_key(c, &project.id)?)?;
+            Ok(())
+        }).unwrap();
     }
 
     #[tokio::test]

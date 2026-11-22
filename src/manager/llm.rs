@@ -39,7 +39,6 @@ impl Failure {
             "context_rejected" => "The management request exceeded the context limit",
             "request_rejected" => "The management provider rejected the request",
             "invalid_response" => "The management response was incomplete or invalid",
-            "turn_budget_exhausted" => "The management turn reached its model-call budget",
             "context_preparation" => "The management context could not be prepared",
             _ => "The management run could not continue",
         }
@@ -64,7 +63,7 @@ impl Failure {
             finish_reason: None,
         }
     }
-    fn invalid_response() -> Self {
+    pub(super) fn invalid_response() -> Self {
         Self {
             kind: "invalid_response".into(),
             http_status: Some(200),

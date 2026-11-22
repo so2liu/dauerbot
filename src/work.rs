@@ -1193,6 +1193,23 @@ pub fn has_takeover(c: &Connection, project: &str, generation: &str) -> Result<b
     )?)
 }
 
+pub fn has_project_takeover(c: &Connection, project: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_leases l
+            LEFT JOIN work_executions e ON e.project_id=l.project_id AND e.generation=l.generation
+            WHERE l.project_id=? AND l.active=1
+              AND (e.status IS NULL OR e.status NOT IN ('sleeping','stopped','exited','error'))
+              AND (EXISTS(SELECT 1 FROM projects p WHERE p.id=l.project_id
+                          AND p.generation=l.generation AND p.terminal IS NOT NULL)
+                   OR EXISTS(SELECT 1 FROM manager_workers w WHERE w.project_id=l.project_id
+                             AND w.generation=l.generation AND w.state IN ('starting','ready')))
+        )",
+        [project],
+        |row| row.get(0),
+    )?)
+}
+
 /// Call only after the execution adapter has independently established native idle.
 /// A clean observation starts the warm period. The journal never proves business success.
 pub fn execution_idle_observed(
