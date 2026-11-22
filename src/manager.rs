@@ -649,6 +649,8 @@ struct DelegateArgs {
     target_cli: Option<String>,
     #[serde(default)]
     generation: Option<String>,
+    #[serde(default)]
+    source_event_id: Option<String>,
 }
 fn file_parent(root: &Path, path: &str) -> Result<(fs::File, std::ffi::CString)> {
     use std::os::fd::{AsRawFd, FromRawFd};

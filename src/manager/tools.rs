@@ -197,7 +197,28 @@ async fn perform(
             let origin_channel = channel.to_owned();
             app.db.call(move|c|{
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
-      let origin=tx.query_row("SELECT origin_event_id FROM manager_runs WHERE id=?", [&context.run], |row| row.get::<_,Option<String>>(0))?;
+      let run_origin=tx.query_row("SELECT origin_event_id FROM manager_runs WHERE id=?", [&context.run], |row| row.get::<_,Option<String>>(0))?;
+      let origin = if let Some(requested) = a.source_event_id.as_deref() {
+          ensure!(
+              !approved_proposal || run_origin.as_deref() == Some(requested),
+              "Approved proposal must use its own source_event_id"
+          );
+          let valid_source: bool = tx.query_row(
+              "SELECT EXISTS(SELECT 1 FROM manager_inputs i
+               JOIN work_events e ON e.id=i.origin_event_id AND e.project_id=i.project_id
+               WHERE i.project_id=? AND i.channel_id=? AND i.origin_event_id=?
+               AND i.kind!='worker' AND (i.kind!='proposal' OR ?))",
+              params![p.id, origin_channel, requested, approved_proposal],
+              |row| row.get(0),
+          )?;
+          ensure!(
+              valid_source,
+              "source_event_id must reference a trusted request in this channel"
+          );
+          Some(requested.to_owned())
+      } else {
+          run_origin
+      };
       let proposal = origin.as_deref().map(|id| work::event(&tx, &p.id, id)).transpose()?
         .filter(|event| event.source == "autonomy");
       let instructions = if let Some(proposal) = &proposal {
@@ -442,8 +463,8 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             vec!["path", "content"],
         ),
         (
-            "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only.",
-            json!({"instructions":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy","custom"]}}),
+            "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only; optional source_event_id selects a specific incoming platform.event_id from this channel.",
+            json!({"instructions":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy","custom"]},"source_event_id":{"type":"string"}}),
             vec!["instructions"],
         ),
         (

@@ -221,27 +221,41 @@ pub(super) fn estimated_tokens(entry: &Entry) -> u64 {
     bytes.div_ceil(3) + 1024 * entry.images.len() as u64
 }
 
+fn is_tool_result(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::User { content }
+            if content.iter().any(|part| matches!(part, UserContent::ToolResult(_)))
+    )
+}
+
 pub(super) fn compaction_cut(history: &[Entry], cutoff: i64, keep: u64) -> Option<usize> {
     let mut retained = 0;
+    let mut fallback = None;
     for index in (1..history.len()).rev() {
         retained += estimated_tokens(&history[index]);
         let next = &history[index];
         if retained >= keep
             && history[index - 1].seq > cutoff
             && history[index - 1].seq < next.seq
-            && matches!(&next.message, Message::User { content } if !content.iter().any(|part| matches!(part, UserContent::ToolResult(_))))
-            && validate_canonical(
-                &history[..index]
-                    .iter()
-                    .map(|entry| entry.message.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .is_ok()
+            && !is_tool_result(&next.message)
         {
-            return Some(index);
+            let prefix = history[..index]
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect::<Vec<_>>();
+            let suffix = std::iter::once(Message::user("summary"))
+                .chain(history[index..].iter().map(|entry| entry.message.clone()))
+                .collect::<Vec<_>>();
+            if validate_canonical(&prefix).is_ok() && validate_canonical(&suffix).is_ok() {
+                if matches!(next.message, Message::User { .. }) {
+                    return Some(index);
+                }
+                fallback.get_or_insert(index);
+            }
         }
     }
-    None
+    fallback
 }
 
 pub(super) fn compact(
@@ -307,7 +321,45 @@ mod tests {
         })
         .collect::<Vec<_>>();
         assert_eq!(compaction_cut(&history, 0, 1), Some(4));
-        assert_eq!(compaction_cut(&history[..4], 0, 1), None);
+        assert_eq!(compaction_cut(&history[..4], 0, 1), Some(3));
+        assert_eq!(compaction_cut(&history[..3], 0, 1), Some(1));
+    }
+    #[test]
+    fn compaction_cuts_between_completed_tool_exchanges_in_one_turn() {
+        use rig_core::message::{AssistantContent, AssistantMessage, ToolCall, ToolFunction};
+        let exchange = |wire: &str, result: &str| {
+            let id = rig_core::message::CallId::from_wire(wire);
+            let name: rig_core::message::ToolName = "read_file".try_into().unwrap();
+            let call = ToolCall::new(id, ToolFunction::new(name, serde_json::json!({})));
+            let id = call.id.clone();
+            let name = call.function.name.clone();
+            [
+                Message::Assistant(AssistantMessage::new(vec![AssistantContent::ToolCall(
+                    call,
+                )])),
+                Message::User {
+                    content: vec![rig_core::transcript::tool_result_message(
+                        id,
+                        name,
+                        result.into(),
+                    )],
+                },
+            ]
+        };
+        let mut messages = vec![Message::user("inspect multiple files")];
+        messages.extend(exchange("c1", "first large result"));
+        messages.extend(exchange("c2", "second large result"));
+        let history = messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| Entry {
+                seq: index as i64 + 1,
+                message,
+                images: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let keep = estimated_tokens(&history[3]) + estimated_tokens(&history[4]);
+        assert_eq!(compaction_cut(&history, 0, keep), Some(3));
     }
     #[test]
     fn compaction_cannot_cut_only_the_memory_and_summary_prefix() {

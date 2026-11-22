@@ -1083,4 +1083,79 @@ mod tests {
             Ok(())
         }).unwrap();
     }
+
+    #[tokio::test]
+    async fn delegate_can_select_earlier_channel_source_and_rejects_foreign_source() {
+        let (_dir, app, project, mut requests, server) = fixture().await;
+        ingest(&app, &project, "oc_a", "om_first", "first topic");
+        ingest(&app, &project, "oc_a", "om_second", "second topic");
+        ingest(&app, &project, "oc_b", "om_other", "other channel");
+        let (first, other): (String, String) = app
+            .db
+            .sync(|c| {
+                let first: String = c.query_row(
+                    "SELECT id FROM work_events WHERE source_id='om_first'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let other: String = c.query_row(
+                    "SELECT id FROM work_events WHERE source_id='om_other'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                c.execute(
+                    "UPDATE manager_inputs SET status='consumed' WHERE origin_event_id=?",
+                    [&other],
+                )?;
+                Ok((first, other))
+            })
+            .unwrap();
+        let manager = tokio::spawn(run(app.clone()));
+        let (_, respond) = receive(&mut requests).await;
+        respond
+            .send(reply(
+                Value::Null,
+                json!([
+                    {"id":"bad","type":"function","function":{"name":"delegate","arguments":json!({"instructions":"foreign","source_event_id":other}).to_string()}},
+                    {"id":"good","type":"function","function":{"name":"delegate","arguments":json!({"instructions":"for first","source_event_id":first}).to_string()}}
+                ]),
+            ))
+            .unwrap();
+        let (follow, respond) = receive(&mut requests).await;
+        let payload = follow["messages"].to_string();
+        assert!(payload.contains("source_event_id must reference a trusted request in this channel"));
+        respond.send(reply(json!("done"), Value::Null)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let done: i64 = app
+                    .db
+                    .sync(|c| {
+                        Ok(c.query_row(
+                            "SELECT count(*) FROM manager_inputs WHERE channel_id='feishu:cli_fixture:oc_a' AND status='consumed'",
+                            [],
+                            |r| r.get(0),
+                        )?)
+                    })
+                    .unwrap();
+                if done == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let origins: Vec<Option<String>> = app
+            .db
+            .sync(|c| {
+                Ok(c.prepare("SELECT json_extract(payload,'$.origin_event_id') FROM work_events WHERE source IN ('management','manager_worker')")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        assert_eq!(origins, vec![Some(first)]);
+        app.shutdown.cancel();
+        manager.await.unwrap();
+        server.abort();
+    }
 }
