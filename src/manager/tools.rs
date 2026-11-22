@@ -102,7 +102,7 @@ async fn perform(
     match call.name.as_str() {
         "read_file" => {
             let a: FileArgs = serde_json::from_value(call.arguments)?;
-            read_file(Path::new(&p.path), &a.path)
+            read_file(Path::new(&p.path), a)
         }
         "write_file" => {
             let a: WriteArgs = serde_json::from_value(call.arguments)?;
@@ -443,8 +443,8 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
     });
     let schemas = [
         (
-            "Read a UTF-8 file up to 8 MiB; returns content and sha256. Relative paths start at the project workspace.",
-            json!({"path":{"type":"string"}}),
+            "Read a UTF-8 file up to 8 MiB in chunks of up to 128 KiB; returns content, sha256, total_bytes, and next_offset when truncated. Relative paths start at the project workspace.",
+            json!({"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":131072}}),
             vec!["path"],
         ),
         (

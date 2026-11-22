@@ -128,7 +128,15 @@ fn publish(
 async fn generate(app: &Arc<App>, mut request: Request) -> Result<()> {
     let workspace = request.workspace;
     request.evidence["project_goals"] = tokio::task::spawn_blocking(move || {
-        let instructions = read_file(Path::new(&workspace), "AGENTS.md").ok();
+        let instructions = read_file(
+        Path::new(&workspace),
+        super::FileArgs {
+            path: "AGENTS.md".into(),
+            offset: None,
+            limit: None,
+        },
+    )
+    .ok();
         json!(
             instructions
                 .as_ref()

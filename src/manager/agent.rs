@@ -337,15 +337,16 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         let cut = if compactions < 4
             && (recover_overflow || budget_estimate > limit.saturating_sub(reserve))
         {
-            session::compaction_cut(&history, cutoff, keep).and_then(|cut| {
+            session::compaction_cut(&history, cutoff, keep).map(|cut| {
                 if cut <= prefix_len {
-                    Some(cut)
+                    cut
                 } else {
                     session::compaction_cut(
                         &history[..(prefix_len + 1).min(history.len())],
                         cutoff,
                         0,
                     )
+                    .unwrap_or(cut)
                 }
             })
         } else {
@@ -353,11 +354,31 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         };
         if let Some(cut) = cut {
             compactions += 1;
-            let summary = history[..cut]
-                .iter()
-                .map(|entry| &entry.message)
-                .collect::<Vec<_>>();
-            let summary = serde_json::to_string(&summary)?;
+            let max_summary_bytes = ((limit / 2) as usize).saturating_mul(3);
+            let mut summary = String::from("[");
+            let mut remaining = max_summary_bytes;
+            for (i, entry) in history[..cut].iter().enumerate() {
+                if i > 0 {
+                    summary.push(',');
+                }
+                let raw = serde_json::to_string(&entry.message)?;
+                if raw.len() <= remaining {
+                    remaining = remaining.saturating_sub(raw.len());
+                    summary.push_str(&raw);
+                } else {
+                    let cap = remaining.clamp(256, 32 * 1024);
+                    let end = raw.floor_char_boundary(cap.min(raw.len()));
+                    let excerpt = json!({
+                        "truncated_for_compaction": true,
+                        "original_bytes": raw.len(),
+                        "preview": &raw[..end],
+                    })
+                    .to_string();
+                    remaining = remaining.saturating_sub(excerpt.len());
+                    summary.push_str(&excerpt);
+                }
+            }
+            summary.push(']');
             let request = CompletionRequest::new(summary)
                 .preamble("Summarize the earlier conversation. Keep requests, decisions, progress, and confirmed or uncertain tool outcomes.")
                 .max_tokens((limit / 8).min(4096));

@@ -636,6 +636,10 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
 #[serde(deny_unknown_fields)]
 struct FileArgs {
     path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -654,11 +658,12 @@ struct DelegateArgs {
     #[serde(default)]
     source_event_id: Option<String>,
 }
-fn read_file(root: &Path, path: &str) -> Result<Value> {
+fn read_file(root: &Path, args: FileArgs) -> Result<Value> {
     use std::os::unix::fs::OpenOptionsExt;
 
     const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
-    let resolved = root.join(crate::feishu::expand_home(Path::new(path)));
+    const MAX_CHUNK_BYTES: usize = 128 * 1024;
+    let resolved = root.join(crate::feishu::expand_home(Path::new(&args.path)));
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -676,8 +681,29 @@ fn read_file(root: &Path, path: &str) -> Result<Value> {
         "File exceeds the 8 MiB read limit"
     );
     let hash = format!("{:x}", Sha256::digest(&bytes));
-    let content = String::from_utf8(bytes).context("Read UTF-8 files only")?;
-    Ok(json!({"path":path,"content":content,"sha256":hash}))
+    let full = String::from_utf8(bytes).context("Read UTF-8 files only")?;
+    let total = full.len();
+    let offset = args.offset.unwrap_or(0);
+    ensure!(offset <= total, "Read offset exceeds file length");
+    let start = full.floor_char_boundary(offset);
+    let limit = args.limit.unwrap_or(MAX_CHUNK_BYTES).clamp(1, MAX_CHUNK_BYTES);
+    let mut end = full.floor_char_boundary(start.saturating_add(limit).min(total));
+    if end == start && start < total {
+        end = full.ceil_char_boundary(start + 1);
+    }
+    let truncated = start > 0 || end < total;
+    let mut result = json!({
+        "path": args.path,
+        "content": &full[start..end],
+        "sha256": hash,
+        "total_bytes": total,
+        "truncated": truncated,
+    });
+    if truncated {
+        result["offset"] = json!(start);
+        result["next_offset"] = json!(if end < total { Some(end) } else { None::<usize> });
+    }
+    Ok(result)
 }
 
 fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
@@ -1782,13 +1808,35 @@ mod tests {
             )
         };
 
+        let read = |path: &str, offset: Option<usize>| {
+            read_file(
+                &root,
+                FileArgs {
+                    path: path.into(),
+                    offset,
+                    limit: None,
+                },
+            )
+            .unwrap()
+        };
+
         let large = "a".repeat(300_000);
         let first = write(skill, &large, None).unwrap();
-        assert_eq!(read_file(&root, skill).unwrap()["content"], large);
+        let mut assembled = String::new();
+        let mut offset = Some(0);
+        while let Some(next) = offset {
+            let chunk = read(skill, Some(next));
+            assert_eq!(chunk["sha256"], first["sha256"]);
+            assert_eq!(chunk["total_bytes"], large.len());
+            assert_eq!(chunk["truncated"], true);
+            assembled.push_str(chunk["content"].as_str().unwrap());
+            offset = chunk["next_offset"].as_u64().map(|n| n as usize);
+        }
+        assert_eq!(assembled, large);
         fs::set_permissions(&absolute, fs::Permissions::from_mode(0o755)).unwrap();
         let link = dir.path().join("skill-link");
         symlink(&absolute, &link).unwrap();
-        assert_eq!(read_file(&root, "../skill-link").unwrap()["sha256"], first["sha256"]);
+        assert_eq!(read("../skill-link", None)["sha256"], first["sha256"]);
         assert!(write("../skill-link", "wrong", Some("stale hash".into())).is_err());
         assert_eq!(fs::read_to_string(&absolute).unwrap(), large);
         write(
