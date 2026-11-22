@@ -86,7 +86,7 @@ def run(binary, quota):
         smoke.MODEL.script(*[
             {"tool": "delegate", "id": tag, "arguments": {"target_cli": "custom", "instructions": tag}}
             for tag in tags
-        ], {"text": ""})
+        ])
         smoke.fixture.FIXTURE.emit(smoke.fixture.message("om_parallel_fixture", "Start both fixture tasks."))
 
         def entries():

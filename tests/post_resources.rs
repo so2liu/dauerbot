@@ -396,11 +396,13 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
             .flat_map(|m| m["content"].as_array().into_iter().flatten())
             .filter(|part| part["type"] == "image_url")
             .count();
+        let mut requests = state.model_requests.lock().unwrap();
         assert_eq!(
-            image_count, 1,
-            "The real manager request must contain downloaded pixels"
+            image_count,
+            requests.len() + 1,
+            "The active transcript must contain each prepared image"
         );
-        state.model_requests.lock().unwrap().push(body);
+        requests.push(body);
         Json(
             json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":"Image inspected in the fixture."},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
         )
@@ -449,6 +451,8 @@ async fn manager_routing_before_or_during_real_download_does_not_strand_images()
             manager::save_provider(
                 c,
                 manager::ConfigInput {
+                    provider_kind: None,
+                    context_window: None,
                     base_url: format!("{base}/v1"),
                     model: "fixture".into(),
                     api_key: Some("fixture".into()),

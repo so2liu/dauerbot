@@ -409,7 +409,7 @@ def main():
         elif real_agent:
             extra_args=[]
         else:
-            extra_args=[sys.executable,str(ROOT/"scripts/mock_agent.py"),"{bridge_exe}","{credentials}","{native_session}","{instructions}"]
+            extra_args=[sys.executable,str(ROOT/"scripts/mock_agent.py"),"--mcp-config","{mcp_config}","{native_session}","{instructions}"]
         project = api("/projects", {"name": "端到端验证项目", "path": str(workspace), "agent": real_agent or "custom",
                                    "extra_args": extra_args})
         key = project["id"]
@@ -644,7 +644,7 @@ def main():
         FIXTURE.emit(message("om_private", "direct-to-user", chat_type="p2p", chat_id="oc_private"))
         wait_for(lambda: any(c["chat_id"]=="oc_private" for c in api("/conversations")["items"]), "new private chat was not discovered")
         assert next(p for p in api("/state")["projects"] if p["id"] == key)["bot"]["app_id"] == "cli_fixture"
-        wait_for(lambda: any(m["receive_id"]=="ou_fixture" for m in FIXTURE.messages), "agent-selected user destination failed")
+        wait_for(lambda: any(m["receive_id"]=="oc_private" and m.get("fixture_reply_to")=="om_private" for m in FIXTURE.messages), "agent-selected user destination failed")
         wait_for(lambda: any(m["source_id"]=="om_private" and m["status"]=="submitted" for m in api(f"/projects/{key}")["messages"]), "private message did not join the same main session")
         checks.append("new private chat enters fixed bot project without chat binding + XML context + MCP explicit user to")
         FIXTURE.emit(message("om_new_group", "new group without binding", chat_id="oc_new_group"))
@@ -698,17 +698,21 @@ def main():
             assert conn.execute("SELECT COUNT(*) FROM idle_handoffs WHERE project_id=?", (key,)).fetchone()[0] == 0
         checks.append("unknown native-child coverage retains the execution beyond the idle deadline while steering still works")
 
-        # Explicit stop still preserves native continuity and timer wakeup.
+        # Stop holds scheduled work until the project is resumed.
         api(f"/projects/{key}/stop", {})
         wait_for(lambda: project_state()["terminal"] is None, "explicit stop did not release owned execution")
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
         timer = api(f"/projects/{key}/timers", {"name": "Scheduled wakeup", "prompt": "scheduled-wakeup", "kind": "once",
                     "at": due.isoformat(), "timezone": "UTC", "to": "oc_fixture", "request_id": "fixture-timer"})
+        wait_for(lambda: any(e["status"] == "queued" and e["payload"].get("timer_id") == timer["id"]
+                             for e in api(f"/projects/{key}/work")["events"]), "timer did not queue while stopped")
+        assert project_state()["terminal"] is None
+        api(f"/projects/{key}/pause", {"paused": False})
         wait_for(lambda: "scheduled-wakeup" in str(FIXTURE.messages), "timer did not wake the fixture and deliver its result")
         wait_for(settled, "timer run did not finish")
         assert project_state()["terminal"] is not None
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1, "timer wake leaked a workspace"
-        checks.append("durable one-shot timer wakes an explicitly stopped fixture through the persisted input journal")
+        checks.append("durable one-shot timer queues during Stop and wakes the fixture after resume")
         FIXTURE.emit(message("om_schedule_tool", "fixture-create-schedule"))
         wait_for(lambda: "scheduled-via-mcp" in str(FIXTURE.messages), "schedule_run tool did not persist and fire its schedule")
         wait_for(settled, "MCP scheduled input did not settle through native idle")
@@ -767,8 +771,10 @@ def main():
         assert len(legacy_rpc("workspace.list")["workspaces"]) == 1
         checks.append("project stop preserves unrelated user-added terminals in its workspace")
         legacy_rpc("pane.close", {"pane_id": user_pane})
-        wait_for(lambda: next(p for p in api("/state")["projects"] if p["id"] == key)["lifecycle"] == "sleeping", "interrupted history incorrectly made a dormant project require manual startup")
-        FIXTURE.emit(message("om_after_stop", "wake automatically after stop"))
+        assert project_state()["paused"]
+        FIXTURE.emit(message("om_after_stop", "process after explicit resume"))
+        wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "queued" for e in api(f"/projects/{key}/work")["events"]), "Stop did not hold new input")
+        api(f"/projects/{key}/pause", {"paused": False})
         wait_for(lambda: any(e["source_id"] == "om_after_stop" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "stopped execution did not automatically wake for new input")
         assert project_state()["generation"] != stopped_generation
         assert project_state()["native_session"] == stopped_native
@@ -776,7 +782,7 @@ def main():
             launches = [json.loads(line) for line in (workspace / ".fixture-launches").read_text().splitlines()]
             assert launches[-1]["resume"] == stopped_native
         assert next(e for e in api(f"/projects/{key}/work")["events"] if e["source_id"] == "om_interrupted")["status"] == "uncertain"
-        checks.append("new messages automatically resume a stopped execution without replaying its uncertain interrupted work")
+        checks.append("Stop preserves new input and resuming retains native identity without replaying uncertain work")
         api(f"/projects/{key}/pause", {"paused": True})
         api(f"/projects/{key}/stop", {}, "POST")
         FIXTURE.emit(message("om_explicit_pause", "preserve an explicit pause"))
@@ -784,7 +790,7 @@ def main():
         assert project_state()["terminal"] is None
         api(f"/projects/{key}/pause", {"paused": False})
         wait_for(lambda: any(e["source_id"] == "om_explicit_pause" and e["status"] == "delivered" for e in api(f"/projects/{key}/work")["events"]), "unpause did not automatically resume delivery")
-        checks.append("only an explicit pause holds new messages; resuming activity automatically wakes the Agent")
+        checks.append("an explicit pause survives Stop and resuming activity wakes the Agent")
         wait_for(native_idle, "old uncertain work pinned the new execution")
         before_final_stop = project_state()["native_session"]
         assert before_final_stop
@@ -792,6 +798,7 @@ def main():
         wait_for(lambda: project_state()["terminal"] is None, "new execution could not stop with old uncertain history")
         due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)
         api(f"/projects/{key}/timers", {"name":"Independent scheduled work","prompt":"independent-after-stop","kind":"once","at":due.isoformat(),"timezone":"UTC","to":"oc_fixture"})
+        api(f"/projects/{key}/pause", {"paused": False})
         wait_for(lambda: "independent-after-stop" in str(FIXTURE.messages), "old uncertain history blocked independent scheduled wakeup")
         if not real_agent:
             fixture_continuity()

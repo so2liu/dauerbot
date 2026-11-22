@@ -34,6 +34,7 @@ class Model:
         self.trigger = None
         self.started = threading.Event()
         self.release = threading.Event()
+        self.waiting = threading.Event()
 
     def script(self, *steps, trigger=None):
         with self.lock:
@@ -41,17 +42,19 @@ class Model:
             self.trigger = trigger
         self.started.clear()
         self.release.clear()
+        self.waiting.clear()
 
     def reply(self, body):
         with self.lock:
             self.requests.append(body)
             matched = self.trigger is None or self.trigger in json.dumps(body)
-            step = self.steps[0] if self.steps and matched else {"text": ""}
+            step = self.steps[0] if self.steps and matched else {"text": "Done."}
             if self.steps and matched and not step.get("repeat"):
                 self.steps.pop(0)
         if matched:
             self.started.set()
         if step.get("wait"):
+            self.waiting.set()
             assert self.release.wait(20), "controlled provider request was not released"
         if step.get("error"):
             return 503, {"error": {"message": "Fixture provider unavailable", "type": "unavailable"}}
@@ -71,7 +74,7 @@ class ModelHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         assert self.headers.get("Authorization") == "Bearer manager-fixture-secret"
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        assert body.get("stream") is not True, "fixture expects non-streaming checkpoint steps"
+        assert body.get("stream") is not True, "fixture expects non-streaming requests"
         status, value = MODEL.reply(body)
         encoded = json.dumps(value).encode()
         try:
@@ -189,7 +192,7 @@ def run_checks(h):
         {"tool": "read_file", "id": "same-provider-call-id", "arguments": {"path": "manager-note.txt"}},
         {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_write", "text": "manager-file-roundtrip-ok"}},
         {"tool": "send_file", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_write", "path": "manager-note.txt"}},
-        {"text": ""},
+        {"text": "Done."},
     )
     fixture.FIXTURE.emit(fixture.message("om_manager_write", "Write and read a project note, then reply in this topic."))
     fixture.wait_for(lambda: any("Your message is saved" in m["content"] and m.get("fixture_reply_to") == "om_manager_write" for m in fixture.FIXTURE.messages), "missing configuration notice did not use the source topic")
@@ -245,7 +248,7 @@ def run_checks(h):
     MODEL.script(
         {"tool": "write_file", "arguments": {"path": "../escape.txt", "content": "must stay in workspace"}},
         {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_boundary", "text": "boundary-denial-recovered"}},
-        {"text": ""},
+        {"text": "Done."},
     )
     fixture.FIXTURE.emit(fixture.message("om_manager_boundary", "Exercise a rejected file effect and continue the conversation."))
     fixture.wait_for(lambda: any("boundary-denial-recovered" in m["content"] for m in fixture.FIXTURE.messages), "denied file effect prevented normal manager recovery")
@@ -257,7 +260,7 @@ def run_checks(h):
     MODEL.script({"wait": True, "tool": "write_file", "arguments": {"path": "stale-write.txt", "content": "must not be written"}}, trigger="Start the controlled delayed model request.")
     fixture.FIXTURE.emit(fixture.message("om_manager_stale", "Start the controlled delayed model request."))
     assert MODEL.started.wait(10), "delayed provider request did not start"
-    MODEL.script({"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_fresh", "text": "fresh-steer-ok"}}, {"text": ""}, trigger="Supersede the delayed request immediately.")
+    MODEL.script({"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_fresh", "text": "fresh-steer-ok"}}, {"text": "Done."}, trigger="Supersede the delayed request immediately.")
     fixture.FIXTURE.emit(fixture.message("om_manager_fresh", "Supersede the delayed request immediately."))
     fixture.wait_for(lambda: any("fresh-steer-ok" in m["content"] for m in fixture.FIXTURE.messages), "fresh manager steer waited for the stale provider")
     MODEL.release.set()
@@ -265,7 +268,7 @@ def run_checks(h):
     assert not (h.workspace / "stale-write.txt").exists(), "late model tool wrote after supersession"
     h.checks.append("fresh input cancels blocked model request; superseded response cannot admit a file effect")
 
-    MODEL.script({"tool": "delegate", "arguments": {"instructions": "Perform manager-native-delegation-fixture and reply to the trusted source topic."}}, {"text": ""})
+    MODEL.script({"tool": "delegate", "arguments": {"instructions": "Perform manager-native-delegation-fixture and reply to the trusted source topic."}}, {"text": "Done."})
     fixture.FIXTURE.emit(fixture.message("om_manager_delegate", "Delegate this coding task to the native worker."))
     fixture.wait_for(lambda: any(e["source"] == "management" and e["status"] == "delivered" for e in h.api(route + "/work")["events"]), "manager did not wake and delegate to the real HERDR worker", timeout=55)
     fixture.wait_for(lambda: any("manager-native-delegation-fixture" in m["content"] for m in fixture.FIXTURE.messages), "native fixture did not receive the manager directive")
@@ -273,8 +276,8 @@ def run_checks(h):
     assert h.api(route)["project"]["ready"]
     h.checks.append("manager delegation wakes isolated native coding worker with real HERDR and exactly three MCP tools")
 
-    # A claimed batch is not fresh work again when native receipts arrive. Crash
-    # after the real delegation and SDK reply while a second model call is held.
+    # Crash after the real delegation and SDK reply while the next model call
+    # is held. Recovery should reuse the transcript without replaying the tool.
     def rows(sql, params=()):
         with sqlite3.connect((h.run / "bridge.sqlite3").as_uri() + "?mode=ro", uri=True) as db:
             db.execute("PRAGMA query_only=ON")
@@ -290,12 +293,11 @@ def run_checks(h):
     for number in range(3):
         fixture.FIXTURE.emit(fixture.message(f"om_manager_batch_{number}", f"Owned FIFO batch instruction {number}"))
     fixture.wait_for(lambda: len(rows("SELECT id FROM manager_inputs WHERE project_id=? AND status='queued'", (h.key,))) == 3, "three inputs did not queue while paused")
-    origin = rows("SELECT id FROM work_events WHERE project_id=? AND source_id='om_manager_batch_0'", (h.key,))[0][0]
     MODEL.script(
-        {"tool": "delegate", "arguments": {"source_event_id": origin, "instructions": "Complete batch-native-once and reply in the original topic."}},
+        {"tool": "delegate", "arguments": {"instructions": "Complete batch-native-once and reply in the original topic."}},
         {"wait": True, "tool": "worker_status", "arguments": {}},
         {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_batch_0", "text": "manager-batch-recovered-once"}},
-        {"text": ""},
+        {"text": "Done."},
     )
     h.api(route + "/pause", {"paused": False})
     fixture.wait_for(lambda: any("batch-native-once" in m["content"] for m in fixture.FIXTURE.messages), "real native batch delegation did not reply", timeout=55)
@@ -309,22 +311,32 @@ def run_checks(h):
     assert rows("SELECT status FROM manager_runs WHERE id=?", (batch_run,))[0][0] == "working"
     for (input_id,) in batch_ids:
         assert rows("SELECT count(*) FROM manager_run_inputs WHERE input_id=?", (input_id,))[0][0] == 1
-    # Preserve the pending CallModel checkpoint and complete effect journal.
-    h.daemon.terminate()
+    assert MODEL.waiting.wait(10), "post-delegation provider request did not start"
+    before_restart = MODEL.requests[-1]["messages"]
+    assert before_restart[-1]["role"] == "tool"
+    assert before_restart[-2]["tool_calls"][0]["function"]["name"] == "delegate"
+    # Lose the process while the provider request is still in flight.
+    h.daemon.kill()
     h.daemon.wait(timeout=15)
     MODEL.release.set()
+    recovery_request = len(MODEL.requests)
     h.boot()
-    fixture.wait_for(lambda: any("manager-batch-recovered-once" in m["content"] for m in fixture.FIXTURE.messages), "batch checkpoint did not recover after fixture process loss", timeout=30)
+    fixture.wait_for(lambda: any("manager-batch-recovered-once" in m["content"] for m in fixture.FIXTURE.messages), "batch transcript did not recover after fixture process loss", timeout=30)
     fixture.wait_for(drained, "owned batch and queued receipts did not drain after recovery", timeout=30)
-    assert rows("SELECT status FROM manager_runs WHERE id=?", (batch_run,))[0][0] == "complete"
+    assert rows("SELECT status FROM manager_runs WHERE id=?", (batch_run,))[0][0] == "superseded"
     for (input_id,) in batch_ids:
         assert rows("SELECT status FROM manager_inputs WHERE id=?", (input_id,))[0][0] == "consumed"
-        assert rows("SELECT count(*) FROM manager_run_inputs WHERE input_id=?", (input_id,))[0][0] == 1
+        assert rows(
+            "SELECT r.status FROM manager_input_claims c JOIN manager_runs r ON r.id=c.run_id WHERE c.input_id=?",
+            (input_id,),
+        ) == [("complete",)]
+    resumed = MODEL.requests[recovery_request]["messages"]
+    assert resumed[:len(before_restart)] == before_restart, "recovery changed the persisted transcript prefix"
     assert rows("SELECT count(*) FROM work_events WHERE project_id=? AND source='management'", (h.key,))[0][0] == delegation_before + 1
     assert len([m for m in fixture.FIXTURE.messages if "batch-native-once" in m["content"]]) == 1
     assert len([m for m in fixture.FIXTURE.messages if "manager-batch-recovered-once" in m["content"]]) == 1
     assert rows("SELECT count(*) FROM manager_inputs WHERE project_id=? AND kind='worker' AND status='consumed' AND json_extract(payload,'$.semantic_task_success')='unconfirmed'", (h.key,))[0][0] >= 1
-    h.checks.append("FIFO inputs atomically owned; real native receipts do not preempt; fixture process loss resumes original batch with one delegation/reply and consumes queued receipts")
+    h.checks.append("FIFO inputs atomically owned; real native receipts do not preempt; fixture process loss resumes the transcript with one delegation/reply and consumes queued receipts")
 
     MODEL.script({"error": True, "repeat": True}, trigger="Exercise a manager provider outage.")
     fixture.FIXTURE.emit(fixture.message("om_manager_unavailable", "Exercise a manager provider outage."))

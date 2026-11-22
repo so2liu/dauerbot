@@ -408,6 +408,12 @@ impl Span<'_> {
             self.attributes
                 .push(number("gen_ai.usage.input_tokens", input));
         }
+        if let Some(tokens) = usage.cached_input_tokens {
+            self.attributes.push(number("gen_ai.usage.cache_read.input_tokens", tokens));
+        }
+        if let Some(tokens) = usage.cache_creation_input_tokens {
+            self.attributes.push(number("gen_ai.usage.cache_creation.input_tokens", tokens));
+        }
         if let Some(output) = usage.output_tokens {
             self.attributes
                 .push(number("gen_ai.usage.output_tokens", output));
