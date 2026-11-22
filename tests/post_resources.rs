@@ -270,7 +270,8 @@ async fn multiple_resources_are_bounded_cached_and_delivered_with_durable_failur
     let document = app.db.message(&file_id).await.unwrap();
     let documents = feishu::download_resources(&app, &document).await.unwrap();
     assert_eq!(documents[0]["kind"], "file");
-    assert!(documents[0]["media_type"].is_null());
+    assert_eq!(documents[0]["media_type"], "text/plain");
+    assert_eq!(documents[0]["bytes"], b"document bytes".len());
     assert_eq!(
         std::fs::read(documents[0]["local_path"].as_str().unwrap()).unwrap(),
         b"document bytes"
