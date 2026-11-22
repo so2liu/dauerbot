@@ -1761,14 +1761,6 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         // User steering may interrupt an owned batch; observations never do. Reserve
         // one of the 32 NEW claim slots for that control input, without reordering
         // ordinary fresh batches or changing their persisted input order.
-        let decision_origin = latest.as_ref()
-            .or_else(|| continuing.iter().rev().find(|input| input.2 == "user"))
-            .or_else(|| candidates.iter().rev().find(|input| input.1.is_some()))
-            .and_then(|input| input.1.as_deref());
-        let mut topic_decisions = match decision_origin {
-            Some(origin) if !proposal_only => topic_decisions::context(&tx, project, origin, None)?,
-            _ => Value::Null,
-        };
         let steering_priority = !continuing.is_empty() && latest.is_some();
         let mut ordered = candidates;
         if steering_priority && let Some(latest) = latest {
@@ -1828,11 +1820,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                     sources.push(trusted_source(&tx, project, origin)?);
                 }
             }
-            let mut required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":reserved,"continuing_inputs":next,"latest_user_steering":latest_steering,"topic_decisions":topic_decisions});
-            if !topic_decisions.is_null() && required.to_string().len() > 215000 {
-                required.as_object_mut().unwrap().remove("topic_decisions");
-                topic_decisions = Value::Null;
-            }
+            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":reserved,"continuing_inputs":next,"latest_user_steering":latest_steering});
             if required.to_string().len() > 215000 {
                 ensure!(
                     !selected_continuing.is_empty() || steering_priority,
@@ -1879,11 +1867,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             if let Some(ref metadata) = metadata {
                 sources.push(metadata.clone());
             }
-            let mut required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":next,"continuing_inputs":previous,"latest_user_steering":latest_steering,"topic_decisions":topic_decisions});
-            if !topic_decisions.is_null() && required.to_string().len() > 215000 {
-                required.as_object_mut().unwrap().remove("topic_decisions");
-                topic_decisions = Value::Null;
-            }
+            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":next,"continuing_inputs":previous,"latest_user_steering":latest_steering});
             if required.to_string().len() > 215000 && (!inputs.is_empty() || !continuing.is_empty())
             {
                 break;
@@ -1923,9 +1907,20 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         } else {
             None
         };
-        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes,"topic_decisions":topic_decisions});
-        if topic_decisions.is_null() {
-            context.as_object_mut().unwrap().remove("topic_decisions");
+        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes});
+        if !proposal_only {
+            let mandatory = json!({
+                "trusted_project":context["trusted_project"], "trusted_sources":context["trusted_sources"],
+                "new_inputs":context["new_inputs"], "continuing_inputs":context["continuing_inputs"],
+                "latest_user_steering":context["latest_user_steering"],
+            });
+            let budget = 215000usize.saturating_sub(mandatory.to_string().len());
+            let origins = inputs.iter().rev().chain(continuing.iter().rev())
+                .filter_map(|input| input.1.clone());
+            let decisions = topic_decisions::batch(&tx, project, origins, budget)?;
+            if !decisions.as_array().unwrap().is_empty() {
+                context["topic_decisions"] = decisions;
+            }
         }
         if proposal_only {
             for field in ["prior_conversation", "effect_evidence", "manager_decisions"] {
@@ -2917,9 +2912,9 @@ mod tests {
         manager_loop::advance(&turn.config,turn.checkpoint.clone(),CancellationToken::new()).await?;
         let wire=seen.lock().unwrap().take().unwrap();
         let context=prompt_context(&wire).context("captured request context")?;
-        assert_eq!(context["topic_decisions"]["origin_event_id"],current);
+        assert_eq!(context["topic_decisions"][0]["origin_event_id"],current);
         assert!(!context["prior_conversation"].to_string().contains("年代改为"));
-        let decisions=context["topic_decisions"]["decisions"].as_array().unwrap();
+        let decisions=context["topic_decisions"][0]["decisions"].as_array().unwrap();
         assert_eq!(decisions.len(),10);
         assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="年代改为 1324 / 1325" && x["source_event_id"]==correction && x["source_message_id"]=="om_correct"));
         assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="不要约克"));
@@ -2949,6 +2944,25 @@ mod tests {
         assert!(task.contains("年代改为 1324 / 1325") && task.contains("不要约克"));
         assert!(task.contains(&current) && task.contains(&correction));
         assert!(!task.contains("独立分支 1080") && !task.contains("别的话题保密决定"));
+        finish(&turn);
+        for index in 0..31 {
+            insert(&format!("om_pending_{index}"),"om_topic","claim main-thread update");
+        }
+        let other=insert("om_also_claimed","om_other_topic","claim second-thread update");
+        let not_claimed=insert("om_beyond_page","om_never_claimed","outside the claim page");
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            topic_decisions::record(c,&p.id,serde_json::from_value(json!({
+                "source_event_id":not_claimed,"branch":"third","key":"update","kind":"current","evidence":"outside the claim page"
+            }))?)?;
+            Ok(())
+        })?;
+        let batch=claim_turn();
+        let prompt=prompt_context(&batch.checkpoint).unwrap();
+        let contexts=prompt["topic_decisions"].as_array().unwrap();
+        assert_eq!(contexts.len(),2);
+        assert!(contexts.iter().any(|entry|entry["origin_event_id"]==other));
+        assert!(contexts.iter().all(|entry|entry["origin_event_id"]!=not_claimed));
         server.abort();
         Ok(())
     }

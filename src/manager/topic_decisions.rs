@@ -116,6 +116,46 @@ pub(super) fn context(
     let Some(source) = source(c, project, origin)? else {
         return Ok(Value::Null);
     };
+    scoped_context(c, project, origin, &source.scope, branch)
+}
+
+pub(super) fn batch(
+    c: &Connection,
+    project: &str,
+    origins: impl Iterator<Item = String>,
+    budget: usize,
+) -> Result<Value> {
+    let mut scopes = std::collections::HashSet::new();
+    let mut contexts = Vec::new();
+    let mut remaining = budget.min(4096).saturating_sub(32);
+    for origin in origins {
+        let Some(source) = source(c, project, &origin)? else {
+            continue;
+        };
+        if !scopes.insert(source.scope.clone()) {
+            continue;
+        }
+        let mut context = scoped_context(c, project, &origin, &source.scope, None)?;
+        while !context.is_null() && context.to_string().len() + 1 > remaining {
+            if context["decisions"].as_array_mut().unwrap().pop().is_none() {
+                context = Value::Null;
+            }
+        }
+        if !context.is_null() && !context["decisions"].as_array().unwrap().is_empty() {
+            remaining -= context.to_string().len() + 1;
+            contexts.push(context);
+        }
+    }
+    Ok(json!(contexts))
+}
+
+fn scoped_context(
+    c: &Connection,
+    project: &str,
+    origin: &str,
+    scope: &str,
+    branch: Option<&str>,
+) -> Result<Value> {
     // One explicit branch for a worker. The Manager may see separate branches,
     // with the branches kept distinct and no implicit winner picked by the host.
     // An old task anchor selects the discussion, not an older version of its
@@ -136,7 +176,7 @@ pub(super) fn context(
          FROM decisions ORDER BY CASE category WHEN 'current' THEN 0 WHEN 'reference' THEN 1 ELSE 2 END,
          source_order DESC,branch,decision_key LIMIT 10",
     )?;
-    let entries = statement.query_map(params![project,source.scope,branch], |r| {
+    let entries = statement.query_map(params![project,scope,branch], |r| {
         let kind: String = r.get(2)?;
         Ok(json!({"branch":r.get::<_,String>(0)?,"key":r.get::<_,String>(1)?,
             "category":kind,"source_event_id":r.get::<_,String>(3)?,"source_message_id":r.get::<_,String>(4)?,
