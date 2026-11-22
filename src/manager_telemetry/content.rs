@@ -87,6 +87,26 @@ fn token_like(token: &str) -> bool {
                     && token.bytes().any(|b| b.is_ascii_uppercase())))
 }
 
+fn basic_value(value: &str) -> bool {
+    use base64::Engine as _;
+    let token = value.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '(' | ')' | ',' | ';'));
+    if token.len() < 4
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b))
+    {
+        return false;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(token))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(token))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token));
+    decoded.is_ok_and(|bytes| {
+        bytes.contains(&b':') && bytes.iter().all(|b| matches!(b, 0x20..=0x7E))
+    })
+}
+
 pub(super) fn clean(text: &str, secrets: &[&str]) -> String {
     clean_text(text, secrets, 0)
 }
@@ -144,12 +164,14 @@ fn clean_plain(text: &str, secrets: &[&str], depth: usize) -> String {
     for line in text.split_inclusive('\n') {
         let lower = line.to_ascii_lowercase();
         let normalized = lower.replace(['_', '-', ' ', '\t', '"', '\'', '\\'], "");
-        let credential_header = lower
+        let credential_header = line
             .split_whitespace()
-            .zip(lower.split_whitespace().skip(1))
+            .zip(line.split_whitespace().skip(1))
             .any(|(scheme, value)| {
-                scheme.trim_start_matches(['"', '\'', '`', '(']) == "bearer"
-                    && crate::manager_context::bearer_value(value)
+                let scheme = scheme.trim_start_matches(['"', '\'', '`', '(']);
+                (scheme.eq_ignore_ascii_case("bearer")
+                    && crate::manager_context::bearer_value(&value.to_ascii_lowercase()))
+                    || (scheme.eq_ignore_ascii_case("basic") && basic_value(value))
             });
         if credential_header {
             result.push_str("[redacted credential-bearing text]");
@@ -352,6 +374,7 @@ mod tests {
             "sk-fixture-secret",
             "pk-fixture-public",
             "Bearer fixture-short",
+            "Basic Zm9vOmJhcg==",
             "Authorization: Basic Zml4dHVyZTpzZWNyZXQ=",
             "Authorization: Bearer fixture-token",
             "ghp_fixtureToken123456",
