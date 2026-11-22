@@ -169,9 +169,7 @@ fn clean_plain(text: &str, secrets: &[&str], depth: usize) -> String {
             .zip(line.split_whitespace().skip(1))
             .any(|(scheme, value)| {
                 let scheme = scheme.trim_start_matches(['"', '\'', '`', '(']);
-                (scheme.eq_ignore_ascii_case("bearer")
-                    && crate::manager_context::bearer_value(&value.to_ascii_lowercase()))
-                    || (scheme.eq_ignore_ascii_case("basic") && basic_value(value))
+                scheme.eq_ignore_ascii_case("basic") && basic_value(value)
             });
         if credential_header {
             result.push_str("[redacted credential-bearing text]");
@@ -374,6 +372,8 @@ mod tests {
             "sk-fixture-secret",
             "pk-fixture-public",
             "Bearer fixture-short",
+            "Bearer abcdefghijklmno",
+            "Bearer   abcdefghijklmno",
             "Basic Zm9vOmJhcg==",
             "Authorization: Basic Zml4dHVyZTpzZWNyZXQ=",
             "Authorization: Bearer fixture-token",
@@ -426,8 +426,10 @@ mod tests {
 
     #[test]
     fn preserves_benign_prose_and_project_paths() {
-        let text = "basic auth overview and bearer tokens\n0123456789abcdef0123456789abcdef01234567\n550e8400-e29b-41d4-a716-446655440000\n/workspace/Package123456789012345678901234567890/config.json\nt-test, t-shirt, t-shirt-style and u-turn";
+        let text = "basic auth overview\n0123456789abcdef0123456789abcdef01234567\n550e8400-e29b-41d4-a716-446655440000\n/workspace/Package123456789012345678901234567890/config.json\nt-test, t-shirt, t-shirt-style and u-turn";
         assert_eq!(test_clean(text), text);
+        let bearer_prose = test_clean("discussing bearer tokens\nfollowing line survives");
+        assert!(bearer_prose.contains("following line survives"));
         assert!(!sensitive_path("project/config.json"));
         assert!(sensitive_path("dev.herdr.feishu-bridge/config.json"));
         let config = test_clean(r#"{"theme":"dark","password":"fixture-password"}"#);
