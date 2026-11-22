@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.15 — 2026-11-22
+
+### Fixed
+
+- Keep source-backed user decisions available after recent conversation history rolls over. The Manager distinguishes current decisions, historical references, and superseded decisions by discussion and work branch. Delegations carry the selected branch's constraints and source references into the worker task. (#175)
+
 ## 0.6.14 — 2026-11-22
 
 ### Fixed
