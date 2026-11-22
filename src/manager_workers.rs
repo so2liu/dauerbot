@@ -22,8 +22,9 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
             execution TEXT NOT NULL DEFAULT 'null', native_session TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL, origin_event_id TEXT
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS manager_worker_active_cli
-        ON manager_workers(project_id,agent) WHERE state IN ('starting','ready');",
+        DROP INDEX IF EXISTS manager_worker_active_cli;
+        CREATE INDEX IF NOT EXISTS manager_worker_project_cli
+        ON manager_workers(project_id,agent,state);",
     )?;
     Ok(())
 }
@@ -69,7 +70,8 @@ pub(crate) fn seat(c: &Connection, parent: &Project, generation: &str) -> Result
 pub(crate) fn controls(c: &Connection, p: &Project) -> Result<()> {
     ensure!(!p.paused, "Resume this project before delegating work");
     ensure!(
-        !work::has_takeover(c, &p.id, &p.generation)?,
+        !c.query_row("SELECT EXISTS(SELECT 1 FROM work_leases WHERE project_id=? AND active=1)",
+            [&p.id], |row| row.get::<_, bool>(0))?,
         "Terminal input is taken over by the user"
     );
     ensure!(
@@ -109,7 +111,7 @@ pub(crate) fn diagnostic_worker(c: &Connection, p: &Project) -> Result<Project> 
         .query_row(
             "SELECT w.generation FROM manager_workers w
          LEFT JOIN work_leases l ON l.project_id=w.project_id AND l.generation=w.generation
-         WHERE w.project_id=? AND w.state IN ('starting','ready','unavailable')
+         WHERE w.project_id=? AND w.state IN ('reserved','starting','ready','unavailable')
            AND json_type(w.execution,'$.terminal_id')='text'
          ORDER BY COALESCE(l.active,0) DESC,
                   CASE w.state WHEN 'unavailable' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
@@ -184,7 +186,7 @@ pub(crate) fn snapshot(c: &Connection, p: &Project) -> Result<Value> {
 }
 
 pub(crate) enum Selection {
-    Ready(Box<Project>),
+    Target(String),
     Unavailable(Value),
 }
 
@@ -192,12 +194,6 @@ fn unavailable(target: &str, reason: &str) -> Selection {
     Selection::Unavailable(
         json!({"status":"worker_unavailable","target_cli":target,"reason":reason,"work_queued":false}),
     )
-}
-
-fn starting(target: &str, generation: &str) -> Selection {
-    Selection::Unavailable(json!({"status":"worker_unavailable","target_cli":target,
-        "reason":"Starting the independent native session; check worker_status before retrying",
-        "work_queued":false,"starting":true,"generation":generation}))
 }
 
 const CLI_NAMES: [&str; 5] = ["codex", "claude", "pi", "agy", "custom"];
@@ -247,11 +243,11 @@ fn current_seat(c: &Connection, parent: &Project, target: &str) -> Result<Option
         .query_row(
             "SELECT w.generation FROM manager_workers w
          WHERE w.project_id=? AND w.agent=? AND w.state!='closed'
-           AND (w.token='' OR w.state IN ('starting','ready'))
+           AND (w.token='' OR w.state IN ('reserved','starting','ready'))
            AND NOT (w.state='unavailable' AND w.execution='null' AND w.native_session=''
              AND w.created_at<=?
              AND NOT EXISTS(SELECT 1 FROM work_executions e WHERE e.generation=w.generation))
-         ORDER BY w.rowid DESC LIMIT 1",
+         ORDER BY CASE WHEN w.state IN ('ready','starting','reserved') THEN 0 ELSE 1 END, w.rowid DESC LIMIT 1",
             params![parent.id, target, db::now() - PREFLIGHT_RETRY_MS],
             |r| r.get::<_, String>(0),
         )
@@ -280,7 +276,7 @@ fn installed_candidates(
             let current = current_seat(c, p, name)?;
             if current
                 .as_ref()
-                .is_none_or(|seat| is_plain(&seat.project) && seat.state != "unavailable")
+                .is_none_or(|seat| seat.state != "unavailable")
             {
                 candidates.push((name, current));
             }
@@ -290,132 +286,107 @@ fn installed_candidates(
     Ok(candidates)
 }
 
-/// Start or select a task execution independently of the legacy project pane.
-pub(crate) async fn select(
-    app: &Arc<App>,
-    p: &Project,
-    target: &str,
-    origin: Option<String>,
-) -> Result<Selection> {
-    ensure!(
-        target.is_empty() || ["codex", "claude", "pi", "agy", "custom"].contains(&target),
-        "Unsupported target CLI; choose codex, claude, pi, agy, or the configured custom CLI"
-    );
-    let automatic = target.is_empty();
-    let target = if automatic {
+/// Resolve the CLI before accepting work. Seat allocation happens separately
+/// against the durable queue, under the project reconciliation lock.
+pub(crate) async fn select(app: &App, p: &Project, target: &str) -> Result<Selection> {
+    ensure!(target.is_empty() || CLI_NAMES.contains(&target), "Unsupported target CLI");
+    let parent = p.clone();
+    if target.is_empty() {
         let choices = catalog(p).await;
-        let parent = p.clone();
-        let observed_choices = choices.clone();
-        let candidates = app
-            .db
-            .call(move |c| installed_candidates(c, &parent, &observed_choices))
-            .await?;
-        let cfg = app.config.read().await.clone();
-        let mut next = None;
-        for (name, current) in candidates {
-            match current {
-                Some(seat) if seat.state == "ready" => {
-                    if available(&cfg, &seat.project).await {
-                        return Ok(Selection::Ready(Box::new(seat.project)));
-                    }
-                }
-                Some(seat) if seat.state == "starting" => {
-                    return Ok(starting(name, &seat.project.generation));
-                }
-                None if next.is_none() => {
-                    next = Some(name);
-                }
-                _ => {}
-            }
-        }
-        let Some(next) = next else {
-            return Ok(Selection::Unavailable(
-                json!({"status":"worker_unavailable",
-                "reason":"No installed worker currently accepts assignments","work_queued":false,"catalog":choices}),
-            ));
-        };
-        next
-    } else {
-        let parent = p.clone();
-        let target_key = target.to_owned();
-        let current = app
-            .db
-            .call(move |c| {
-                controls(c, &parent)?;
-                current_seat(c, &parent, &target_key)
-            })
-            .await?;
-        if let Some(current) = current {
-            if !is_plain(&current.project) {
-                return Ok(unavailable(
-                    target,
-                    "An active legacy worker owns this CLI slot; preserve it or stop it before creating a plain worker",
-                ));
-            }
-            return Ok(match current.state.as_str() {
-                "ready" if available(&app.config.read().await.clone(), &current.project).await => {
-                    Selection::Ready(Box::new(current.project))
-                }
-                "ready" => unavailable(target, "The worker's native session is not available"),
-                "starting" => starting(target, &current.project.generation),
-                _ => unavailable(target, &current.error),
-            });
-        }
-        target
-    };
-
-    let mut worker = candidate(p, target);
-    if !automatic && !adapter::plain_worker_available(&worker).await {
-        return Ok(Selection::Unavailable(
-            json!({"status":"worker_unavailable","target_cli":target,
-            "reason":"Worker command unavailable; choose an installed CLI","work_queued":false,
-            "catalog":catalog(p).await}),
+        let observed = choices.clone();
+        let candidates = app.db.call(move |c| installed_candidates(c, &parent, &observed)).await?;
+        return Ok(candidates.first().map_or_else(
+            || Selection::Unavailable(json!({"status":"worker_unavailable","reason":"No installed worker currently accepts assignments","work_queued":false,"catalog":choices})),
+            |(name, _)| Selection::Target((*name).into()),
         ));
     }
-    let generation = db::id();
-    let project_id = p.id.clone();
-    let agent = target.to_owned();
-    let generation_key = generation.clone();
-    app.db.call(move |c| {
-        c.execute("INSERT INTO manager_workers(generation,project_id,agent,token,state,created_at,origin_event_id) VALUES(?,?,?,'','starting',?,?)",
-            params![generation_key,project_id,agent,db::now(),origin])?;
-        Ok(())
+    let name = target.to_owned();
+    let seat = app.db.call(move |c| {
+        controls(c, &parent)?;
+        current_seat(c, &parent, &name)
     }).await?;
-    worker.name = format!("{} · {}", p.name, target);
-    worker.agent = target.into();
-    worker.mcp_token.clear();
-    worker.generation = generation.clone();
-    worker.native_session.clear();
-    worker.terminal = None;
-    worker.terminal_pid = None;
-    worker.ready = false;
-    worker.execution = Value::Null;
-    let app = Arc::clone(app);
-    tokio::spawn(async move {
-        let Some(_permit) = app.service.gate.enter() else {
-            return;
-        };
-        let id = worker.id.clone();
-        let lock = app.project_lock(&id).await;
-        let _guard = lock.lock().await;
-        let generation = worker.generation.clone();
-        if launch(&app, worker).await.is_err() {
-            // No tool input has been submitted. Do not surface arbitrary CLI
-            // output, which can contain local configuration or credentials.
-            let _ = app
-                .db
-                .call(move |c| {
-                    fail(
-                        c,
-                        &id,
-                        &generation,
-                        "Native startup failed; verify that the CLI is installed and logged in",
-                    )
-                })
-                .await;
+    if let Some(seat) = seat
+        && seat.state == "unavailable"
+    {
+        return Ok(unavailable(target, &seat.error));
+    }
+    if !adapter::plain_worker_available(&candidate(p, target)).await {
+        return Ok(unavailable(target, "Worker command unavailable; choose an installed CLI"));
+    }
+    Ok(Selection::Target(target.into()))
+}
+
+pub(crate) async fn warm(app: &App, parent: &Project) -> Result<()> {
+    let Selection::Target(agent) = select(app, parent, "").await? else {
+        anyhow::bail!("No worker is available");
+    };
+    let parent = parent.clone();
+    let worker = app.db.call(move |c| {
+        controls(c, &parent)?;
+        if current_seat(c, &parent, &agent)?.is_some() {
+            return Ok(None);
         }
-    });
-    Ok(starting(target, &generation))
+        let generation = db::id();
+        c.execute("INSERT INTO manager_workers(generation,project_id,agent,state,created_at)
+            VALUES(?,?,?,'reserved',?)",params![generation,parent.id,agent,db::now()])?;
+        Ok(seat(c, &parent, &generation)?.map(|s| s.project))
+    }).await?;
+    if let Some(worker) = worker {
+        launch_assigned(app, worker).await?;
+    }
+    Ok(())
+}
+
+/// Bind accepted work and any new seat in the same transaction. A generation
+/// with a queued assignment or an unresolved run is never reused.
+fn allocate(c: &Connection, parent: &Project, limit: Option<usize>, idle_seats: &[String]) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    if controls(&tx, parent).is_err() {
+        return Ok(());
+    }
+    let pending = tx.prepare(
+        "SELECT id,json_extract(payload,'$.expected_agent'),json_extract(payload,'$.origin_event_id')
+         FROM work_events WHERE project_id=? AND source='manager_worker' AND status='worker_waiting'
+         AND json_extract(payload,'$.target_generation') IS NULL ORDER BY rowid",
+    )?.query_map([&parent.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (event, agent, origin) in pending {
+        let idle: Option<String> = tx.query_row(
+            "SELECT w.generation FROM manager_workers w
+             WHERE w.project_id=?1 AND w.agent=?2 AND w.token='' AND w.state='ready'
+             AND w.generation IN (SELECT value FROM json_each(?3))
+             AND NOT EXISTS(SELECT 1 FROM work_events e WHERE e.project_id=w.project_id
+                 AND e.status='worker_waiting' AND json_extract(e.payload,'$.target_generation')=w.generation)
+             AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.project_id=w.project_id AND r.generation=w.generation
+                 AND r.status IN ('submitting','submitted','running','uncertain'))
+             AND NOT EXISTS(SELECT 1 FROM work_leases t WHERE t.project_id=w.project_id AND t.generation=w.generation AND t.active=1)
+             ORDER BY w.rowid LIMIT 1",
+            params![parent.id, agent, json!(idle_seats).to_string()], |row| row.get(0),
+        ).optional()?;
+        let generation = if let Some(idle) = idle {
+            idle
+        } else {
+            let count: i64 = tx.query_row(
+                "SELECT count(*) FROM manager_workers WHERE project_id=? AND agent=? AND token='' AND state IN ('reserved','starting','ready')",
+                params![parent.id, agent], |row| row.get(0),
+            )?;
+            if limit.is_some_and(|limit| count as usize >= limit) {
+                continue;
+            }
+            let generation = db::id();
+            tx.execute(
+                "INSERT INTO manager_workers(generation,project_id,agent,state,created_at,origin_event_id) VALUES(?,?,?,'reserved',?,?)",
+                params![generation,parent.id,agent,db::now(),origin],
+            )?;
+            generation
+        };
+        tx.execute(
+            "UPDATE work_events SET payload=json_set(payload,'$.target_generation',?),updated_at=? WHERE id=?",
+            params![generation,db::now(),event],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 async fn observe(cfg: &config::Config, p: &Project) -> Result<Value> {
@@ -532,12 +503,6 @@ pub(crate) fn check_plain_target(p: &Project, record: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn available(cfg: &config::Config, p: &Project) -> bool {
-    observe(cfg, p)
-        .await
-        .is_ok_and(|r| check_plain_target(p, &r).is_ok())
-}
-
 async fn launch(app: &App, mut p: Project) -> Result<()> {
     let parent = app.db.project(&p.id).await?;
     let check = parent.clone();
@@ -652,7 +617,7 @@ fn observation(
 
 pub(crate) fn fail(c: &Connection, project: &str, generation: &str, reason: &str) -> Result<()> {
     let tx = c.unchecked_transaction()?;
-    let changed = tx.execute("UPDATE manager_workers SET state='unavailable',error=? WHERE generation=? AND project_id=? AND state IN ('starting','ready')",
+    let changed = tx.execute("UPDATE manager_workers SET state='unavailable',error=? WHERE generation=? AND project_id=? AND state IN ('reserved','starting','ready')",
         params![reason,generation,project])?;
     if changed != 0 {
         observation(&tx, project, generation, "unavailable", reason)?;
@@ -667,7 +632,73 @@ pub(crate) fn fail(c: &Connection, project: &str, generation: &str, reason: &str
     Ok(())
 }
 
+async fn launch_assigned(app: &App, worker: Project) -> Result<()> {
+    let project = worker.id.clone();
+    let generation = worker.generation.clone();
+    let reserved = worker.clone();
+    let can_launch = app.db.call(move |c| {
+        let parent = db::project_by_key(c, &reserved.id)?;
+        if controls(c, &parent).is_err() {
+            return Ok(false);
+        }
+        Ok(c.execute("UPDATE manager_workers SET state='starting',created_at=? WHERE project_id=? AND generation=? AND state='reserved'",
+            params![db::now(),reserved.id,reserved.generation])? == 1)
+    }).await?;
+    if can_launch && launch(app, worker).await.is_err() {
+        app.db.call(move |c| fail(c, &project, &generation,
+            "Native startup failed; verify that the CLI is installed and logged in")).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn reconcile(app: &Arc<App>, parent: &Project) -> Result<()> {
+    let cfg = app.config.read().await.clone();
+    let p = parent.clone();
+    let ready = app.db.call(move |c| {
+        let pending: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_events
+            WHERE project_id=? AND source='manager_worker' AND status='worker_waiting'
+            AND json_extract(payload,'$.target_generation') IS NULL)", [&p.id], |row| row.get(0))?;
+        if !pending || controls(c, &p).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(active(c, &p)?.into_iter().filter(|s| s.state == "ready" && is_plain(&s.project))
+            .map(|s| s.project).collect::<Vec<_>>()))
+    }).await?;
+    if let Some(ready) = ready {
+        let mut probes = tokio::task::JoinSet::new();
+        for worker in ready {
+            let cfg = cfg.clone();
+            probes.spawn(async move {
+                let observed = observe(&cfg, &worker).await.ok()?;
+                check_plain_target(&worker, &observed).ok()?;
+                matches!(observed["status"]["state"].as_str(), None | Some("" | "unknown" | "idle" | "done"))
+                    .then_some(worker.generation)
+            });
+        }
+        let mut idle = Vec::new();
+        while let Some(result) = probes.join_next().await {
+            if let Ok(Some(generation)) = result {
+                idle.push(generation);
+            }
+        }
+        let p = parent.clone();
+        let limit = cfg.manager_workers_per_cli.map(std::num::NonZeroUsize::get);
+        app.db.call(move |c| allocate(c, &p, limit, &idle)).await?;
+    }
+    let p = parent.clone();
+    let reserved = app.db.call(move |c| {
+        if controls(c, &p).is_err() {
+            return Ok(Vec::new());
+        }
+        let generations = c.prepare("SELECT generation FROM manager_workers WHERE project_id=? AND state='reserved' ORDER BY rowid")?
+            .query_map([&p.id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        generations.into_iter().map(|generation| {
+            Ok(seat(c,&p,&generation)?.context("Reserved worker disappeared")?.project)
+        }).collect::<Result<Vec<_>>>()
+    }).await?;
+    for worker in reserved {
+        launch_assigned(app, worker).await?;
+    }
     let p = parent.clone();
     let seats = app.db.call(move |c| {
         let mut seats = active(c,&p)?;
@@ -686,7 +717,6 @@ pub(crate) async fn reconcile(app: &Arc<App>, parent: &Project) -> Result<()> {
         }
         Ok(seats)
     }).await?;
-    let cfg = app.config.read().await.clone();
     let mut tasks = tokio::task::JoinSet::new();
     for s in seats {
         let app = Arc::clone(app);
@@ -864,6 +894,20 @@ pub(crate) fn closed(c: &Connection, generation: &str) -> Result<()> {
 }
 
 pub(crate) async fn stop_all(app: &App, p: &Project) -> Result<()> {
+    let project = p.id.clone();
+    app.db.call(move |c| {
+        let tx = c.unchecked_transaction()?;
+        tx.execute("UPDATE work_tasks SET status='cancelled',updated_at=?1 WHERE id IN
+            (SELECT task_id FROM work_events WHERE project_id=?2 AND source='manager_worker'
+             AND status='worker_waiting' AND json_extract(payload,'$.target_generation') IS NULL)",
+            params![db::now(),project])?;
+        tx.execute("UPDATE work_events SET status='cancelled',error='Stopped by the user',updated_at=?1
+            WHERE project_id=?2 AND source='manager_worker' AND status='worker_waiting'
+            AND json_extract(payload,'$.target_generation') IS NULL",params![db::now(),project])?;
+        tx.commit()?;
+        Ok(())
+    }).await?;
+
     let parent = p.clone();
     let seats = app
         .db
@@ -936,6 +980,30 @@ mod tests {
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
+
+    #[test]
+    fn migration_removes_legacy_uniqueness_and_is_repeatable_with_parallel_rows() -> Result<()> {
+        let c = Connection::open_in_memory()?;
+        c.execute_batch("CREATE TABLE projects(id TEXT PRIMARY KEY); INSERT INTO projects VALUES('project');")?;
+        migrate(&c)?;
+        c.execute_batch("CREATE UNIQUE INDEX manager_worker_active_cli ON manager_workers(project_id,agent)
+            WHERE state IN ('starting','ready');
+            INSERT INTO manager_workers(generation,project_id,agent,state,created_at)
+            VALUES('first','project','codex','ready',1);")?;
+        let tx = c.unchecked_transaction()?;
+        migrate(&tx)?;
+        tx.execute("INSERT INTO manager_workers(generation,project_id,agent,state,created_at)
+            VALUES('second','project','codex','starting',2)", [])?;
+        tx.commit()?;
+        migrate(&c)?;
+        let rows: i64 = c.query_row("SELECT count(*) FROM manager_workers", [], |r| r.get(0))?;
+        assert_eq!(rows, 2);
+        assert_eq!(c.query_row("SELECT count(*) FROM sqlite_schema WHERE name='manager_worker_active_cli'",
+            [], |r| r.get::<_, i64>(0))?, 0);
+        assert_eq!(c.query_row("SELECT [unique] FROM pragma_index_list('manager_workers')
+            WHERE name='manager_worker_project_cli'", [], |r| r.get::<_, i64>(0))?, 0);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn attention_needed_worker_remains_visible_without_authorizing_dispatch() {
@@ -1080,7 +1148,7 @@ mod tests {
                 params![parent.id,db::now()])?;
             Ok(())
         }).unwrap();
-        assert!(matches!(select(&app,&parent,"custom",None).await.unwrap(),
+        assert!(matches!(select(&app,&parent,"custom").await.unwrap(),
             Selection::Unavailable(result) if result["reason"] == "Integration missing"));
         app.db
             .sync(|c| {
@@ -1092,29 +1160,16 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(
-            matches!(select(&app,&parent,"custom",None).await.unwrap(), Selection::Unavailable(result) if result["work_queued"]==false)
-        );
-        let launched = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let pending = app
-                    .db
-                    .sync(|c| {
-                        Ok(active(c, &parent)?.into_iter().find(|s| {
-                            s.project.execution["launch_permit"]
-                                .as_str()
-                                .is_some_and(|permit| std::path::Path::new(permit).exists())
-                        }))
-                    })
-                    .unwrap();
-                if let Some(pending) = pending {
-                    break pending.project;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the independent generation should release its launch gate");
+        assert!(matches!(select(&app,&parent,"custom").await.unwrap(), Selection::Target(target) if target=="custom"));
+        let generation = db::id();
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_workers(generation,project_id,agent,state,created_at)
+                VALUES(?,?,'custom','starting',?)",params![generation,parent.id,db::now()])?;
+            Ok(())
+        }).unwrap();
+        let worker = app.db.sync(|c| Ok(seat(c,&parent,&generation)?.unwrap().project)).unwrap();
+        launch(&app, worker).await.unwrap();
+        let launched = app.db.sync(|c| Ok(seat(c,&parent,&generation)?.unwrap().project)).unwrap();
         assert_eq!(launched.terminal_pid, Some(8420));
         assert!(
             register(&app, launched.clone(), "w1:p2", Some(mcp::CONTRACT))
@@ -1123,7 +1178,7 @@ mod tests {
         );
         reconcile(&app, &parent).await.unwrap();
         assert!(
-            matches!(select(&app,&parent,"custom",None).await.unwrap(), Selection::Ready(worker) if worker.generation==launched.generation)
+            app.db.sync(|c| Ok(seat(c,&parent,&launched.generation)?.unwrap().project.ready)).unwrap()
         );
         app.db.sync(|c| {
             assert_ne!(db::project_by_key(c,&parent.id)?.generation,launched.generation);
