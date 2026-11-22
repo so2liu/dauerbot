@@ -89,7 +89,7 @@ async fn perform(
     channel: &str,
 ) -> Result<Value> {
     let lock = app.project_lock(&ctx.project).await;
-    let guard = lock.lock().await;
+    let guard = lock.clone().lock_owned().await;
     let context = ctx.clone();
     let approved_proposal = app
         .db
@@ -107,14 +107,14 @@ async fn perform(
         }
         "write_file" => {
             let a: WriteArgs = serde_json::from_value(call.arguments)?;
-            drop(guard);
             let db = app.db.clone();
             let context = ctx.clone();
             tokio::task::spawn_blocking(move || {
-                write_file_checked(Path::new(&p.path), a, || {
+                let _guard = guard;
+                write_file_checked(Path::new(&p.path), a, |mutate| {
                     db.sync(|c| {
                         valid(c, &context)?;
-                        Ok(())
+                        mutate()
                     })
                 })
             })

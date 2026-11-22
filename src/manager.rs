@@ -712,13 +712,13 @@ fn read_file(root: &Path, args: FileArgs) -> Result<Value> {
 
 #[cfg(test)]
 fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
-    write_file_checked(root, args, || Ok(()))
+    write_file_checked(root, args, |mutate| mutate())
 }
 
 fn write_file_checked(
     root: &Path,
     args: WriteArgs,
-    validate: impl Fn() -> Result<()>,
+    mut commit: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
 ) -> Result<Value> {
     use std::io::ErrorKind;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -746,26 +746,30 @@ fn write_file_checked(
             (target, Some(permissions))
         }
         Err(error) if error.kind() == ErrorKind::NotFound && args.expected_sha256.is_none() => {
-            validate()?;
-            fs::create_dir_all(parent)?;
+            commit(&mut || {
+                fs::create_dir_all(parent)?;
+                Ok(())
+            })?;
             (path, None)
         }
         Err(error) => return Err(error.into()),
     };
     if permissions.is_none() && fs::symlink_metadata(&target).is_ok_and(|m| m.is_symlink()) {
         // Creating through a dangling link must leave the link itself in place.
-        validate()?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&target)?;
-        ensure!(file.metadata()?.is_file(), "Write a regular file");
-        file.write_all(args.content.as_bytes())?;
-        file.set_len(args.content.len() as u64)?;
-        file.sync_all()?;
+        commit(&mut || {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&target)?;
+            ensure!(file.metadata()?.is_file(), "Write a regular file");
+            file.write_all(args.content.as_bytes())?;
+            file.set_len(args.content.len() as u64)?;
+            file.sync_all()?;
+            Ok(())
+        })?;
     } else {
         let mut file =
             tempfile::NamedTempFile::new_in(target.parent().context("File path has no parent")?)?;
@@ -774,8 +778,13 @@ fn write_file_checked(
             file.as_file().set_permissions(permissions)?;
         }
         file.as_file().sync_all()?;
-        validate()?;
-        file.persist(target)?;
+        let mut file = Some(file);
+        commit(&mut || {
+            file.take()
+                .expect("commit runs once")
+                .persist(&target)?;
+            Ok(())
+        })?;
     }
     Ok(
         json!({"path":args.path,"sha256":format!("{:x}",Sha256::digest(args.content.as_bytes())),"status":"written"}),
