@@ -60,10 +60,14 @@ pub(crate) fn decoder(name: &str) -> Option<PathBuf> {
     })
 }
 
-pub(crate) async fn extract(input: File, resolve: fn(&str) -> Option<PathBuf>) -> Result<Frame> {
+pub(crate) async fn extract(
+    mut input: File,
+    resolve: fn(&str) -> Option<PathBuf>,
+) -> Result<Frame> {
     let ffprobe = resolve("ffprobe").context("ffprobe was not found")?;
     let ffmpeg = resolve("ffmpeg").context("ffmpeg was not found")?;
     tokio::time::timeout(Duration::from_secs(8), async {
+        std::io::Seek::rewind(&mut input)?;
         let probe = run(
             &ffprobe,
             input.try_clone()?,
@@ -91,7 +95,6 @@ pub(crate) async fn extract(input: File, resolve: fn(&str) -> Option<PathBuf>) -
         );
         let timestamp = duration * 0.2;
         // ffprobe and ffmpeg inherit duplicates of the same open file description.
-        let mut input = input;
         std::io::Seek::rewind(&mut input)?;
         let bytes = run(
             &ffmpeg,

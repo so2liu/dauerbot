@@ -3109,7 +3109,8 @@ mod tests {
         assert_eq!(file["bytes"], FILE.len());
         assert_eq!(file["media_type"], "application/pdf");
         if preview_available {
-            let preview = resources.iter().find(|r| r["frame_seconds"].is_number()).unwrap();
+            let preview = resources.iter().find(|r| r["frame_seconds"].is_number())
+                .unwrap_or_else(|| panic!("Video preview failed: {}", video["frame_extraction_error"]));
             assert_eq!(preview["frame_seconds"], 1.0);
             assert_eq!(preview["duration_seconds"], 5.0);
             let path = preview["local_path"].as_str().unwrap();
