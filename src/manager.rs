@@ -1,5 +1,6 @@
 //! Restricted management actor. Native CLI authority stays in the worker.
 mod topic_decisions;
+mod topic_history;
 use crate::{
     App, db,
     db::Project,
@@ -1731,7 +1732,6 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             return Ok(None);
         }
         let history=tx.prepare("SELECT e.name,e.status,e.result,e.id FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=? ORDER BY e.rowid DESC LIMIT 32")?.query_map([project],|r|Ok(json!({"effect_id":r.get::<_,String>(3)?,"tool":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"result_summary":r.get::<_,String>(2)?.chars().take(2000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let prior=tx.prepare("SELECT kind,payload FROM manager_inputs WHERE project_id=? AND status='consumed' ORDER BY rowid DESC LIMIT 8")?.query_map([project],|r|Ok(json!({"kind":r.get::<_,String>(0)?,"data_summary":r.get::<_,String>(1)?.chars().take(3000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut instructions = json!({});
         for path in ["AGENTS.md", "HANDOFF.md"] {
             if let Ok(file) = read_file(Path::new(&p.path), path) {
@@ -1745,7 +1745,6 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 );
             }
         }
-        let notes=tx.prepare("SELECT n.note FROM manager_turn_notes n JOIN manager_runs r ON r.id=n.run_id WHERE r.project_id=? ORDER BY r.rowid DESC LIMIT 8")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let latest=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {prepared} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
         // A new trusted user source selects the discussion; otherwise retain only
         // the selected, still-owned user objective, never consumed conversation history.
@@ -1907,17 +1906,30 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         } else {
             None
         };
-        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes});
+        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":[],"effect_evidence":history,"manager_decisions":[]});
+        let history_anchor = if steering_priority {
+            inputs.first()
+        } else {
+            inputs.iter().rev().chain(continuing.iter().rev()).find(|item| item.2 == "user")
+                .or_else(|| inputs.iter().rev().chain(continuing.iter().rev())
+                    .find(|item| item.2 == "worker" && item.1.is_some()))
+        }.and_then(|item| item.1.as_deref());
+        if let Some(anchor) = history_anchor
+            && let Some(anchor_scope) = topic_decisions::discussion(&tx, project, anchor)?
+        {
+            context["topic_history_origin_event_id"] = json!(anchor);
+            if let Some((_, steering, _, _)) = &latest_context {
+                let steering_scope = steering.as_deref().map(|origin|
+                    topic_decisions::discussion(&tx, project, origin)).transpose()?.flatten();
+                if steering_scope.as_deref() != Some(&anchor_scope) {
+                    context["latest_user_steering"] = Value::Null;
+                }
+            }
+        }
         if !proposal_only {
-            let mandatory = json!({
-                "trusted_project":context["trusted_project"], "trusted_sources":context["trusted_sources"],
-                "new_inputs":context["new_inputs"], "continuing_inputs":context["continuing_inputs"],
-                "latest_user_steering":context["latest_user_steering"],
-            });
-            let budget = 215000usize.saturating_sub(mandatory.to_string().len());
             let origins = inputs.iter().rev().chain(continuing.iter().rev())
                 .filter_map(|input| input.1.clone());
-            let decisions = topic_decisions::batch(&tx, project, origins, budget)?;
+            let decisions = topic_decisions::batch(&tx, project, origins, 4096)?;
             if !decisions.as_array().unwrap().is_empty() {
                 context["topic_decisions"] = decisions;
             }
@@ -1927,7 +1939,12 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 context[field] = json!([]);
             }
         }
-        if context.to_string().len() > 250000
+        let history_reserve = if history_anchor.is_some() {
+            topic_history::TRUNCATION_RESERVE
+        } else {
+            0
+        };
+        if context.to_string().len() + history_reserve > 250000
             && let Some(evidence) = context["effect_evidence"].as_array_mut()
         {
             for effect in evidence {
@@ -1936,19 +1953,10 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 }
             }
         }
-        for optional in [
-            "prior_conversation",
-            "manager_decisions",
-            "workspace_instructions",
-            "topic_decisions",
-        ] {
-            if context.to_string().len() <= 250000 {
-                break;
-            }
-            context.as_object_mut().unwrap().remove(optional);
+        if context.to_string().len() + history_reserve > 250000 {
+            context.as_object_mut().unwrap().remove("workspace_instructions");
         }
-        // Spend only otherwise unused context on quotes. Never evict current input.
-        let mut quote_budget = 250000usize.saturating_sub(context.to_string().len());
+        let mut quote_budget = 250000usize.saturating_sub(context.to_string().len() + history_reserve);
         let new_items = context["new_inputs"].as_array_mut().unwrap();
         let mut new_origins: Vec<_> = inputs.iter().map(|item| item.1.as_deref()).collect();
         if steering_priority && new_origins.len() > 1 {
@@ -1971,7 +1979,9 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 &mut quote_budget,
             )?;
         }
-        if let Some((_, origin, _, _)) = &latest_context {
+        if !context["latest_user_steering"].is_null()
+            && let Some((_, origin, _, _)) = &latest_context
+        {
             attach_quote(
                 &tx,
                 project,
@@ -1979,6 +1989,9 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 &mut context["latest_user_steering"]["data"],
                 &mut quote_budget,
             )?;
+        }
+        if !proposal_only && let Some(anchor) = history_anchor {
+            topic_history::attach(&tx, project, anchor, &mut context, 250000)?;
         }
         let prompt = context.to_string();
         ensure!(
@@ -2883,10 +2896,15 @@ mod tests {
             else if id=="om_old" { original=origin; }
             finish(&turn);
         }
+        for index in 0..32 {
+            insert(&format!("om_history_{index:02}"),"om_topic",&format!("Same-topic history {index:02}"));
+            let turn=claim_turn();
+            app.db.sync(|c| finish_turn(c,&turn.context,&format!("Same-topic note {index:02}")))?;
+        }
         for index in 0..10 {
             insert(&format!("om_noise_{index}"),"om_other_topic","ordinary unrelated update");
             let turn=claim_turn();
-            finish(&turn);
+            app.db.sync(|c| finish_turn(c,&turn.context,"Unrelated turn note"))?;
         }
         let resumed = app.db.sync(|c| topic_decisions::context(c,&p.id,&original,Some("florence")))?;
         assert_eq!(resumed["origin_event_id"],original);
@@ -2913,7 +2931,18 @@ mod tests {
         let wire=seen.lock().unwrap().take().unwrap();
         let context=prompt_context(&wire).context("captured request context")?;
         assert_eq!(context["topic_decisions"][0]["origin_event_id"],current);
+        assert_eq!(context["topic_history_origin_event_id"],current);
         assert!(!context["prior_conversation"].to_string().contains("年代改为"));
+        assert!(context["prior_conversation"].as_array().unwrap().iter().any(|entry|
+            entry["source_event_id"]==correction && entry["body_in_topic_decisions"]==true));
+        assert_eq!(context["new_inputs"][0]["data"]["user_input"]["body"],"继续 Florence 主线");
+        let retained: Vec<_> = context["prior_conversation"].as_array().unwrap().iter()
+            .filter_map(|entry| entry["data"]["user_input"]["body"].as_str())
+            .filter(|body| body.starts_with("Same-topic history")).collect();
+        assert_eq!(retained,(0..32).map(|index| format!("Same-topic history {index:02}")).collect::<Vec<_>>());
+        assert_eq!(context["manager_decisions"].as_array().unwrap().len(),32);
+        assert_eq!(context["manager_decisions"][0],"Same-topic note 00");
+        assert!(context["topic_history_truncation"].is_null());
         let decisions=context["topic_decisions"][0]["decisions"].as_array().unwrap();
         assert_eq!(decisions.len(),10);
         assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="年代改为 1324 / 1325" && x["source_event_id"]==correction && x["source_message_id"]=="om_correct"));
@@ -2922,6 +2951,8 @@ mod tests {
         assert!(decisions.iter().any(|x|x["branch"]=="other-florence" && x["category"]=="current"));
         assert!(decisions.iter().filter(|x|x.to_string().contains("York")).all(|x|x["category"]=="reference"));
         assert!(!wire.to_string().contains("别的话题保密决定"));
+        assert!(!wire.to_string().contains("ordinary unrelated update"));
+        assert!(!wire.to_string().contains("Unrelated turn note"));
         let outcome=tool(&app,&turn.context,ToolCall {
             occurrence:"delegate".into(),name:"delegate".into(),
             arguments:json!({"source_event_id":current,"decision_branch":"florence","instructions":"Continue the accepted branch"}),
@@ -2945,6 +2976,34 @@ mod tests {
         assert!(task.contains(&current) && task.contains(&correction));
         assert!(!task.contains("独立分支 1080") && !task.contains("别的话题保密决定"));
         finish(&turn);
+        for index in 0..12 {
+            insert(&format!("om_bulk_{index:02}"),"om_topic",&format!("Bulk {index:02} {}", "x".repeat(28_000)));
+            let bulk_turn=claim_turn();
+            app.db.sync(|c| finish_turn(c,&bulk_turn.context,&format!("Bulk note {index:02} {}", "n".repeat(7900))))?;
+        }
+        insert("om_budget_followup","om_topic","Current message survives history pressure");
+        let mut budget_turn=claim_turn();
+        budget_turn.config.base_url=turn.config.base_url.clone();
+        manager_loop::advance(&budget_turn.config,budget_turn.checkpoint.clone(),CancellationToken::new()).await?;
+        let budget_wire=seen.lock().unwrap().take().unwrap();
+        let budget_context=prompt_context(&budget_wire).context("captured budget-limited request")?;
+        assert!(budget_context.to_string().len()<=250_000);
+        assert_eq!(budget_context["new_inputs"][0]["data"]["user_input"]["body"],
+            "Current message survives history pressure");
+        let retained: Vec<_> = budget_context["prior_conversation"].as_array().unwrap().iter()
+            .map(|entry| &entry["data"]["user_input"]["body"].as_str().unwrap()[..7]).collect();
+        assert!(!retained.is_empty() && retained.len()<12);
+        assert_eq!(retained,((12-retained.len())..12).map(|index| format!("Bulk {index:02}")).collect::<Vec<_>>());
+        assert_eq!(budget_context["topic_history_truncation"]["older_inputs_omitted"],
+            16+32+1+12-retained.len());
+        let notes=budget_context["manager_decisions"].as_array().unwrap();
+        assert!(notes.len()<12);
+        assert_eq!(budget_context["topic_history_truncation"]["older_turn_notes_omitted"],44-notes.len());
+        for (index,note) in ((12-notes.len())..12).zip(notes) {
+            assert!(note.as_str().unwrap().starts_with(&format!("Bulk note {index:02} ")));
+        }
+        assert_eq!(budget_context["topic_decisions"][0]["decisions"].as_array().unwrap().len(),10);
+        finish(&budget_turn);
         for index in 0..31 {
             insert(&format!("om_pending_{index}"),"om_topic","claim main-thread update");
         }
