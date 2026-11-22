@@ -2031,7 +2031,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         } else {
             None
         };
-        let checkpoint = match pi::Turn::select(tx.path(), project, &prompt, &images)? {
+        let checkpoint = match pi::Turn::select(tx.path(), &p, &prompt, &images)? {
             Some(checkpoint) => checkpoint,
             None => manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?,
         };

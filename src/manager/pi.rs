@@ -42,7 +42,7 @@ pub(super) struct Turn {
 impl Turn {
     pub(super) fn select(
         database: Option<&str>,
-        project: &str,
+        project: &crate::db::Project,
         prompt: &str,
         images: &[ImageRef],
     ) -> Result<Option<Value>> {
@@ -53,21 +53,28 @@ impl Turn {
             return Ok(None);
         };
         ensure!(
-            !project.is_empty()
+            !project.id.is_empty()
                 && project
+                    .id
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
             "Invalid Manager project identity"
         );
-        let path = root.join("manager-pi").join(project);
+        let path = root.join(".dauerbot").join("manager-pi").join(&project.id);
         let executable = match std::fs::read_to_string(path) {
             Ok(raw) => PathBuf::from(raw.trim()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         ensure!(
-            executable.is_absolute() && executable.is_file(),
+            executable.is_absolute(),
             "Select an absolute Pi executable path"
+        );
+        let executable = executable.canonicalize()?;
+        let workspace = Path::new(&project.path).canonicalize()?;
+        ensure!(
+            executable.is_file() && !executable.starts_with(workspace),
+            "Select a trusted Pi executable outside the project workspace"
         );
         Ok(Some(
             json!({"pi": Self { executable, prompt: prompt.into(), images: images.to_vec(), started: false }}),
@@ -84,6 +91,7 @@ async fn tool_request(mut stream: UnixStream, app: &Arc<App>, ctx: &Context) -> 
             .read_until(b'\n', &mut request),
     )
     .await??;
+    ensure!(request.last() == Some(&b'\n'), "Incomplete Pi tool request");
     let call: ToolCall = serde_json::from_slice(&request)?;
     let result = if TOOLS.contains(&call.name.as_str())
         && !call.occurrence.is_empty()
@@ -348,8 +356,8 @@ mod tests {
             app.db.sync(|c| finish_turn(c, &noise.context, ""))?;
         }
         let active = insert("om_current", "om_topic", "Current fixture instruction")?;
-        let marker_dir = app.dir.join("manager-pi");
-        std::fs::create_dir(&marker_dir)?;
+        let marker_dir = app.dir.join(".dauerbot").join("manager-pi");
+        std::fs::create_dir_all(&marker_dir)?;
         std::fs::write(
             marker_dir.join(&project.id),
             executable.as_os_str().as_encoded_bytes(),
