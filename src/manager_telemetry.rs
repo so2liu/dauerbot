@@ -187,6 +187,16 @@ impl Exporter {
     }
 }
 
+pub(crate) fn redact_arguments(arguments: &str, provider_key: &str) -> String {
+    let mut clean = content::clean(arguments, &[provider_key]);
+    const MAX_BYTES: usize = 1_024;
+    if clean.len() > MAX_BYTES {
+        clean.truncate(clean.floor_char_boundary(MAX_BYTES));
+        clean.push_str(" [omitted remaining arguments]");
+    }
+    clean
+}
+
 fn now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -224,26 +234,15 @@ impl Trace {
         project: &str,
         channel: &str,
         provider_key: &str,
-        mut inputs: Vec<(String, Option<String>)>,
+        inputs: Vec<(String, Option<String>)>,
     ) -> Self {
-        let secrets = [
-            exporter.settings.public_key.as_str(),
-            exporter.settings.secret_key.as_str(),
-            provider_key,
-        ];
-        for (_, body) in &mut inputs {
-            *body = body
-                .take()
-                .filter(|_| exporter.includes_content())
-                .map(|raw| content::clean(&raw, &secrets));
-        }
-        Self {
+        let mut trace = Self {
             session: trace_id(&json!(["dauerbot.manager", project, channel]).to_string()),
             provider_key: provider_key.into(),
             root_output: None,
             protected_tool_seen: false,
             exporter,
-            inputs,
+            inputs: Vec::new(),
             started: now(),
             ended: 0,
             root: span_id(),
@@ -251,7 +250,20 @@ impl Trace {
             dropped: 0,
             outcome: "interrupted",
             export_on_drop: true,
+        };
+        trace.set_inputs(inputs);
+        trace
+    }
+
+    pub(crate) fn set_inputs(&mut self, mut inputs: Vec<(String, Option<String>)>) {
+        let secrets = self.secrets();
+        for (_, body) in &mut inputs {
+            *body = body
+                .take()
+                .filter(|_| self.exporter.includes_content())
+                .map(|raw| content::clean(&raw, &secrets));
         }
+        self.inputs = inputs;
     }
 
     fn secrets(&self) -> [&str; 3] {
@@ -277,62 +289,77 @@ impl Trace {
 
     fn payload(&self) -> Value {
         let end = self.ended.max(self.started);
+        let input_ids = self.inputs.iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let trace_id = trace_id(&self.root);
         let context = [
             text("langfuse.trace.name", TRACE_NAME),
             text("langfuse.session.id", &self.session),
             text("langfuse.version", env!("CARGO_PKG_VERSION")),
+        ];
+        let mut root_attributes = vec![
+            text("langfuse.observation.type", "span"),
+            text("langfuse.observation.metadata.outcome", self.outcome),
+            text(
+                "langfuse.trace.metadata.input_ids",
+                &json!(input_ids).to_string(),
+            ),
             number(
                 "langfuse.trace.metadata.batch_size",
                 self.inputs.len() as u64,
             ),
             number("langfuse.trace.metadata.dropped_spans", self.dropped as u64),
         ];
-        let spans: Vec<_> = self
+        let bodies = self
             .inputs
             .iter()
-            .flat_map(|(id, body)| {
-                let trace_id = trace_id(id);
-                let mut root_attributes = vec![
-                    text("langfuse.observation.type", "span"),
-                    text("langfuse.observation.metadata.outcome", self.outcome),
-                ];
-                let mut admitted_attributes = vec![text("langfuse.observation.type", "span")];
-                if let Some(body) = body {
-                    let input = observation_content("langfuse.observation.input", body);
-                    root_attributes.push(input.clone());
-                    admitted_attributes.push(input);
-                }
-                if self.outcome == "ok" {
-                    root_attributes.extend(self.root_output.iter().cloned());
-                }
-                let root = json!({
-                    "spanId":self.root,"name":TRACE_NAME,"kind":1,
-                    "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":end.to_string(),
-                    "status":status(self.outcome),"attributes":root_attributes
-                });
-                let admitted = json!({
-                    "spanId":span_id(),"name":"manager.user_input","kind":1,
-                    "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":self.started.to_string(),
-                    "status":{"code":1},"attributes":admitted_attributes
-                });
-                let context = &context;
-                std::iter::once(root)
-                    .chain(std::iter::once(admitted))
-                    .chain(self.spans.iter().cloned())
-                    .enumerate()
-                    .map(move |(index, mut span)| {
-                        span["traceId"] = json!(trace_id);
-                        if index != 0 {
-                            span["parentSpanId"] = json!(self.root);
-                        }
-                        span["attributes"]
-                            .as_array_mut()
-                            .expect("span attributes")
-                            .extend_from_slice(context);
-                        span
-                    })
+            .filter_map(|(_, body)| body.as_deref())
+            .collect::<Vec<_>>();
+        match bodies.as_slice() {
+            [] => {}
+            [body] => root_attributes.push(observation_content("langfuse.observation.input", body)),
+            _ => root_attributes.push(observation_content(
+                "langfuse.observation.input",
+                &json!(bodies).to_string(),
+            )),
+        }
+        if self.outcome == "ok" {
+            root_attributes.extend(self.root_output.iter().cloned());
+        }
+        let root = json!({
+            "spanId":self.root,"name":TRACE_NAME,"kind":1,
+            "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":end.to_string(),
+            "status":status(self.outcome),"attributes":root_attributes
+        });
+        let admitted = self.inputs.iter().map(|(id, body)| {
+            let mut attributes = vec![
+                text("langfuse.observation.type", "span"),
+                text("langfuse.observation.metadata.input_id", id),
+            ];
+            if let Some(body) = body {
+                attributes.push(observation_content("langfuse.observation.input", body));
+            }
+            json!({
+                "spanId":span_id(),"name":"manager.user_input","kind":1,
+                "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":self.started.to_string(),
+                "status":{"code":1},"attributes":attributes
             })
-            .collect();
+        });
+        let spans = std::iter::once(root)
+            .chain(admitted)
+            .chain(self.spans.iter().cloned())
+            .enumerate()
+            .map(|(index, mut span)| {
+                span["traceId"] = json!(trace_id);
+                if index != 0 {
+                    span["parentSpanId"] = json!(self.root);
+                }
+                span["attributes"]
+                    .as_array_mut()
+                    .expect("span attributes")
+                    .extend_from_slice(&context);
+                span
+            })
+            .collect::<Vec<_>>();
         json!({"resourceSpans":[{
             "resource":{"attributes":[text("service.name","dauerbot")]},
             "scopeSpans":[{"scope":{"name":"dauerbot.manager"},"spans":spans}]
@@ -342,7 +369,7 @@ impl Trace {
 
 impl Drop for Trace {
     fn drop(&mut self) {
-        if self.inputs.is_empty() || !self.export_on_drop {
+        if !self.export_on_drop {
             return;
         }
         let Ok(slot) = self.exporter.slots.clone().try_acquire_owned() else {
@@ -424,7 +451,7 @@ impl Span<'_> {
         if !parts.is_empty() {
             let clean = content::clean(&json!(parts).to_string(), &self.trace.secrets());
             let attribute = observation_content(OBSERVATION_OUTPUT, &clean);
-            if final_response {
+            if final_response && self.info["name"] == "manager.generation" {
                 self.trace.root_output = Some(attribute.clone());
             }
             self.attributes.push(attribute);
@@ -505,7 +532,7 @@ impl Drop for Span<'_> {
 }
 
 fn status(outcome: &str) -> Value {
-    json!({"code":if matches!(outcome, "complete" | "ok" | "queued" | "held") {1} else {2}})
+    json!({"code":if matches!(outcome, "complete" | "ok" | "queued" | "held" | "submitted" | "running_in_background") {1} else {2}})
 }
 
 fn text(key: &str, value: &str) -> Value {
@@ -534,17 +561,34 @@ pub(crate) fn assert_input_export(inputs: Vec<(String, Option<String>)>, expecte
         public_key: "fixture-public".into(),
         secret_key: "fixture-secret".into(),
         ..Settings::default()
-    }).unwrap().unwrap();
-    let mut trace = Trace::new(exporter, "project", "channel", "provider<&credential", inputs);
+    })
+    .unwrap()
+    .unwrap();
+    let mut trace = Trace::new(
+        exporter,
+        "project",
+        "channel",
+        "provider<&credential",
+        inputs,
+    );
     trace.export_on_drop = false;
     let payload = trace.payload();
-    let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
+    let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
     assert_eq!(spans.len(), 2);
-    for (span, name) in spans.iter().zip(["manager.interaction", "manager.user_input"]) {
+    for (span, name) in spans
+        .iter()
+        .zip(["manager.interaction", "manager.user_input"])
+    {
         assert_eq!(span["name"], name);
-        assert!(span["attributes"].as_array().unwrap().contains(&text(
-            "langfuse.observation.input", expected,
-        )), "{span}");
+        assert!(
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .contains(&text("langfuse.observation.input", expected,)),
+            "{span}"
+        );
     }
 }
 
@@ -555,7 +599,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn long_content_reaches_each_trace_without_truncation() {
+    fn long_content_reaches_one_batch_trace_without_truncation() {
         let exporter = Exporter::configured(Settings {
             enabled: true,
             include_content: true,
@@ -590,7 +634,7 @@ mod tests {
         let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
             .unwrap();
-        assert_eq!(spans.len(), 6);
+        assert_eq!(spans.len(), 4);
         let attribute = |span: &Value, key: &str| {
             span["attributes"]
                 .as_array()
@@ -599,34 +643,39 @@ mod tests {
                 .find(|attribute| attribute["key"] == key)
                 .map(|attribute| attribute["value"].clone())
         };
-        assert_ne!(spans[0]["traceId"], spans[3]["traceId"]);
-        for group in spans.chunks_exact(3) {
-            assert!(group[0].get("parentSpanId").is_none());
-            for span in &group[1..] {
-                assert_eq!(span["parentSpanId"], group[0]["spanId"]);
-                assert_eq!(span["traceId"], group[0]["traceId"]);
+        assert!(spans[0].get("parentSpanId").is_none());
+        assert_eq!(
+            attribute(&spans[0], "langfuse.trace.metadata.input_ids").unwrap()["stringValue"],
+            r#"["one","two"]"#
+        );
+        assert_eq!(
+            attribute(&spans[0], "langfuse.trace.metadata.batch_size").unwrap()["intValue"],
+            "2"
+        );
+        let mut span_ids = std::collections::HashSet::new();
+        for (index, span) in spans.iter().enumerate() {
+            assert!(span_ids.insert(span["spanId"].as_str().unwrap()));
+            assert_eq!(span["traceId"], spans[0]["traceId"]);
+            if index > 0 {
+                assert_eq!(span["parentSpanId"], spans[0]["spanId"]);
             }
-            for span in group {
-                assert_eq!(
-                    attribute(span, "langfuse.session.id").unwrap()["stringValue"],
-                    trace.session
-                );
-                assert_eq!(
-                    attribute(span, "langfuse.trace.name").unwrap()["stringValue"],
-                    TRACE_NAME
-                );
-            }
-            for span in &group[..2] {
-                let input = attribute(span, "langfuse.observation.input").unwrap();
-                assert_eq!(input["stringValue"].as_str().unwrap(), user);
-            }
-            for span in [&group[0], &group[2]] {
-                let output = attribute(span, OBSERVATION_OUTPUT).unwrap();
-                assert_eq!(
-                    output["stringValue"].as_str().unwrap(),
-                    json!([{"type":"text","text":reply}]).to_string()
-                );
-            }
+            assert_eq!(
+                attribute(span, "langfuse.session.id").unwrap()["stringValue"],
+                trace.session
+            );
+        }
+        for span in &spans[1..3] {
+            assert_eq!(span["name"], "manager.user_input");
+            assert_eq!(
+                attribute(span, "langfuse.observation.input").unwrap()["stringValue"],
+                user
+            );
+        }
+        for span in [&spans[0], &spans[3]] {
+            assert_eq!(
+                attribute(span, OBSERVATION_OUTPUT).unwrap()["stringValue"],
+                json!([{"type":"text","text":reply}]).to_string()
+            );
         }
         assert!(!payload.to_string().contains("[truncated]"));
     }

@@ -38,6 +38,35 @@ struct SendFile {
     reply_to_message_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegateArgs {
+    instructions: String,
+    target_cli: Option<String>,
+    source_event_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerArgs {
+    instructions: String,
+    generation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduleArgs {
+    name: String,
+    prompt: String,
+    kind: String,
+    at: Option<Value>,
+    interval_seconds: Option<i64>,
+    cron: Option<String>,
+    timezone: Option<String>,
+    to: Option<String>,
+    purpose: String,
+}
+
 pub(super) async fn execute(
     app: &Arc<App>,
     ctx: &Context,
@@ -121,19 +150,27 @@ async fn perform(
             .await?
         }
         "delegate" | "steer_worker" => {
-            let a: DelegateArgs = serde_json::from_value(call.arguments)?;
             let steer = call.name == "steer_worker";
+            let (instructions, target_cli, source_event_id, generation) = if steer {
+                let args: SteerArgs = serde_json::from_value(call.arguments)?;
+                (args.instructions, None, None, args.generation)
+            } else {
+                let args: DelegateArgs = serde_json::from_value(call.arguments)?;
+                (
+                    args.instructions,
+                    args.target_cli,
+                    args.source_event_id,
+                    None,
+                )
+            };
             ensure!(
-                !a.instructions.trim().is_empty(),
+                !instructions.trim().is_empty(),
                 "Worker instructions are empty"
             );
-            if steer && (p.agent == "auto" || a.generation.is_some()) {
-                ensure!(
-                    a.target_cli.is_none(),
-                    "Choose an existing generation for steering, not a new CLI"
-                );
-                let generation = a
-                    .generation
+            if steer
+                && (p.agent == "auto" || generation.as_ref().is_some_and(|g| g != &p.generation))
+            {
+                let generation = generation
                     .context("Choose the running worker generation from worker_status")?;
                 let context = ctx.clone();
                 let target = generation.clone();
@@ -161,9 +198,7 @@ async fn perform(
                         generation,
                         task_run: Some(task_run),
                         segments: vec![
-                            crate::herdr::terminal_control::Segment::Text {
-                                text: a.instructions,
-                            },
+                            crate::herdr::terminal_control::Segment::Text { text: instructions },
                             crate::herdr::terminal_control::Segment::Key {
                                 key: "enter".into(),
                             },
@@ -173,18 +208,9 @@ async fn perform(
                 )
                 .await;
             }
-            ensure!(
-                a.generation.is_none(),
-                "Choose a CLI with target_cli when delegating a new task"
-            );
-            let target_cli = a.target_cli.as_deref();
             drop(guard);
-            let selected = if a.target_cli.is_some() || (!steer && p.agent == "auto") {
-                ensure!(
-                    !steer,
-                    "Choose target_cli on delegate; steer_worker is scoped to the legacy primary conversation"
-                );
-                match crate::manager_workers::select(app, &p, target_cli.unwrap_or("")).await? {
+            let selected = if target_cli.is_some() || (!steer && p.agent == "auto") {
+                match crate::manager_workers::select(app, &p, target_cli.as_deref().unwrap_or("")).await? {
                     crate::manager_workers::Selection::Target(agent) => Some(agent),
                     crate::manager_workers::Selection::Unavailable(mut result) => {
                         if result["catalog"].is_null() {
@@ -202,8 +228,9 @@ async fn perform(
             let origin_channel = channel.to_owned();
             app.db.call(move|c|{
       let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
+      ensure!(generation.as_ref().is_none_or(|g| g == &p.generation), "Legacy worker generation changed");
       let run_origin=tx.query_row("SELECT origin_event_id FROM manager_runs WHERE id=?", [&context.run], |row| row.get::<_,Option<String>>(0))?;
-      let origin = if let Some(requested) = a.source_event_id.as_deref() {
+      let origin = if let Some(requested) = source_event_id.as_deref() {
           ensure!(
               !approved_proposal || run_origin.as_deref() == Some(requested),
               "Approved proposal must use its own source_event_id"
@@ -227,7 +254,7 @@ async fn perform(
       let proposal = origin.as_deref().map(|id| work::event(&tx, &p.id, id)).transpose()?
         .filter(|event| event.source == "autonomy");
       let instructions = if let Some(proposal) = &proposal {
-          ensure!(!steer && a.target_cli.is_none(), "Approved proposal must use the current worker");
+          ensure!(!steer && target_cli.is_none(), "Approved proposal must use the current worker");
           ensure!(approved_origin(&tx, &p.id, &proposal.id)?, "Approved proposal authority changed");
           if let Some(existing) = tx.query_row(
               &format!("SELECT e.id FROM work_events e WHERE e.project_id=? AND e.source IN ('management','manager_worker')
@@ -240,7 +267,7 @@ async fn perform(
           }
           proposal.payload["instructions"].as_str().context("Approved proposal instructions are missing")?
       } else {
-          &a.instructions
+          &instructions
       };
       if selected.is_some() {
           crate::manager_workers::controls(&tx,&p)?;
@@ -296,7 +323,19 @@ async fn perform(
             crate::manager_close::close(app, &p, ctx, effect, args).await
         }
         "schedule_run" => {
-            let mut input: work::TimerInput = serde_json::from_value(call.arguments)?;
+            let args: ScheduleArgs = serde_json::from_value(call.arguments)?;
+            let input = work::TimerInput {
+                name: args.name,
+                prompt: args.prompt,
+                kind: args.kind,
+                at: args.at,
+                interval_seconds: args.interval_seconds,
+                cron: args.cron,
+                timezone: args.timezone.unwrap_or_else(|| "UTC".into()),
+                to: args.to,
+                purpose: args.purpose,
+                request_id: Some(effect.to_owned()),
+            };
             ensure!(
                 matches!(input.purpose.as_str(), "user" | "internal"),
                 "Choose user or internal schedule purpose"
@@ -304,7 +343,6 @@ async fn perform(
             if let Some(to) = input.to.as_deref() {
                 crate::feishu::recipient_type(to)?;
             }
-            input.request_id = Some(effect.to_owned());
             let context = ctx.clone();
             app.db
                 .call(move |c| {
@@ -409,14 +447,27 @@ pub(super) fn detach(c: &Connection, project: &str, channel: &str, id: &str) -> 
 }
 
 pub(super) fn wake_detached(c: &Connection, effect: &str) -> Result<()> {
+    let arguments: Option<(String, String)> = c
+        .query_row(
+            "SELECT e.arguments,p.api_key FROM manager_detached_effects d
+         JOIN manager_effects e ON e.id=d.effect_id CROSS JOIN manager_provider_config p
+         WHERE e.id=? AND e.status IN ('complete','uncertain') AND p.id=1",
+            [effect],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((arguments, key)) = arguments else {
+        return Ok(());
+    };
+    let arguments = crate::manager_telemetry::redact_arguments(&arguments, &key);
     c.execute(
         "INSERT OR IGNORE INTO manager_inputs(id,project_id,kind,payload,created_at,channel_id,signal)
          SELECT 'bg-tool:'||e.id,d.project_id,'worker',
-            json_object('kind','background_tool_result','task_id',e.id,'tool',e.name,'result',json(e.result)),
+            json_object('kind','background_tool_result','task_id',e.id,'tool',e.name,'arguments',?,'result',json(e.result)),
             ?,d.channel_id,'wake'
          FROM manager_detached_effects d JOIN manager_effects e ON e.id=d.effect_id
          WHERE e.id=? AND e.status IN ('complete','uncertain')",
-        params![db::now(),effect],
+        params![arguments,db::now(),effect],
     )?;
     Ok(())
 }
@@ -507,7 +558,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             vec![],
         ),
         (
-            "Create a project schedule. Use user for work explicitly requested by the user; internal for your own follow-up checks.",
+            "Create a project schedule. Use user for work explicitly requested by the user; internal for your own follow-up checks. Use RFC3339 for at, 5-field Unix syntax for cron, an IANA timezone, and an oc_ or ou_ ID for to.",
             json!({"name":{"type":"string"},"prompt":{"type":"string"},"kind":{"type":"string","enum":["once","interval","cron"]},"at":{"type":"string"},"interval_seconds":{"type":"integer"},"cron":{"type":"string"},"timezone":{"type":"string"},"to":{"type":"string"},"purpose":{"type":"string","enum":["user","internal"]}}),
             vec!["name", "prompt", "kind", "purpose"],
         ),

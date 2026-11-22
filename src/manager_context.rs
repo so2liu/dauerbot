@@ -232,6 +232,15 @@ fn redact_json(value: &mut Value, depth: usize, budget: &mut RedactionBudget) {
         _ => {}
     }
 }
+pub(crate) fn bearer_value(value: &str) -> bool {
+    let value = value.trim_matches(['"', '\'', '`', '(', ')', ',', '.']);
+    value.len() >= 16
+        || value.len() >= 6
+            && value
+                .bytes()
+                .any(|b| b.is_ascii_digit() || b"-_+/=.".contains(&b))
+}
+
 fn redact_text(text: &str) -> (String, bool) {
     let lower = text.to_ascii_lowercase();
     if lower.contains("-----begin") && lower.contains("private key-----") {
@@ -266,7 +275,7 @@ fn redact_text(text: &str) -> (String, bool) {
         for token in line.split_inclusive(char::is_whitespace) {
             let trimmed = token.trim();
             let cleaned = trimmed.trim_start_matches(['"', '\'', '(', '[']);
-            if bearer
+            if (bearer && bearer_value(cleaned))
                 || cleaned.starts_with("sk-")
                 || cleaned.starts_with("sk_")
                 || cleaned.to_ascii_lowercase().starts_with("data:image/")

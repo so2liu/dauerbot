@@ -216,16 +216,57 @@ fn telemetry_inputs(
          FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id
          JOIN manager_ingested_inputs x ON x.input_id=i.id
          LEFT JOIN manager_session_messages m ON m.seq=x.message_seq
-         WHERE b.run_id=? AND i.kind='user' ORDER BY i.rowid LIMIT 64",
-    )?.query_map(params![includes_content,run], |row| Ok((row.get(0)?,row.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+         WHERE b.run_id=? ORDER BY i.rowid",
+    )?
+    .query_map(params![includes_content, run], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?
+    .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> Result<()> {
+    let mut trace = app.manager_telemetry.as_ref().map(|exporter| {
+        crate::manager_telemetry::Trace::new(
+            exporter.clone(),
+            &turn.context.project,
+            channel,
+            &turn.config.api_key,
+            Vec::new(),
+        )
+    });
+    let result = drive_turn(&app, turn, channel, workspace, &mut trace).await;
+    if let Some(trace) = &mut trace {
+        if result.is_err() {
+            trace.finish("failed");
+        }
+        let run = turn.context.run.clone();
+        let includes_content = app
+            .manager_telemetry
+            .as_ref()
+            .is_some_and(|e| e.includes_content());
+        match app
+            .db
+            .call(move |c| telemetry_inputs(c, &run, includes_content))
+            .await
+        {
+            Ok(inputs) => trace.set_inputs(inputs),
+            Err(_) => tracing::warn!("Manager telemetry input lookup failed"),
+        }
+    }
+    result
+}
+
+async fn drive_turn(
+    app: &Arc<App>,
+    turn: &Turn,
+    channel: &str,
+    workspace: &Path,
+    trace: &mut Option<crate::manager_telemetry::Trace>,
+) -> Result<()> {
     let context = &turn.context;
     if let Some(debug) = &turn.debug {
         let echo = crate::feishu::send_debug_reply(
-            &app,
+            app,
             &context.project,
             &debug.app_id,
             &debug.chat,
@@ -234,7 +275,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         );
         tokio::select! {
             biased;
-            _ = interruption(&app, context, channel) => return Ok(()),
+            _ = interruption(app, context, channel) => return Ok(()),
             result = echo => {
                 if result.is_err() {
                     tracing::warn!("Manager input debug reply failed");
@@ -242,27 +283,6 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
             }
         }
     }
-    let mut trace = if let Some(exporter) = &app.manager_telemetry {
-        let run = context.run.clone();
-        let includes_content = exporter.includes_content();
-        let inputs = app.db.call(move |c| telemetry_inputs(c, &run, includes_content)).await;
-        match inputs {
-            Ok(inputs) if !inputs.is_empty() => Some(crate::manager_telemetry::Trace::new(
-                exporter.clone(),
-                &context.project,
-                channel,
-                &turn.config.api_key,
-                inputs,
-            )),
-            Ok(_) => None,
-            Err(_) => {
-                tracing::warn!("Manager telemetry input lookup failed");
-                None
-            }
-        }
-    } else {
-        None
-    };
     let cache_key = format!(
         "dauerbot:{:x}",
         Sha256::digest(format!("{}:{channel}", context.project))
@@ -271,10 +291,10 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
     let mut index = 0;
     let mut compactions = 0;
     loop {
-        let snapshot = memory::read(workspace).await.ok();
+        let snapshot = memory::snapshot(workspace).await;
         let run = context.clone();
         let key = channel.to_owned();
-        let (history, (last_input, last_estimate, cutoff)) = app
+        let (history, (last_input, last_estimate, cutoff, has_head_memory)) = app
             .db
             .call(move |c| {
                 let tx = c.unchecked_transaction()?;
@@ -294,8 +314,8 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                 }
                 let history = session::load(&tx, &run.project, &key)?;
                 let last_usage = tx.query_row(
-                    "SELECT last_input_tokens,last_estimate,compaction_seq FROM manager_channels WHERE project_id=? AND channel_id=?",
-                    params![run.project,key], |r| Ok((r.get::<_, Option<i64>>(0)?,r.get::<_, Option<i64>>(1)?,r.get::<_, i64>(2)?)),
+                    "SELECT last_input_tokens,last_estimate,compaction_seq,head_memory IS NOT NULL FROM manager_channels WHERE project_id=? AND channel_id=?",
+                    params![run.project,key], |r| Ok((r.get::<_, Option<i64>>(0)?,r.get::<_, Option<i64>>(1)?,r.get::<_, i64>(2)?,r.get::<_, bool>(3)?)),
                 )?;
                 tx.commit()?;
                 Ok((history, last_usage))
@@ -315,8 +335,9 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         } else {
             (limit / 8).clamp(256, 20_000)
         };
+        let head_memory_len = usize::from(has_head_memory);
         let mut summary_budget = limit / 2;
-        let prefix_len = history
+        let prefix_len = head_memory_len + history[head_memory_len..]
             .iter()
             .take_while(|entry| {
                 let cost = session::estimated_tokens(entry);
@@ -351,7 +372,11 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
             let max_summary_bytes = ((limit / 2) as usize).saturating_mul(3);
             let mut summary = String::from("[");
             let mut remaining = max_summary_bytes;
-            for (i, entry) in history[..cut].iter().enumerate() {
+            for (i, entry) in history[..cut]
+                .iter()
+                .skip(head_memory_len)
+                .enumerate()
+            {
                 if i > 0 {
                     summary.push(',');
                 }
@@ -374,14 +399,40 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
             }
             summary.push(']');
             let request = CompletionRequest::new(summary)
-                .preamble("Summarize the earlier conversation. Keep requests, decisions, progress, and confirmed or uncertain tool outcomes.")
+                .preamble("Summarize the earlier conversation. Keep requests, decisions, progress, and confirmed or uncertain tool outcomes. Preserve active message_id and event_id values, worker generations, and the user's language.")
                 .max_tokens((limit / 8).min(4096));
+            let mut span = trace.as_mut().map(|trace| {
+                let mut span = trace.span("manager.compaction", "generation");
+                span.model(&turn.config.model);
+                span
+            });
             let response = tokio::select! {
                 biased;
-                _ = interruption(&app, context, channel) => return Ok(()),
-                result = llm::call(&turn.config, request, None) => result?,
+                _ = interruption(app, context, channel) => return Ok(()),
+                result = llm::call(&turn.config, request, None) => result,
             };
-            let summary = rig_core::transcript::assistant_text_from_choice(&response.choice);
+            let summary = match response {
+                Ok(response) => {
+                    let summary =
+                        rig_core::transcript::assistant_text_from_choice(&response.choice);
+                    if let Some(span) = &mut span {
+                        span.response(response.usage);
+                        span.finish(if summary.trim().is_empty() {
+                            "failed"
+                        } else {
+                            "ok"
+                        });
+                    }
+                    summary
+                }
+                Err(error) => {
+                    if let Some(span) = &mut span {
+                        span.finish("failed");
+                    }
+                    return Err(error.into());
+                }
+            };
+            drop(span);
             ensure!(
                 !summary.trim().is_empty(),
                 Failure::invalid_response()
@@ -417,21 +468,38 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         });
         let response = tokio::select! {
             biased;
-            _ = interruption(&app, context, channel) => return Ok(()),
+            _ = interruption(app, context, channel) => return Ok(()),
             result = llm::call(&turn.config, request, Some(&cache_key)) => match result {
                 Err(error) if error.kind == "context_rejected" && !recover_overflow && compactions < 4 => {
+                    if let Some(span) = &mut span {
+                        span.finish("context_rejected");
+                    }
                     recover_overflow = true;
                     continue;
                 }
-                result => result?,
+                Err(error) => {
+                    if let Some(span) = &mut span {
+                        span.finish("failed");
+                    }
+                    return Err(error.into());
+                }
+                Ok(response) => response,
             },
         };
         index += 1;
         observation.finish("provider_responded");
+        let assistant = response.message();
+        let complete = response.error.is_none()
+            && response.aborted.is_none()
+            && !matches!(
+                response.finish_reason(),
+                Some(FinishReason::Length | FinishReason::ContentFilter | FinishReason::Other(_))
+            )
+            && assistant.is_some();
         if let Some(mut span) = span.take() {
             span.response(response.usage);
             span.assistant(response.choice.iter());
-            span.finish("ok");
+            span.finish(if complete { "ok" } else { "failed" });
         }
         drop(span);
         recover_overflow = false;
@@ -448,18 +516,8 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                 params![input_tokens,last_estimate,run.project,key])?;
             Ok(())
         }).await?;
-        ensure!(
-            response.error.is_none()
-                && response.aborted.is_none()
-                && !matches!(
-                    response.finish_reason(),
-                    Some(
-                        FinishReason::Length | FinishReason::ContentFilter | FinishReason::Other(_)
-                    )
-                ),
-            Failure::invalid_response()
-        );
-        let assistant = response.message().ok_or_else(Failure::invalid_response)?;
+        ensure!(complete, Failure::invalid_response());
+        let assistant = assistant.ok_or_else(Failure::invalid_response)?;
         let calls = match &assistant {
             Message::Assistant(message) => message.tool_calls().cloned().collect::<Vec<_>>(),
             _ => Vec::new(),
@@ -513,8 +571,10 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                 tokio::select! {
                     biased;
                     result = &mut task => result??,
-                    interrupt = interruption(&app, context, channel) => {
+                    interrupt = interruption(app, context, channel) => {
                         if matches!(interrupt, Interrupt::Closed) {
+                            // Recovery wakes use the journaled arguments because this
+                            // tool batch has no canonical checkpoint.
                             return Ok(());
                         }
                         interrupted = true;
@@ -523,31 +583,28 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                     }
                 }
             };
-            if let Some(trace) = &mut trace {
-                let mut span = trace.span("manager.tool", "tool");
-                span.tool(
-                    name,
-                    &Value::Object(call.function.arguments.clone()),
-                    &result,
-                    if tool_result_failed(&result) {
-                        "failed"
-                    } else {
-                        "ok"
-                    },
-                );
+            if let Some(trace) = trace
+                && detached.as_ref().is_none_or(|(index, _)| *index != offset)
+            {
+                trace_tool(trace, call, &result);
             }
             results.push((call.id.clone(), call.function.name.clone(), result));
         }
         let run = context.clone();
         let key = channel.to_owned();
         let finished = calls.is_empty();
-        app.db
+        let detached_result = app
+            .db
             .call(move |c| {
                 let tx = c.unchecked_transaction()?;
                 valid(&tx, &run)?;
-                if let Some((index, effect)) = detached {
-                    results[index].2 = tools::detach(&tx, &run.project, &key, &effect)?;
-                }
+                let detached_result = if let Some((index, effect)) = detached {
+                    let result = tools::detach(&tx, &run.project, &key, &effect)?;
+                    results[index].2 = result.clone();
+                    Some((index, result))
+                } else {
+                    None
+                };
                 let mut batch = vec![assistant];
                 if !results.is_empty() {
                     let content = results
@@ -577,16 +634,44 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                     recovered(&tx, &run)?;
                 }
                 tx.commit()?;
-                Ok(())
+                Ok(detached_result)
             })
             .await?;
+        if let (Some(trace), Some((index, result))) = (trace.as_mut(), detached_result) {
+            trace_tool(trace, &calls[index], &result);
+        }
         if finished || interrupted {
-            if let Some(trace) = &mut trace {
+            if let Some(trace) = trace {
                 trace.finish(if interrupted { "interrupted" } else { "ok" });
             }
             return Ok(());
         }
     }
+}
+
+fn trace_tool(
+    trace: &mut crate::manager_telemetry::Trace,
+    call: &rig_core::message::ToolCall,
+    result: &Value,
+) {
+    let outcome = match result["status"].as_str() {
+        Some("running_in_background") => "running_in_background",
+        Some("queued") => "queued",
+        Some("held") => "held",
+        Some("submitted") => "submitted",
+        Some("refused") => "refused",
+        Some("worker_unavailable") => "worker_unavailable",
+        Some("skipped_due_to_steering") => "skipped_due_to_steering",
+        Some("uncertain") => "uncertain",
+        _ if tool_result_failed(result) => "failed",
+        _ => "ok",
+    };
+    trace.span("manager.tool", "tool").tool(
+        call.function.name.as_str(),
+        &Value::Object(call.function.arguments.clone()),
+        result,
+        outcome,
+    );
 }
 
 pub(super) async fn run(app: Arc<App>) {
@@ -635,7 +720,7 @@ async fn run_channel(app: Arc<App>, project: &str, channel: &str) -> Result<()> 
     let p = app.db.project(project).await?;
     let workspace = Path::new(&p.path);
     prepare_group_context(&app, project, channel).await;
-    let snapshot = memory::read(workspace).await.ok();
+    let snapshot = memory::snapshot(workspace).await;
     let (project, key) = (project.to_owned(), channel.to_owned());
     let Some(turn) = app
         .db
@@ -1008,13 +1093,18 @@ mod tests {
             tx.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at)
                 VALUES('run',?,1,1,'{\"channel_id\":\"local:default\"}','working','old-host',1)", [&project.id])?;
             tx.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status)
-                VALUES('effect','run','0','send_md','{}','submitting')", [])?;
+                VALUES('effect','run','0','send_md',?,'submitting')",
+                [json!({"to":"oc_fixture","text":"fixture message", "api_key":"fixture-secret"}).to_string()])?;
             assert_eq!(tools::detach(&tx, &project.id, channel::LOCAL, "effect")?["status"], "running_in_background");
             tx.commit()?;
             migrate(c, true)?;
             migrate(c, true)?;
             let result: String = c.query_row("SELECT payload FROM manager_inputs WHERE id='bg-tool:effect' AND signal='wake'", [], |r|r.get(0))?;
-            assert_eq!(serde_json::from_str::<Value>(&result)?["result"]["status"], "uncertain");
+            let payload: Value = serde_json::from_str(&result)?;
+            assert_eq!(payload["result"]["status"], "uncertain");
+            let arguments = payload["arguments"].as_str().unwrap();
+            assert!(arguments.contains("fixture message"));
+            assert!(!arguments.contains("fixture-secret"));
             Ok(())
         }).unwrap();
     }
