@@ -352,7 +352,7 @@ fn intent_for_worker(
     instructions: &str,
     origin: Option<&str>,
     steer: bool,
-    worker: Option<&Project>,
+    worker: Option<(&str, Option<&Project>)>,
 ) -> Result<String> {
     ensure!(
         !instructions.trim().is_empty() && instructions.len() <= 1048576,
@@ -376,10 +376,10 @@ fn intent_for_worker(
         crate::cli_switch::latest(c, &p.id)?.filter(crate::cli_switch::blocks_worker)
     };
     let mut payload = json!({"instructions":instructions,"origin_event_id":origin,"manager_effect_id":id,"steer":steer,"expected_agent":transition.as_ref().map(|r|r.target.as_str()).unwrap_or(&p.agent),"expected_native":if transition.is_some(){""}else{&p.native_session},"target_generation":if transition.is_none()&&p.terminal.is_some(){Some(&p.generation)}else{None},"transition_id":transition.as_ref().map(|r|&r.id)});
-    let source = if let Some(worker) = worker {
-        payload["expected_agent"] = json!(worker.agent);
-        payload["expected_native"] = json!(worker.native_session);
-        payload["target_generation"] = json!(worker.generation);
+    let source = if let Some((agent, worker)) = worker {
+        payload["expected_agent"] = json!(agent);
+        payload["expected_native"] = json!(worker.map(|p| &p.native_session));
+        payload["target_generation"] = json!(worker.map(|p| &p.generation));
         "manager_worker"
     } else {
         "management"
@@ -1024,7 +1024,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     // Establish that the requested discussion belongs to this batch before
     // starting any additional native execution.
     let context=ctx.clone();let chosen_source=a.source_event_id.clone();
-    let (seat_origin, requested_cli) = app.db.call(move|c| {
+    let requested_cli = app.db.call(move|c| {
         valid(c,&context)?;
         let origin=select_origin(c,&context,chosen_source.as_deref())?;
         let text=origin.as_deref().map(|id| c.query_row(
@@ -1032,7 +1032,7 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
              WHERE e.id=? AND e.project_id=? AND m.direction='in'",
             params![id,context.project], |row| row.get::<_,String>(0)).optional())
             .transpose()?.flatten();
-        Ok((origin,text.as_deref().and_then(named_cli)))
+        Ok(text.as_deref().and_then(named_cli))
     }).await?;
     if steer && (p.agent=="auto" || a.generation.is_some()) {
         ensure!(a.target_cli.is_none(),"Choose an existing generation for steering, not a new CLI");
@@ -1061,8 +1061,8 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
     let target_cli = requested_cli.as_deref().or(a.target_cli.as_deref());
     let selected = if a.target_cli.is_some() || (!steer && (requested_cli.is_some() || p.agent=="auto")) {
         ensure!(!steer,"Choose target_cli on delegate; steer_worker is scoped to the legacy primary conversation");
-        match crate::manager_workers::select(app,&p,target_cli.unwrap_or(""),seat_origin).await? {
-            crate::manager_workers::Selection::Ready(worker) => Some(*worker),
+        match crate::manager_workers::select(app,&p,target_cli.unwrap_or("")).await? {
+            crate::manager_workers::Selection::Target(agent) => Some(agent),
             crate::manager_workers::Selection::Unavailable(mut result) => {
                 if result["catalog"].is_null() {
                     result["catalog"]=crate::manager_workers::catalog(&p).await;
@@ -1094,22 +1094,15 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       } else {
           &a.instructions
       };
-      let independent = selected.as_ref().filter(|worker| worker.generation!=p.generation);
-      if let Some(worker) = independent {
-          let current=crate::manager_workers::authorize(&tx,&p,&worker.generation,true)?.project;
-          ensure!(current.terminal==worker.terminal && current.native_session==worker.native_session,
-              "The independent worker changed before assignment");
-      } else if let Some(worker) = &selected {
+      if selected.is_some() {
           crate::manager_workers::controls(&tx,&p)?;
-          ensure!(p.generation==worker.generation && p.terminal==worker.terminal && p.native_session==worker.native_session
-              && p.ready && p.execution["mcp_registered"]==true,"The primary worker changed before assignment");
       }
-      let held=independent.is_none() && crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
+      let held=selected.is_none() && crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
       ensure!(!steer||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
       ensure!(!steer||!held,"Worker steering is held by a CLI transition");
-      let id=intent_for_worker(&tx,&p,&request,instructions,origin.as_deref(),steer,independent)?;
+      let id=intent_for_worker(&tx,&p,&request,instructions,origin.as_deref(),steer,selected.as_deref().map(|agent| (agent,None)))?;
       let event=work::event(&tx,&p.id,&id)?;tx.commit()?;
-      Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"]}))
+      Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"],"work_queued":true,"assignment_pending":selected.is_some() && event.payload["target_generation"].is_null()}))
     }).await
    },
    "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();let mut snapshot=app.db.call(move|c|{let current=valid(c,&authority)?;worker_snapshot(c,&current.id,&current.generation)}).await?;snapshot["agent"]=json!(p.agent);snapshot["generation"]=json!(p.generation);snapshot["native_session"]=json!(p.native_session);snapshot["ready"]=json!(p.ready);snapshot["paused"]=json!(p.paused);snapshot["mcp_registered"]=json!(p.execution["mcp_registered"]==true);snapshot["available_clis"]=crate::manager_workers::catalog(&p).await;snapshot["obsolete_executions"]=json!(obsolete);snapshot["input_effect_journal"]=journal;Ok(snapshot)},
@@ -1221,7 +1214,8 @@ fn worker_snapshot(c: &Connection, project: &str, generation: &str) -> Result<Va
             let independent = r.get::<_, String>(7)? == "manager_worker";
             let held = status == "queued" && transition.as_ref().is_some_and(|request|
                 request.holds_input || (!independent && request.phase == "recovery_exhausted"));
-            Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":status,"held":held,"run_status":r.get::<_,Option<String>>(2)?,"error":r.get::<_,String>(3)?,"transition_id":r.get::<_,Option<String>>(4)?,"expected_agent":r.get::<_,Option<String>>(5)?,"generation":r.get::<_,Option<String>>(6)?}))
+            let generation: Option<String> = r.get(6)?;
+            Ok(json!({"event_id":r.get::<_,String>(0)?,"event_status":status,"held":held,"run_status":r.get::<_,Option<String>>(2)?,"error":r.get::<_,String>(3)?,"transition_id":r.get::<_,Option<String>>(4)?,"expected_agent":r.get::<_,Option<String>>(5)?,"assignment_pending":independent && status=="queued" && generation.is_none(),"generation":generation}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
     let work = work::snapshot(c, project)?;
     let workers = crate::manager_workers::snapshot(c,&db::project_by_key(c,project)?)?;
@@ -5116,9 +5110,9 @@ mod tests {
             }
             let one=crate::manager_workers::seat(c,&parent,"worker-one")?.unwrap().project;
             let two=crate::manager_workers::seat(c,&parent,"worker-two")?.unwrap().project;
-            let a=intent_for_worker(c,&parent,"effect-one","first task",None,false,Some(&one))?;
-            let b=intent_for_worker(c,&parent,"effect-two","second task",None,false,Some(&two))?;
-            let later=intent_for_worker(c,&parent,"effect-later","held by pause",None,false,Some(&one))?;
+            let a=intent_for_worker(c,&parent,"effect-one","first task",None,false,Some((&one.agent,Some(&one))))?;
+            let b=intent_for_worker(c,&parent,"effect-two","second task",None,false,Some((&two.agent,Some(&two))))?;
+            let later=intent_for_worker(c,&parent,"effect-later","held by pause",None,false,Some((&one.agent,Some(&one))))?;
             let workers=worker_snapshot(c,&parent.id,&parent.generation)?;
             assert_eq!(workers["workers"].as_array().unwrap().len(),2);
             assert!(work::claim_next(c,&parent.id,"primary",db::now())?.is_none());

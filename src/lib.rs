@@ -181,14 +181,7 @@ impl App {
             if resume {
                 bail!("Automatic projects resume their task workers through Manager");
             }
-            match manager_workers::select(self, &p, "", None).await? {
-                manager_workers::Selection::Ready(_) => {}
-                manager_workers::Selection::Unavailable(info) => {
-                    if info["starting"] != true {
-                        bail!("{}", info["reason"].as_str().unwrap_or("No worker is available"));
-                    }
-                }
-            }
+            manager_workers::warm(self, &p).await?;
             return Ok(p);
         }
         self.start_inner(&p.id, resume).await

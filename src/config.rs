@@ -15,6 +15,8 @@ pub struct Config {
     pub herdr_session: String,
     pub herdr_config: String,
     pub feishu_base: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager_workers_per_cli: Option<std::num::NonZeroUsize>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub app_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -30,6 +32,7 @@ impl Default for Config {
             herdr_session: "dauerbot".into(),
             herdr_config: String::new(),
             feishu_base: "https://open.feishu.cn".into(),
+            manager_workers_per_cli: None,
             app_id: String::new(),
             app_secret: String::new(),
         }
