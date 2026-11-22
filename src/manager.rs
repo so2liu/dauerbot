@@ -1918,7 +1918,9 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             && let Some(anchor_scope) = topic_decisions::discussion(&tx, project, anchor)?
         {
             context["topic_history_origin_event_id"] = json!(anchor);
-            if let Some((_, steering, _, _)) = &latest_context {
+            if let Some((_, steering, _, status)) = &latest_context
+                && status == "consumed"
+            {
                 let steering_scope = steering.as_deref().map(|origin|
                     topic_decisions::discussion(&tx, project, origin)).transpose()?.flatten();
                 if steering_scope.as_deref() != Some(&anchor_scope) {
@@ -3022,6 +3024,8 @@ mod tests {
         assert_eq!(contexts.len(),2);
         assert!(contexts.iter().any(|entry|entry["origin_event_id"]==other));
         assert!(contexts.iter().all(|entry|entry["origin_event_id"]!=not_claimed));
+        assert_eq!(prompt["latest_user_steering"]["source_event_id"],not_claimed);
+        assert_eq!(prompt["latest_user_steering"]["context_only_not_batch_member"],true);
         server.abort();
         Ok(())
     }
