@@ -19,9 +19,24 @@ const RECOVERY: &str =
 const SUMMARY: &str = "PI-NATIVE-COMPACTION-CHECKPOINT: retain the established goal.";
 const SUMMARY_REQUEST: &str = "Create a structured context checkpoint summary";
 
+fn is_compaction_request(request: &Value) -> bool {
+    if request["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return false;
+    }
+    let messages = request["messages"].to_string();
+    messages.contains(SUMMARY_REQUEST)
+        || messages.contains(
+            "Create a concise checkpoint of the user's request and the progress shown above",
+        )
+}
+
 enum ModelReply {
     Text(&'static str),
     LongText(&'static str, bool),
+    Hang,
     Tool(&'static str, Value),
 }
 
@@ -30,6 +45,8 @@ struct ServerState {
     script: Mutex<VecDeque<ModelReply>>,
     requests: Mutex<Vec<Value>>,
     attempted_sends: AtomicUsize,
+    in_flight: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 struct ProviderFixture {
@@ -72,8 +89,7 @@ impl ProviderFixture {
                     let model = model.clone();
                     async move {
                         assert_eq!(headers["authorization"], "Bearer private-manager-key");
-                        let summarizes = body["tools"].as_array().is_none_or(Vec::is_empty)
-                            && body["messages"].to_string().contains(SUMMARY_REQUEST);
+                        let summarizes = is_compaction_request(&body);
                         let reply = if summarizes {
                             ModelReply::Text(SUMMARY)
                         } else {
@@ -83,6 +99,11 @@ impl ProviderFixture {
                         let mut prompt_tokens = 10;
                         let (delta, finish) = match reply {
                             ModelReply::Text(text) => (json!({"role":"assistant","content":text}), "stop"),
+                            ModelReply::Hang => {
+                                model.in_flight.notify_one();
+                                model.release.notified().await;
+                                return StatusCode::BAD_GATEWAY.into_response();
+                            }
                             ModelReply::LongText(marker, trigger) => {
                                 if trigger { prompt_tokens = 125_000; }
                                 (json!({"role":"assistant","content":format!("{marker} {}", "fixture ".repeat(3750))}), "stop")
@@ -138,9 +159,7 @@ impl ProviderFixture {
         assert!(self.state.script.lock().unwrap().is_empty());
         let requests = std::mem::take(&mut *self.state.requests.lock().unwrap());
         for request in &requests {
-            let is_summary = request["tools"].as_array().is_none_or(Vec::is_empty)
-                && request["messages"].to_string().contains(SUMMARY_REQUEST);
-            if is_summary {
+            if is_compaction_request(request) {
                 continue;
             }
             let tools = request["tools"]
@@ -541,6 +560,122 @@ async fn pi_persistent_session_keeps_native_compaction() -> Result<()> {
     );
     eprintln!(
         "Pi made its own threshold summarization call after four long turns and resumed the same session from its durable compaction entry."
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly selected installed Pi executable"]
+async fn pi_persistent_session_does_not_replay_active_interrupted_turn() -> Result<()> {
+    let provider = ProviderFixture::start().await?;
+    let (_dir, app, project, config) = configured(&provider).await?;
+    insert(
+        &app,
+        &project,
+        "om_settled",
+        "om_crash_root",
+        "omt_crash_thread",
+        "PI-SETTLED: establish a checkpoint.",
+    )?;
+    provider
+        .claim_and_drive(
+            app.clone(),
+            &project,
+            [ModelReply::Text(
+                "PI-SETTLED-ANSWER: the last committed transcript.",
+            )],
+        )
+        .await?;
+    let settled = snapshots(&app, &project)?;
+    let origin = insert(
+        &app,
+        &project,
+        "om_interrupted",
+        "om_crash_root",
+        "omt_crash_thread",
+        "PI-INTERRUPTED: preserve me without replay.",
+    )?;
+    provider.state.script.lock().unwrap().extend([
+        ModelReply::Tool(
+            "write_file",
+            json!({"path":"before-crash.txt","content":"Committed before interrupted response"}),
+        ),
+        ModelReply::Hang,
+    ]);
+    let turn = app.db.sync(|c| {
+        crate::work::sync_inbound(c)?;
+        super::super::claim(c, &project.id)?.context("active fixture turn")
+    })?;
+    let run = turn.context.run.clone();
+    let driver = tokio::spawn(super::super::drive(app.clone(), turn));
+    tokio::time::timeout(Duration::from_secs(20), provider.state.in_flight.notified()).await?;
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+    provider.state.release.notify_one();
+    assert_eq!(provider.state.requests.lock().unwrap().len(), 2);
+
+    let store = app.dir.clone();
+    drop(app);
+    // The production owner token changes with the daemon process. Recreate that
+    // transition explicitly because this fixture reopens App in the same test process.
+    {
+        let db = rusqlite::Connection::open(store.join("bridge.sqlite3"))?;
+        assert_eq!(
+            db.execute(
+                "UPDATE manager_runs SET owner='prior-fixture-daemon' WHERE id=?",
+                [&run]
+            )?,
+            1
+        );
+    }
+    let app = App::new(store, config)?;
+    let resumed = app
+        .db
+        .sync(|c| super::super::claim(c, &project.id)?.context("interrupted fixture claim"))?;
+    assert_eq!(resumed.context.run, run);
+    assert_eq!(resumed.checkpoint["pi"]["started"], true);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            super::super::drive(app.clone(), resumed)
+        )
+        .await?
+        .is_err()
+    );
+    assert_eq!(
+        provider.state.requests.lock().unwrap().len(),
+        2,
+        "resubmitted the interrupted provider request"
+    );
+    assert_eq!(
+        snapshots(&app, &project)?,
+        settled,
+        "published an interrupted trajectory"
+    );
+    app.db.sync(|c| {
+        assert_eq!(
+            c.query_row(
+                "SELECT status FROM manager_inputs WHERE origin_event_id=?",
+                [&origin],
+                |row| row.get::<_, String>(0)
+            )?,
+            "processing"
+        );
+        let effects = c
+            .prepare("SELECT name,status FROM manager_effects WHERE run_id=? ORDER BY rowid")?
+            .query_map([&run], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(effects, vec![("write_file".into(), "complete".into())]);
+        Ok(())
+    })?;
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&project.path).join("before-crash.txt"))?,
+        "Committed before interrupted response"
+    );
+    eprintln!(
+        "An interrupted live Pi request kept the input and confirmed effect. Restoring its working claim made no provider request and left the last settled snapshot intact."
     );
     Ok(())
 }

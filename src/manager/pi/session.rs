@@ -24,7 +24,7 @@ pub(in crate::manager) fn migrate(c: &Connection) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 
 pub(super) struct Snapshot {
     id: String,

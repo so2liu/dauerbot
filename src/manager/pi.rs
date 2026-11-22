@@ -329,7 +329,14 @@ async fn run(
     let mut recovery = false;
     let mut expected = None;
     if let (Some(old), Some(staged)) = (&old, &staged) {
-        if session::stage(cwd, old, staged).is_ok() {
+        let old_copy = old.clone();
+        let source_dir = cwd.to_owned();
+        let destination = staged.clone();
+        let restored = tokio::task::spawn_blocking(move || {
+            session::stage(&source_dir, &old_copy, &destination)
+        })
+        .await?;
+        if restored.is_ok() {
             expected = Some(old.session_id.as_str());
         } else {
             discard_staged(staged)?;
@@ -369,7 +376,10 @@ async fn run(
     if let (Some(scope), Some(dir), Some(staged), Some(id)) =
         (turn.scope.clone(), state_dir, staged, session_id)
     {
-        let snapshot = session::publish(&dir, &staged, id)?;
+        let state_dir = dir.clone();
+        let snapshot =
+            tokio::task::spawn_blocking(move || session::publish(&state_dir, &staged, id))
+                .await??;
         app.db
             .call(move |c| session::finish(c, &context, &scope, &snapshot, &note))
             .await?;
