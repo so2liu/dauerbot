@@ -1,4 +1,5 @@
 //! Restricted management actor. Native CLI authority stays in the worker.
+mod topic_decisions;
 use crate::{
     App, db,
     db::Project,
@@ -44,6 +45,7 @@ pub(crate) fn uses_manager(c: &Connection, project: &str) -> Result<bool> {
         [project], |row|row.get::<_,bool>(0))?)
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
+    topic_decisions::migrate(c)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS standalone_projects(
         project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
     )")?;
@@ -525,6 +527,12 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
             context = crate::envelope::scheduled_body(&original.payload)?;
         }
     }
+    if let Some(decisions) = event.payload.get("topic_decisions") {
+        context.push_str(&format!(
+            "\n<topic_decisions trust=\"user_input\">{}</topic_decisions>",
+            crate::envelope::escape(&decisions.to_string())
+        ));
+    }
     Ok(format!(
         "<management_delegation effect_id=\"{}\" trust=\"daemon_metadata\">\n{}\n<manager_instructions trust=\"agent_content\">{}</manager_instructions>\n</management_delegation>",
         crate::envelope::escape(&event.source_id),
@@ -550,6 +558,7 @@ struct DelegateArgs {
     instructions: String,
     source_event_id: Option<String>,
     target_cli: Option<String>,
+    decision_branch: Option<String>,
     #[serde(default)]
     generation: Option<String>,
 }
@@ -1014,6 +1023,18 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
   match call.name.as_str() {
    "read_file"=>{let a:FileArgs=serde_json::from_value(call.arguments)?;read_file(Path::new(&p.path),&a.path)},
    "write_file"=>{let a:WriteArgs=serde_json::from_value(call.arguments)?;write_file(Path::new(&p.path),a)},
+   "record_topic_decision"=>{
+    let input:topic_decisions::Record=serde_json::from_value(call.arguments)?;
+    let context=ctx.clone();
+    app.db.call(move|c|{
+        let tx=c.unchecked_transaction()?;
+        let p=valid(&tx,&context)?;
+        select_origin(&tx,&context,Some(&input.source_event_id))?;
+        let outcome=topic_decisions::record(&tx,&p.id,input)?;
+        tx.commit()?;
+        Ok(outcome)
+    }).await
+   },
    "delegate"|"steer_worker"=>{
     let a:DelegateArgs=serde_json::from_value(call.arguments)?;let steer=call.name=="steer_worker";
     ensure!(!a.instructions.trim().is_empty() && a.instructions.len() <= 1048576,
@@ -1098,6 +1119,15 @@ async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
       ensure!(!steer||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
       ensure!(!steer||!held,"Worker steering is held by a CLI transition");
       let id=intent_for_worker(&tx,&p,&request,instructions,origin.as_deref(),steer,selected.as_deref().map(|agent| (agent,None)))?;
+      if let (Some(branch),Some(origin))=(a.decision_branch.as_deref(),origin.as_deref())
+        && !steer && proposal.is_none()
+      {
+          let decisions=topic_decisions::context(&tx,&p.id,origin,Some(branch))?;
+          if !decisions.is_null() {
+              tx.execute("UPDATE work_events SET payload=json_set(payload,'$.topic_decisions',json(?)) WHERE id=? AND project_id=?",
+                  params![decisions.to_string(),id,p.id])?;
+          }
+      }
       let event=work::event(&tx,&p.id,&id)?;tx.commit()?;
       Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"],"work_queued":true,"assignment_pending":selected.is_some() && event.payload["target_generation"].is_null()}))
     }).await
@@ -1731,6 +1761,13 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         // User steering may interrupt an owned batch; observations never do. Reserve
         // one of the 32 NEW claim slots for that control input, without reordering
         // ordinary fresh batches or changing their persisted input order.
+        let decision_origin = latest.as_ref()
+            .or_else(|| continuing.iter().rev().find(|input| input.2 == "user"))
+            .and_then(|input| input.1.as_deref());
+        let mut topic_decisions = match decision_origin {
+            Some(origin) if !proposal_only => topic_decisions::context(&tx, project, origin, None)?,
+            _ => Value::Null,
+        };
         let steering_priority = !continuing.is_empty() && latest.is_some();
         let mut ordered = candidates;
         if steering_priority && let Some(latest) = latest {
@@ -1790,7 +1827,11 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                     sources.push(trusted_source(&tx, project, origin)?);
                 }
             }
-            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":reserved,"continuing_inputs":next,"latest_user_steering":latest_steering});
+            let mut required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":reserved,"continuing_inputs":next,"latest_user_steering":latest_steering,"topic_decisions":topic_decisions});
+            if !topic_decisions.is_null() && required.to_string().len() > 215000 {
+                required.as_object_mut().unwrap().remove("topic_decisions");
+                topic_decisions = Value::Null;
+            }
             if required.to_string().len() > 215000 {
                 ensure!(
                     !selected_continuing.is_empty() || steering_priority,
@@ -1837,7 +1878,11 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             if let Some(ref metadata) = metadata {
                 sources.push(metadata.clone());
             }
-            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":next,"continuing_inputs":previous,"latest_user_steering":latest_steering});
+            let mut required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":next,"continuing_inputs":previous,"latest_user_steering":latest_steering,"topic_decisions":topic_decisions});
+            if !topic_decisions.is_null() && required.to_string().len() > 215000 {
+                required.as_object_mut().unwrap().remove("topic_decisions");
+                topic_decisions = Value::Null;
+            }
             if required.to_string().len() > 215000 && (!inputs.is_empty() || !continuing.is_empty())
             {
                 break;
@@ -1877,7 +1922,10 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         } else {
             None
         };
-        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes});
+        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":prior,"effect_evidence":history,"manager_decisions":notes,"topic_decisions":topic_decisions});
+        if topic_decisions.is_null() {
+            context.as_object_mut().unwrap().remove("topic_decisions");
+        }
         if proposal_only {
             for field in ["prior_conversation", "effect_evidence", "manager_decisions"] {
                 context[field] = json!([]);
@@ -1896,6 +1944,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             "prior_conversation",
             "manager_decisions",
             "workspace_instructions",
+            "topic_decisions",
         ] {
             if context.to_string().len() <= 250000 {
                 break;
@@ -2797,6 +2846,99 @@ mod tests {
             assert_eq!(count, 2);
             Ok(())
         })
+    }
+
+    #[tokio::test]
+    async fn topic_decisions_survive_history_window_and_reach_provider_and_fresh_task() -> Result<()> {
+        use axum::{Json, Router, routing::post};
+        let (_dir, app, p) = fixture().await;
+        let insert = |message: &str, root: &str, body: &str| {
+            app.db.ingest_bot(&p.id, "cli_fixture", "oc_fixture", message, body,
+                &json!({"source":{"chat_id":"oc_fixture","chat_type":"group","message_type":"text",
+                    "thread_id":root,"root_id":root,"sender":{"open_id":"ou_fixture"}}})).unwrap().unwrap()
+        };
+        let claim_turn = || app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            Ok(claim(c,&p.id)?.unwrap())
+        }).unwrap();
+        let finish = |turn: &Turn| app.db.sync(|c| finish_turn(c,&turn.context,"")).unwrap();
+        let mut correction = String::new();
+        for (id, root, branch, key, kind, evidence) in [
+            ("om_old","om_topic","florence","year","current","年代定 1320"),
+            ("om_other","om_other_topic","florence","year","current","别的话题保密决定 1900"),
+            ("om_reference","om_topic","florence","reference","reference","York 只供参考"),
+            ("om_branch","om_topic","other-florence","year","current","独立分支 1080"),
+            ("om_correct","om_topic","florence","year","current","年代改为 1324 / 1325"),
+            ("om_no_york","om_topic","florence","opening","current","不要约克"),
+        ] {
+            let origin=insert(id,root,evidence);
+            let turn=claim_turn();
+            let result=tool(&app,&turn.context,ToolCall {
+                occurrence:"record".into(),name:"record_topic_decision".into(),
+                arguments:json!({"source_event_id":origin,"branch":branch,"key":key,"kind":kind,"evidence":evidence}),
+            }).await?;
+            assert_eq!(result["status"],"recorded");
+            assert_eq!(result["source_event_id"],origin);
+            if id=="om_correct" { correction=origin; }
+            finish(&turn);
+        }
+        for index in 0..10 {
+            insert(&format!("om_noise_{index}"),"om_other_topic","ordinary unrelated update");
+            let turn=claim_turn();
+            finish(&turn);
+        }
+        let current=insert("om_followup","om_topic","继续 Florence 主线");
+        let mut turn=claim_turn();
+        let seen=Arc::new(std::sync::Mutex::new(None));
+        let captured=seen.clone();
+        let router=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {
+            let captured=captured.clone();
+            async move {
+                *captured.lock().unwrap()=Some(body);
+                Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        turn.config.base_url=format!("http://{}/v1",listener.local_addr()?);
+        let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap() });
+        manager_loop::advance(&turn.config,turn.checkpoint.clone(),CancellationToken::new()).await?;
+        let wire=seen.lock().unwrap().take().unwrap();
+        let context=prompt_context(&wire).context("captured request context")?;
+        assert_eq!(context["topic_decisions"]["origin_event_id"],current);
+        assert!(!context["prior_conversation"].to_string().contains("年代改为"));
+        let decisions=context["topic_decisions"]["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(),5);
+        assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="年代改为 1324 / 1325" && x["source_event_id"]==correction && x["source_message_id"]=="om_correct"));
+        assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="不要约克"));
+        assert!(decisions.iter().any(|x|x["category"]=="obsolete" && x["user_evidence"]=="年代定 1320"));
+        assert!(decisions.iter().any(|x|x["branch"]=="other-florence" && x["category"]=="current"));
+        assert!(decisions.iter().filter(|x|x.to_string().contains("York")).all(|x|x["category"]=="reference"));
+        assert!(!wire.to_string().contains("别的话题保密决定"));
+        let outcome=tool(&app,&turn.context,ToolCall {
+            occurrence:"delegate".into(),name:"delegate".into(),
+            arguments:json!({"source_event_id":current,"decision_branch":"florence","instructions":"Continue the accepted branch"}),
+        }).await?;
+        assert_eq!(outcome["status"],"queued");
+        let mut event=app.db.sync(|c|work::event(c,&p.id,outcome["event_id"].as_str().unwrap()))?;
+        assert_eq!(event.payload["origin_event_id"],current);
+        assert_eq!(event.payload["topic_decisions"]["origin_event_id"],current);
+        let mut fresh=p.clone();
+        fresh.generation="fresh-fixture-worker".into();
+        fresh.native_session.clear();
+        fresh.mcp_token.clear();
+        event.payload["target_generation"]=json!(fresh.generation);
+        let path=crate::worker_task::fixture_assignment(&app,&fresh,&event).await?;
+        let command=tokio::process::Command::new("/bin/sh")
+            .arg("-c").arg("cat \"$1\"").arg("fixture-worker").arg(path)
+            .current_dir(&fresh.path).output().await?;
+        assert!(command.status.success());
+        let task=String::from_utf8(command.stdout)?;
+        assert!(task.contains("年代改为 1324 / 1325") && task.contains("不要约克"));
+        assert!(task.contains(&current) && task.contains(&correction));
+        assert!(!task.contains("独立分支 1080") && !task.contains("别的话题保密决定"));
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]
