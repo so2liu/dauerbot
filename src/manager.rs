@@ -1763,6 +1763,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         // ordinary fresh batches or changing their persisted input order.
         let decision_origin = latest.as_ref()
             .or_else(|| continuing.iter().rev().find(|input| input.2 == "user"))
+            .or_else(|| candidates.iter().rev().find(|input| input.1.is_some()))
             .and_then(|input| input.1.as_deref());
         let mut topic_decisions = match decision_origin {
             Some(origin) if !proposal_only => topic_decisions::context(&tx, project, origin, None)?,
@@ -2900,7 +2901,9 @@ mod tests {
             }
         }));
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        turn.config.base_url=format!("http://{}/v1",listener.local_addr()?);
+        let local_url = format!("http://{}",listener.local_addr()?);
+        turn.config.base_url = format!("{local_url}/v1");
+        app.config.write().await.feishu_base = local_url;
         let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap() });
         manager_loop::advance(&turn.config,turn.checkpoint.clone(),CancellationToken::new()).await?;
         let wire=seen.lock().unwrap().take().unwrap();
