@@ -222,7 +222,7 @@ struct Checkpoint {
     #[serde(default)]
     image_input_digest: Option<String>,
 }
-fn definitions() -> Vec<ToolDefinition> {
+pub(crate) fn definitions() -> Vec<ToolDefinition> {
     let schemas = [
         (
             "Read a bounded UTF-8 project file; returns content and sha256.",

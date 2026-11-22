@@ -119,6 +119,12 @@ The manager uses the selected user project's runtime identity and instructions; 
 
 New input can interrupt an in-flight manager model request. The daemon owns input delivery and external-effect records, retaining uncertain submissions instead of repeating them after a restart. Pause, Stop, terminal takeover and CLI transitions remain daemon controls. Native model selection and repair controls remain available when the manager provider is unavailable. When shared credentials are missing, incoming messages and schedules remain queued for the manager until setup is complete.
 
+#### Opt in to the restricted Pi Manager
+
+A managed project can run its model loop in Pi 1.5.1 or a compatible Pi CLI. In the daemon data directory, create `.dauerbot/manager-pi/<project-id>` containing the absolute path to the trusted Pi executable outside the project workspace. The selector applies to newly claimed Manager runs. Remove it to select the built-in runtime for subsequent runs. The project stays in managed mode and retains the same Manager provider and native coding worker.
+
+The daemon launches Pi in an isolated directory with private settings, no session file, no native CLI credentials, and only the nine Manager tools registered by Dauerbot. File changes, delegation, messaging and scheduling still pass through the daemon's existing authority and effect journal. Each claimed run starts an isolated Pi conversation from the daemon's scoped context. Service handover waits for an active Pi run to settle. A Pi process or daemon interruption keeps input and effect receipts for recovery. A fresh input uses the existing Manager supersession rules. To switch away after an interrupted run, remove the selector before the next user input.
+
 ## CLI and HERDR sessions
 
 ```sh
