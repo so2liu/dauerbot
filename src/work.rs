@@ -599,7 +599,9 @@ fn claim(
         }
         // Resource preparation runs independently of project reconciliation.
         // Skip only those messages; later steering must not wait for a download.
-        let prepared = "NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=COALESCE(work_events.message_id,(SELECT origin.message_id FROM work_events origin WHERE work_events.source IN ('management','manager_worker') AND origin.id=json_extract(work_events.payload,'$.origin_event_id'))) AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
+        let prepared = format!("NOT EXISTS(SELECT 1 FROM messages m WHERE m.id=COALESCE(work_events.message_id,
+             (SELECT origin.message_id FROM work_events origin WHERE work_events.source IN ('management','manager_worker')
+             AND origin.id=json_extract(work_events.payload,'$.origin_event_id'))) AND {})", crate::feishu::preparation_pending());
         // A minimal delivery-journal fixture can omit the manager schema.
         // Production stores always install it before reconciling work.
         let source = if independent {
