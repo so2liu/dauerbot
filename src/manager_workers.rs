@@ -111,7 +111,7 @@ pub(crate) fn diagnostic_worker(c: &Connection, p: &Project) -> Result<Project> 
         .query_row(
             "SELECT w.generation FROM manager_workers w
          LEFT JOIN work_leases l ON l.project_id=w.project_id AND l.generation=w.generation
-         WHERE w.project_id=? AND w.state IN ('starting','ready','unavailable')
+         WHERE w.project_id=? AND w.state IN ('reserved','starting','ready','unavailable')
            AND json_type(w.execution,'$.terminal_id')='text'
          ORDER BY COALESCE(l.active,0) DESC,
                   CASE w.state WHEN 'unavailable' THEN 0 WHEN 'ready' THEN 1 ELSE 2 END,
@@ -243,11 +243,11 @@ fn current_seat(c: &Connection, parent: &Project, target: &str) -> Result<Option
         .query_row(
             "SELECT w.generation FROM manager_workers w
          WHERE w.project_id=? AND w.agent=? AND w.state!='closed'
-           AND (w.token='' OR w.state IN ('starting','ready'))
+           AND (w.token='' OR w.state IN ('reserved','starting','ready'))
            AND NOT (w.state='unavailable' AND w.execution='null' AND w.native_session=''
              AND w.created_at<=?
              AND NOT EXISTS(SELECT 1 FROM work_executions e WHERE e.generation=w.generation))
-         ORDER BY CASE WHEN w.state IN ('ready','starting') THEN 0 ELSE 1 END, w.rowid DESC LIMIT 1",
+         ORDER BY CASE WHEN w.state IN ('ready','starting','reserved') THEN 0 ELSE 1 END, w.rowid DESC LIMIT 1",
             params![parent.id, target, db::now() - PREFLIGHT_RETRY_MS],
             |r| r.get::<_, String>(0),
         )
@@ -276,7 +276,7 @@ fn installed_candidates(
             let current = current_seat(c, p, name)?;
             if current
                 .as_ref()
-                .is_none_or(|seat| is_plain(&seat.project) && seat.state != "unavailable")
+                .is_none_or(|seat| seat.state != "unavailable")
             {
                 candidates.push((name, current));
             }
@@ -306,9 +306,6 @@ pub(crate) async fn select(app: &App, p: &Project, target: &str) -> Result<Selec
         current_seat(c, &parent, &name)
     }).await?;
     if let Some(seat) = seat {
-        if !is_plain(&seat.project) {
-            return Ok(unavailable(target, "An active legacy worker owns this CLI slot"));
-        }
         if seat.state == "unavailable" {
             return Ok(unavailable(target, &seat.error));
         }
@@ -331,7 +328,7 @@ pub(crate) async fn warm(app: &App, parent: &Project) -> Result<()> {
         }
         let generation = db::id();
         c.execute("INSERT INTO manager_workers(generation,project_id,agent,state,created_at)
-            VALUES(?,?,?,'starting',?)",params![generation,parent.id,agent,db::now()])?;
+            VALUES(?,?,?,'reserved',?)",params![generation,parent.id,agent,db::now()])?;
         Ok(seat(c, &parent, &generation)?.map(|s| s.project))
     }).await?;
     if let Some(worker) = worker {
@@ -342,10 +339,10 @@ pub(crate) async fn warm(app: &App, parent: &Project) -> Result<()> {
 
 /// Bind accepted work and any new seat in the same transaction. A generation
 /// with a queued assignment or an unresolved run is never reused.
-fn allocate(c: &Connection, parent: &Project, limit: Option<usize>, idle_seats: &[String]) -> Result<Vec<Project>> {
+fn allocate(c: &Connection, parent: &Project, limit: Option<usize>, idle_seats: &[String]) -> Result<()> {
     let tx = c.unchecked_transaction()?;
     if controls(&tx, parent).is_err() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let pending = tx.prepare(
         "SELECT id,json_extract(payload,'$.expected_agent'),json_extract(payload,'$.origin_event_id')
@@ -353,7 +350,6 @@ fn allocate(c: &Connection, parent: &Project, limit: Option<usize>, idle_seats: 
          AND json_extract(payload,'$.target_generation') IS NULL ORDER BY rowid",
     )?.query_map([&parent.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut launches = Vec::new();
     for (event, agent, origin) in pending {
         let idle: Option<String> = tx.query_row(
             "SELECT w.generation FROM manager_workers w
@@ -371,7 +367,7 @@ fn allocate(c: &Connection, parent: &Project, limit: Option<usize>, idle_seats: 
             idle
         } else {
             let count: i64 = tx.query_row(
-                "SELECT count(*) FROM manager_workers WHERE project_id=? AND agent=? AND state IN ('starting','ready')",
+                "SELECT count(*) FROM manager_workers WHERE project_id=? AND agent=? AND token='' AND state IN ('reserved','starting','ready')",
                 params![parent.id, agent], |row| row.get(0),
             )?;
             if limit.is_some_and(|limit| count as usize >= limit) {
@@ -379,10 +375,9 @@ fn allocate(c: &Connection, parent: &Project, limit: Option<usize>, idle_seats: 
             }
             let generation = db::id();
             tx.execute(
-                "INSERT INTO manager_workers(generation,project_id,agent,state,created_at,origin_event_id) VALUES(?,?,?,'starting',?,?)",
+                "INSERT INTO manager_workers(generation,project_id,agent,state,created_at,origin_event_id) VALUES(?,?,?,'reserved',?,?)",
                 params![generation,parent.id,agent,db::now(),origin],
             )?;
-            launches.push(seat(&tx, parent, &generation)?.context("New worker disappeared")?.project);
             generation
         };
         tx.execute(
@@ -391,7 +386,7 @@ fn allocate(c: &Connection, parent: &Project, limit: Option<usize>, idle_seats: 
         )?;
     }
     tx.commit()?;
-    Ok(launches)
+    Ok(())
 }
 
 async fn observe(cfg: &config::Config, p: &Project) -> Result<Value> {
@@ -622,7 +617,7 @@ fn observation(
 
 pub(crate) fn fail(c: &Connection, project: &str, generation: &str, reason: &str) -> Result<()> {
     let tx = c.unchecked_transaction()?;
-    let changed = tx.execute("UPDATE manager_workers SET state='unavailable',error=? WHERE generation=? AND project_id=? AND state IN ('starting','ready')",
+    let changed = tx.execute("UPDATE manager_workers SET state='unavailable',error=? WHERE generation=? AND project_id=? AND state IN ('reserved','starting','ready')",
         params![reason,generation,project])?;
     if changed != 0 {
         observation(&tx, project, generation, "unavailable", reason)?;
@@ -640,7 +635,16 @@ pub(crate) fn fail(c: &Connection, project: &str, generation: &str, reason: &str
 async fn launch_assigned(app: &App, worker: Project) -> Result<()> {
     let project = worker.id.clone();
     let generation = worker.generation.clone();
-    if launch(app, worker).await.is_err() {
+    let reserved = worker.clone();
+    let can_launch = app.db.call(move |c| {
+        let parent = db::project_by_key(c, &reserved.id)?;
+        if controls(c, &parent).is_err() {
+            return Ok(false);
+        }
+        Ok(c.execute("UPDATE manager_workers SET state='starting',created_at=? WHERE project_id=? AND generation=? AND state='reserved'",
+            params![db::now(),reserved.id,reserved.generation])? == 1)
+    }).await?;
+    if can_launch && launch(app, worker).await.is_err() {
         app.db.call(move |c| fail(c, &project, &generation,
             "Native startup failed; verify that the CLI is installed and logged in")).await?;
     }
@@ -679,10 +683,21 @@ pub(crate) async fn reconcile(app: &Arc<App>, parent: &Project) -> Result<()> {
         }
         let p = parent.clone();
         let limit = cfg.manager_workers_per_cli.map(std::num::NonZeroUsize::get);
-        let launches = app.db.call(move |c| allocate(c, &p, limit, &idle)).await?;
-        for worker in launches {
-            launch_assigned(app, worker).await?;
+        app.db.call(move |c| allocate(c, &p, limit, &idle)).await?;
+    }
+    let p = parent.clone();
+    let reserved = app.db.call(move |c| {
+        if controls(c, &p).is_err() {
+            return Ok(Vec::new());
         }
+        let generations = c.prepare("SELECT generation FROM manager_workers WHERE project_id=? AND state='reserved' ORDER BY rowid")?
+            .query_map([&p.id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        generations.into_iter().map(|generation| {
+            Ok(seat(c,&p,&generation)?.context("Reserved worker disappeared")?.project)
+        }).collect::<Result<Vec<_>>>()
+    }).await?;
+    for worker in reserved {
+        launch_assigned(app, worker).await?;
     }
     let p = parent.clone();
     let seats = app.db.call(move |c| {

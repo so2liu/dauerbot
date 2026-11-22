@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 
 
@@ -52,9 +53,13 @@ for line in sys.stdin:
 def run(binary, quota):
     h = smoke.Harness(binary)
     try:
-        (h.run / "config.json").write_text(json.dumps(
-            {} if quota is None else {"manager_workers_per_cli": quota}
-        ))
+        if quota is not None:
+            subprocess.run([str(h.binary), "--data-dir", str(h.run), "init"],
+                           env=h.env, check=True, capture_output=True, timeout=20)
+            config_file = h.run / "config.json"
+            config = json.loads(config_file.read_text())
+            config["manager_workers_per_cli"] = quota
+            config_file.write_text(json.dumps(config))
         program = h.workspace / "worker.py"
         program.write_text(WORKER)
         h.boot()
@@ -64,9 +69,15 @@ def run(binary, quota):
             "model": "fixture-manager", "api_key": "manager-fixture-secret",
             "expected_revision": initial["revision"],
         }, "PUT")
+        interpreter = Path(sys.executable).resolve()
+        # Framework builds may exec an inner Mach-O; name the actual executable
+        # so the foreground process check sees the same binary that we launch.
+        framework_app = interpreter.parent.parent / "Resources/Python.app/Contents/MacOS/Python"
+        if framework_app.is_file():
+            interpreter = framework_app
         project = h.api("/projects", {
             "name": "Parallel worker fixture", "path": str(h.workspace),
-            "agent": "custom", "extra_args": [sys.executable, "-u", str(program)],
+            "agent": "custom", "extra_args": [str(interpreter), "-u", str(program)],
         })
         route = f"/projects/{project['id']}"
         h.api(route + "/bot", {"app_id": "cli_fixture", "app_secret": "fixture-secret"}, "PUT")
@@ -101,6 +112,15 @@ def run(binary, quota):
             smoke.fixture.wait_for(waiting, "second task was not durably queued without a seat")
             assert receipt(tags[1]) is None
             assert entries()[0][2:4] == (first["generation"], first["run"])
+            with sqlite3.connect(h.run / "bridge.sqlite3") as db:
+                accepted = db.execute(
+                    """SELECT json_extract(result,'$.status'),json_extract(result,'$.work_queued'),
+                              json_extract(result,'$.assignment_pending')
+                       FROM manager_effects WHERE name='delegate' ORDER BY rowid"""
+                ).fetchall()
+            assert accepted == [("queued", 1, 1), ("queued", 1, 1)]
+            print(json.dumps({"quota": quota, "durable_waiting": entries()[1], "delegate_receipts": accepted}),
+                  flush=True)
             (h.workspace / (tags[0] + ".release")).touch()
         second = smoke.fixture.wait_for(lambda: receipt(tags[1]), "second real worker did not start", timeout=35)
         if quota is None:
