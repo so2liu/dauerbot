@@ -372,6 +372,7 @@ pub struct ResourcePreparation {
     pub message_id: String,
     pub source_id: String,
     pub bot_app_id: String,
+    quoted_resource_message_id: Option<String>,
 }
 
 // Acknowledged messages still need resources while a live manager input
@@ -397,6 +398,74 @@ const RESOURCE_ELIGIBLE: &str = "EXISTS(
     ))
 )";
 
+// Both direct and verified quoted references own their respective Feishu message IDs.
+const HAS_RESOURCES: &str = "(json_extract(m.attachment,'$.file_key') IS NOT NULL
+    OR json_array_length(m.attachment,'$.resources')>0
+    OR json_array_length(m.attachment,'$.quoted_message.resources')>0)";
+
+// Give only the reply waiting for a direct-parent lookup a short head start.
+// Unrelated steer items remain eligible; a backed-up quote queue never holds
+// its own reply indefinitely.
+pub(crate) fn preparation_pending() -> String {
+    let quote_cutoff = db::now().saturating_sub(2_000);
+    format!("(({HAS_RESOURCES} AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)
+        OR (json_extract(m.attachment,'$.quote_pending')=1 AND m.created_at>{quote_cutoff}))")
+}
+
+fn quote_resource_owner(attachment: &Value) -> Option<&str> {
+    let quote = &attachment["quoted_message"];
+    quote["resources"].as_array().filter(|items| !items.is_empty())?;
+    quote["message_id"].as_str().filter(|id| {
+        quote["status"] == "ok" && attachment["source"]["parent_id"] == *id
+    })
+}
+
+fn direct_resources(attachment: &Value) -> Vec<Value> {
+    let mut resources: Vec<_> = attachment["resources"].as_array().into_iter().flatten()
+        .filter(|resource| resource["quoted"] != true && resource["frame_seconds"].is_null())
+        .cloned().collect();
+    if resources.is_empty() && attachment["file_key"].is_string() {
+        resources.push(json!({"file_key":attachment["file_key"],"file_name":attachment["file_name"],
+            "kind":attachment["kind"],"declared_duration_seconds":attachment["declared_duration_seconds"]}));
+    }
+    resources
+}
+
+pub(crate) fn message_resources(m: &db::Message) -> Vec<Value> {
+    attachment_resources(&m.attachment, &m.source_id)
+}
+
+pub(crate) fn attachment_resources(attachment: &Value, source_id: &str) -> Vec<Value> {
+    if attachment["resources_ready"] == true
+        && let Some(resources) = attachment["resources"].as_array()
+    {
+        return resources.iter().cloned().map(|mut resource| {
+            if resource["message_id"].is_null() {
+                resource["message_id"] = json!(source_id);
+            }
+            if resource["chat_id"].is_null() {
+                resource["chat_id"] = attachment["source"]["chat_id"].clone();
+            }
+            resource
+        }).collect();
+    }
+    let mut resources = direct_resources(attachment);
+    for resource in &mut resources {
+        resource["message_id"] = json!(source_id);
+        resource["chat_id"] = attachment["source"]["chat_id"].clone();
+    }
+    if let Some(parent) = quote_resource_owner(attachment) {
+        resources.extend(attachment["quoted_message"]["resources"].as_array().unwrap().iter().map(|resource| {
+            let mut resource = resource.clone();
+            resource["message_id"] = json!(parent);
+            resource["chat_id"] = attachment["source"]["chat_id"].clone();
+            resource["quoted"] = json!(true);
+            resource
+        }));
+    }
+    resources
+}
+
 pub fn begin_resource_preparation(
     c: &rusqlite::Connection,
     message: &db::Message,
@@ -409,6 +478,7 @@ pub fn begin_resource_preparation(
             .as_str()
             .unwrap_or("")
             .to_owned(),
+        quoted_resource_message_id: quote_resource_owner(&message.attachment).map(str::to_owned),
     };
     let changed = c.execute(&format!("UPDATE messages AS m SET attachment=json_set(attachment,'$.resource_preparation',?) WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND json_extract(attachment,'$.resource_preparation') IS NULL AND {RESOURCE_ELIGIBLE}"),rusqlite::params![preparation.token,preparation.message_id,preparation.source_id,preparation.bot_app_id])?;
     Ok((changed == 1).then_some(preparation))
@@ -435,35 +505,42 @@ pub fn finish_resource_preparation(
     } else {
         json!({"members_status":"unavailable"})
     };
-    let changed=c.execute(&format!("UPDATE messages AS m SET attachment=json_remove(json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)),'$.resource_preparation') WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND {RESOURCE_ELIGIBLE}"),rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token])?;
+    let changed=c.execute(&format!("UPDATE messages AS m SET attachment=json_remove(json_set(attachment,'$.resources',json(?),'$.resources_ready',json('true'),'$.resource_context',json(?)),'$.resource_preparation') WHERE id=? AND source_id=? AND COALESCE(json_extract(attachment,'$.bot_app_id'),'')=? AND json_extract(attachment,'$.resource_preparation')=? AND COALESCE(json_extract(attachment,'$.resources_ready'),0)!=1 AND (CASE WHEN json_array_length(attachment,'$.quoted_message.resources')>0
+         THEN json_extract(attachment,'$.quoted_message.message_id') ELSE NULL END) IS ?7 AND {RESOURCE_ELIGIBLE}"),rusqlite::params![serde_json::to_string(&resources)?,context.to_string(),preparation.message_id,preparation.source_id,preparation.bot_app_id,preparation.token,preparation.quoted_resource_message_id])?;
     Ok(changed == 1)
 }
 
 /// Only the original message ID and keys are downloaded. Preparation never
 /// holds the project delivery lock; resource names and captions remain user data.
 pub async fn download_resources(app: &App, m: &db::Message) -> Result<Vec<Value>> {
+    prepare_resources(app, m, Duration::from_secs(80), crate::video_preview::decoder).await
+}
+
+pub(crate) async fn prepare_resources(
+    app: &App,
+    m: &db::Message,
+    timeout: Duration,
+    resolve_decoder: fn(&str) -> Option<PathBuf>,
+) -> Result<Vec<Value>> {
     let message = m.clone();
     let preparation = app
         .db
         .call(move |c| begin_resource_preparation(c, &message))
         .await?
         .context("Resources are already prepared or owned by another attempt")?;
-    let mut resources = m.attachment["resources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if resources.is_empty() && m.attachment["file_key"].is_string() {
-        resources.push(json!({"file_key":m.attachment["file_key"],"file_name":m.attachment["file_name"],"kind":m.attachment["kind"]}));
-    }
+    let mut resources = message_resources(m);
+    let mut frames = Vec::new();
     let mut remaining = MAX_FILE;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(80);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let timeout_reason = format!("Message resource preparation timed out ({} ms total)", timeout.as_millis());
     for (index, resource) in resources.iter_mut().enumerate() {
         if let Some(o) = resource.as_object_mut() {
             o.remove("local_path");
             o.remove("error");
+            o.remove("frame_extraction_error");
         }
         if tokio::time::Instant::now() >= deadline {
-            resource["error"] = json!("Message resource preparation timed out (80 seconds total)");
+            resource["error"] = json!(timeout_reason);
             continue;
         }
         if index >= 16 || remaining == 0 {
@@ -477,21 +554,32 @@ pub async fn download_resources(app: &App, m: &db::Message) -> Result<Vec<Value>
         )
         .await;
         match downloaded {
-            Ok(Ok(Some(metadata))) => {
-                if let (Some(resource), Some(metadata)) =
-                    (resource.as_object_mut(), metadata.as_object())
-                {
-                    resource.extend(metadata.clone());
+            Ok(Ok(Some(download))) => {
+                resource.as_object_mut().unwrap().extend(download.metadata);
+                if let Some(video_file) = download.video_file {
+                    match tokio::time::timeout_at(deadline,
+                        prepare_frame(app, m, resource, video_file, index, &preparation.token, resolve_decoder)).await
+                    {
+                        Ok(Ok((duration, frame))) => {
+                            resource["duration_seconds"] = json!(duration);
+                            frames.push(frame);
+                        }
+                        Ok(Err(error)) => resource["frame_extraction_error"] =
+                            json!(error.to_string()),
+                        Err(_) => resource["frame_extraction_error"] =
+                            json!("Message preparation deadline reached"),
+                    }
                 }
             }
             Ok(Ok(None)) => resource["error"] = json!("Resource key is missing"),
             Ok(Err(error)) => resource["error"] = json!(error.to_string()),
             Err(_) => {
                 resource["error"] =
-                    json!("Message resource preparation timed out (80 seconds total)")
+                    json!(timeout_reason)
             }
         }
     }
+    resources.extend(frames);
     let context = tokio::time::timeout_at(deadline, context(app, m))
         .await
         .unwrap_or_else(|_| json!({"members_status":"unavailable"}));
@@ -530,7 +618,7 @@ pub async fn resource_worker(app: Arc<App>) {
         };
         let next = app.db.call(|c| {
             use rusqlite::OptionalExtension;
-            Ok(c.query_row(&format!("SELECT m.id FROM messages m WHERE m.direction='in' AND {RESOURCE_ELIGIBLE} AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1 AND json_extract(m.attachment,'$.resource_preparation') IS NULL ORDER BY m.rowid LIMIT 1"),[],|r|r.get::<_,String>(0)).optional()?)
+            Ok(c.query_row(&format!("SELECT m.id FROM messages m WHERE m.direction='in' AND {RESOURCE_ELIGIBLE} AND {HAS_RESOURCES} AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1 AND json_extract(m.attachment,'$.resource_preparation') IS NULL ORDER BY m.rowid LIMIT 1"),[],|r|r.get::<_,String>(0)).optional()?)
         }).await;
         match next {
             Ok(Some(id)) => {
@@ -553,6 +641,11 @@ pub async fn resource_worker(app: Arc<App>) {
     }
 }
 
+struct DownloadedResource {
+    metadata: serde_json::Map<String, Value>,
+    video_file: Option<std::fs::File>,
+}
+
 async fn download_resource(
     app: &App,
     m: &db::Message,
@@ -560,11 +653,16 @@ async fn download_resource(
     index: usize,
     attempt: &str,
     remaining: &mut u64,
-) -> Result<Option<Value>> {
+) -> Result<Option<DownloadedResource>> {
     let Some(key) = resource["file_key"].as_str() else {
         return Ok(None);
     };
     let kind = resource["kind"].as_str().unwrap_or("file");
+    let source_id = if resource["quoted"] == true {
+        quote_resource_owner(&m.attachment).context("Quoted resource owner is unavailable")?
+    } else {
+        &m.source_id
+    };
     let cfg = app.config.read().await.clone();
     let binding = app.db.bot(&m.project_id).await?;
     anyhow::ensure!(
@@ -575,7 +673,7 @@ async fn download_resource(
     let mut url = reqwest::Url::parse(&format!("{}/open-apis/im/v1/messages", cfg.feishu_base))?;
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("Invalid URL"))?
-        .push(&m.source_id)
+        .push(source_id)
         .push("resources")
         .push(key);
     url.query_pairs_mut()
@@ -585,8 +683,12 @@ async fn download_resource(
         .get(url)
         .bearer_auth(token)
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+        .map_err(|err| anyhow::anyhow!("Feishu resource request failed: {}", if err.is_timeout() { "timeout" } else { "transport error" }))?;
+    anyhow::ensure!(response.status().is_success(), "Feishu resource download returned HTTP {}", response.status().as_u16());
+    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok()).and_then(|value| value.split(';').next())
+        .map(str::trim).filter(|value| value.len() <= 127 && value.contains('/')).map(str::to_owned);
     if response.content_length().is_some_and(|n| n > *remaining) {
         bail!("Incoming resources exceed the 100 MB message limit");
     }
@@ -600,7 +702,11 @@ async fn download_resource(
             "attachment"
         });
     let key_hash = format!("{:x}", Sha256::digest(key.as_bytes()));
-    let name = format!("{}-{index}-{}-{name}", m.id, &key_hash[..16]);
+    let mut end = name.len().min(120);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let name = format!("{}-{index}-{}-{}", m.id, &key_hash[..16], &name[..end]);
     let temporary = format!(".{}-{attempt}-{index}.part", m.id);
     let (mut cache, file) =
         crate::multimodal::CacheWrite::create(&app.dir, &m.project_id, &name, &temporary)?;
@@ -609,7 +715,7 @@ async fn download_resource(
     let mut head = Vec::new();
     let mut total = 0_u64;
     let result = async {
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.map_err(|_| anyhow::anyhow!("Feishu resource body interrupted"))? {
             let bytes = chunk.len() as u64;
             if bytes > *remaining {
                 *remaining = 0;
@@ -633,9 +739,43 @@ async fn download_resource(
     }
     .await;
     result?;
-    Ok(Some(
-        json!({"local_path":cache.path,"cache_root":cache.root,"cache_project_id":m.project_id,"cache_message_id":m.id,"cache_source_id":m.source_id,"sha256":format!("{:x}",hasher.finalize()),"bytes":total,"media_type":crate::multimodal::image_type(&head)}),
-    ))
+    let detected_type = crate::multimodal::image_type(&head);
+    let media_type = detected_type.or(content_type.as_deref());
+    let metadata = json!({"local_path":cache.path,"cache_root":cache.root,"cache_project_id":m.project_id,
+        "cache_message_id":m.id,"cache_source_id":source_id,"sha256":format!("{:x}",hasher.finalize()),
+        "bytes":total,"media_type":media_type,"duration_seconds":resource["declared_duration_seconds"],
+        "file_name":resource["file_name"].as_str().unwrap_or_else(|| if kind=="image" {"image.png"} else {"attachment"})});
+    let video_file = if matches!(kind, "video" | "media") || media_type.is_some_and(|mime| mime.starts_with("video/")) {
+        Some(file.into_std().await)
+    } else {
+        None
+    };
+    Ok(Some(DownloadedResource { metadata: metadata.as_object().unwrap().clone(), video_file }))
+}
+
+async fn prepare_frame(
+    app: &App,
+    message: &db::Message,
+    resource: &Value,
+    file: std::fs::File,
+    index: usize,
+    attempt: &str,
+    resolve_decoder: fn(&str) -> Option<PathBuf>,
+) -> Result<(f64, Value)> {
+    let frame = crate::video_preview::extract(file, resolve_decoder).await?;
+    let name = format!("{}-{index}-preview.png", message.id);
+    let temporary = format!(".{}-{attempt}-{index}-preview.part", message.id);
+    let (mut cache, target) = crate::multimodal::CacheWrite::create(&app.dir, &message.project_id, &name, &temporary)?;
+    let mut target = tokio::fs::File::from_std(target);
+    target.write_all(&frame.bytes).await?;
+    target.sync_all().await?;
+    cache.publish()?;
+    Ok((frame.duration, json!({"kind":"image","file_name":"video-preview-20-percent.png",
+        "file_key":resource["file_key"],"message_id":resource["message_id"],"chat_id":resource["chat_id"],
+        "quoted":resource["quoted"],"frame_seconds":frame.timestamp,"duration_seconds":frame.duration,
+        "local_path":cache.path,"cache_root":cache.root,"cache_project_id":message.project_id,
+        "cache_message_id":message.id,"cache_source_id":resource["message_id"],
+        "sha256":format!("{:x}",Sha256::digest(&frame.bytes)),"bytes":frame.bytes.len(),"media_type":"image/png"})))
 }
 
 pub struct Inbound {
@@ -812,13 +952,12 @@ pub(crate) fn cached_quote(
             return quote(parent, Some(bot), Some(kind), &body, None);
         }
         let source = &attachment["source"];
-        quote(
-            parent,
-            source["sender"]["open_id"].as_str(),
-            source["message_type"].as_str(),
-            &body,
-            None,
-        )
+        let mut result = quote(parent, source["sender"]["open_id"].as_str(),
+            source["message_type"].as_str(), &body, None);
+        result["resources"] = json!(direct_resources(&attachment).into_iter().map(|r| {
+            resource_reference(&r, r["kind"].as_str().unwrap_or("file"), &r["file_key"])
+        }).collect::<Vec<_>>());
+        result
     }))
 }
 
@@ -838,6 +977,7 @@ fn remote_quote(
     let content: Value =
         serde_json::from_str(item["body"]["content"].as_str().ok_or("invalid_response")?)
             .map_err(|_| "invalid_response")?;
+    let mut resources = Vec::new();
     let body = match kind {
         "text" => content["text"]
             .as_str()
@@ -847,7 +987,7 @@ fn remote_quote(
             let post = post_document(&content);
             let mut body = post["title"].as_str().unwrap_or_default().to_owned();
             body.push('\n');
-            collect_post(&post["content"], &mut body, &mut Vec::new());
+            collect_post(&post["content"], &mut body, &mut resources);
             body.trim().replace("[image]", "[image] image.png")
         }
         "image" => "[image] image.png".into(),
@@ -859,7 +999,12 @@ fn remote_quote(
         }
         _ => return Err("unsupported_message_type"),
     };
-    Ok(quote(parent, Some(sender), Some(kind), &body, None))
+    if let Some(key) = content["file_key"].as_str().or(content["image_key"].as_str()) {
+        resources.push(resource_reference(&content, kind, &json!(key)));
+    }
+    let mut result = quote(parent, Some(sender), Some(kind), &body, None);
+    result["resources"] = json!(resources);
+    Ok(result)
 }
 
 async fn fetch_quote(
@@ -953,13 +1098,15 @@ pub(crate) async fn prepare_quote(app: &App) -> Result<bool> {
         };
     let result = result.unwrap_or_else(|reason| quote(parent, None, None, "", Some(reason)));
     app.db.call(move |c| {
-        c.execute("UPDATE messages SET attachment=json_remove(json_set(attachment,'$.quoted_message',json(?)),'$.quote_pending') WHERE id=? AND json_extract(attachment,'$.quote_pending')=1", rusqlite::params![result.to_string(),id])?;
+        c.execute("UPDATE messages SET attachment=json_remove(json_set(attachment,'$.quoted_message',json(?1)),
+           '$.quote_pending', CASE WHEN json_array_length(?1,'$.resources')>0 THEN '$.resources_ready' ELSE '$.__unused' END) WHERE id=?2 AND json_extract(attachment,'$.quote_pending')=1", rusqlite::params![result.to_string(),id])?;
         Ok(())
     }).await?;
+    app.notify.notify_one();
     Ok(true)
 }
 
-// Parent lookups do not share the attachment queue or gate message delivery.
+// Parent lookups do not share the attachment downloader.
 pub async fn quote_worker(app: Arc<App>) {
     while !app.shutdown.is_cancelled() {
         if let Some(_permit) = app.service.gate.enter() {
@@ -975,6 +1122,15 @@ pub async fn quote_worker(app: Arc<App>) {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
         }
     }
+}
+
+fn resource_reference(content: &Value, kind: &str, key: &Value) -> Value {
+    let duration = content["duration"].as_f64().map(|milliseconds| milliseconds / 1000.0)
+        .or_else(|| content["declared_duration_seconds"].as_f64());
+    let fallback = if kind == "image" { "image.png" } else { "attachment" };
+    let name = content["file_name"].as_str().unwrap_or(fallback);
+    let name: String = name.chars().take(160).collect();
+    json!({"kind":kind,"file_key":key,"file_name":name,"declared_duration_seconds":duration})
 }
 
 pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
@@ -1011,7 +1167,7 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
         .as_str()
         .or(content["image_key"].as_str())
     {
-        json!({"file_key":key,"file_name":content["file_name"],"kind":kind})
+        resource_reference(&content, kind, &json!(key))
     } else {
         json!({})
     };
@@ -1078,10 +1234,10 @@ fn collect_post(v: &Value, text: &mut String, resources: &mut Vec<Value>) {
                 }
             }
             "at" => text.push_str(v["user_name"].as_str().unwrap_or("@mention")),
-            "media" => {
+            "media" | "file" | "audio" | "video" => {
                 if let Some(key) = v["file_key"].as_str().filter(|k| !k.is_empty()) {
                     if !resources.iter().any(|r| r["file_key"] == key) {
-                        resources.push(json!({"kind":"file","file_key":key,"file_name":"video"}));
+                        resources.push(resource_reference(v, v["tag"].as_str().unwrap(), &json!(key)));
                     }
                     text.push_str("[media]");
                 }

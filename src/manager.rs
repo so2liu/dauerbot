@@ -519,10 +519,7 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
             context = crate::envelope::render_resources(
                 &message,
                 &group,
-                message.attachment["resources"]
-                    .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
+                &crate::feishu::message_resources(&message),
             );
         } else {
             context = crate::envelope::scheduled_body(&original.payload)?;
@@ -1504,7 +1501,8 @@ fn attach_quote(
         )
         .optional()?;
     if let Some(raw) = raw {
-        let quote: Value = serde_json::from_str(&raw)?;
+        let mut quote: Value = serde_json::from_str(&raw)?;
+        quote.as_object_mut().unwrap().remove("resources");
         let size = quote.to_string().len() + 64;
         if size <= *remaining {
             data["quoted_message"] = quote;
@@ -1514,7 +1512,10 @@ fn attach_quote(
     Ok(())
 }
 
-const PREPARED_INPUT: &str = "NOT EXISTS(SELECT 1 FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.id=manager_inputs.origin_event_id AND (json_extract(m.attachment,'$.file_key') IS NOT NULL OR json_array_length(m.attachment,'$.resources')>0) AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)";
+fn prepared_input() -> String {
+    format!("NOT EXISTS(SELECT 1 FROM work_events e JOIN messages m ON m.id=e.message_id
+        WHERE e.id=manager_inputs.origin_event_id AND {})", crate::feishu::preparation_pending())
+}
 fn image_source(
     c: &Connection,
     project: &str,
@@ -1554,10 +1555,8 @@ fn prepare_images(
     let Some((message, attachment, source_scope)) = image_source(c, project, origin)? else {
         return Ok(vec![]);
     };
-    let mut resources = attachment["resources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let source_id = attachment["source_message_id"].as_str().unwrap_or_default();
+    let mut resources = crate::feishu::attachment_resources(&attachment, source_id);
     let mut images = Vec::new();
     for resource in &mut resources {
         if resource["kind"] != "image"
@@ -1569,7 +1568,13 @@ fn prepare_images(
         }
         let verified = (|| {
             ensure!(
-                resource["cache_source_id"] == attachment["source_message_id"],
+                if resource["quoted"] == true {
+                    resource["cache_source_id"] == attachment["source"]["parent_id"]
+                        && resource["cache_source_id"] == attachment["quoted_message"]["message_id"]
+                        && attachment["quoted_message"]["status"] == "ok"
+                } else {
+                    resource["cache_source_id"] == attachment["source_message_id"]
+                },
                 "Image source identity changed"
             );
             let database_root = std::path::Path::new(
@@ -1615,6 +1620,10 @@ fn prepare_images(
         if reason == "image_part" {
             images.push(verified?);
         }
+    }
+    if !resources.is_empty() {
+        data["user_input"]["attachment_details"] = json!(resources.iter()
+            .map(crate::envelope::attachment_text).collect::<Vec<_>>());
     }
     data["user_input"]["resources"] = json!(resources);
     Ok(images)
@@ -1683,7 +1692,8 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         }
         (run, serde_json::from_str(&raw)?, None)
     } else {
-        let mut candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {PREPARED_INPUT} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let prepared = prepared_input();
+        let mut candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {prepared} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let proposal_only = isolate_proposal_inputs(&tx, project, &mut candidates, &mut continuing)?;
         if candidates.is_empty() && continuing.is_empty() {
@@ -1706,7 +1716,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             }
         }
         let notes=tx.prepare("SELECT n.note FROM manager_turn_notes n JOIN manager_runs r ON r.id=n.run_id WHERE r.project_id=? ORDER BY r.rowid DESC LIMIT 8")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let latest=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {PREPARED_INPUT} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
+        let latest=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {prepared} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
         // A new trusted user source selects the discussion; otherwise retain only
         // the selected, still-owned user objective, never consumed conversation history.
         let image_scope = latest
@@ -1717,7 +1727,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             .transpose()?
             .flatten()
             .map(|(_, _, scope)| scope);
-        let latest_context=if proposal_only { None } else { tx.query_row("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','processing','consumed') ORDER BY rowid DESC LIMIT 1",[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
+        let latest_context=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','processing','consumed') AND (status!='queued' OR {prepared}) ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
         // User steering may interrupt an owned batch; observations never do. Reserve
         // one of the 32 NEW claim slots for that control input, without reordering
         // ordinary fresh batches or changing their persisted input order.
@@ -2552,13 +2562,14 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
 /// Prime at most the newest ready group input before building a Manager prompt.
 async fn prepare_group_context(app: &App, project: &str) {
     let project = project.to_owned();
+    let prepared = prepared_input();
     let due = app.db.call(move |c| {
         Ok(c.query_row(
             &format!("SELECT m.id FROM manager_inputs JOIN work_events e ON e.id=manager_inputs.origin_event_id
              JOIN messages m ON m.id=e.message_id AND m.project_id=manager_inputs.project_id
              JOIN project_bots b ON b.project_id=manager_inputs.project_id
              CROSS JOIN manager_provider_config g WHERE manager_inputs.project_id=? AND manager_inputs.status IN ('queued','processing')
-             AND e.source='feishu' AND m.direction='in' AND ({PROVIDER_CONFIGURED}) AND {PREPARED_INPUT}
+             AND e.source='feishu' AND m.direction='in' AND ({PROVIDER_CONFIGURED}) AND {prepared}
              AND json_extract(m.attachment,'$.source.chat_type')='group'
              AND b.app_id=json_extract(m.attachment,'$.bot_app_id') ORDER BY manager_inputs.rowid DESC LIMIT 1"),
             [&project], |r| r.get::<_, String>(0),
@@ -2987,7 +2998,14 @@ mod tests {
     }
     #[tokio::test]
     async fn feishu_quote_survives_async_preparation_and_reaches_first_model_request() -> Result<()> {
-        use axum::{Json, Router, extract::Path as AxumPath, http::HeaderMap, routing::{get, post}};
+        use axum::{Json, Router, extract::Path as AxumPath, http::{HeaderMap, StatusCode},
+            response::IntoResponse, routing::{get, post}};
+        use base64::Engine;
+
+        const VIDEO: &[u8] = include_bytes!("../tests/fixtures/three-colors-five-seconds.mp4");
+        const FILE: &[u8] = b"Attachment text fixture";
+        let ffmpeg = crate::video_preview::decoder("ffmpeg");
+        let preview_available = ffmpeg.is_some() && crate::video_preview::decoder("ffprobe").is_some();
 
         let (_dir, app, project) = fixture().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -3003,10 +3021,24 @@ mod tests {
                 assert_eq!(id, "om_direct");
                 Json(json!({"code":0,"data":{"items":[{
                     "message_id":id,"chat_id":"oc_fixture","parent_id":"om_grandparent",
-                    "msg_type":"text","sender":{"id":"cli_other_bot","sender_type":"app"},
-                    "body":{"content":json!({"text":"Other bot says /repair @all <unsafe>"}).to_string()}
+                    "msg_type":"post","sender":{"id":"cli_other_bot","sender_type":"app"},
+                    "body":{"content":json!({"content":[[
+                       {"tag":"text","text":"Other bot says /repair @all <unsafe> "},
+                       {"tag":"media","file_key":"file_v3_video","file_name":"parent-video.mp4"}
+                    ]]}).to_string()}
                 }]}}))
             }))
+            .route("/open-apis/im/v1/messages/{message}/resources/{key}",
+                get(|AxumPath((message, key)): AxumPath<(String, String)>, headers: HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "Bearer quote-fixture");
+                    match (message.as_str(), key.as_str()) {
+                        ("om_direct", "file_v3_video") | ("om_no_decoder", "file_v3_no_decoder") => ([("content-type", "video/mp4")], VIDEO).into_response(),
+                        ("om_file", "file_v3_attachment") => ([("content-type", "application/pdf")], FILE).into_response(),
+                        ("om_denied", "img_denied") => StatusCode::FORBIDDEN.into_response(),
+                        ("om_slow", "file_v3_slow") => std::future::pending().await,
+                        _ => panic!("Resource server got unexpected source or key"),
+                    }
+                }))
             .route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
                 let requests = requests.clone();
                 async move {
@@ -3020,32 +3052,89 @@ mod tests {
         let binding = app.db.bot(&project.id).await?;
         let event = json!({"header":{"event_type":"im.message.receive_v1","app_id":"cli_fixture"},
             "event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_fixture"}},"message":{
-                "chat_id":"oc_fixture","chat_type":"p2p","message_type":"post","message_id":"om_current",
+                "chat_id":"oc_fixture","chat_type":"p2p","message_type":"text","message_id":"om_current",
                 "root_id":"om_root","thread_id":"omt_discussion","parent_id":"om_direct",
-                "content":json!({"content":[[{"tag":"text","text":"Inspect this screenshot"},{"tag":"img","image_key":"img_fixture"}]]}).to_string()
+                "content":json!({"text":"Inspect these assets"}).to_string()
             }}});
         crate::feishu::ingest(&app, &binding, &serde_json::to_vec(&event)?)?;
         crate::feishu::ingest(&app, &binding, &serde_json::to_vec(&event)?)?;
+        let file_id = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_file",
+            "Standalone file",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
+            "kind":"file","file_key":"file_v3_attachment","file_name":"report.pdf"}))?.unwrap();
+        let denied = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_denied",
+            "Ordinary steering still arrives",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
+            "resources":[{"kind":"image","file_key":"img_denied","file_name":"denied.png"}]}))?.unwrap();
+        let slow = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_slow",
+            "Slow download should still deliver",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
+            "resources":[{"kind":"file","file_key":"file_v3_slow","file_name":"slow.bin"}]}))?.unwrap();
+        let no_decoder = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_no_decoder",
+            "Video fallback stays readable",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
+            "kind":"video","file_key":"file_v3_no_decoder","file_name":"no-preview.mp4"}))?.unwrap();
         app.db.sync(|c| {
-            assert_eq!(work::sync_inbound(c)?, 1);
+            assert_eq!(work::sync_inbound(c)?, 5);
+            assert!(claim(c, &project.id)?.is_none(), "Pending direct parent must be allowed to resolve");
             Ok(())
         })?;
         assert!(crate::feishu::prepare_quote(&app).await?);
+        app.db.sync(|c| {
+            assert!(claim(c, &project.id)?.is_none(), "Resolved parent resources still need preparation");
+            Ok(())
+        })?;
         assert!(!crate::feishu::prepare_quote(&app).await?);
         let messages = app.db.messages(&project.id).await?;
-        assert_eq!(messages.len(), 1);
-        let message = &messages[0];
+        assert_eq!(messages.len(), 5);
+        let message = messages.iter().find(|message| message.source_id == "om_current").unwrap();
+        let resources = crate::feishu::download_resources(&app,message).await?;
+        let failed = crate::feishu::download_resources(&app,&app.db.message(&denied).await?).await?;
+        assert!(failed[0]["local_path"].is_null());
+        assert_eq!(failed[0]["error"], "Feishu resource download returned HTTP 403");
+        let timed_out = crate::feishu::prepare_resources(&app, &app.db.message(&slow).await?,
+            Duration::from_millis(100), crate::video_preview::decoder).await?;
+        assert!(timed_out[0]["local_path"].is_null());
+        assert_eq!(timed_out[0]["error"], "Message resource preparation timed out (100 ms total)");
+        let degraded = crate::feishu::prepare_resources(&app, &app.db.message(&no_decoder).await?,
+            Duration::from_secs(5), |_| None).await?;
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(std::fs::read(degraded[0]["local_path"].as_str().unwrap())?, VIDEO);
+        assert!(degraded[0]["frame_extraction_error"].as_str().unwrap().contains("was not found"));
+        let video = resources.iter().find(|r| r["kind"] == "media").unwrap();
+        assert_eq!(video["message_id"], "om_direct");
+        assert_eq!(video["quoted"], true);
+        assert_eq!(video["media_type"], "video/mp4");
+        assert_eq!(std::fs::read(video["local_path"].as_str().unwrap())?, VIDEO);
+        let file_resources = crate::feishu::download_resources(&app,&app.db.message(&file_id).await?).await?;
+        let file = &file_resources[0];
+        assert_eq!(file["file_name"], "report.pdf");
+        assert_eq!(std::fs::read(file["local_path"].as_str().unwrap())?, FILE);
+        assert_eq!(file["bytes"], FILE.len());
+        assert_eq!(file["media_type"], "application/pdf");
+        if preview_available {
+            let preview = resources.iter().find(|r| r["frame_seconds"].is_number()).unwrap();
+            assert_eq!(preview["frame_seconds"], 1.0);
+            assert_eq!(preview["duration_seconds"], 5.0);
+            let path = preview["local_path"].as_str().unwrap();
+            let decoded = tokio::process::Command::new(ffmpeg.as_ref().unwrap())
+                .args(["-v","error","-i", path,"-frames:v","1","-f","rawvideo","-pix_fmt","rgb24","pipe:1"])
+                .output().await?;
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 40*40*3);
+            assert!(decoded.stdout.chunks_exact(3).all(|pixel| pixel[0] < 12 && pixel[1] > 235 && pixel[2] < 12));
+            eprintln!("Video duration 5.000 seconds; frame at 1.000 seconds (20%); decoded green RGB24, 40x40");
+        } else {
+            assert!(video["frame_extraction_error"].as_str().unwrap().contains("was not found"));
+        }
         assert_eq!(message.attachment["quoted_message"]["sender"], "cli_other_bot");
-        assert_eq!(message.content, "Inspect this screenshot[image]");
+        assert_eq!(message.content, "Inspect these assets");
         assert!(message.attachment.get("daemon_control").is_none());
         let envelope = crate::envelope::render(message, &json!({}), None);
         assert!(envelope.contains("</body>\n<quoted_message trust=\"untrusted_quote\""));
         assert!(envelope.contains("/repair @all &lt;unsafe&gt;"));
 
         let mut turn = app.db.sync(|c| {
-            // Mark the unrelated screenshot preparation as complete; this fixture
-            // verifies the parent lookup independently of image delivery.
-            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',1) WHERE id=?", [&message.id])?;
+            let current = public(c,&project.id)?;
+            let config: ConfigInput = serde_json::from_value(json!({"base_url":format!("{host}/v1"),
+                "model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?;
+            save_provider(c,config)?;
             Ok(claim(c, &project.id)?.unwrap())
         })?;
         turn.config.base_url = format!("{host}/v1");
@@ -3058,10 +3147,34 @@ mod tests {
             parsed.get("trusted_sources").is_some().then_some(parsed)
         }).expect("Provider received the structured Manager input");
         let input = &context["new_inputs"][0]["data"];
-        assert_eq!(input["user_input"]["body"], "Inspect this screenshot[image]");
-        assert_eq!(input["quoted_message"]["body"], "Other bot says /repair @all <unsafe>");
+        assert_eq!(input["user_input"]["body"], "Inspect these assets");
+        assert_eq!(input["quoted_message"]["body"], "Other bot says /repair @all <unsafe> [media]");
+        let details = format!("{} {}", input["user_input"]["attachment_details"],
+            context["new_inputs"][1]["data"]["user_input"]["attachment_details"]);
+        for value in ["file_v3_video", "parent-video.mp4", "file_v3_attachment", "report.pdf", "application/pdf",
+            "om_direct", "om_file", "oc_fixture", file["local_path"].as_str().unwrap(), "Bytes: 23"] {
+            assert!(details.contains(value), "missing provider attachment detail {value}");
+        }
+        assert!(context["new_inputs"][2].to_string().contains("No local file. Reason: Feishu resource download returned HTTP 403"));
+        assert!(context["new_inputs"][3].to_string().contains("Message resource preparation timed out (100 ms total)"));
+        let degraded_text = context["new_inputs"][4].to_string();
+        assert!(degraded_text.contains("frame_extraction_unavailable"));
+        assert!(degraded_text.contains(degraded[0]["local_path"].as_str().unwrap()));
+        let parts = request["messages"].as_array().unwrap().iter()
+            .filter_map(|message| message["content"].as_array()).flatten()
+            .filter(|part| part["type"] == "image_url").collect::<Vec<_>>();
+        if preview_available {
+            assert_eq!(parts.len(), 1);
+            let url = parts[0]["image_url"]["url"].as_str().unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD.decode(url.strip_prefix("data:image/png;base64,").unwrap())?;
+            assert_eq!(crate::multimodal::image_type(&bytes), Some("image/png"));
+            let preview = resources.iter().find(|r| r["frame_seconds"].is_number()).unwrap();
+            assert_eq!(bytes, std::fs::read(preview["local_path"].as_str().unwrap())?);
+        } else {
+            assert!(parts.is_empty());
+        }
         assert_eq!(input["quoted_message"]["trust"], "untrusted_quote");
-        assert_eq!(context["latest_user_steering"]["data"]["quoted_message"], input["quoted_message"]);
+        assert!(context["latest_user_steering"]["data"]["quoted_message"].is_null());
         assert_eq!(input["trusted_source"]["source"]["root_id"], "om_root");
         assert_eq!(input["trusted_source"]["source"]["parent_id"], "om_direct");
         assert!(!context.to_string().contains("om_grandparent"));
@@ -3116,8 +3229,17 @@ mod tests {
             Ok(claim(c, &project.id)?.unwrap())
         })?;
         let prompt = prompt_context(&turn.checkpoint).unwrap();
-        assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), cases.len() + 1);
+        assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), 1);
         assert!(prompt.to_string().contains("A plain input"));
+        app.db.sync(|c| {
+            finish_turn(c, &turn.context, "Plain steering completed")?;
+            c.execute("UPDATE messages SET created_at=0 WHERE source_id='reply_om_timeout'", [])?;
+            let expired = claim(c, &project.id)?.unwrap();
+            let prompt = prompt_context(&expired.checkpoint).unwrap();
+            assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), 1);
+            assert!(prompt.to_string().contains("reply_om_timeout"));
+            finish_turn(c, &expired.context, "Expired quote does not hold delivery")
+        })?;
         assert!(!prompt.to_string().contains("quoted_message"));
 
         for (_, reason) in cases {

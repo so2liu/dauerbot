@@ -38,6 +38,7 @@ pub mod project_instructions;
 mod repair_lane;
 pub mod service;
 pub mod update;
+mod video_preview;
 pub mod work;
 pub mod workspace;
 
@@ -1379,7 +1380,7 @@ impl App {
             let context = feishu::context(self, &message).await;
             let message = self.db.message(&message.id).await?;
             Ok(envelope::render_resources(&message, &context,
-                message.attachment["resources"].as_array().map(Vec::as_slice).unwrap_or_default()))
+                &feishu::message_resources(&message)))
         } else {
             envelope::scheduled_body(&event.payload).map_err(Into::into)
         };
