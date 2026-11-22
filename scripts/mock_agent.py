@@ -16,6 +16,10 @@ import threading
 import tty
 import xml.etree.ElementTree as ET
 
+if sys.argv[1:2] == ["--mcp-config"]:
+    server = json.loads(Path(sys.argv[2]).read_text())["mcpServers"]["herdr_feishu"]
+    sys.argv[1:3] = [server["command"], server["args"][server["args"].index("--credentials") + 1]]
+
 tty.setraw(0)
 sys.stdout.write("\x1b[?2004h")
 sys.stdout.flush()
@@ -369,7 +373,12 @@ try:
                 to = "oc_fixture"
             with (Path.cwd() / ".fixture-deliveries").open("a") as deliveries:
                 deliveries.write(json.dumps({"source": source, "generation": Path(sys.argv[2]).parent.name, **({"manager_effect_id": delegation.attrib["effect_id"]} if delegation is not None else {})}) + "\n")
-            reply_anchor = {"reply_to_message_id": source} if envelope is not None and to == envelope.find("source").attrib["chat_id"] else {}
+            reply_anchor = {"reply_to_message_id": source} if envelope is not None else {}
+            if event.attrib["source"] == "timer":
+                if body.strip() == "scheduled-internal-via-mcp":
+                    reply_anchor = {"reply_to_message_id": "om_internal_schedule"}
+                else:
+                    reply_anchor = {"source_event_id": event.attrib["event_id"], "intent": "result"}
             tool("send_md", {"to": to, "text": f"**Fixture result**\n\n{source}\n\n{text}", "request_id": "reply-" + (delegation.attrib["effect_id"] if delegation is not None else source), **reply_anchor})
             if body == "fixture-create-schedule":
                 due = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)

@@ -188,8 +188,6 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
         ("post", json!({"zh_cn":{"title":"","content":[paragraph]}}))
     };
     let Some(anchor) = m.attachment["reply_to_message_id"].as_str() else {
-        // send_out admits new roots only for a requested result or decision
-        // scoped to a single work occurrence and explicit destination.
         let body =
             json!({"receive_id":to,"msg_type":kind,"content":content.to_string(),"uuid":m.id});
         let value = api_json(

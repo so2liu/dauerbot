@@ -156,7 +156,9 @@ pub(super) fn model_name(text: &str) -> String {
 pub(super) fn has_protected_tool(request: &CompletionRequest) -> bool {
     request.chat_history.iter().any(|message| match message {
         Message::Assistant(message) => message.content.iter().any(|item| match item {
-            AssistantContent::ToolCall(call) => call.function.arguments
+            AssistantContent::ToolCall(call) => call
+                .function
+                .arguments
                 .get("path")
                 .and_then(Value::as_str)
                 .is_some_and(sensitive_path),
@@ -177,24 +179,12 @@ pub(super) fn request_text(request: &CompletionRequest) -> String {
                         // Allow only human text and leave files, observations,
                         // configuration, system instructions and metadata behind.
                         if let Ok(context) = serde_json::from_str::<Value>(&text.text)
-                            && context["trusted_project"].is_object()
+                            && context["event"] == "user"
                         {
-                            for field in ["new_inputs", "continuing_inputs"] {
-                                for input in context[field].as_array().into_iter().flatten() {
-                                    if input["kind"] == "user" {
-                                        append(
-                                            &mut result,
-                                            "user",
-                                            input["data"]["user_input"]["body"].as_str(),
-                                        );
-                                    }
-                                }
-                            }
                             append(
                                 &mut result,
                                 "user",
-                                context["latest_user_steering"]["data"]["user_input"]["body"]
-                                    .as_str(),
+                                context["data"]["user_input"]["body"].as_str(),
                             );
                         }
                     }
@@ -224,6 +214,19 @@ pub(super) fn append(target: &mut String, role: &str, value: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_text_extracts_only_user_text_from_channel_events() {
+        let request = CompletionRequest::new(serde_json::json!({
+            "event":"user","data":{"user_input":{"body":"hello from the channel","resources":["private resource"]}}
+        }).to_string()).message(Message::user(serde_json::json!({
+            "event":"worker","data":{"user_input":{"body":"internal observation"}}
+        }).to_string()));
+        let text = request_text(&request);
+        assert!(text.contains("hello from the channel"));
+        assert!(!text.contains("private resource"));
+        assert!(!text.contains("internal observation"));
+    }
+
     use super::*;
 
     #[test]
@@ -323,9 +326,13 @@ mod tests {
             "tools": []
         }))
         .unwrap();
-        request.chat_history.push(call("send_md", json!({"text":"Reply"})));
+        request
+            .chat_history
+            .push(call("send_md", json!({"text":"Reply"})));
         assert!(!has_protected_tool(&request));
-        request.chat_history.push(call("read_file", json!({"path":"private/.env"})));
+        request
+            .chat_history
+            .push(call("read_file", json!({"path":"private/.env"})));
         assert!(has_protected_tool(&request));
     }
 }

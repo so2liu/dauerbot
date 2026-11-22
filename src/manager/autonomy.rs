@@ -1,9 +1,8 @@
 //! Proposal-only provider calls and durable publication into the ordinary outbox.
-use super::{PROVIDER_CONFIGURED, read_file};
+use super::{PROVIDER_CONFIGURED, llm::{self, ProviderConfig}, read_file};
 use crate::{
     App, autonomy,
     db::{self, enqueue_out_request},
-    manager_loop::{self, ProviderConfig},
     panel,
 };
 use anyhow::{Result, ensure};
@@ -32,10 +31,10 @@ fn claim(c: &Connection, now: i64) -> Result<Option<Request>> {
     let Some(settings) = autonomy::claim_due(c, now)? else {
         return Ok(None);
     };
-    let (base_url, model, api_key, provider_revision, configured) = c.query_row(
-        &format!("SELECT base_url,model,api_key,revision,({PROVIDER_CONFIGURED}) FROM manager_provider_config g WHERE id=1"),
+    let (base_url, model, api_key, provider_revision, configured, provider_kind, context_window) = c.query_row(
+        &format!("SELECT base_url,model,api_key,revision,({PROVIDER_CONFIGURED}),provider_kind,context_window FROM manager_provider_config g WHERE id=1"),
         [],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,bool>(4)?)),
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,bool>(4)?,r.get::<_,String>(5)?,r.get(6)?)),
     )?;
     if !configured {
         return Ok(None);
@@ -61,6 +60,8 @@ fn claim(c: &Connection, now: i64) -> Result<Option<Request>> {
             model,
             api_key,
             supports_images: false,
+            provider_kind: serde_json::from_value(json!(provider_kind))?,
+            context_window,
         },
         provider_revision,
         workspace,
@@ -140,7 +141,7 @@ async fn generate(app: &Arc<App>, mut request: Request) -> Result<()> {
     let evidence =
         serde_json::from_str(&redacted).unwrap_or_else(|_| json!({"project_evidence":redacted}));
     let result =
-        manager_loop::propose(&request.provider, SYSTEM, &evidence, app.shutdown.clone()).await?;
+        llm::propose(&request.provider, SYSTEM, &evidence, app.shutdown.clone()).await?;
     let submission = serde_json::from_value(result)?;
     let Some(_permit) = app.service.gate.enter() else {
         return Ok(());

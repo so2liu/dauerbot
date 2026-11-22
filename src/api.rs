@@ -863,11 +863,7 @@ async fn manager_context(State(app): State<Arc<App>>, Path(id): Path<String>) ->
     let mut view = app.manager_context.view(&p.id);
     if view["requests"].as_array().is_some_and(Vec::is_empty) {
         let project = p.id;
-        let fallback = app.db.call(move |c| {
-            use rusqlite::OptionalExtension;
-            let row: Option<(String,String)> = c.query_row("SELECT id,checkpoint FROM manager_runs WHERE project_id=? ORDER BY rowid DESC LIMIT 1", [&project], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-            Ok(row.and_then(|(run,checkpoint)| serde_json::from_str(&checkpoint).ok().and_then(|checkpoint| crate::manager_context::normalized(&checkpoint,&run))))
-        }).await?;
+        let fallback = app.db.call(move |c| crate::manager::session_context(c, &project)).await?;
         if let Some(fallback) = fallback {
             view["requests"] = json!([fallback]);
         }
@@ -1424,7 +1420,7 @@ mod manager_context_tests {
         app.db.sync(|c| {
             assert!(!crate::manager::uses_manager(c,&standalone.id)?);
             assert_eq!(standalone.agent,"agy");
-            crate::manager::save_provider(c, crate::manager::ConfigInput {
+            crate::manager::save_provider(c, crate::manager::ConfigInput { provider_kind: None, context_window: None,
                 base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(),
                 api_key:Some("fixture-not-a-credential".into()), clear_api_key:false,
                 expected_revision:0, supports_images:None,
@@ -1461,7 +1457,7 @@ mod manager_context_tests {
         let request = rig_core::completion::CompletionRequest::new("fixture context");
         let guard = app
             .manager_context
-            .capture(&project.id, "fixture-run", 1, &request);
+            .capture(&project.id, "fixture-run", 1, None, &request);
         let snapshot = app.manager_context.view(&project.id);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

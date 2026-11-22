@@ -22,7 +22,6 @@ pub mod herdr;
 pub mod manager;
 mod manager_close;
 pub mod manager_context;
-pub mod manager_loop;
 mod manager_telemetry;
 mod manager_terminal;
 mod manager_workers;
@@ -541,7 +540,9 @@ impl App {
             }
         }
         let mut new_root = false;
-        if m.attachment["reply_to_message_id"].as_str().is_none() {
+        if m.attachment["reply_to_message_id"].as_str().is_none()
+            && !m.attachment["manager_effect"].is_string()
+        {
             let Some(scope) = m.attachment["discussion_scope"].as_str().filter(|_| {
                 matches!(
                     m.attachment["discussion_intent"].as_str(),

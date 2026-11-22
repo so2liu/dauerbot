@@ -30,11 +30,6 @@ struct Record {
     value: Value,
 }
 
-pub(crate) struct Observer {
-    pub store: Arc<Store>,
-    pub project: String,
-    pub run: String,
-}
 pub(crate) struct Guard {
     store: Arc<Store>,
     id: String,
@@ -54,10 +49,14 @@ impl Store {
         project: &str,
         run: &str,
         turn: u64,
+        channel_id: Option<&str>,
         request: &CompletionRequest,
     ) -> Guard {
         let id = crate::db::id();
-        let value = prepared(&id, run, turn, request);
+        let mut value = prepared(&id, run, turn, request);
+        if let Some(channel_id) = channel_id {
+            value["channel_id"] = json!(channel_id);
+        }
         if let Ok(mut records) = self.0.lock() {
             records.push_back(Record {
                 project: project.into(),
@@ -449,15 +448,12 @@ fn prepared(id: &str, run: &str, turn: u64, request: &CompletionRequest) -> Valu
     json!({"id":id,"run_id":run,"turn":turn,"prepared_at_ms":now(),"finished_at_ms":null,"status":"prepared","source":"logical_request","blocks":builder.blocks,"tools":tools,"truncated":builder.truncated,"redactions":if builder.redacted {vec!["Known sensitive fields or values removed"]}else{vec![]}})
 }
 
-pub(crate) fn normalized(checkpoint: &Value, run: &str) -> Option<Value> {
-    let request = crate::manager_loop::normalized_context(checkpoint.clone())?;
+pub(crate) fn normalized(messages: &[Message], run: &str) -> Value {
     let mut builder = Builder::new();
     // Persisted checkpoint structure is deliberately labelled as normalized;
     // hydration, correction feedback and historical wire timing are not rebuilt.
-    builder.messages(&request.chat_history);
-    Some(
-        json!({"id":format!("checkpoint-{run}"),"run_id":run,"turn":0,"prepared_at_ms":null,"finished_at_ms":null,"status":"historical_normalized","source":"checkpoint_normalized","blocks":builder.blocks,"tools":[],"truncated":builder.truncated,"redactions":if builder.redacted {vec!["Known sensitive fields or values removed"]}else{vec![]}}),
-    )
+    builder.messages(messages);
+        json!({"id":format!("checkpoint-{run}"),"run_id":run,"turn":0,"prepared_at_ms":null,"finished_at_ms":null,"status":"historical_normalized","source":"checkpoint_normalized","blocks":builder.blocks,"tools":[],"truncated":builder.truncated,"redactions":if builder.redacted {vec!["Known sensitive fields or values removed"]}else{vec![]}})
 }
 pub(crate) fn bounded(mut view: Value) -> Value {
     while serde_json::to_vec(&view).map_or(true, |bytes| bytes.len() > MAX_API_BYTES) {
@@ -501,7 +497,7 @@ mod tests {
             content: vec![UserContent::ToolResult(result)],
         });
         let store = Arc::new(Store::default());
-        let _guard = store.capture("fixture-project", "fixture-run", 1, &request);
+        let _guard = store.capture("fixture-project", "fixture-run", 1, None, &request);
         let view = store.view("fixture-project");
         let snapshot = &view["requests"][0];
         let encoded = snapshot.to_string();
@@ -649,13 +645,13 @@ mod tests {
     fn store_is_read_only_scoped_bounded_and_drop_marks_abandoned() {
         let store = Arc::new(Store::default());
         let request = CompletionRequest::new("hello");
-        let guard = store.capture("a", "run", 0, &request);
+        let guard = store.capture("a", "run", 0, None, &request);
         let first = store.view("a");
         assert_eq!(first, store.view("a"));
         assert!(store.view("b")["requests"].as_array().unwrap().is_empty());
         drop(guard);
         assert_eq!(store.view("a")["requests"][0]["status"], "abandoned");
-        let mut guard = store.capture("a", "run", 1, &request);
+        let mut guard = store.capture("a", "run", 1, None, &request);
         guard.finish("provider_responded");
         drop(guard);
         assert_eq!(
@@ -663,7 +659,7 @@ mod tests {
             "provider_responded"
         );
         for _ in 0..MAX_REQUESTS + 1 {
-            drop(store.capture("b", "run", 0, &request));
+            drop(store.capture("b", "run", 0, None, &request));
         }
         assert!(store.view("a")["requests"].as_array().unwrap().is_empty());
         assert_eq!(store.0.lock().unwrap().len(), MAX_REQUESTS);
@@ -688,9 +684,7 @@ mod tests {
                 .to_string()
                 .contains("PIXELS_MUST_NOT_APPEAR")
         );
-        let checkpoint =
-            crate::manager_loop::begin("saved user".into(), "saved system".into()).unwrap();
-        let fallback = normalized(&checkpoint, "r").unwrap();
+        let fallback = normalized(&[Message::user("saved user")], "r");
         assert_eq!(fallback["source"], "checkpoint_normalized");
         assert!(fallback["prepared_at_ms"].is_null());
     }

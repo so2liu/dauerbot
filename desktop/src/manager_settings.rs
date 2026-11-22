@@ -31,10 +31,47 @@ pub fn status(project: &Value) -> &str {
         .unwrap_or("unavailable")
 }
 
+const PROTOCOLS: [(&str, &str); 3] = [
+    ("openai_completions", "OpenAI Chat Completions"),
+    ("openai_responses", "OpenAI Responses"),
+    ("anthropic", "Anthropic Messages"),
+];
+
+fn configured_protocol(config: &Value) -> &'static str {
+    PROTOCOLS
+        .iter()
+        .find(|(id, _)| config["provider_kind"] == *id)
+        .map_or(PROTOCOLS[0].0, |(id, _)| *id)
+}
+
+fn parse_context_window(input: &str) -> Result<Option<u32>, &'static str> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    input
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value >= 1024)
+        .map(Some)
+        .ok_or("Context window must be a whole number of at least 1024.")
+}
+
+fn provider_payload(
+    config: &Value,
+    endpoint: &str,
+    model: &str,
+    protocol: &str,
+    context_window: Option<u32>,
+) -> Value {
+    json!({"base_url":endpoint,"model":model,"provider_kind":protocol,
+        "context_window":context_window,"expected_revision":config["revision"]})
+}
+
 fn image_identity_changed(
     event: &InputEvent,
-    previous: &(String, String),
-    current: &(String, String),
+    previous: &(String, String, &str),
+    current: &(String, String, &str),
 ) -> bool {
     matches!(event, InputEvent::Change) && previous != current
 }
@@ -49,11 +86,13 @@ pub struct ManagerSettings {
     open: bool,
     dirty: bool,
     supports_images: bool,
-    image_identity: (String, String),
+    image_identity: (String, String, &'static str),
+    protocol: &'static str,
     message: String,
     tx: mpsc::Sender<Work>,
     endpoint: Entity<InputState>,
     model: Entity<InputState>,
+    context_window: Entity<InputState>,
     key: Entity<InputState>,
 }
 impl ManagerSettings {
@@ -61,6 +100,7 @@ impl ManagerSettings {
         let endpoint =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://api.openai.com/v1"));
         let model = cx.new(|cx| InputState::new(window, cx).placeholder("Model ID"));
+        let context_window = cx.new(|cx| InputState::new(window, cx));
         let key = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("API key")
@@ -172,7 +212,10 @@ impl ManagerSettings {
             }
         })
         .detach();
-        for (index, input) in [&endpoint, &model, &key].into_iter().enumerate() {
+        for (index, input) in [&endpoint, &model, &context_window, &key]
+            .into_iter()
+            .enumerate()
+        {
             cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
                 if !matches!(event, InputEvent::Change) {
                     return;
@@ -181,6 +224,7 @@ impl ManagerSettings {
                     let identity = (
                         this.endpoint.read(cx).value().to_string(),
                         this.model.read(cx).value().to_string(),
+                        this.protocol,
                     );
                     if image_identity_changed(event, &this.image_identity, &identity) {
                         this.supports_images = false;
@@ -202,11 +246,13 @@ impl ManagerSettings {
             open: false,
             dirty: false,
             supports_images: false,
-            image_identity: (String::new(), String::new()),
+            image_identity: (String::new(), String::new(), PROTOCOLS[0].0),
+            protocol: PROTOCOLS[0].0,
             message: String::new(),
             tx,
             endpoint,
             model,
+            context_window,
             key,
         }
     }
@@ -219,21 +265,28 @@ impl ManagerSettings {
             let first = self.config.is_null();
             self.config = provider.clone();
             self.fill_inputs = true;
-            if first && (self.config["configured"] != true || self.config["migration_conflict"] == true) {
+            if first
+                && (self.config["configured"] != true || self.config["migration_conflict"] == true)
+            {
                 self.open = true;
             }
         }
     }
-    fn request(
-        &mut self,
-        method: &'static str,
-        body: Option<Value>,
-        cx: &mut Context<Self>,
-    ) {
+    fn request(&mut self, method: &'static str, body: Option<Value>, cx: &mut Context<Self>) {
         self.serial += 1;
-        let ticket = Ticket { serial: self.serial };
+        let ticket = Ticket {
+            serial: self.serial,
+        };
         self.ticket = Some(ticket.clone());
-        if self.tx.send(Work { ticket, method, body }).is_err() {
+        if self
+            .tx
+            .send(Work {
+                ticket,
+                method,
+                body,
+            })
+            .is_err()
+        {
             self.ticket = None;
             self.message = "Manager settings are unavailable".into();
         }
@@ -267,7 +320,7 @@ impl Render for ManagerSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = crate::ui_theme::palette(cx);
         if std::mem::take(&mut self.clear_inputs) {
-            for input in [&self.endpoint, &self.model, &self.key] {
+            for input in [&self.endpoint, &self.model, &self.context_window, &self.key] {
                 input.update(cx, |input, cx| input.set_value("", window, cx));
             }
         }
@@ -281,18 +334,32 @@ impl Render for ManagerSettings {
                     )
                 });
             }
+            self.protocol = configured_protocol(&self.config);
+            self.context_window.update(cx, |input, cx| {
+                let limit = self.config["context_window"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                input.set_value(limit, window, cx);
+            });
             self.image_identity = (
                 self.config["base_url"].as_str().unwrap_or("").into(),
                 self.config["model"].as_str().unwrap_or("").into(),
+                self.protocol,
             );
             self.supports_images = self.config["supports_images"] == true;
             self.dirty = false;
         }
+        let context_window = parse_context_window(self.context_window.read(cx).value().as_ref());
         self.dirty = !self.config.is_null()
             && (self.endpoint.read(cx).value().as_ref()
                 != self.config["base_url"].as_str().unwrap_or("")
                 || self.model.read(cx).value().as_ref()
                     != self.config["model"].as_str().unwrap_or("")
+                || self.protocol != configured_protocol(&self.config)
+                || context_window
+                    .as_ref()
+                    .map_or(true, |value| json!(value) != self.config["context_window"])
                 || !self.key.read(cx).value().is_empty()
                 || self.supports_images != (self.config["supports_images"] == true));
         let busy = self.ticket.is_some();
@@ -306,17 +373,40 @@ impl Render for ManagerSettings {
                 .child(self.language.text("The previous projects used different managers. Review and save the shared provider.")));
         }
         if self.open {
-            view=view.child(self.field("OpenAI-compatible endpoint", &self.endpoint, palette)).child(self.field("Manager model", &self.model, palette)).child(self.field("Manager API key", &self.key, palette))
+            view = view
+                .child(div().flex().flex_col().gap_1()
+                    .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("Provider protocol")))
+                    .child(div().flex().flex_wrap().gap_2().children(PROTOCOLS.map(|(protocol, label)| {
+                        Button::new(protocol).small().selected(self.protocol == protocol).disabled(busy)
+                            .child(control_label(self.language.text(label)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.protocol != protocol {
+                                    this.protocol = protocol;
+                                    this.image_identity.2 = protocol;
+                                    this.supports_images = false;
+                                    this.dirty = true;
+                                    cx.notify();
+                                }
+                            }))
+                    }))))
+                .child(self.field("Provider endpoint", &self.endpoint, palette))
+                .child(self.field("Manager model", &self.model, palette))
+                .child(self.field("Context window (tokens, optional)", &self.context_window, palette))
+                .child(div().text_size(px(11.)).text_color(rgb(if context_window.is_ok() { palette.muted } else { palette.error }))
+                    .child(self.language.text(context_window.as_ref().err().copied().unwrap_or("Leave blank for automatic context detection."))))
+                .child(self.field("Manager API key", &self.key, palette))
                 .child(Button::new("manager-image-capability").small().selected(self.supports_images).disabled(busy||!self.config["supports_images"].is_boolean())
                     .child(control_label(self.language.text(if self.supports_images {"Image input declared supported"}else{"Declare image input support"})))
                     .on_click(cx.listener(|this,_,_,cx| { this.supports_images = !this.supports_images; cx.notify(); })))
-                .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references.")))
+                .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text("Enable only when this endpoint, model, and protocol support image input. Otherwise images remain explicit file references.")))
                 .child(div().text_size(px(11.)).text_color(rgb(palette.muted)).child(self.language.text(if self.config["has_api_key"]==true {"API key saved. Leave blank to keep it."}else{"No manager API key saved"})))
                 .child(div().flex().flex_wrap().gap_2()
                     .child(Button::new("save-manager-config").small().primary().child(control_label(self.language.text("Save manager settings")))
-                        .disabled(busy||revision.is_none())
+                        .disabled(busy||revision.is_none()||context_window.is_err())
                         .on_click(cx.listener(|this,_,_,cx| {
-                            let mut body=json!({"base_url":this.endpoint.read(cx).value().to_string(),"model":this.model.read(cx).value().to_string(),"expected_revision":this.config["revision"]});
+                            let Ok(limit) = parse_context_window(this.context_window.read(cx).value().as_ref()) else { return; };
+                            let mut body = provider_payload(&this.config, this.endpoint.read(cx).value().as_ref(),
+                                this.model.read(cx).value().as_ref(), this.protocol, limit);
                             if this.config["supports_images"].is_boolean() { body["supports_images"] = json!(this.supports_images); }
                             let key=this.key.read(cx).value().to_string();if !key.is_empty(){body["api_key"]=json!(key);}
                             this.request("PUT",Some(body),cx);
@@ -342,11 +432,19 @@ impl Render for ManagerSettings {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputEvent, image_identity_changed};
+    use super::{
+        InputEvent, configured_protocol, image_identity_changed, parse_context_window,
+        provider_payload,
+    };
+    use serde_json::{Value, json};
     #[test]
     fn declaration_resets_only_for_real_provider_identity_changes() {
-        let saved: (String, String) = ("https://fixture.invalid/v1".into(), "vision".into());
-        let changed = (saved.0.clone(), "another-model".into());
+        let saved: (String, String, &str) = (
+            "https://fixture.invalid/v1".into(),
+            "vision".into(),
+            "openai_completions",
+        );
+        let changed = (saved.0.clone(), "another-model".into(), saved.2);
         for event in [
             InputEvent::PressEnter { secondary: false },
             InputEvent::PressEnter { secondary: true },
@@ -365,7 +463,16 @@ mod tests {
         assert!(image_identity_changed(
             &InputEvent::Change,
             &saved,
-            &("https://another.invalid/v1".into(), saved.1.clone())
+            &(
+                "https://another.invalid/v1".into(),
+                saved.1.clone(),
+                saved.2
+            )
+        ));
+        assert!(image_identity_changed(
+            &InputEvent::Change,
+            &saved,
+            &(saved.0.clone(), saved.1.clone(), "anthropic")
         ));
         // A freshly populated form or a declaration for edited values is bound
         // to that identity, even when it differs from the previously saved form.
@@ -374,5 +481,35 @@ mod tests {
             &changed,
             &changed
         ));
+    }
+    #[test]
+    fn provider_protocol_and_context_limit_serialize_including_clear() {
+        let config = json!({"revision":5});
+        assert_eq!(configured_protocol(&config), "openai_completions");
+        assert_eq!(
+            configured_protocol(&json!({"provider_kind":"anthropic"})),
+            "anthropic"
+        );
+        let payload = provider_payload(
+            &config,
+            "https://fixture.invalid",
+            "model",
+            "openai_responses",
+            parse_context_window(" 8192 ").unwrap(),
+        );
+        assert_eq!(payload["provider_kind"], "openai_responses");
+        assert_eq!(payload["context_window"], 8192);
+        assert_eq!(payload["expected_revision"], 5);
+        let payload = provider_payload(
+            &config,
+            "https://fixture.invalid",
+            "model",
+            "anthropic",
+            parse_context_window(" ").unwrap(),
+        );
+        assert_eq!(payload.get("context_window"), Some(&Value::Null));
+        for invalid in ["0", "1023", "-1024", "2.5", "4294967296"] {
+            assert!(parse_context_window(invalid).is_err());
+        }
     }
 }

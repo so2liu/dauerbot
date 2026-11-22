@@ -1,13 +1,16 @@
 //! Restricted management actor. Native CLI authority stays in the worker.
-mod pi;
-mod topic_decisions;
-mod topic_history;
+pub(crate) mod llm;
+mod agent;
+mod tools;
+mod channel;
+mod memory;
+mod session;
 use crate::{
     App, db,
     db::Project,
-    manager_loop::{self, Failure, LoopAction, ProviderConfig, ToolCall},
     work,
 };
+use self::{llm::{Failure, ProviderConfig}, tools::ToolCall};
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -21,7 +24,6 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio_util::sync::CancellationToken;
 
 mod autonomy;
 
@@ -47,8 +49,6 @@ pub(crate) fn uses_manager(c: &Connection, project: &str) -> Result<bool> {
         [project], |row|row.get::<_,bool>(0))?)
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
-    topic_decisions::migrate(c)?;
-    pi::session::migrate(c)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS standalone_projects(
         project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
     )")?;
@@ -72,6 +72,18 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
         supports_images INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL DEFAULT 0, migration_conflict INTEGER NOT NULL DEFAULT 0
     );")?;
+    for (column, definition) in [
+        ("provider_kind", "TEXT NOT NULL DEFAULT 'openai_completions'"),
+        ("context_window", "INTEGER"),
+    ] {
+        let exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('manager_provider_config') WHERE name=?)",
+            [column], |row| row.get(0),
+        )?;
+        if !exists {
+            c.execute(&format!("ALTER TABLE manager_provider_config ADD COLUMN {column} {definition}"), [])?;
+        }
+    }
     // A blank singleton also marks a completed migration, including after a key is cleared.
     let migrated = c.execute("INSERT OR IGNORE INTO manager_provider_config(id,base_url,model,api_key,supports_images,migration_conflict)
         SELECT 1,old.base_url,old.model,old.api_key,old.supports_images,
@@ -107,9 +119,39 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     }
     crate::manager_close::migrate(c, recover)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_input_claims(input_id TEXT PRIMARY KEY REFERENCES manager_inputs(id) ON DELETE CASCADE,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS manager_claim_run ON manager_input_claims(run_id);")?;
-    if recover {
-        c.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE status='submitting'",[json!({"status":"uncertain","message":"The host stopped during this effect; do not repeat it without inspecting evidence."}).to_string()])?;
+    session::migrate(c)?;
+    session::migrate_inputs(c)?;
+    let transcript_recorded = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('manager_effects') WHERE name='transcript_recorded')",
+        [], |row| row.get::<_, bool>(0),
+    )?;
+    if !transcript_recorded {
+        c.execute("ALTER TABLE manager_effects ADD COLUMN transcript_recorded INTEGER NOT NULL DEFAULT 0", [])?;
     }
+    if recover {
+        c.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE status='submitting'",
+            [json!({"status":"uncertain","message":"The host stopped during this effect; inspect evidence before retrying."}).to_string()])?;
+    }
+    c.execute(
+        "INSERT OR IGNORE INTO manager_detached_effects(effect_id,project_id,channel_id)
+         SELECT DISTINCT e.id,r.project_id,COALESCE(json_extract(r.checkpoint,'$.channel_id'),i.channel_id,'local:default')
+         FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id
+         LEFT JOIN manager_inputs i ON i.origin_event_id=r.origin_event_id AND i.project_id=r.project_id
+         WHERE e.transcript_recorded=0 AND e.status IN ('complete','uncertain') AND r.status='working'
+         AND json_valid(r.checkpoint) AND (? OR json_type(r.checkpoint,'$.channel_id') IS NULL)",
+        [recover],
+    )?;
+    let effects = c.prepare("SELECT effect_id FROM manager_detached_effects")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for effect in effects {
+        tools::wake_detached(c, &effect)?;
+    }
+    c.execute(
+        "UPDATE manager_runs SET status='superseded' WHERE status='working'
+         AND (? OR NOT json_valid(checkpoint) OR json_type(checkpoint,'$.channel_id') IS NULL)",
+        [recover],
+    )?;
     Ok(())
 }
 #[derive(Deserialize)]
@@ -123,7 +165,14 @@ pub struct ConfigInput {
     pub expected_revision: i64,
     #[serde(default)]
     pub supports_images: Option<bool>,
+    pub provider_kind: Option<llm::ProviderKind>,
+    #[serde(default, deserialize_with = "explicit_context_window")]
+    pub context_window: Option<Option<u32>>,
 }
+fn explicit_context_window<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Option<u32>>, D::Error> {
+    Option::deserialize(d).map(Some)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeInput {
@@ -139,13 +188,14 @@ const PROVIDER_CONFIGURED: &str = "g.migration_conflict=0 AND trim(g.base_url)!=
 pub fn public_provider(c: &Connection) -> Result<Value> {
     Ok(c.query_row(
         &format!("SELECT base_url,model,trim(api_key)!='',supports_images,revision,migration_conflict,
-            ({PROVIDER_CONFIGURED}) FROM manager_provider_config g WHERE g.id=1"),
+            ({PROVIDER_CONFIGURED}),provider_kind,context_window FROM manager_provider_config g WHERE g.id=1"),
         [],
         |row| Ok(json!({
             "base_url":row.get::<_,String>(0)?,"model":row.get::<_,String>(1)?,
             "has_api_key":row.get::<_,bool>(2)?,"supports_images":row.get::<_,bool>(3)?,
             "revision":row.get::<_,i64>(4)?,"migration_conflict":row.get::<_,bool>(5)?,
-            "configured":row.get::<_,bool>(6)?
+            "configured":row.get::<_,bool>(6)?,"provider_kind":row.get::<_,String>(7)?,
+            "context_window":row.get::<_,Option<u32>>(8)?
         })),
     )?)
 }
@@ -196,19 +246,23 @@ pub fn save_provider(c: &Connection, input: ConfigInput) -> Result<Value> {
         base_url: input.base_url.clone(),
         model: input.model.clone(),
         supports_images: false,
+        provider_kind: input.provider_kind.unwrap_or(serde_json::from_value(current["provider_kind"].clone())?),
+        context_window: input.context_window.unwrap_or(serde_json::from_value(current["context_window"].clone())?),
         api_key: if key.is_empty() { "configuration-placeholder".into() } else { key.clone() },
     };
     config.validate()?;
     let supports_images = input.supports_images.unwrap_or_else(|| {
         current["base_url"] == input.base_url
             && current["model"] == input.model
+            && current["provider_kind"] == config.provider_kind.as_str()
             && current["supports_images"] == true
     });
-    tx.execute("UPDATE manager_provider_config SET base_url=?,model=?,api_key=?,supports_images=?,
+    tx.execute("UPDATE manager_provider_config SET base_url=?,model=?,api_key=?,supports_images=?,provider_kind=?,context_window=?,
         revision=revision+1,updated_at=?,migration_conflict=0 WHERE id=1",
-        params![input.base_url,input.model,key,supports_images,db::now()])?;
+        params![input.base_url,input.model,key,supports_images,config.provider_kind.as_str(),config.context_window,db::now()])?;
     tx.execute("UPDATE manager_config SET revision=revision+1,input_revision=input_revision+1,error='',next_attempt_at=0", [])?;
     tx.execute("UPDATE manager_runs SET status='superseded' WHERE status='working'", [])?;
+    tx.execute("UPDATE manager_channels SET retry_at=0,last_input_tokens=NULL,last_estimate=NULL", [])?;
     let result = public_provider(&tx)?;
     tx.commit()?;
     Ok(result)
@@ -298,6 +352,13 @@ pub fn route_event(c: &Connection, event: &str) -> Result<()> {
         },
         &json!({"event_id":event,"source":source,"trusted_source":trusted_source,"user_input":user_input}),
     )?;
+    if source == "timer" {
+        c.execute(
+            "UPDATE work_events SET payload=json_set(payload,'$.origin_channel_id',
+             (SELECT channel_id FROM manager_inputs WHERE id=?)) WHERE id=?",
+            params![event,event],
+        )?;
+    }
     c.execute(
         "UPDATE work_events SET status='managed' WHERE id=? AND status='queued'",
         [event],
@@ -314,8 +375,33 @@ fn input(
     payload: &Value,
 ) -> Result<()> {
     c.execute("INSERT OR IGNORE INTO manager_config(project_id,mode) VALUES(?,'manager')", [project])?;
-    if c.execute("INSERT OR IGNORE INTO manager_inputs(id,project_id,origin_event_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)",params![id,project,origin,kind,payload.to_string(),db::now()])?==1 {
- c.execute("UPDATE manager_config SET input_revision=input_revision+CASE WHEN ?='user' THEN 1 ELSE 0 END,next_attempt_at=CASE WHEN ?='user' THEN 0 ELSE next_attempt_at END WHERE project_id=?",params![kind,kind,project])?; }
+    let event = origin.map(|origin| {
+        c.query_row(
+            "SELECT source,payload FROM work_events WHERE id=? AND project_id=?",
+            params![origin, project],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()
+    }).transpose()?.flatten();
+    let channel_id = match event {
+        Some((source, raw)) => channel::for_event(c, project, &source, &serde_json::from_str(&raw)?)?,
+        None => None,
+    };
+    let channel_id = if let Some(event) = payload["event_id"].as_str()
+        && let Some(channel) = c.query_row(
+            "SELECT json_extract(payload,'$.origin_channel_id') FROM work_events WHERE project_id=? AND id=?",
+            params![project,event], |row| row.get::<_,Option<String>>(0),
+        ).optional()?.flatten()
+    { channel } else { channel_id.unwrap_or_else(|| channel::LOCAL.into()) };
+    let signal = if kind == "user" { channel::Signal::Steer } else { channel::Signal::Wake };
+    if c.execute(
+        "INSERT OR IGNORE INTO manager_inputs(id,project_id,origin_event_id,kind,payload,created_at,channel_id,signal)
+         VALUES(?,?,?,?,?,?,?,?)",
+        params![id,project,origin,kind,payload.to_string(),db::now(),channel_id,signal.as_str()],
+    )? == 1 && kind == "user" {
+        c.execute("UPDATE manager_channels SET retry_at=0 WHERE project_id=? AND channel_id=?",
+            params![project,channel_id])?;
+        c.execute("UPDATE manager_config SET next_attempt_at=0 WHERE project_id=?", [project])?;
+    }
     Ok(())
 }
 #[derive(Clone)]
@@ -327,6 +413,7 @@ pub(crate) struct Context {
 }
 pub(crate) fn valid(c: &Connection, ctx: &Context) -> Result<Project> {
     let p = crate::db::project_by_key(c, &ctx.project)?;
+    ensure!(uses_manager(c, &p.id)?, "Project no longer uses Manager");
     let matches:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_config WHERE project_id=? AND revision=? AND input_revision=?)",params![ctx.project,ctx.revision,ctx.input_revision],|r|r.get(0))?;
     ensure!(
         matches && !p.paused,
@@ -336,8 +423,14 @@ pub(crate) fn valid(c: &Connection, ctx: &Context) -> Result<Project> {
         !work::has_takeover(c, &p.id, &p.generation)?,
         "Native input is under explicit user control"
     );
-    let owned:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_runs WHERE id=? AND project_id=? AND owner=? AND status='working')",params![ctx.run,ctx.project,owner()],|r|r.get(0))?;
-    ensure!(owned, "Management turn ownership changed");
+    let run_channel = c.query_row(
+        "SELECT CASE WHEN json_valid(checkpoint) THEN json_extract(checkpoint,'$.channel_id') END
+         FROM manager_runs WHERE id=? AND project_id=? AND owner=? AND status='working'",
+        params![ctx.run,ctx.project,owner()], |row| row.get::<_,Option<String>>(0),
+    ).optional()?.context("Management turn ownership changed")?;
+    if let Some(channel_id) = run_channel.as_deref() {
+        ensure!(channel::bound(c, &ctx.project, channel_id)?, "Manager channel belongs to a previous bot");
+    }
     Ok(p)
 }
 fn intent(
@@ -530,12 +623,6 @@ pub async fn body(app: &App, p: &Project, event: &work::Event) -> Result<String>
             context = crate::envelope::scheduled_body(&original.payload)?;
         }
     }
-    if let Some(decisions) = event.payload.get("topic_decisions") {
-        context.push_str(&format!(
-            "\n<topic_decisions trust=\"user_input\">{}</topic_decisions>",
-            crate::envelope::escape(&decisions.to_string())
-        ));
-    }
     Ok(format!(
         "<management_delegation effect_id=\"{}\" trust=\"daemon_metadata\">\n{}\n<manager_instructions trust=\"agent_content\">{}</manager_instructions>\n</management_delegation>",
         crate::envelope::escape(&event.source_id),
@@ -559,96 +646,9 @@ struct WriteArgs {
 #[serde(deny_unknown_fields)]
 struct DelegateArgs {
     instructions: String,
-    source_event_id: Option<String>,
     target_cli: Option<String>,
-    decision_branch: Option<String>,
     #[serde(default)]
     generation: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerStatusArgs {
-    input_id: Option<String>,
-    #[serde(default)]
-    after_effect: i64,
-    #[serde(default)]
-    detail_offset: usize,
-}
-/// A bounded read path for the exact input owned by this active batch. Historical
-/// joins identify its effect ancestry, but never grant authority on their own.
-fn input_effect_journal(
-    c: &Connection,
-    ctx: &Context,
-    args: WorkerStatusArgs,
-    current_effect: &str,
-) -> Result<Value> {
-    valid(c, ctx)?;
-    let Some(input) = args.input_id else {
-        ensure!(
-            args.after_effect == 0 && args.detail_offset == 0,
-            "Choose an owned input_id for effect journal paging"
-        );
-        return Ok(Value::Null);
-    };
-    ensure!(
-        args.after_effect >= 0 && args.detail_offset <= 262144,
-        "Effect journal cursor exceeds its bound"
-    );
-    let owned:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.id=? AND i.project_id=? AND i.status='processing' AND own.run_id=?)",params![input,ctx.project,ctx.run],|r|r.get(0))?;
-    ensure!(
-        owned,
-        "Effect evidence requires an input currently owned by this batch"
-    );
-    let records=c.prepare("SELECT DISTINCT e.rowid,e.id,e.run_id,e.name,e.status,e.arguments,e.result FROM manager_effects e JOIN manager_run_inputs ancestry ON ancestry.run_id=e.run_id WHERE ancestry.input_id=? AND e.rowid>? AND e.id!=? ORDER BY e.rowid LIMIT 9")?.query_map(params![input,args.after_effect,current_effect],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let more = records.len() > 8;
-    let mut cursor = args.after_effect;
-    let mut effects = Vec::new();
-    for (row, id, run, name, status, arguments, result) in records.into_iter().take(8) {
-        cursor = row;
-        let argument_chars = arguments.chars().count();
-        let result_chars = result.chars().count();
-        effects.push(json!({"effect_cursor":row,"effect_id":id,"manager_run_id":run,"tool":name,"status":status,"detail_offset":args.detail_offset,"arguments_chunk":arguments.chars().skip(args.detail_offset).take(2000).collect::<String>(),"result_chunk":result.chars().skip(args.detail_offset).take(2000).collect::<String>(),"arguments_chars":argument_chars,"result_chars":result_chars,"more_details":argument_chars>args.detail_offset+2000 || result_chars>args.detail_offset+2000}));
-    }
-    Ok(
-        json!({"input_id":input,"effects":effects,"next_effect_cursor":if more{Some(cursor)}else{None},"instructions":"These are recorded effects, not new requests. Never replay confirmed or uncertain actions. Continue with after_effect for older/later entries; for long arguments/results repeat the preceding cursor with detail_offset advanced by 2000. Delivery or idle is not semantic task success."}),
-    )
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MessageArgs {
-    to: String,
-    text: String,
-    reply_to_message_id: Option<String>,
-    intent: Option<MessageIntent>,
-    source_event_id: Option<String>,
-}
-#[derive(Copy, Clone, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum MessageIntent {
-    Receipt,
-    Result,
-    Decision,
-    Progress,
-}
-impl MessageIntent {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Receipt => "receipt",
-            Self::Result => "result",
-            Self::Decision => "decision",
-            Self::Progress => "progress",
-        }
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SendFileArgs {
-    to: String,
-    path: String,
-    caption: Option<String>,
-    reply_to_message_id: Option<String>,
-    source_event_id: Option<String>,
-    intent: Option<MessageIntent>,
 }
 fn file_parent(root: &Path, path: &str) -> Result<(fs::File, std::ffi::CString)> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -801,122 +801,6 @@ fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
         json!({"path":args.path,"sha256":format!("{:x}",Sha256::digest(args.content.as_bytes())),"status":"written"}),
     )
 }
-// Treat a clear singular assignment in the trusted source as a routing
-// constraint. Ambiguous or multi-CLI prose still goes through the Manager.
-fn named_cli(text: &str) -> Option<String> {
-    let normalized = text.to_ascii_lowercase();
-    let words = normalized.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
-    let known = ["codex", "claude", "pi", "agy", "custom"];
-    if known.iter().filter(|cli| words.clone().any(|word| word == **cli)).count() > 1 {
-        return None;
-    }
-    let mut targets = text.split(['。', '！', '；', ';', '，', ',', '\n']).filter_map(|part| {
-        let part = part.trim_start();
-        let part = if part.starts_with('@') {
-            part.split_once(char::is_whitespace)?.1.trim_start()
-        } else {
-            part
-        };
-        let part = part.to_ascii_lowercase();
-        let part = part.strip_prefix('请').unwrap_or(&part).trim_start();
-        let target = ["使用", "用", "让", "use ", "ask "]
-            .into_iter().find_map(|prefix| part.strip_prefix(prefix))?.trim_start();
-        let name = target.split(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch,'_'|'-'|'/')).next()?;
-        known.contains(&name).then(|| name.to_owned())
-    });
-    let first = targets.next()?;
-    targets.all(|target| target == first).then_some(first)
-}
-
-fn select_origin(c: &Connection, ctx: &Context, requested: Option<&str>) -> Result<Option<String>> {
-    let origins=c.prepare("SELECT DISTINCT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id IS NOT NULL")?.query_map([&ctx.run],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    if let Some(requested) = requested {
-        ensure!(
-            origins.iter().any(|id| id == requested),
-            "Choose source_event_id from this turn's trusted_sources"
-        );
-        return Ok(Some(requested.into()));
-    }
-    ensure!(
-        origins.len() <= 1,
-        "Multiple discussions are present; choose source_event_id from trusted_sources"
-    );
-    Ok(origins.into_iter().next())
-}
-fn effect_result(c: &Connection, id: &str, result: &Value, status: &str) -> Result<()> {
-    c.execute(
-        "UPDATE manager_effects SET status=?,result=? WHERE id=?",
-        params![status, result.to_string(), id],
-    )?;
-    Ok(())
-}
-/// A receipt belongs to an explicit user source, not a transient model turn.
-/// Reuse its immutable outbox entry; a new model occurrence is not a new send.
-fn enqueue_receipt(
-    c: &Connection,
-    ctx: &Context,
-    effect: &str,
-    args: &MessageArgs,
-) -> Result<(String, bool)> {
-    valid(c, ctx)?;
-    let origin = select_origin(c, ctx, args.source_event_id.as_deref())?
-        .context("A receipt requires a trusted user source")?;
-    let request = format!("manager-receipt-{}-{origin}", ctx.project);
-    if let Some(id) = c
-        .query_row(
-            "SELECT id FROM messages WHERE project_id=? AND direction='out' AND source_id=?",
-            params![ctx.project, request],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        return Ok((id, false));
-    }
-    let user_source: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.origin_event_id=? AND i.kind='user' AND i.status='processing' AND EXISTS(SELECT 1 FROM manager_input_claims own WHERE own.input_id=i.id AND own.run_id=b.run_id))",
-        params![ctx.run, origin],
-        |r| r.get(0),
-    )?;
-    ensure!(user_source, "Only new user input can receive a receipt");
-    let (source, raw): (String, String) = c.query_row(
-        "SELECT m.source_id,m.attachment FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.id=? AND e.project_id=? AND m.direction='in'",
-        params![origin, ctx.project],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    let attachment: Value = serde_json::from_str(&raw)?;
-    let binding = crate::bot::get(c, &ctx.project)?.context("Connect this project's bot first")?;
-    ensure!(
-        attachment["bot_app_id"] == binding.app_id,
-        "A receipt requires this project's trusted Feishu source"
-    );
-    let source_meta = &attachment["source"];
-    ensure!(
-        source_meta["chat_id"].as_str() == Some(args.to.as_str())
-            || (source_meta["chat_type"] == "p2p"
-                && source_meta["sender"]["open_id"].as_str() == Some(args.to.as_str())),
-        "A receipt must address its original user conversation"
-    );
-    let anchor = args
-        .reply_to_message_id
-        .as_deref()
-        .context("A receipt requires an explicit trusted discussion anchor")?;
-    ensure!(
-        anchor == source
-            || source_meta["root_id"].as_str() == Some(anchor)
-            || source_meta["parent_id"].as_str() == Some(anchor),
-        "A receipt must use its original trusted discussion"
-    );
-    let id = db::enqueue_out_request(
-        c,
-        &ctx.project,
-        &binding.app_id,
-        &request,
-        &args.text,
-        json!({"to":args.to,"reply_to_message_id":anchor,"manager_effect":effect,
-            "manager_receipt_origin":origin,"manager_revision":ctx.revision}),
-    )?;
-    Ok((id, true))
-}
 pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
     if let Some(revision) = attachment["manager_provider_revision"].as_i64() {
         let allowed: bool = c.query_row(
@@ -980,261 +864,9 @@ fn proposal_run(c: &Connection, run: &str) -> Result<bool> {
     )?)
 }
 
-fn proposal_tool_allowed(name: &str, arguments: &Value) -> bool {
-    match name {
-        "worker_status" => true,
-        "delegate" => arguments["target_cli"].is_null(),
-        "send_md" => !matches!(arguments["intent"].as_str(), Some("receipt" | "progress")),
-        _ => false,
-    }
-}
-
-// A dispatch is journaled in work_runs in the same transaction as its claim.
 const FAILED_BEFORE_SUBMISSION: &str = "e.status='failed' AND e.received_at IS NULL
     AND NOT EXISTS(SELECT 1 FROM work_runs r WHERE r.event_id=e.id)";
 
-async fn tool(app: &Arc<App>, ctx: &Context, call: ToolCall) -> Result<Value> {
-    let Some(_permit) = app.service.gate.enter() else {
-        bail!("Service ownership changed")
-    };
-    let lock = app.project_lock(&ctx.project).await;
-    let guard = lock.lock().await;
-    let context = ctx.clone();
-    let occurrence = call.occurrence.clone();
-    let name = call.name.clone();
-    let arguments = call.arguments.to_string();
-    let approved_proposal = app.db.call({
-        let run = ctx.run.clone();
-        move |c| proposal_run(c, &run)
-    }).await?;
-    if approved_proposal && !proposal_tool_allowed(&call.name, &call.arguments) {
-        return Ok(json!({"error":"Approved proposals can only delegate to the current worker and update the approved discussion"}));
-    }
-    let admitted=app.db.call(move|c|{
-  let tx=c.unchecked_transaction()?;valid(&tx,&context)?;
-  if let Some((id,old_name,old_arguments,status,result))=tx.query_row("SELECT id,name,arguments,status,result FROM manager_effects WHERE run_id=? AND occurrence=?",params![context.run,occurrence],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()? {
-   ensure!(old_name==name&&old_arguments==arguments,"Tool occurrence changed content");let value=if status=="submitting"{json!({"status":"uncertain","message":"A previous attempt may have committed; inspect existing evidence before any new effect."})}else{serde_json::from_str(&result)?};return Ok((id,Some(value)));
-  }
-  let id=format!("manager-{}",db::id());tx.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES(?,?,?,?,?,'submitting')",params![id,context.run,occurrence,name,arguments])?;tx.commit()?;Ok((id,None))
- }).await?;
-    let (effect, previous) = admitted;
-    if let Some(previous) = previous {
-        return Ok(previous);
-    }
-    let p = app.db.project(&ctx.project).await?;
-    let result:Result<Value>=async {
-  match call.name.as_str() {
-   "read_file"=>{let a:FileArgs=serde_json::from_value(call.arguments)?;read_file(Path::new(&p.path),&a.path)},
-   "write_file"=>{let a:WriteArgs=serde_json::from_value(call.arguments)?;write_file(Path::new(&p.path),a)},
-   "record_topic_decision"=>{
-    let input:topic_decisions::Record=serde_json::from_value(call.arguments)?;
-    let context=ctx.clone();
-    app.db.call(move|c|{
-        let tx=c.unchecked_transaction()?;
-        let p=valid(&tx,&context)?;
-        select_origin(&tx,&context,Some(&input.source_event_id))?;
-        let outcome=topic_decisions::record(&tx,&p.id,input)?;
-        tx.commit()?;
-        Ok(outcome)
-    }).await
-   },
-   "delegate"|"steer_worker"=>{
-    let a:DelegateArgs=serde_json::from_value(call.arguments)?;let steer=call.name=="steer_worker";
-    ensure!(!a.instructions.trim().is_empty() && a.instructions.len() <= 1048576,
-        "Worker instructions must contain 1 to 1048576 bytes");
-    // Establish that the requested discussion belongs to this batch before
-    // starting any additional native execution.
-    let context=ctx.clone();let chosen_source=a.source_event_id.clone();
-    let requested_cli = app.db.call(move|c| {
-        valid(c,&context)?;
-        let origin=select_origin(c,&context,chosen_source.as_deref())?;
-        let text=origin.as_deref().map(|id| c.query_row(
-            "SELECT m.content FROM work_events e JOIN messages m ON m.id=e.message_id
-             WHERE e.id=? AND e.project_id=? AND m.direction='in'",
-            params![id,context.project], |row| row.get::<_,String>(0)).optional())
-            .transpose()?.flatten();
-        Ok(text.as_deref().and_then(named_cli))
-    }).await?;
-    if steer && (p.agent=="auto" || a.generation.is_some()) {
-        ensure!(a.target_cli.is_none(),"Choose an existing generation for steering, not a new CLI");
-        let generation = a.generation.context("Choose the running worker generation from worker_status")?;
-        let context=ctx.clone();
-        let target=generation.clone();
-        let task_run = app.db.call(move|c| {
-            let parent=valid(c,&context)?;
-            crate::manager_workers::authorize(c,&parent,&target,true)?;
-            c.query_row("SELECT id FROM work_runs
-                WHERE project_id=? AND generation=? AND status IN ('submitted','running')
-                ORDER BY rowid DESC LIMIT 1", params![parent.id,target], |row|row.get::<_,String>(0))
-                .optional()?.context("No active task is running on the selected worker")
-        }).await?;
-        drop(guard);
-        return crate::manager_terminal::send(app,ctx,crate::manager_terminal::SendArgs {
-            generation,
-            task_run:Some(task_run),
-            segments: vec![
-                crate::herdr::terminal_control::Segment::Text { text: a.instructions },
-                crate::herdr::terminal_control::Segment::Key { key:"enter".into() },
-            ],
-        },&effect).await;
-    }
-    ensure!(a.generation.is_none(),"Choose a CLI with target_cli when delegating a new task");
-    let target_cli = requested_cli.as_deref().or(a.target_cli.as_deref());
-    let selected = if a.target_cli.is_some() || (!steer && (requested_cli.is_some() || p.agent=="auto")) {
-        ensure!(!steer,"Choose target_cli on delegate; steer_worker is scoped to the legacy primary conversation");
-        match crate::manager_workers::select(app,&p,target_cli.unwrap_or("")).await? {
-            crate::manager_workers::Selection::Target(agent) => Some(agent),
-            crate::manager_workers::Selection::Unavailable(mut result) => {
-                if result["catalog"].is_null() {
-                    result["catalog"]=crate::manager_workers::catalog(&p).await;
-                }
-                return Ok(result);
-            },
-        }
-    } else {
-        None
-    };
-    let context=ctx.clone();let request=effect.clone();app.db.call(move|c|{
-      let tx=c.unchecked_transaction()?;let p=valid(&tx,&context)?;
-      let origin=select_origin(&tx,&context,a.source_event_id.as_deref())?;
-      let proposal = origin.as_deref().map(|id| work::event(&tx, &p.id, id)).transpose()?
-        .filter(|event| event.source == "autonomy");
-      let instructions = if let Some(proposal) = &proposal {
-          ensure!(!steer && a.target_cli.is_none(), "Approved proposal must use the current worker");
-          ensure!(approved_origin(&tx, &p.id, &proposal.id)?, "Approved proposal authority changed");
-          if let Some(existing) = tx.query_row(
-              &format!("SELECT e.id FROM work_events e WHERE e.project_id=? AND e.source IN ('management','manager_worker')
-               AND json_extract(e.payload,'$.origin_event_id')=? AND NOT ({FAILED_BEFORE_SUBMISSION})
-               ORDER BY e.rowid LIMIT 1"),
-              params![p.id,proposal.id], |row| row.get::<_,String>(0)
-          ).optional()? {
-              let event = work::event(&tx, &p.id, &existing)?;
-              return Ok(json!({"event_id":existing,"status":event.status,"proposal_id":proposal.payload["proposal_id"]}));
-          }
-          proposal.payload["instructions"].as_str().context("Approved proposal instructions are missing")?
-      } else {
-          &a.instructions
-      };
-      if selected.is_some() {
-          crate::manager_workers::controls(&tx,&p)?;
-      }
-      let held=selected.is_none() && crate::cli_switch::latest(&tx,&p.id)?.as_ref().is_some_and(crate::cli_switch::blocks_worker);
-      ensure!(!steer||(p.terminal.is_some()&&p.ready),"Worker is not ready; delegate to wake it");
-      ensure!(!steer||!held,"Worker steering is held by a CLI transition");
-      let id=intent_for_worker(&tx,&p,&request,instructions,origin.as_deref(),steer,selected.as_deref().map(|agent| (agent,None)))?;
-      if let (Some(branch),Some(origin))=(a.decision_branch.as_deref(),origin.as_deref())
-        && !steer && proposal.is_none()
-      {
-          let decisions=topic_decisions::context(&tx,&p.id,origin,Some(branch))?;
-          if !decisions.is_null() {
-              tx.execute("UPDATE work_events SET payload=json_set(payload,'$.topic_decisions',json(?)) WHERE id=? AND project_id=?",
-                  params![decisions.to_string(),id,p.id])?;
-          }
-      }
-      let event=work::event(&tx,&p.id,&id)?;tx.commit()?;
-      Ok(json!({"effect_id":request,"event_id":id,"status":if held{"held"}else{"queued"},"worker_agent":event.payload["expected_agent"],"generation":event.payload["target_generation"],"transition_id":event.payload["transition_id"],"work_queued":true,"assignment_pending":selected.is_some() && event.payload["target_generation"].is_null()}))
-    }).await
-   },
-   "worker_status"=>{drop(guard);let args:WorkerStatusArgs=serde_json::from_value(call.arguments)?;let context=ctx.clone();let own_effect=effect.clone();let journal=app.db.call(move|c|input_effect_journal(c,&context,args,&own_effect)).await?;let obsolete=crate::manager_close::inspect(app,&p).await?;let authority=ctx.clone();let mut snapshot=app.db.call(move|c|{let current=valid(c,&authority)?;worker_snapshot(c,&current.id,&current.generation)}).await?;snapshot["agent"]=json!(p.agent);snapshot["generation"]=json!(p.generation);snapshot["native_session"]=json!(p.native_session);snapshot["ready"]=json!(p.ready);snapshot["paused"]=json!(p.paused);snapshot["mcp_registered"]=json!(p.execution["mcp_registered"]==true);snapshot["available_clis"]=crate::manager_workers::catalog(&p).await;snapshot["obsolete_executions"]=json!(obsolete);snapshot["input_effect_journal"]=journal;Ok(snapshot)},
-   "cli_send_keys"=>{drop(guard);let args:crate::manager_terminal::SendArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::send(app,ctx,args,&effect).await},
-   "cli_view"=>{drop(guard);let args:crate::manager_terminal::ViewArgs=serde_json::from_value(call.arguments)?;crate::manager_terminal::view(app,ctx,args,&effect).await},
-   "close_agent"=>{let args:crate::manager_close::CloseArgs=serde_json::from_value(call.arguments)?;crate::manager_close::close(app,&p,ctx,&effect,args).await},
-   "schedule_run"=>{
-    let mut input:work::TimerInput=serde_json::from_value(call.arguments)?;
-    ensure!(matches!(input.purpose.as_str(),"user"|"internal"),"Choose user or internal schedule purpose");
-    if let Some(to)=input.to.as_deref() { crate::feishu::recipient_type(to)?; }
-    input.request_id=Some(effect.clone());
-    let context=ctx.clone();
-    app.db.call(move|c|{
-      let tx=c.unchecked_transaction()?;
-      valid(&tx,&context)?;
-      let timer=work::create_timer(&tx,&context.project,input,db::now())?;
-      tx.commit()?;
-      Ok(json!(timer))
-    }).await
-   },
-   "send_md"|"send_file"=>{
-    let (to,text,anchor,path,intent,source)=if call.name=="send_md" {
-        let a:MessageArgs=serde_json::from_value(call.arguments)?;
-        (a.to,a.text,a.reply_to_message_id,None,a.intent,a.source_event_id)
-    }else{
-        let a:SendFileArgs=serde_json::from_value(call.arguments)?;
-        let path=crate::feishu::allowed_file(&p,Path::new(&a.path),&app.dir)?;
-        let root=fs::canonicalize(&p.path)?;
-        if let Ok(relative)=path.strip_prefix(&root) {
-            file_parent(&root,&relative.to_string_lossy())?;
-        } else {
-            ensure!(path.starts_with(app.dir.join("files")),"Only workspace files and downloaded attachments are available");
-        }
-        ensure!(a.intent.is_none() || a.intent == Some(MessageIntent::Result),"Use result for an independent file");
-        (a.to,a.caption.unwrap_or_default(),a.reply_to_message_id,Some(path),a.intent,a.source_event_id)
-    };
-    crate::feishu::recipient_type(&to)?;
-    ensure!(!text.trim().is_empty()||path.is_some(),"Message content is empty");
-    ensure!(text.len()<=131072,"Message is too large");
-    let context=ctx.clone();let request=effect.clone();
-    let (message,dispatch,progress)=app.db.call(move|c|{
-        let tx=c.unchecked_transaction()?;
-        let p=valid(&tx,&context)?;
-        if intent==Some(MessageIntent::Receipt) {
-            let args=MessageArgs{to,text,reply_to_message_id:anchor,intent,source_event_id:source};
-            let (message, dispatch)=enqueue_receipt(&tx,&context,&request,&args)?;
-            tx.commit()?;return Ok((message,dispatch,None));
-        }
-        let binding=crate::bot::get(&tx,&p.id)?.context("Connect this project's bot first")?;
-        let mut attachment=json!({"to":to,"manager_effect":request,"reply_to_message_id":anchor});
-        if let Some(intent)=intent {
-            attachment["discussion_intent"]=json!(intent.as_str());
-        }
-        if (approved_proposal || anchor.is_none() || source.is_some() || matches!(intent, Some(MessageIntent::Decision | MessageIntent::Progress)))
-            && let Some(event)=select_origin(&tx,&context,source.as_deref())?
-        {
-            crate::discussion::origin(&tx,&p.id,&event,&binding.app_id,&to,true,&mut attachment)?;
-        }
-        if !attachment["reply_to_message_id"].is_string() {
-            ensure!(matches!(intent, Some(MessageIntent::Result | MessageIntent::Decision)) && attachment["discussion_scope"].is_string(),
-                "Choose a trusted source discussion or a specific work occurrence for this requested result or decision");
-        }
-        if intent==Some(MessageIntent::Progress) {
-            tx.commit()?;
-            return Ok((String::new(),false,Some((binding.app_id,text,attachment))));
-        }
-        if let Some(path)=path {attachment["path"]=json!(path);}
-        let id=db::enqueue_out_request(&tx,&p.id,&binding.app_id,&request,&text,attachment)?;
-        tx.commit()?;Ok((id,true,None))
-    }).await?;
-    // The journal is committed before remote IO. Do not hold the project lock
-    // across Feishu: fresh input and deterministic controls remain immediate.
-    drop(guard);
-    if let Some((app_id,text,attachment))=progress {
-        return crate::discussion::progress(app,p.id,app_id,effect.clone(),text,attachment).await;
-    }
-    let send_error=if dispatch {app.send_out(&message).await.err().map(|e|e.to_string())}else{None};let m=app.db.message(&message).await?;Ok(json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}))
-   },
-   _=>bail!("This management tool is not available"),
-  }
- }.await;
-    // Result persistence belongs to the admitted effect even if steering arrived
-    // meanwhile. Only the actor checkpoint has the stricter current-revision CAS.
-    let value = match result {
-        Ok(value) => value,
-        Err(error) => json!({"error":error.to_string()}),
-    };
-    let id = effect.clone();
-    let saved = value.clone();
-    app.db
-        .call(move |c| {
-            let status = if saved["status"] == "uncertain" {
-                "uncertain"
-            } else {
-                "complete"
-            };
-            effect_result(c, &id, &saved, status)
-        })
-        .await?;
-    app.notify.notify_one();
-    Ok(value)
-}
 fn worker_snapshot(c: &Connection, project: &str, generation: &str) -> Result<Value> {
     let transition = crate::cli_switch::latest(c, project)?;
     let delegations = c.prepare("SELECT e.id,e.status,r.status,e.error,json_extract(e.payload,'$.transition_id'),json_extract(e.payload,'$.expected_agent'),json_extract(e.payload,'$.target_generation'),e.source FROM work_events e LEFT JOIN work_runs r ON r.event_id=e.id WHERE e.project_id=? AND e.source IN ('management','manager_worker') ORDER BY e.rowid DESC LIMIT 24")?
@@ -1326,7 +958,13 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             c.query_row("SELECT id FROM work_events WHERE project_id=? AND id=?",
                 params![project,scope], |row| row.get::<_,String>(0)).optional()
         ).transpose()?.flatten();
-        let origin = origin.or(scoped_origin);
+        let worker_origin = a["task_worker_generation"].as_str().map(|generation| {
+            c.query_row(
+                "SELECT origin_event_id FROM manager_workers WHERE project_id=? AND generation=?",
+                params![project,generation], |row| row.get::<_,Option<String>>(0),
+            ).optional()
+        }).transpose()?.flatten().flatten();
+        let origin = origin.or(scoped_origin).or(worker_origin);
         observation(
             c,
             project,
@@ -1392,51 +1030,6 @@ pub(crate) fn observation(
         payload,
     )
 }
-struct Turn {
-    context: Context,
-    config: ProviderConfig,
-    checkpoint: Value,
-    debug_dispatch: Option<DebugDispatch>,
-}
-struct DebugDispatch {
-    bot_app_id: String,
-    to: String,
-    anchor: String,
-    payload: String,
-}
-
-fn debug_dispatch(
-    c: &Connection,
-    project: &str,
-    origins: impl Iterator<Item = impl AsRef<str>>,
-    payload: &str,
-) -> Result<Option<DebugDispatch>> {
-    let mut source = c.prepare(
-        "SELECT b.app_id, json_extract(m.attachment,'$.source.chat_id'), m.source_id
-         FROM work_events e JOIN messages m ON m.id=e.message_id
-         JOIN project_bots b ON b.project_id=e.project_id
-         WHERE e.id=? AND e.project_id=? AND e.source='feishu' AND m.direction='in'
-           AND json_extract(m.attachment,'$.bot_app_id')=b.app_id
-           AND json_extract(m.attachment,'$.source.chat_id') GLOB 'oc_*'
-           AND m.source_id GLOB 'om_*'",
-    )?;
-    for origin in origins {
-        let target = source
-            .query_row(params![origin.as_ref(), project], |row| {
-                Ok(DebugDispatch {
-                    bot_app_id: row.get(0)?,
-                    to: row.get(1)?,
-                    anchor: row.get(2)?,
-                    payload: payload.to_owned(),
-                })
-            })
-            .optional()?;
-        if target.is_some() {
-            return Ok(target);
-        }
-    }
-    Ok(None)
-}
 fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
     let e = work::event(c, project, id)?;
     if e.source == "autonomy" {
@@ -1475,11 +1068,11 @@ fn prompt_input(raw: &str, event_id: Option<&str>) -> Result<Value> {
         value["full_input_retained"] = json!(true);
         value["source_event_id"] = json!(event_id);
         value["continuation"] = json!(
-            "Only a bounded preview is shown. The original input is retained intact. Delegate with this source_event_id to inspect the full original before treating its request as complete."
+            "Only a bounded preview is shown. The original input is retained intact."
         );
     }
     if value.to_string().len() > 120000 {
-        value = json!({"source_event_id":event_id,"full_input_retained":true,"continuation":"The full original input and attachments are retained intact. Delegate using this source_event_id to inspect them before treating the request as complete."});
+        value = json!({"source_event_id":event_id,"full_input_retained":true,"continuation":"The original input and attachments are retained intact."});
     }
     Ok(value)
 }
@@ -1488,32 +1081,6 @@ fn own_input(c: &Connection, run: &str, input: &str) -> Result<()> {
     c.execute("INSERT INTO manager_input_claims(input_id,run_id) VALUES(?,?) ON CONFLICT(input_id) DO UPDATE SET run_id=excluded.run_id", params![input, run])?;
     ensure!(c.execute("UPDATE manager_inputs SET status='processing' WHERE id=? AND status IN ('queued','processing')", [input])? == 1, "Input is no longer claimable");
     Ok(())
-}
-fn adopt_legacy_claim(c: &Connection, project: &str) -> Result<()> {
-    let run: Option<String> = c.query_row("SELECT id FROM manager_runs WHERE project_id=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1", [project], |r|r.get(0)).optional()?;
-    if let Some(run) = run {
-        let ids = c.prepare("SELECT i.id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=? AND i.status='queued' AND NOT EXISTS(SELECT 1 FROM manager_input_claims own WHERE own.input_id=i.id) ORDER BY i.rowid")?.query_map([&run], |r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for id in ids {
-            own_input(c, &run, &id)?;
-        }
-    }
-    Ok(())
-}
-fn continuation_input(raw: &str, origin: Option<&str>) -> Result<Value> {
-    let value = prompt_input(raw, origin)?;
-    if value.to_string().len() <= 2400 {
-        return Ok(value);
-    }
-    let preview = value["user_input"]["body"]
-        .as_str()
-        .or_else(|| value["instructions"].as_str())
-        .unwrap_or("")
-        .chars()
-        .take(500)
-        .collect::<String>();
-    Ok(
-        json!({"source_event_id":origin,"full_input_retained":true,"preview":preview,"continuation":"Already owned input, not a new request. Its full original payload and attachments remain durable; inspect through the original trusted source before declaring completion. Do not repeat confirmed or uncertain effects."}),
-    )
 }
 fn attach_quote(
     c: &Connection,
@@ -1553,39 +1120,25 @@ fn image_source(
     c: &Connection,
     project: &str,
     origin: &str,
-) -> Result<Option<(String, Value, String)>> {
+) -> Result<Option<(String, Value)>> {
     let row: Option<(String, String, String)> = c.query_row("SELECT m.id,m.source_id,m.attachment FROM work_events e JOIN messages m ON m.id=e.message_id WHERE e.id=? AND e.project_id=? AND m.project_id=? AND m.direction='in'", params![origin,project,project], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((id, source_id, raw)) = row else {
         return Ok(None);
     };
     let mut a: Value = serde_json::from_str(&raw)?;
     a["source_message_id"] = json!(source_id);
-    let source = &a["source"];
-    let discussion = source["root_id"]
-        .as_str()
-        .filter(|v| !v.is_empty())
-        .or_else(|| source["thread_id"].as_str().filter(|v| !v.is_empty()))
-        .unwrap_or(if source["chat_type"] == "group" {
-            &source_id
-        } else {
-            "main"
-        });
-    let scope = json!([a["bot_app_id"], source["chat_id"], discussion]).to_string();
-    Ok(Some((id, a, scope)))
+    Ok(Some((id, a)))
 }
 fn prepare_images(
     c: &Connection,
     project: &str,
     origin: Option<&str>,
-    scope: Option<&str>,
-    supports_images: bool,
-    used: usize,
     data: &mut Value,
 ) -> Result<Vec<crate::multimodal::ImageRef>> {
     let Some(origin) = origin else {
         return Ok(vec![]);
     };
-    let Some((message, attachment, source_scope)) = image_source(c, project, origin)? else {
+    let Some((message, attachment)) = image_source(c, project, origin)? else {
         return Ok(vec![]);
     };
     let source_id = attachment["source_message_id"].as_str().unwrap_or_default();
@@ -1624,11 +1177,7 @@ fn prepare_images(
                 &database_root.join("files").join(project),
             )
         })();
-        let reason = if !supports_images {
-            "image_capability_not_declared"
-        } else if scope != Some(source_scope.as_str()) {
-            "different_discussion_scope"
-        } else if used + images.len() >= crate::multimodal::MAX_IMAGES {
+        let reason = if images.len() >= crate::multimodal::MAX_IMAGES {
             "image_count_limit"
         } else if !resource["local_path"].is_string() {
             "image_resource_unavailable"
@@ -1647,10 +1196,14 @@ fn prepare_images(
         } else if verified.is_err() {
             "image_cache_metadata_unverified"
         } else {
-            "image_part"
+            "verified_image_reference"
         };
-        resource["image_delivery"] = json!({"mode":if reason == "image_part" {"image_part"}else{"path_only"},"reason":reason,"note":if reason == "image_part" {"Image bytes will be verified and supplied as image content to this configured model."}else{"The current model has not received image pixels. Inline input requires an explicit endpoint/model declaration, verified PNG/JPEG/GIF/WebP files up to 2 MiB, and at most 4 images. A local path is only a file reference; do not claim to have viewed the image. Delegate inspection when needed and report any inability."}});
-        if reason == "image_part" {
+        resource["image_delivery"] = if reason == "verified_image_reference" {
+            json!({"mode":"image_reference","reason":reason})
+        } else {
+            json!({"mode":"path_only","reason":reason,"note":"Image pixels are unavailable. Inline input requires a verified PNG, JPEG, GIF, or WebP of up to 2 MiB and at most 4 images per message."})
+        };
+        if reason == "verified_image_reference" {
             images.push(verified?);
         }
     }
@@ -1660,469 +1213,6 @@ fn prepare_images(
     }
     data["user_input"]["resources"] = json!(resources);
     Ok(images)
-}
-type InputRow = (String, Option<String>, String, String);
-
-fn isolate_proposal_inputs(
-    c: &Connection,
-    project: &str,
-    queued: &mut Vec<InputRow>,
-    continuing: &mut Vec<InputRow>,
-) -> Result<bool> {
-    let mut proposal_source = c.prepare(
-        "SELECT source='autonomy' FROM work_events WHERE project_id=? AND id=?",
-    )?;
-    let mut proposals = HashSet::new();
-    for (_, origin, _, _) in continuing.iter().chain(queued.iter()) {
-        if let Some(origin) = origin
-            && proposal_source.query_row(params![project, origin], |r| r.get::<_,bool>(0))
-                .optional()?.unwrap_or(false)
-        {
-            proposals.insert(origin.clone());
-        }
-    }
-    if proposals.is_empty() {
-        return Ok(false);
-    }
-    let ordinary = continuing.iter().chain(queued.iter())
-        .any(|(_, origin, _, _)| origin.as_ref().is_none_or(|origin| !proposals.contains(origin)));
-    let scope = (!ordinary).then(|| {
-        continuing.iter().chain(queued.iter()).find_map(|(_, origin, _, _)| origin.clone())
-    }).flatten();
-    let include = |(_, origin, _, _): &InputRow| match &scope {
-        Some(scope) => origin.as_ref() == Some(scope),
-        None => origin.as_ref().is_none_or(|origin| !proposals.contains(origin)),
-    };
-    queued.retain(&include);
-    continuing.retain(include);
-    Ok(scope.is_some())
-}
-
-fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
-    let tx = c.unchecked_transaction()?;
-    let p = db::project_by_key(&tx, project)?;
-    let config:Option<(String,String,String,i64,i64,bool)>=tx.query_row(&format!("SELECT g.base_url,g.model,g.api_key,m.revision,m.input_revision,g.supports_images FROM manager_config m CROSS JOIN manager_provider_config g WHERE m.project_id=? AND m.next_attempt_at<=? AND ({PROVIDER_CONFIGURED})"),params![project,db::now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-    let Some((base_url, model, api_key, revision, _, supports_images)) = config else {
-        return Ok(None);
-    };
-    if p.paused || work::has_takeover(&tx, project, &p.generation)? {
-        return Ok(None);
-    }
-    let input_revision: i64 = tx.query_row(
-        "SELECT input_revision FROM manager_config WHERE project_id=?",
-        [project],
-        |r| r.get(0),
-    )?;
-    adopt_legacy_claim(&tx, project)?;
-    let existing=tx.query_row("SELECT id,checkpoint,owner FROM manager_runs WHERE project_id=? AND revision=? AND input_revision=? AND status='working' AND checkpoint!='null' ORDER BY rowid DESC LIMIT 1",params![project,revision,input_revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
-    let (run, checkpoint, debug_dispatch) = if let Some((run, raw, previous_owner)) = existing {
-        if previous_owner != owner() {
-            tx.execute("UPDATE manager_effects SET status='uncertain',result=? WHERE run_id=? AND status='submitting'",params![json!({"status":"uncertain","message":"The previous host stopped during this effect; inspect evidence, do not replay."}).to_string(),run])?;
-            tx.execute(
-                "UPDATE manager_runs SET owner=? WHERE id=?",
-                params![owner(), run],
-            )?;
-        }
-        (run, serde_json::from_str(&raw)?, None)
-    } else {
-        let prepared = prepared_input();
-        let mut candidates=tx.prepare(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND {prepared} ORDER BY rowid LIMIT 32"))?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut continuing=tx.prepare("SELECT i.id,i.origin_event_id,i.kind,i.payload FROM manager_inputs i JOIN manager_input_claims own ON own.input_id=i.id WHERE i.project_id=? AND i.status='processing' ORDER BY i.rowid LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let proposal_only = isolate_proposal_inputs(&tx, project, &mut candidates, &mut continuing)?;
-        if candidates.is_empty() && continuing.is_empty() {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let mut history=tx.prepare("SELECT e.name,e.status,e.result,e.id FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=? ORDER BY e.rowid DESC LIMIT 32")?.query_map([project],|r|Ok(json!({"effect_id":r.get::<_,String>(3)?,"tool":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"result_summary":r.get::<_,String>(2)?.chars().take(2000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut instructions = json!({});
-        for path in ["AGENTS.md", "HANDOFF.md"] {
-            if let Ok(file) = read_file(Path::new(&p.path), path) {
-                instructions[path] = json!(
-                    file["content"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(24000)
-                        .collect::<String>()
-                );
-            }
-        }
-        let mut latest=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {prepared} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
-        let pi_executable = pi::Turn::executable(tx.path(), &p)?;
-        let mut pi_scope = None;
-        let mut pi_steers_across_topics = false;
-        if pi_executable.is_some() && !proposal_only {
-            let discussion = |input: &InputRow| -> Result<Option<String>> {
-                input.1.as_deref().map(|origin| topic_decisions::discussion(&tx, project, origin))
-                    .transpose().map(Option::flatten)
-            };
-            let steering = latest.as_ref().filter(|_| !continuing.is_empty());
-            let selected = steering.or(candidates.first()).or(continuing.first());
-            if let Some(selected) = selected {
-                pi_scope = discussion(selected)?;
-                pi_steers_across_topics = steering.is_some();
-                let mut page = Vec::new();
-                for item in candidates {
-                    if discussion(&item)? != pi_scope {
-                        if steering.is_none() { break; }
-                        continue;
-                    }
-                    page.push(item);
-                }
-                candidates = page;
-                let mut owned = Vec::new();
-                for item in continuing {
-                    if discussion(&item)? == pi_scope {
-                        owned.push(item);
-                    }
-                }
-                continuing = owned;
-                if let Some(item) = latest.as_ref()
-                    && discussion(item)? != pi_scope
-                {
-                    latest = None;
-                }
-                // A preempting control can be outside the FIFO page or belong
-                // to a different discussion from the previously owned work.
-                if candidates.is_empty() && let Some(item) = latest.as_ref() {
-                    candidates.push(item.clone());
-                }
-                if pi_scope.is_some() {
-                    // Only input-scoped journals are available to this session.
-                    history.clear();
-                }
-            }
-        }
-        // A new trusted user source selects the discussion; otherwise retain only
-        // the selected, still-owned user objective, never consumed conversation history.
-        let image_scope = latest
-            .as_ref()
-            .or_else(|| continuing.iter().find(|v| v.2 == "user"))
-            .and_then(|v| v.1.as_deref())
-            .map(|origin| image_source(&tx, project, origin))
-            .transpose()?
-            .flatten()
-            .map(|(_, _, scope)| scope);
-        let latest_context=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,payload,status FROM manager_inputs WHERE project_id=? AND kind='user' AND status IN ('queued','processing','consumed') AND (status!='queued' OR {prepared}) ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
-        // User steering may interrupt an owned batch; observations never do. Reserve
-        // one of the 32 NEW claim slots for that control input, without reordering
-        // ordinary fresh batches or changing their persisted input order.
-        let steering_priority = (pi_steers_across_topics || !continuing.is_empty()) && latest.is_some();
-        let mut ordered = candidates;
-        if steering_priority && let Some(latest) = latest {
-            ordered.retain(|item| item.0 != latest.0);
-            ordered.truncate(31);
-            ordered.insert(0, latest);
-        }
-        let mut inputs = Vec::new();
-        let mut origins = HashSet::new();
-        let mut current = Vec::new();
-        let mut previous = Vec::new();
-        let mut images = Vec::new();
-        let mut trusted_sources = Vec::new();
-        let latest_steering = match &latest_context {
-            Some((id, origin, raw, status)) => {
-                let mut steering = json!({"input_id":id,"source_event_id":origin,"history_only_not_reply_target":status=="consumed","already_consumed":status=="consumed","context_only_not_batch_member":true});
-                if pi_scope.is_none() {
-                    steering["data"] = prompt_input(raw, origin.as_deref())?;
-                }
-                steering
-            }
-            None => Value::Null,
-        };
-        let mut selected_continuing = Vec::new();
-        for candidate in continuing {
-            let (id, origin, kind, raw) = &candidate;
-            let mut data = continuation_input(raw, origin.as_deref())?;
-            let candidate_images = if kind == "user" {
-                prepare_images(
-                    &tx,
-                    project,
-                    origin.as_deref(),
-                    image_scope.as_deref(),
-                    supports_images,
-                    images.len(),
-                    &mut data,
-                )?
-            } else {
-                vec![]
-            };
-            let item = json!({"input_id":id,"kind":kind,"journal_available":true,"journal_instructions":"Before any external action, call worker_status with this input_id to inspect its paginated original-run effect journal, including confirmed and uncertain effects. Do not treat this input as a new task.","data":data});
-            let mut next = previous.clone();
-            next.push(item.clone());
-            let metadata = origin
-                .as_ref()
-                .filter(|id| !origins.contains(*id))
-                .map(|id| trusted_source(&tx, project, id))
-                .transpose()?;
-            let mut sources = trusted_sources.clone();
-            if let Some(ref metadata) = metadata {
-                sources.push(metadata.clone());
-            }
-            // Reserve space for a genuine new steering control before selecting a
-            // bounded continuation page. Unselected inputs keep their OLD owner.
-            let mut reserved = Vec::new();
-            if steering_priority && let Some((_, origin, kind, raw)) = ordered.first() {
-                reserved.push(json!({"kind":kind,"data":prompt_input(raw,origin.as_deref())?}));
-                if let Some(origin) = origin
-                    && !origins.contains(origin)
-                {
-                    sources.push(trusted_source(&tx, project, origin)?);
-                }
-            }
-            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":reserved,"continuing_inputs":next,"latest_user_steering":latest_steering});
-            if required.to_string().len() > 215000 {
-                ensure!(
-                    !selected_continuing.is_empty() || steering_priority,
-                    "Trusted continuation metadata exceeds the management context bound"
-                );
-                break;
-            }
-            previous.push(item);
-            images.extend(candidate_images);
-            if let Some(metadata) = metadata {
-                trusted_sources.push(metadata);
-            }
-            if let Some(origin) = origin {
-                origins.insert(origin.clone());
-            }
-            selected_continuing.push(candidate);
-        }
-        let continuing = selected_continuing;
-        for candidate in ordered {
-            let (_, origin, kind, raw) = &candidate;
-            let mut data = prompt_input(raw, origin.as_deref())?;
-            let candidate_images = if kind == "user" {
-                prepare_images(
-                    &tx,
-                    project,
-                    origin.as_deref(),
-                    image_scope.as_deref(),
-                    supports_images,
-                    images.len(),
-                    &mut data,
-                )?
-            } else {
-                vec![]
-            };
-            let item = json!({"kind":kind,"data":data});
-            let metadata = origin
-                .as_ref()
-                .filter(|id| !origins.contains(*id))
-                .map(|id| trusted_source(&tx, project, id))
-                .transpose()?;
-            let mut next = current.clone();
-            next.push(item.clone());
-            let mut sources = trusted_sources.clone();
-            if let Some(ref metadata) = metadata {
-                sources.push(metadata.clone());
-            }
-            let required = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":sources,"new_inputs":next,"continuing_inputs":previous,"latest_user_steering":latest_steering});
-            if required.to_string().len() > 215000 && (!inputs.is_empty() || !continuing.is_empty())
-            {
-                break;
-            }
-            ensure!(
-                required.to_string().len() <= 215000,
-                "Trusted input metadata exceeds the management context bound"
-            );
-            current.push(item);
-            images.extend(candidate_images);
-            if let Some(metadata) = metadata {
-                trusted_sources.push(metadata);
-            }
-            if let Some(origin) = origin {
-                origins.insert(origin.clone());
-            }
-            inputs.push(candidate);
-        }
-        if steering_priority && current.len() > 1 {
-            current.rotate_left(1);
-        }
-        let mut latest_steering = latest_steering;
-        if let Some((id, _, _, _)) = &latest_context {
-            let present = inputs.iter().any(|item| &item.0 == id);
-            let owned = continuing.iter().any(|item| &item.0 == id);
-            if let Some(object) = latest_steering.as_object_mut() {
-                object.insert("present_in_new_inputs".into(), json!(present));
-                object.insert("present_in_continuing_inputs".into(), json!(owned));
-                object.insert(
-                    "context_only_not_batch_member".into(),
-                    json!(!present && !owned),
-                );
-            }
-        }
-        if pi_scope.is_some()
-            && latest_steering["present_in_new_inputs"] != true
-            && latest_steering["present_in_continuing_inputs"] != true
-        {
-            latest_steering = Value::Null;
-        }
-        let origin = if origins.len() == 1 {
-            origins.iter().next().cloned()
-        } else {
-            None
-        };
-        let mut context = json!({"trusted_project":{"id":p.id,"name":p.name,"workspace":p.path},"trusted_sources":trusted_sources,"new_inputs":current,"continuing_inputs":previous,"continuation_policy":"Continuing inputs are already claimed goals, not new messages. Continue only unfinished work, preserve confirmed/uncertain effect receipts, and follow latest_user_steering. A delivered/settled worker receipt is not semantic task success.","steering_priority":steering_priority,"latest_user_steering":latest_steering,"workspace_instructions":instructions,"prior_conversation":[],"effect_evidence":history,"manager_decisions":[]});
-        let history_anchor = if steering_priority {
-            inputs.first()
-        } else {
-            inputs.iter().rev().chain(continuing.iter().rev()).find(|item| item.2 == "user")
-                .or_else(|| inputs.iter().rev().chain(continuing.iter().rev())
-                    .find(|item| item.2 == "worker" && item.1.is_some()))
-        }.and_then(|item| item.1.as_deref());
-        if let Some(anchor) = history_anchor
-            && let Some(anchor_scope) = topic_decisions::discussion(&tx, project, anchor)?
-        {
-            context["topic_history_origin_event_id"] = json!(anchor);
-            if let Some((_, steering, _, status)) = &latest_context
-                && status == "consumed"
-            {
-                let steering_scope = steering.as_deref().map(|origin|
-                    topic_decisions::discussion(&tx, project, origin)).transpose()?.flatten();
-                if steering_scope.as_deref() != Some(&anchor_scope) {
-                    context["latest_user_steering"] = Value::Null;
-                }
-            }
-        }
-        if !proposal_only {
-            let origins = inputs.iter().rev().chain(continuing.iter().rev())
-                .filter_map(|input| input.1.clone());
-            let decisions = topic_decisions::batch(&tx, project, origins, 4096)?;
-            if !decisions.as_array().unwrap().is_empty() {
-                context["topic_decisions"] = decisions;
-            }
-        }
-        if proposal_only {
-            for field in ["prior_conversation", "effect_evidence", "manager_decisions"] {
-                context[field] = json!([]);
-            }
-        }
-        let history_reserve = if history_anchor.is_some() {
-            topic_history::TRUNCATION_RESERVE
-        } else {
-            0
-        };
-        if context.to_string().len() + history_reserve > 250000
-            && let Some(evidence) = context["effect_evidence"].as_array_mut()
-        {
-            for effect in evidence {
-                if let Some(summary) = effect["result_summary"].as_str() {
-                    effect["result_summary"] = json!(summary.chars().take(64).collect::<String>());
-                }
-            }
-        }
-        if context.to_string().len() + history_reserve > 250000 {
-            context.as_object_mut().unwrap().remove("workspace_instructions");
-        }
-        let mut quote_budget = 250000usize.saturating_sub(context.to_string().len() + history_reserve);
-        let new_items = context["new_inputs"].as_array_mut().unwrap();
-        let mut new_origins: Vec<_> = inputs.iter().map(|item| item.1.as_deref()).collect();
-        if steering_priority && new_origins.len() > 1 {
-            new_origins.rotate_left(1);
-        }
-        for (item, origin) in new_items.iter_mut().zip(new_origins) {
-            attach_quote(&tx, project, origin, &mut item["data"], &mut quote_budget)?;
-        }
-        for (item, input) in context["continuing_inputs"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .zip(&continuing)
-        {
-            attach_quote(
-                &tx,
-                project,
-                input.1.as_deref(),
-                &mut item["data"],
-                &mut quote_budget,
-            )?;
-        }
-        if pi_scope.is_none() && !context["latest_user_steering"].is_null()
-            && let Some((_, origin, _, _)) = &latest_context
-        {
-            attach_quote(
-                &tx,
-                project,
-                origin.as_deref(),
-                &mut context["latest_user_steering"]["data"],
-                &mut quote_budget,
-            )?;
-        }
-        if !proposal_only && let Some(anchor) = history_anchor {
-            topic_history::attach(&tx, project, anchor, &mut context, 250000)?;
-        }
-        let prompt = context.to_string();
-        ensure!(
-            prompt.len() <= 250000,
-            "Management context exceeds its bound"
-        );
-        let debug_dispatch = if p.debug_mode {
-            let admitted_steering = latest_context.as_ref().and_then(|(id, origin, _, _)| {
-                origin
-                    .as_ref()
-                    .filter(|_| inputs.iter().any(|input| &input.0 == id))
-            });
-            let origins = admitted_steering.into_iter().chain(
-                inputs
-                    .iter()
-                    .rev()
-                    .chain(continuing.iter().rev())
-                    .filter_map(|input| input.1.as_ref()),
-            );
-            match debug_dispatch(&tx, project, origins, &prompt) {
-                Ok(Some(dispatch)) => Some(dispatch),
-                Ok(None) => {
-                    tracing::debug!(
-                        project,
-                        "Manager prompt debug has no trusted Feishu discussion"
-                    );
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(project, "Manager prompt debug discussion lookup failed");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let checkpoint = match pi_executable {
-            Some(executable) => pi::Turn::checkpoint(executable, prompt, images, pi_scope),
-            None => manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?,
-        };
-        let run = db::id();
-        tx.execute(
-            "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
-            [project],
-        )?;
-        tx.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,origin_event_id,checkpoint,status,owner,created_at) VALUES(?,?,?,?,?,?,'working',?,?)",params![run,project,revision,input_revision,origin,checkpoint.to_string(),owner(),db::now()])?;
-        for (id, _, _, _) in continuing.iter().chain(inputs.iter()) {
-            own_input(&tx, &run, id)?;
-            tx.execute(
-                "INSERT INTO manager_run_inputs(run_id,input_id) VALUES(?,?)",
-                params![run, id],
-            )?;
-        }
-        (run, checkpoint, debug_dispatch)
-    };
-    tx.commit()?;
-    Ok(Some(Turn {
-        context: Context {
-            project: project.into(),
-            run,
-            revision,
-            input_revision,
-        },
-        config: ProviderConfig {
-            base_url,
-            model,
-            api_key,
-            supports_images,
-        },
-        checkpoint,
-        debug_dispatch,
-    }))
 }
 fn provider_unavailable(c: &Connection, project: &str) -> Result<bool> {
     let (configured, revision): (bool, i64) = c.query_row(
@@ -2163,258 +1253,10 @@ fn provider_unavailable(c: &Connection, project: &str) -> Result<bool> {
     }
     Ok(true)
 }
-fn claim_or_repair(c: &Connection, project: &str) -> Result<Option<Turn>> {
-    if provider_unavailable(c, project)? { return Ok(None); }
-    match claim(c, project) {
-        Ok(turn) => Ok(turn),
-        Err(_) => {
-            let p = db::project_by_key(c, project)?;
-            if p.paused || work::has_takeover(c, project, &p.generation)? {
-                return Ok(None);
-            }
-            let config:Option<(i64,i64)>=c.query_row("SELECT revision,input_revision FROM manager_config WHERE project_id=?",[project],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            let Some((revision, input_revision)) = config else {
-                return Ok(None);
-            };
-            // Reserve a failed claim's own generation-bound repair context.
-            // Its inputs stay queued and no ordinary task body reaches a worker.
-            let ctx = Context {
-                project: project.into(),
-                run: db::id(),
-                revision,
-                input_revision,
-            };
-            let tx = c.unchecked_transaction()?;
-            tx.execute("UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",[project])?;
-            tx.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES(?,?,?,?,'null','working',?,?)",params![ctx.run,project,revision,input_revision,owner(),db::now()])?;
-            tx.execute("INSERT INTO manager_run_inputs(run_id,input_id) SELECT ?,id FROM manager_inputs WHERE project_id=? AND status='queued' ORDER BY rowid LIMIT 32",params![ctx.run,project])?;
-            tx.commit()?;
-            let mut error = Failure::internal();
-            error.kind = "context_preparation".into();
-            failure(c, &ctx, &error)?;
-            Ok(None)
-        }
-    }
-}
-async fn current(app: &App, ctx: &Context) -> bool {
-    let Some(_permit) = app.service.gate.enter() else {
-        return false;
-    };
-    let context = ctx.clone();
-    app.db
-        .call(move |c| Ok(valid(c, &context).is_ok()))
-        .await
-        .unwrap_or(false)
-}
-async fn checkpoint(app: &App, ctx: &Context, value: &Value, model_responded: bool) -> Result<()> {
-    let Some(_permit) = app.service.gate.enter() else {
-        bail!("Service ownership changed")
-    };
-    let context = ctx.clone();
-    let correction = value
-        .get("last_correction")
-        .filter(|v| !v.is_null())
-        .map(Value::to_string);
-    let value = value.to_string();
-    ensure!(
-        value.len() <= 2_097_152,
-        "Management checkpoint exceeds its bound"
-    );
-    app.db.call(move|c|{let tx=c.unchecked_transaction()?;valid(&tx,&context)?;ensure!(tx.execute("UPDATE manager_runs SET checkpoint=? WHERE id=? AND owner=? AND status='working'",params![value,context.run,owner()])?==1,"Management turn ownership changed");if let Some(correction)=correction {tx.execute("UPDATE manager_runs SET error=json_set(CASE WHEN json_valid(error) THEN error ELSE '{}' END,'$.last_correction',json(?)) WHERE id=?",params![correction,context.run])?;}
-if model_responded { recovered(&tx,&context)?; }tx.commit()?;Ok(())}).await
-}
-async fn drive(app: Arc<App>, turn: Turn) -> Result<()> {
-    let mut trace = if let Some(exporter) = &app.manager_telemetry {
-        let run = turn.context.run.clone();
-        let includes_content = exporter.includes_content();
-        match app.db.call(move |c| {
-            Ok(c.prepare("SELECT i.id,CASE WHEN ? AND json_valid(i.payload) THEN
-                json_extract(i.payload,'$.user_input.body') ELSE NULL END
-                FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id
-                WHERE b.run_id=? AND i.kind='user' ORDER BY i.rowid LIMIT 64")?
-                .query_map(params![includes_content, run], |row|
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        }).await {
-            Ok(inputs) if !inputs.is_empty() => Some(crate::manager_telemetry::Trace::new(exporter.clone(), inputs)),
-            Ok(_) => None,
-            Err(_) => {
-                tracing::warn!("Manager telemetry input lookup failed");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let result = drive_turn(app, turn, trace.as_mut()).await;
-    if let Some(trace) = &mut trace {
-        trace.finish(match &result {
-            Ok(outcome) => outcome,
-            Err(error) if error.downcast_ref::<Failure>().is_some() => "model_failure",
-            Err(_) => "turn_interrupted_or_failed",
-        });
-    }
-    result.map(|_| ())
-}
-
-async fn drive_turn(
-    app: Arc<App>,
-    mut turn: Turn,
-    mut trace: Option<&mut crate::manager_telemetry::Trace>,
-) -> Result<&'static str> {
-    loop {
-        // A completed iteration has checkpointed both the provider response and
-        // every tool result. Yield only here, never by cancelling live model I/O.
-        if app.service.manager_gate.is_closed() {
-            return Ok("yielded");
-        }
-        ensure!(
-            current(&app, &turn.context).await,
-            "Management turn superseded"
-        );
-        if let Some(dispatch) = turn.debug_dispatch.take() {
-            let echo = crate::feishu::send_debug_reply(
-                &app,
-                &turn.context.project,
-                &dispatch.bot_app_id,
-                &dispatch.to,
-                &dispatch.anchor,
-                &dispatch.payload,
-            );
-            tokio::pin!(echo);
-            loop {
-                tokio::select! {
-                    result = &mut echo => {
-                        if let Err(error) = result {
-                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, %error, "Debug echo failed; continuing manager dispatch");
-                        }
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        if app.shutdown.is_cancelled() || !current(&app, &turn.context).await {
-                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, "Debug echo interrupted by management turn supersession");
-                            bail!("Management turn superseded");
-                        }
-                        if app.service.manager_gate.is_closed() {
-                            tracing::warn!(project = %turn.context.project, run = %turn.context.run, anchor = %dispatch.anchor, "Debug echo interrupted by service handover");
-                            return Ok("yielded");
-                        }
-                    }
-                }
-            }
-            // Revalidate after Feishu I/O, which may overlap new steering.
-            if app.service.manager_gate.is_closed() {
-                return Ok("yielded");
-            }
-            ensure!(
-                current(&app, &turn.context).await,
-                "Management turn superseded"
-            );
-        }
-        if let Some(pi) = turn.checkpoint.get("pi").cloned() {
-            return pi::drive(app, &turn.context, &turn.config, pi).await;
-        }
-        let cancel = CancellationToken::new();
-        let step = {
-            let model = manager_loop::advance_observed(
-                &turn.config,
-                turn.checkpoint.clone(),
-                cancel.clone(),
-                Some(crate::manager_context::Observer {
-                    store: app.manager_context.clone(),
-                    project: turn.context.project.clone(),
-                    run: turn.context.run.clone(),
-                }),
-                trace.as_deref_mut(),
-            );
-            tokio::pin!(model);
-            loop {
-                tokio::select! {result=&mut model=>break result?,_=tokio::time::sleep(Duration::from_millis(100))=>{if app.shutdown.is_cancelled()||!current(&app,&turn.context).await{cancel.cancel();bail!("Management turn superseded");}}}
-            }
-        };
-        checkpoint(&app, &turn.context, &step.checkpoint, step.model_responded).await?;
-        turn.checkpoint = step.checkpoint;
-        match step.action {
-            LoopAction::Continue => continue,
-            LoopAction::Tools(calls) => {
-                let mut results = Vec::new();
-                for call in calls {
-                    let occurrence = call.occurrence.clone();
-                    let mut span = trace
-                        .as_deref_mut()
-                        .map(|trace| trace.span(&call.name, "tool"));
-                    if let Some(span) = &mut span {
-                        span.tool_input(&call.name, &call.arguments);
-                    }
-                    let value = tool(&app, &turn.context, call).await;
-                    if let Some(span) = &mut span {
-                        span.tool_outcome(match value.as_ref() {
-                            Ok(value) => tool_trace_outcome(value),
-                            Err(_) => "failed",
-                        });
-                    }
-                    let value = value?;
-                    results.push((occurrence, value));
-                }
-                if results.iter().all(|(_, result)| result["ignored_terminal_stop"] == true)
-                    && !results.is_empty()
-                {
-                    let Some(_permit) = app.service.gate.enter() else {
-                        return Ok("yielded");
-                    };
-                    let context = turn.context.clone();
-                    app.db.call(move |c| finish_turn(c, &context,
-                        "Terminal observation stopped because the tool budget was exhausted."))
-                        .await?;
-                    return Ok("tool_budget_exhausted");
-                }
-                turn.checkpoint = manager_loop::supply_tool_results(turn.checkpoint, results)?;
-                checkpoint(&app, &turn.context, &turn.checkpoint, false).await?;
-            }
-            LoopAction::Done(note) => {
-                let context = turn.context.clone();
-                let Some(_permit) = app.service.gate.enter() else {
-                    return Ok("yielded");
-                };
-                app.db
-                    .call(move |c| finish_turn(c, &context, &note))
-                    .await?;
-                return Ok("complete");
-            }
-        }
-    }
-}
-fn tool_trace_outcome(value: &Value) -> &'static str {
-    if value["ignored_terminal_stop"] == true {
-        return "ignored_terminal_stop";
-    }
-    match value["status"].as_str() {
-        Some("uncertain") => "uncertain",
-        Some("held") => "held",
-        Some("queued" | "pending") => "queued",
-        Some("failed" | "rejected" | "unavailable" | "worker_unavailable" | "observation_stopped") => "failed",
-        _ if !value["error"].is_null() && value["error"] != "" => "failed",
-        _ => "ok",
-    }
-}
-
-fn finish_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
-    let tx = c.unchecked_transaction()?;
-    valid(&tx, context)?;
-    close_turn(&tx, context, note)?;
-    recovered(&tx, context)?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn close_turn(c: &Connection, context: &Context, note: &str) -> Result<()> {
+fn close_turn(c: &Connection, context: &Context) -> Result<()> {
     c.execute(
         "UPDATE manager_runs SET status='complete' WHERE id=?",
         [&context.run],
-    )?;
-    c.execute(
-        "INSERT OR REPLACE INTO manager_turn_notes(run_id,note) VALUES(?,?)",
-        params![context.run, note.chars().take(8000).collect::<String>()],
     )?;
     c.execute("UPDATE manager_inputs SET status='consumed' WHERE id IN
         (SELECT input_id FROM manager_input_claims WHERE run_id=?) AND status='processing'",
@@ -2569,7 +1411,7 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
     if exhausted {
         // End this batch so its saved tool effects cannot be admitted a second
         // time. Unclaimed inputs and outstanding delegations retain their state.
-        close_turn(&tx, ctx, error.summary())?;
+        close_turn(&tx, ctx)?;
         tx.execute("UPDATE manager_config SET error='',next_attempt_at=? WHERE project_id=?",
             params![next_attempt, ctx.project])?;
         tx.commit()?;
@@ -2683,19 +1525,20 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
     Ok(())
 }
 /// Prime at most the newest ready group input before building a Manager prompt.
-async fn prepare_group_context(app: &App, project: &str) {
+async fn prepare_group_context(app: &App, project: &str, channel_id: &str) {
     let project = project.to_owned();
+    let channel_id = channel_id.to_owned();
     let prepared = prepared_input();
     let due = app.db.call(move |c| {
         Ok(c.query_row(
             &format!("SELECT m.id FROM manager_inputs JOIN work_events e ON e.id=manager_inputs.origin_event_id
              JOIN messages m ON m.id=e.message_id AND m.project_id=manager_inputs.project_id
              JOIN project_bots b ON b.project_id=manager_inputs.project_id
-             CROSS JOIN manager_provider_config g WHERE manager_inputs.project_id=? AND manager_inputs.status IN ('queued','processing')
+             CROSS JOIN manager_provider_config g WHERE manager_inputs.project_id=? AND manager_inputs.channel_id=? AND manager_inputs.status IN ('queued','processing')
              AND e.source='feishu' AND m.direction='in' AND ({PROVIDER_CONFIGURED}) AND {prepared}
              AND json_extract(m.attachment,'$.source.chat_type')='group'
              AND b.app_id=json_extract(m.attachment,'$.bot_app_id') ORDER BY manager_inputs.rowid DESC LIMIT 1"),
-            [&project], |r| r.get::<_, String>(0),
+            params![project,channel_id], |r| r.get::<_, String>(0),
         ).optional()?)
     }).await;
     if let Ok(Some(id)) = due && let Ok(message) = app.db.message(&id).await {
@@ -2704,59 +1547,7 @@ async fn prepare_group_context(app: &App, project: &str) {
 }
 
 pub async fn run(app: Arc<App>) {
-    tokio::spawn(autonomy::run(app.clone()));
-    let running = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));
-    loop {
-        tokio::select! {_=app.shutdown.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(200))=>{}}
-        let Some(_permit) = app.service.gate.enter() else {
-            continue;
-        };
-        let projects=app.db.call(|c|Ok(c.prepare("SELECT m.project_id FROM manager_config m JOIN projects p ON p.id=m.project_id WHERE p.paused=0 AND m.next_attempt_at<=? AND (EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=m.project_id AND i.status IN ('queued','processing')) OR EXISTS(SELECT 1 FROM manager_runs r WHERE r.project_id=m.project_id AND r.status='working'))")?.query_map([db::now()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)).await.unwrap_or_default();
-        for project in projects {
-            if !running.lock().await.insert(project.clone()) {
-                continue;
-            }
-            let app = app.clone();
-            let running = running.clone();
-            tokio::spawn(async move {
-                // Retain the actor through claim, all step/effect checkpoints,
-                // and failure persistence before service ownership may transfer.
-                let Some(_manager_permit) = app.service.manager_gate.enter() else {
-                    running.lock().await.remove(&project);
-                    return;
-                };
-                prepare_group_context(&app, &project).await;
-                let claim_project = project.clone();
-                let turn = {
-                    let Some(_permit) = app.service.gate.enter() else {
-                        running.lock().await.remove(&project);
-                        return;
-                    };
-                    app.db
-                        .call(move |c| claim_or_repair(c, &claim_project))
-                        .await
-                };
-                if let Ok(Some(turn)) = turn {
-                    let context = turn.context.clone();
-                    if let Err(error) = drive(app.clone(), turn).await {
-                        let Some(_permit) = app.service.gate.enter() else {
-                            running.lock().await.remove(&project);
-                            return;
-                        };
-                        if !app.shutdown.is_cancelled() {
-                            let error = error
-                                .downcast_ref::<Failure>()
-                                .cloned()
-                                .unwrap_or_else(Failure::internal);
-                            let _ = app.db.call(move |c| failure(c, &context, &error)).await;
-                        }
-                        app.notify.notify_one();
-                    }
-                }
-                running.lock().await.remove(&project);
-            });
-        }
-    }
+    agent::run(app).await;
 }
 fn settle_inputs(c: &Connection, _run: &str) -> Result<()> {
     settle_sources(c)
@@ -2771,21 +1562,26 @@ pub fn settle_sources(c: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn session_context(c: &Connection, project: &str) -> Result<Option<Value>> {
+    let latest = c.query_row(
+        "SELECT id,json_extract(checkpoint,'$.channel_id') FROM manager_runs
+         WHERE project_id=? AND json_valid(checkpoint) AND json_type(checkpoint,'$.channel_id')='text'
+         ORDER BY rowid DESC LIMIT 1",
+        [project],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ).optional()?;
+    let Some((run, channel)) = latest else { return Ok(None) };
+    let mut messages = vec![rig_core::message::Message::system(SYSTEM)];
+    messages.extend(session::load(c, project, &channel)?.into_iter().map(|entry| entry.message));
+    let mut view = crate::manager_context::normalized(&messages, &run);
+    view["channel_id"] = json!(channel);
+    Ok(Some(view))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{config::Config, db::ProjectInput};
-    #[test]
-    fn clear_user_cli_assignments_are_preserved() {
-        assert_eq!(named_cli("请用 Claude 跑这项"), Some("claude".into()));
-        assert_eq!(named_cli("@bot 让 agy 做这个"), Some("agy".into()));
-        assert_eq!(named_cli("Use pi for this"), Some("pi".into()));
-        assert_eq!(named_cli("不要用 agy"), None);
-        assert_eq!(named_cli("有没有 codex"), None);
-        assert_eq!(named_cli("用 codex 修复，用 claude 复核"), None);
-        assert_eq!(named_cli("Use codex for the fix and have claude review it"), None);
-    }
-
     pub(super) async fn fixture() -> (tempfile::TempDir, Arc<App>, Project) {
         let dir = tempfile::tempdir().unwrap();
         let (app, project) = fixture_at(dir.path()).await;
@@ -2813,7 +1609,7 @@ mod tests {
                 crate::bot::save(c, &p.id, "cli_fixture", "private-fixture-key", false)?;
                 save_provider(
                     c,
-                    ConfigInput {
+                    ConfigInput { provider_kind: None, context_window: None,
                         base_url: "http://127.0.0.1:9/v1".into(),
                         model: "fixture-manager".into(),
                         api_key: Some("private-manager-key".into()),
@@ -2827,272 +1623,6 @@ mod tests {
             .unwrap();
         (app, p)
     }
-    #[tokio::test]
-    async fn proposal_turn_is_scoped_and_delegates_the_approved_instructions_exactly_once() -> Result<()> {
-        let (_dir, app, project) = fixture().await;
-        let approved = "Change only the workspace README and verify that its example is accurate.";
-        let now = db::now();
-        let approval = json!({"proposal_id":"prop","to":"oc_fixture","app_id":"cli_fixture","anchor":"om_approval","instructions":approved});
-        app.db.sync(|c| {
-            c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at)
-              VALUES('proposal-task',?,'Approved proposal',?,'queued',?,?)",
-              params![project.id,approved,now,now])?;
-            c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
-              VALUES('proposal-event',?,'proposal-task','autonomy','prop',?,'queued',?,?)",
-              params![project.id,approval.to_string(),now,now])?;
-            c.execute("INSERT INTO autonomy_settings(project_id,enabled,owner_open_id,app_id,chat_id)
-                VALUES(?,1,'ou_fixture','cli_fixture','oc_fixture')", [&project.id])?;
-            c.execute("INSERT INTO proposals(id,project_id,number,title,why_now,scope,not_doing,
-                acceptance,risk,effort,category,dedupe_hash,status,created_at,decided_by,
-                execution_event_id,source_message_id)
-                VALUES('prop',?,1,'Fixture','Fixture','Fixture','Fixture','Fixture','Fixture','small',
-                'documentation','fixture','approved',?,'ou_fixture','proposal-event','om_approval')",
-                params![project.id, now])?;
-            route_event(c, "proposal-event")?;
-            input(c, &project.id, "ordinary", None, "user", &json!({"body":"An unrelated request"}))
-        })?;
-        let proposal = app.db.sync(|c| {
-            let ordinary = claim(c, &project.id)?.unwrap();
-            assert!(!proposal_run(c, &ordinary.context.run)?);
-            finish_turn(c, &ordinary.context, "")?;
-            let proposal = claim(c, &project.id)?.unwrap();
-            assert!(proposal_run(c, &proposal.context.run)?);
-            let prompt = prompt_context(&proposal.checkpoint).unwrap();
-            assert_eq!(prompt["trusted_sources"].as_array().unwrap().len(), 1);
-            assert_eq!(prompt["trusted_sources"][0]["message_id"], "om_approval");
-            assert_eq!(prompt["prior_conversation"], json!([]));
-            Ok(proposal)
-        })?;
-        let locate = |occurrence: &str, name: &str, arguments: Value| ToolCall {
-            occurrence: occurrence.to_owned(), name: name.to_owned(), arguments,
-        };
-        let denied = tool(&app, &proposal.context, locate("write", "write_file",
-            json!({"path":"should-not-exist","content":"fixed"}))).await?;
-        assert!(denied["error"].is_string());
-        assert!(!Path::new(&project.path).join("should-not-exist").exists());
-        let wrong_origin = tool(&app, &proposal.context, locate("wrong", "delegate",
-            json!({"source_event_id":"ordinary","instructions":"broader changes"}))).await?;
-        assert!(wrong_origin["error"].is_string());
-        let mut delegated = None;
-        for call in ["delegate-first", "delegate-duplicate"] {
-            let result = tool(&app, &proposal.context, locate(call, "delegate",
-                json!({"source_event_id":"proposal-event","instructions":"broader changes"}))).await?;
-            let id = result["event_id"].as_str().unwrap().to_owned();
-            assert!(delegated.as_ref().is_none_or(|previous| previous == &id));
-            delegated = Some(id);
-        }
-        let first = delegated.unwrap();
-        app.db.sync(|c| {
-            let count: u32 = c.query_row("SELECT count(*) FROM work_events WHERE source='management'", [], |r| r.get(0))?;
-            assert_eq!(count, 1);
-            let event = work::event(c, &project.id, &first)?;
-            assert_eq!(event.payload["proposal_id"], "prop");
-            assert_eq!(event.payload["instructions"], approved);
-            c.execute("UPDATE projects SET agent='pi' WHERE id=?", [&project.id])?;
-            assert!(work::claim_next(c, &project.id, "", now)?.is_none());
-            assert_eq!(work::event(c, &project.id, &first)?.status, "failed");
-            let count: u32 = c.query_row("SELECT count(*) FROM work_runs WHERE event_id=?", [&first], |r| r.get(0))?;
-            assert_eq!(count, 0);
-            Ok(())
-        })?;
-
-        let retry = tool(&app, &proposal.context, locate("retry-preclaim", "delegate",
-            json!({"source_event_id":"proposal-event","instructions":"unapproved instructions"}))).await?;
-        let replacement = retry["event_id"].as_str().unwrap();
-        assert_ne!(replacement, &first);
-        let run = app.db.sync(|c| {
-            let event = work::event(c, &project.id, replacement)?;
-            assert_eq!(event.payload["expected_agent"], "pi");
-            assert_eq!(event.payload["instructions"], approved);
-            let run = work::claim_next(c, &project.id, "", now)?.unwrap();
-            assert_eq!(run.event_id, replacement);
-            Ok(run)
-        })?;
-        for (delivery, occurrence) in [("uncertain", "repeat-uncertain"), ("failed", "repeat-after-claim")] {
-            app.db.sync(|c| work::delivery(c, &run.id, delivery, "Fixture transport", now))?;
-            let replay = tool(&app, &proposal.context, locate(occurrence, "delegate",
-                json!({"source_event_id":"proposal-event","instructions":"unapproved instructions"}))).await?;
-            assert_eq!(replay["event_id"], replacement);
-            assert_eq!(replay["status"], delivery);
-        }
-        app.db.sync(|c| {
-            let count: u32 = c.query_row("SELECT count(*) FROM work_events WHERE source='management'", [], |r| r.get(0))?;
-            assert_eq!(count, 2);
-            Ok(())
-        })
-    }
-
-    #[tokio::test]
-    async fn topic_decisions_survive_history_window_and_reach_provider_and_fresh_task() -> Result<()> {
-        use axum::{Json, Router, routing::post};
-        let (_dir, app, p) = fixture().await;
-        let insert = |message: &str, root: &str, body: &str| {
-            app.db.ingest_bot(&p.id, "cli_fixture", "oc_fixture", message, body,
-                &json!({"source":{"chat_id":"oc_fixture","chat_type":"group","message_type":"text",
-                    "thread_id":root,"root_id":root,"sender":{"open_id":"ou_fixture"}}})).unwrap().unwrap()
-        };
-        let claim_turn = || app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            Ok(claim(c,&p.id)?.unwrap())
-        }).unwrap();
-        let finish = |turn: &Turn| app.db.sync(|c| finish_turn(c,&turn.context,"")).unwrap();
-        let mut correction = String::new();
-        let mut original = String::new();
-        let mut cases = vec![
-            ("om_old","om_topic","florence","year","current","年代定 1320"),
-            ("om_other","om_other_topic","florence","year","current","别的话题保密决定 1900"),
-            ("om_reference","om_topic","florence","reference","reference","York 只供参考"),
-            ("om_branch","om_topic","other-florence","year","current","独立分支 1080"),
-            ("om_no_york","om_topic","florence","opening","current","不要约克"),
-        ];
-        let older_years: Vec<_> = (0..11).map(|i| (format!("om_year_{i}"), format!("年代暂定 {}", 1300+i))).collect();
-        cases.extend(older_years.iter().map(|(id,text)|(id.as_str(),"om_topic","florence","year","current",text.as_str())));
-        cases.push(("om_correct","om_topic","florence","year","current","年代改为 1324 / 1325"));
-        for (id, root, branch, key, kind, evidence) in cases {
-            let origin=insert(id,root,evidence);
-            let turn=claim_turn();
-            let result=tool(&app,&turn.context,ToolCall {
-                occurrence:"record".into(),name:"record_topic_decision".into(),
-                arguments:json!({"source_event_id":origin,"branch":branch,"key":key,"kind":kind,"evidence":evidence}),
-            }).await?;
-            assert_eq!(result["status"],"recorded");
-            assert_eq!(result["source_event_id"],origin);
-            if id=="om_correct" { correction=origin; }
-            else if id=="om_old" { original=origin; }
-            finish(&turn);
-        }
-        for index in 0..32 {
-            insert(&format!("om_history_{index:02}"),"om_topic",&format!("Same-topic history {index:02}"));
-            let turn=claim_turn();
-            app.db.sync(|c| finish_turn(c,&turn.context,&format!("Same-topic note {index:02}")))?;
-        }
-        for index in 0..10 {
-            insert(&format!("om_noise_{index}"),"om_other_topic","ordinary unrelated update");
-            let turn=claim_turn();
-            app.db.sync(|c| finish_turn(c,&turn.context,"Unrelated turn note"))?;
-        }
-        let resumed = app.db.sync(|c| topic_decisions::context(c,&p.id,&original,Some("florence")))?;
-        assert_eq!(resumed["origin_event_id"],original);
-        assert!(resumed["decisions"].as_array().unwrap().iter().any(|entry|
-            entry["key"]=="year" && entry["category"]=="current" && entry["source_event_id"]==correction));
-        let current=insert("om_followup","om_topic","继续 Florence 主线");
-        let mut turn=claim_turn();
-        let seen=Arc::new(std::sync::Mutex::new(None));
-        let captured=seen.clone();
-        let router=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {
-            let captured=captured.clone();
-            async move {
-                *captured.lock().unwrap()=Some(body);
-                Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
-                    "choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}))
-            }
-        }));
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let local_url = format!("http://{}",listener.local_addr()?);
-        turn.config.base_url = format!("{local_url}/v1");
-        app.config.write().await.feishu_base = local_url;
-        let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap() });
-        manager_loop::advance(&turn.config,turn.checkpoint.clone(),CancellationToken::new()).await?;
-        let wire=seen.lock().unwrap().take().unwrap();
-        let context=prompt_context(&wire).context("captured request context")?;
-        assert_eq!(context["topic_decisions"][0]["origin_event_id"],current);
-        assert_eq!(context["topic_history_origin_event_id"],current);
-        assert!(!context["prior_conversation"].to_string().contains("年代改为"));
-        assert!(context["prior_conversation"].as_array().unwrap().iter().any(|entry|
-            entry["source_event_id"]==correction && entry["body_in_topic_decisions"]==true));
-        assert_eq!(context["new_inputs"][0]["data"]["user_input"]["body"],"继续 Florence 主线");
-        let retained: Vec<_> = context["prior_conversation"].as_array().unwrap().iter()
-            .filter_map(|entry| entry["data"]["user_input"]["body"].as_str())
-            .filter(|body| body.starts_with("Same-topic history")).collect();
-        assert_eq!(retained,(0..32).map(|index| format!("Same-topic history {index:02}")).collect::<Vec<_>>());
-        assert_eq!(context["manager_decisions"].as_array().unwrap().len(),32);
-        assert_eq!(context["manager_decisions"][0],"Same-topic note 00");
-        assert!(context["topic_history_truncation"].is_null());
-        let decisions=context["topic_decisions"][0]["decisions"].as_array().unwrap();
-        assert_eq!(decisions.len(),10);
-        assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="年代改为 1324 / 1325" && x["source_event_id"]==correction && x["source_message_id"]=="om_correct"));
-        assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="不要约克"));
-        assert!(decisions.iter().any(|x|x["category"]=="obsolete" && x["user_evidence"].as_str().unwrap().starts_with("年代暂定")));
-        assert!(decisions.iter().any(|x|x["branch"]=="other-florence" && x["category"]=="current"));
-        assert!(decisions.iter().filter(|x|x.to_string().contains("York")).all(|x|x["category"]=="reference"));
-        assert!(!wire.to_string().contains("别的话题保密决定"));
-        assert!(!wire.to_string().contains("ordinary unrelated update"));
-        assert!(!wire.to_string().contains("Unrelated turn note"));
-        let outcome=tool(&app,&turn.context,ToolCall {
-            occurrence:"delegate".into(),name:"delegate".into(),
-            arguments:json!({"source_event_id":current,"decision_branch":"florence","instructions":"Continue the accepted branch"}),
-        }).await?;
-        assert_eq!(outcome["status"],"queued");
-        let mut event=app.db.sync(|c|work::event(c,&p.id,outcome["event_id"].as_str().unwrap()))?;
-        assert_eq!(event.payload["origin_event_id"],current);
-        assert_eq!(event.payload["topic_decisions"]["origin_event_id"],current);
-        let mut fresh=p.clone();
-        fresh.generation="fresh-fixture-worker".into();
-        fresh.native_session.clear();
-        fresh.mcp_token.clear();
-        event.payload["target_generation"]=json!(fresh.generation);
-        let path=crate::worker_task::fixture_assignment(&app,&fresh,&event).await?;
-        let command=tokio::process::Command::new("/bin/sh")
-            .arg("-c").arg("cat \"$1\"").arg("fixture-worker").arg(path)
-            .current_dir(&fresh.path).output().await?;
-        assert!(command.status.success());
-        let task=String::from_utf8(command.stdout)?;
-        assert!(task.contains("年代改为 1324 / 1325") && task.contains("不要约克"));
-        assert!(task.contains(&current) && task.contains(&correction));
-        assert!(!task.contains("独立分支 1080") && !task.contains("别的话题保密决定"));
-        finish(&turn);
-        for index in 0..12 {
-            insert(&format!("om_bulk_{index:02}"),"om_topic",&format!("Bulk {index:02} {}", "x".repeat(28_000)));
-            let bulk_turn=claim_turn();
-            app.db.sync(|c| finish_turn(c,&bulk_turn.context,&format!("Bulk note {index:02} {}", "n".repeat(7900))))?;
-        }
-        insert("om_budget_followup","om_topic","Current message survives history pressure");
-        let mut budget_turn=claim_turn();
-        budget_turn.config.base_url=turn.config.base_url.clone();
-        manager_loop::advance(&budget_turn.config,budget_turn.checkpoint.clone(),CancellationToken::new()).await?;
-        let budget_wire=seen.lock().unwrap().take().unwrap();
-        let budget_context=prompt_context(&budget_wire).context("captured budget-limited request")?;
-        assert!(budget_context.to_string().len()<=250_000);
-        assert_eq!(budget_context["new_inputs"][0]["data"]["user_input"]["body"],
-            "Current message survives history pressure");
-        let retained: Vec<_> = budget_context["prior_conversation"].as_array().unwrap().iter()
-            .map(|entry| &entry["data"]["user_input"]["body"].as_str().unwrap()[..7]).collect();
-        assert!(!retained.is_empty() && retained.len()<12);
-        assert_eq!(retained,((12-retained.len())..12).map(|index| format!("Bulk {index:02}")).collect::<Vec<_>>());
-        assert_eq!(budget_context["topic_history_truncation"]["older_inputs_omitted"],
-            16+32+1+12-retained.len());
-        let notes=budget_context["manager_decisions"].as_array().unwrap();
-        assert!(notes.len()<12);
-        assert_eq!(budget_context["topic_history_truncation"]["older_turn_notes_omitted"],44-notes.len());
-        for (index,note) in ((12-notes.len())..12).zip(notes) {
-            assert!(note.as_str().unwrap().starts_with(&format!("Bulk note {index:02} ")));
-        }
-        assert_eq!(budget_context["topic_decisions"][0]["decisions"].as_array().unwrap().len(),10);
-        finish(&budget_turn);
-        for index in 0..31 {
-            insert(&format!("om_pending_{index}"),"om_topic","claim main-thread update");
-        }
-        let other=insert("om_also_claimed","om_other_topic","claim second-thread update");
-        let not_claimed=insert("om_beyond_page","om_never_claimed","outside the claim page");
-        app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            topic_decisions::record(c,&p.id,serde_json::from_value(json!({
-                "source_event_id":not_claimed,"branch":"third","key":"update","kind":"current","evidence":"outside the claim page"
-            }))?)?;
-            Ok(())
-        })?;
-        let batch=claim_turn();
-        let prompt=prompt_context(&batch.checkpoint).unwrap();
-        let contexts=prompt["topic_decisions"].as_array().unwrap();
-        assert_eq!(contexts.len(),2);
-        assert!(contexts.iter().any(|entry|entry["origin_event_id"]==other));
-        assert!(contexts.iter().all(|entry|entry["origin_event_id"]!=not_claimed));
-        assert_eq!(prompt["latest_user_steering"]["source_event_id"],not_claimed);
-        assert_eq!(prompt["latest_user_steering"]["context_only_not_batch_member"],true);
-        server.abort();
-        Ok(())
-    }
-
     #[tokio::test]
     async fn group_context_reaches_manager_and_worker_without_crossing_source_scope() -> Result<()> {
         use axum::{Json, Router, routing::{get, post}};
@@ -3116,7 +1646,7 @@ mod tests {
                 "sender":{"open_id":"ou_fixture"}
             }}))?.unwrap();
         app.db.sync(work::sync_inbound)?;
-        prepare_group_context(&app, &p.id).await;
+        prepare_group_context(&app, &p.id, "feishu:cli_fixture:oc_original").await;
         let mut worker = app.db.sync(|c| {
             let managed = trusted_source(c, &p.id, &id)?;
             assert_eq!(managed["group_context"]["name"], "Original group");
@@ -3129,6 +1659,14 @@ mod tests {
         let xml = body(&app, &p, &worker).await?;
         assert!(xml.contains(r#"<chat name="Original group"/>"#));
         assert!(xml.contains(r#"name="Fixture sender""#));
+        let mut assigned_worker = p.clone();
+        assigned_worker.generation = "fixture-generation".into();
+        let mut assignment_event = worker.clone();
+        assignment_event.payload["target_generation"] = json!(assigned_worker.generation);
+        let assignment = crate::worker_task::fixture_assignment(&app, &assigned_worker, &assignment_event).await?;
+        let assignment = fs::read_to_string(assignment)?;
+        assert!(assignment.contains("Original group"));
+
         app.db.ingest_bot(&p.id,"cli_fixture","oc_other","om_other_group","hello",
             &json!({"source":{"chat_id":"oc_other","chat_type":"group","message_type":"text"}}))?;
         app.db.sync(|c| {
@@ -3149,414 +1687,9 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn unconfigured_projects_hold_input_without_delegating_and_share_the_saved_provider() {
-        let (_dir, app, first) = fixture().await;
-        let second = app.db.create(ProjectInput {
-            name: "Second fixture".into(),
-            path: first.path.clone(),
-            agent: "codex".into(),
-            chat_id: String::new(),
-            native_session: String::new(),
-            extra_args: vec![],
-        }).await.unwrap();
-        // A nonempty model/key still requires an endpoint.
-        app.db.sync(|c| {
-            c.execute("UPDATE manager_provider_config SET base_url='' WHERE id=1", [])?;
-            Ok(())
-        }).unwrap();
-        ingest(&app, &first, "om_provider_required", "Hold this request");
-        ingest(&app, &first, "om_provider_required_again", "Also keep this request");
-        app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            for project in [&first.id, &second.id] {
-                let state = public(c, project)?;
-                assert_eq!(state["mode"], "manager");
-                assert_eq!(state["status"], "unavailable");
-                assert_eq!(state["error"], PROVIDER_REQUIRED);
-                assert!(state.get("api_key").is_none());
-                assert!(claim(c, project)?.is_none());
-                assert!(claim_or_repair(c, project)?.is_none());
-                assert!(work::claim_next(c, project, "fixture", db::now())?.is_none());
-            }
-            // Repeated actor polling retains the original topic and at most one notice.
-            assert!(claim_or_repair(c, &first.id)?.is_none());
-            for table in ["manager_failures", "manager_runs", "work_runs"] {
-                let count: u32 = c.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))?;
-                assert_eq!(count, 0, "{table}");
-            }
-            let pending: u32 = c.query_row("SELECT count(*) FROM manager_inputs WHERE status='queued'", [], |row| row.get(0))?;
-            assert_eq!(pending, 2);
-            let notices = c.prepare("SELECT attachment FROM messages WHERE direction='out'")?
-                .query_map([], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            assert_eq!(notices.len(), 1);
-            let notice: Value = serde_json::from_str(&notices[0])?;
-            assert_eq!(notice["reply_to_message_id"], "om_provider_required");
-            validate_outbox(c, &first.id, &notice)?;
-            assert!(set_mode(c, &first.id, ModeInput {
-                mode:"native".into(), request_id:String::new(), expected_revision:0
-            }).is_err());
-
-            let current = public_provider(c)?;
-            save_provider(c, ConfigInput {
-                base_url:"https://provider.example/v1".into(), model:"shared-fixture".into(), api_key:None,
-                clear_api_key:false, expected_revision:current["revision"].as_i64().unwrap(),
-                supports_images:Some(true),
-            })?;
-            assert!(validate_outbox(c, &first.id, &notice).is_err());
-            for project in [&first.id, &second.id] {
-                let state = public(c, project)?;
-                assert_eq!(state["model"], "shared-fixture");
-                assert_eq!(state["status"], "ready");
-                assert_eq!(state["supports_images"], true);
-            }
-            assert!(claim_or_repair(c, &first.id)?.is_some());
-            Ok(())
-        }).unwrap();
-    }
-
-    #[tokio::test]
-    async fn old_provider_migration_is_single_shot_and_preserves_unclaimed_and_uncertain_work() {
-        let (_dir, app, first) = fixture().await;
-        let new_project = |name: &str| ProjectInput {
-            name:name.into(), path:first.path.clone(), agent:"codex".into(),
-            chat_id:String::new(), native_session:String::new(), extra_args:vec![],
-        };
-        let different = app.db.create(new_project("Compared legacy fixture")).await.unwrap();
-        let native = app.db.create(new_project("Legacy native fixture")).await.unwrap();
-        let absent = app.db.create(new_project("Legacy fixture without configuration")).await.unwrap();
-        app.db.sync(|c| {
-            c.execute_batch("DROP TABLE manager_provider_config;")?;
-            c.execute("UPDATE manager_config SET base_url='https://fixture.example',model='old-fixture',
-                api_key='fixture-key-a',mode='manager',revision=3 WHERE project_id=?", [&first.id])?;
-            c.execute("UPDATE manager_config SET base_url='https://fixture.example/v1',model='chosen-fixture',
-                api_key='fixture-key-b',supports_images=1,mode='manager',revision=4 WHERE project_id=?", [&different.id])?;
-            c.execute("UPDATE manager_config SET mode='native' WHERE project_id=?", [&native.id])?;
-            c.execute("DELETE FROM manager_config WHERE project_id=?", [&absent.id])?;
-            for (id, state) in [("legacy-queued", "queued"), ("legacy-uncertain", "uncertain")] {
-                c.execute("INSERT INTO work_tasks(id,project_id,title,instructions,status,created_at,updated_at)
-                    VALUES(?,?,'Legacy task','Legacy payload',?,1,1)", params![id,native.id,state])?;
-                c.execute("INSERT INTO work_events(id,project_id,task_id,source,source_id,payload,status,created_at,updated_at)
-                    VALUES(?,?,?,'local',?,?,?,1,1)",
-                    params![id,native.id,id,id,json!({"content":"preserve this"}).to_string(),state])?;
-            }
-            c.execute("INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at)
-                VALUES('legacy-run',?,'legacy-uncertain','legacy-uncertain','legacy-generation','uncertain',1,1)", [&native.id])?;
-            Ok(())
-        }).unwrap();
-        let path = app.dir.join("bridge.sqlite3");
-        // Handover opens the real migration pipeline on a private fixture store.
-        let db = db::Db::open_handover(&path).unwrap();
-        db.sync(|c| {
-            let schema: i64 = c.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            assert_eq!(schema, 7);
-            assert_eq!(crate::api::PROTOCOL, 7);
-            let selected = public_provider(c)?;
-            assert_eq!(selected["model"], "chosen-fixture");
-            assert_eq!(selected["migration_conflict"], true);
-            assert_eq!(selected["configured"], false);
-            assert!(claim(c, &native.id)?.is_none());
-            assert_eq!(selected["supports_images"], true);
-            for project in [&first.id,&different.id,&native.id,&absent.id] {
-                assert_eq!(public(c, project)?["model"], "chosen-fixture");
-            }
-            assert_eq!(work::event(c, &native.id, "legacy-queued")?.status, "managed");
-            assert_eq!(work::event(c, &native.id, "legacy-uncertain")?.status, "uncertain");
-            assert_eq!(work::run(c, &native.id, "legacy-run")?.status, "uncertain");
-            let moved: u32 = c.query_row("SELECT count(*) FROM manager_inputs WHERE origin_event_id='legacy-queued'", [], |row| row.get(0))?;
-            assert_eq!(moved, 1);
-            let confirmed = save_provider(c, ConfigInput {
-                base_url:"https://fixture.example/v1".into(),model:"chosen-fixture".into(),api_key:None,
-                clear_api_key:false,expected_revision:selected["revision"].as_i64().unwrap(),supports_images:None,
-            })?;
-            assert_eq!(confirmed["configured"], true);
-            assert!(claim(c, &native.id)?.is_some());
-            save_provider(c, ConfigInput {
-                base_url:"https://fixture.example/v1".into(),model:"chosen-fixture".into(),api_key:None,
-                clear_api_key:true,expected_revision:confirmed["revision"].as_i64().unwrap(),supports_images:None,
-            })?;
-            Ok(())
-        }).unwrap();
-        drop(db);
-        db::Db::open_handover(&path).unwrap().sync(|c| {
-            let provider = public_provider(c)?;
-            assert_eq!(provider["has_api_key"], false);
-            assert_eq!(provider["migration_conflict"], false);
-            let stale: u32 = c.query_row("SELECT count(*) FROM manager_config WHERE api_key!=''", [], |row| row.get(0))?;
-            assert_eq!(stale, 0);
-            Ok(())
-        }).unwrap();
-    }
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
     }
-    #[tokio::test]
-    async fn feishu_quote_survives_async_preparation_and_reaches_first_model_request() -> Result<()> {
-        use axum::{Json, Router, extract::Path as AxumPath, http::{HeaderMap, StatusCode},
-            response::IntoResponse, routing::{get, post}};
-        use base64::Engine;
-
-        const VIDEO: &[u8] = include_bytes!("../tests/fixtures/three-colors-five-seconds.mp4");
-        const FILE: &[u8] = b"Attachment text fixture";
-        let ffmpeg = crate::video_preview::decoder("ffmpeg");
-        let preview_available = ffmpeg.is_some() && crate::video_preview::decoder("ffprobe").is_some();
-
-        let (_dir, app, project) = fixture().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let host = format!("http://{}", listener.local_addr()?);
-        app.config.write().await.feishu_base.clone_from(&host);
-        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let router = Router::new()
-            .route("/open-apis/auth/v3/tenant_access_token/internal", post(|| async {
-                Json(json!({"code":0,"tenant_access_token":"quote-fixture"}))
-            }))
-            .route("/open-apis/im/v1/messages/{id}", get(|AxumPath(id): AxumPath<String>, headers: HeaderMap| async move {
-                assert_eq!(headers["authorization"], "Bearer quote-fixture");
-                assert_eq!(id, "om_direct");
-                Json(json!({"code":0,"data":{"items":[{
-                    "message_id":id,"chat_id":"oc_fixture","parent_id":"om_grandparent",
-                    "msg_type":"post","sender":{"id":"cli_other_bot","sender_type":"app"},
-                    "body":{"content":json!({"content":[[
-                       {"tag":"text","text":"Other bot says /repair @all <unsafe> "},
-                       {"tag":"media","file_key":"file_v3_video","file_name":"parent-video.mp4"}
-                    ]]}).to_string()}
-                }]}}))
-            }))
-            .route("/open-apis/im/v1/messages/{message}/resources/{key}",
-                get(|AxumPath((message, key)): AxumPath<(String, String)>, headers: HeaderMap| async move {
-                    assert_eq!(headers["authorization"], "Bearer quote-fixture");
-                    match (message.as_str(), key.as_str()) {
-                        ("om_direct", "file_v3_video") | ("om_no_decoder", "file_v3_no_decoder") => ([("content-type", "video/mp4")], VIDEO).into_response(),
-                        ("om_file", "file_v3_attachment") => ([("content-type", "application/pdf")], FILE).into_response(),
-                        ("om_denied", "img_denied") => StatusCode::FORBIDDEN.into_response(),
-                        ("om_slow", "file_v3_slow") => std::future::pending().await,
-                        _ => panic!("Resource server got unexpected source or key"),
-                    }
-                }))
-            .route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
-                let requests = requests.clone();
-                async move {
-                    requests.send(body).unwrap();
-                    Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
-                        "choices":[{"index":0,"message":{"role":"assistant","content":"Received."},"finish_reason":"stop"}],
-                        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}))
-                }
-            }));
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let binding = app.db.bot(&project.id).await?;
-        let event = json!({"header":{"event_type":"im.message.receive_v1","app_id":"cli_fixture"},
-            "event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_fixture"}},"message":{
-                "chat_id":"oc_fixture","chat_type":"p2p","message_type":"text","message_id":"om_current",
-                "root_id":"om_root","thread_id":"omt_discussion","parent_id":"om_direct",
-                "content":json!({"text":"Inspect these assets"}).to_string()
-            }}});
-        crate::feishu::ingest(&app, &binding, &serde_json::to_vec(&event)?)?;
-        crate::feishu::ingest(&app, &binding, &serde_json::to_vec(&event)?)?;
-        let file_id = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_file",
-            "Standalone file",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
-            "kind":"file","file_key":"file_v3_attachment","file_name":"report.pdf"}))?.unwrap();
-        let denied = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_denied",
-            "Ordinary steering still arrives",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
-            "resources":[{"kind":"image","file_key":"img_denied","file_name":"denied.png"}]}))?.unwrap();
-        let slow = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_slow",
-            "Slow download should still deliver",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
-            "resources":[{"kind":"file","file_key":"file_v3_slow","file_name":"slow.bin"}]}))?.unwrap();
-        let no_decoder = app.db.ingest_bot(&project.id,"cli_fixture","oc_fixture","om_no_decoder",
-            "Video fallback stays readable",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","root_id":"om_root"},
-            "kind":"video","file_key":"file_v3_no_decoder","file_name":"no-preview.mp4"}))?.unwrap();
-        app.db.sync(|c| {
-            assert_eq!(work::sync_inbound(c)?, 5);
-            assert!(claim(c, &project.id)?.is_none(), "Pending direct parent must be allowed to resolve");
-            Ok(())
-        })?;
-        assert!(crate::feishu::prepare_quote(&app).await?);
-        app.db.sync(|c| {
-            assert!(claim(c, &project.id)?.is_none(), "Resolved parent resources still need preparation");
-            Ok(())
-        })?;
-        assert!(!crate::feishu::prepare_quote(&app).await?);
-        let messages = app.db.messages(&project.id).await?;
-        assert_eq!(messages.len(), 5);
-        let message = messages.iter().find(|message| message.source_id == "om_current").unwrap();
-        let resources = crate::feishu::download_resources(&app,message).await?;
-        let failed = crate::feishu::download_resources(&app,&app.db.message(&denied).await?).await?;
-        assert!(failed[0]["local_path"].is_null());
-        assert_eq!(failed[0]["error"], "Feishu resource download returned HTTP 403");
-        let timed_out = crate::feishu::prepare_resources(&app, &app.db.message(&slow).await?,
-            Duration::from_millis(100), crate::video_preview::decoder).await?;
-        assert!(timed_out[0]["local_path"].is_null());
-        assert_eq!(timed_out[0]["error"], "Message resource preparation timed out (100 ms total)");
-        let degraded = crate::feishu::prepare_resources(&app, &app.db.message(&no_decoder).await?,
-            Duration::from_secs(5), |_| None).await?;
-        assert_eq!(degraded.len(), 1);
-        assert_eq!(std::fs::read(degraded[0]["local_path"].as_str().unwrap())?, VIDEO);
-        assert!(degraded[0]["frame_extraction_error"].as_str().unwrap().contains("was not found"));
-        let video = resources.iter().find(|r| r["kind"] == "media").unwrap();
-        assert_eq!(video["message_id"], "om_direct");
-        assert_eq!(video["quoted"], true);
-        assert_eq!(video["media_type"], "video/mp4");
-        assert_eq!(std::fs::read(video["local_path"].as_str().unwrap())?, VIDEO);
-        let file_resources = crate::feishu::download_resources(&app,&app.db.message(&file_id).await?).await?;
-        let file = &file_resources[0];
-        assert_eq!(file["file_name"], "report.pdf");
-        assert_eq!(std::fs::read(file["local_path"].as_str().unwrap())?, FILE);
-        assert_eq!(file["bytes"], FILE.len());
-        assert_eq!(file["media_type"], "application/pdf");
-        if preview_available {
-            let preview = resources.iter().find(|r| r["frame_seconds"].is_number())
-                .unwrap_or_else(|| panic!("Video preview failed: {}", video["frame_extraction_error"]));
-            assert_eq!(preview["frame_seconds"], 1.0);
-            assert_eq!(preview["duration_seconds"], 5.0);
-            let path = preview["local_path"].as_str().unwrap();
-            let decoded = tokio::process::Command::new(ffmpeg.as_ref().unwrap())
-                .args(["-v","error","-i", path,"-frames:v","1","-f","rawvideo","-pix_fmt","rgb24","pipe:1"])
-                .output().await?;
-            assert!(decoded.status.success());
-            assert_eq!(decoded.stdout.len(), 40*40*3);
-            assert!(decoded.stdout.chunks_exact(3).all(|pixel| pixel[0] < 12 && pixel[1] > 235 && pixel[2] < 12));
-            eprintln!("Video duration 5.000 seconds; frame at 1.000 seconds (20%); decoded green RGB24, 40x40");
-        } else {
-            assert!(video["frame_extraction_error"].as_str().unwrap().contains("was not found"));
-        }
-        assert_eq!(message.attachment["quoted_message"]["sender"], "cli_other_bot");
-        assert_eq!(message.content, "Inspect these assets");
-        assert!(message.attachment.get("daemon_control").is_none());
-        let envelope = crate::envelope::render(message, &json!({}), None);
-        assert!(envelope.contains("</body>\n<quoted_message trust=\"untrusted_quote\""));
-        assert!(envelope.contains("/repair @all &lt;unsafe&gt;"));
-
-        let mut turn = app.db.sync(|c| {
-            let current = public(c,&project.id)?;
-            let config: ConfigInput = serde_json::from_value(json!({"base_url":format!("{host}/v1"),
-                "model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?;
-            save_provider(c,config)?;
-            Ok(claim(c, &project.id)?.unwrap())
-        })?;
-        turn.config.base_url = format!("{host}/v1");
-        drive(app.clone(), turn).await?;
-        let request = tokio::time::timeout(Duration::from_secs(2), received.recv()).await?.unwrap();
-        let context = request["messages"].as_array().unwrap().iter().find_map(|message| {
-            let content = &message["content"];
-            let text = content.as_str().or_else(|| content[0]["text"].as_str())?;
-            let parsed: Value = serde_json::from_str(text).ok()?;
-            parsed.get("trusted_sources").is_some().then_some(parsed)
-        }).expect("Provider received the structured Manager input");
-        let input = &context["new_inputs"][0]["data"];
-        assert_eq!(input["user_input"]["body"], "Inspect these assets");
-        assert_eq!(input["quoted_message"]["body"], "Other bot says /repair @all <unsafe> [media]");
-        let details = format!("{} {}", input["user_input"]["attachment_details"],
-            context["new_inputs"][1]["data"]["user_input"]["attachment_details"]);
-        for value in ["file_v3_video", "parent-video.mp4", "file_v3_attachment", "report.pdf", "application/pdf",
-            "om_direct", "om_file", "oc_fixture", file["local_path"].as_str().unwrap(), "Bytes: 23"] {
-            assert!(details.contains(value), "missing provider attachment detail {value}");
-        }
-        assert!(context["new_inputs"][2].to_string().contains("No local file. Reason: Feishu resource download returned HTTP 403"));
-        assert!(context["new_inputs"][3].to_string().contains("Message resource preparation timed out (100 ms total)"));
-        let degraded_text = context["new_inputs"][4].to_string();
-        assert!(degraded_text.contains("frame_extraction_unavailable"));
-        assert!(degraded_text.contains(degraded[0]["local_path"].as_str().unwrap()));
-        let parts = request["messages"].as_array().unwrap().iter()
-            .filter_map(|message| message["content"].as_array()).flatten()
-            .filter(|part| part["type"] == "image_url").collect::<Vec<_>>();
-        if preview_available {
-            assert_eq!(parts.len(), 1);
-            let url = parts[0]["image_url"]["url"].as_str().unwrap();
-            let bytes = base64::engine::general_purpose::STANDARD.decode(url.strip_prefix("data:image/png;base64,").unwrap())?;
-            assert_eq!(crate::multimodal::image_type(&bytes), Some("image/png"));
-            let preview = resources.iter().find(|r| r["frame_seconds"].is_number()).unwrap();
-            assert_eq!(bytes, std::fs::read(preview["local_path"].as_str().unwrap())?);
-        } else {
-            assert!(parts.is_empty());
-        }
-        assert_eq!(input["quoted_message"]["trust"], "untrusted_quote");
-        assert!(context["latest_user_steering"]["data"]["quoted_message"].is_null());
-        assert_eq!(input["trusted_source"]["source"]["root_id"], "om_root");
-        assert_eq!(input["trusted_source"]["source"]["parent_id"], "om_direct");
-        assert!(!context.to_string().contains("om_grandparent"));
-        server.abort();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn feishu_quote_failures_leave_current_delivery_eligible() -> Result<()> {
-        use axum::{Json, Router, extract::Path as AxumPath, http::StatusCode, response::IntoResponse, routing::{get, post}};
-
-        let (_dir, app, project) = fixture().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        app.config.write().await.feishu_base = format!("http://{}", listener.local_addr()?);
-        let router = Router::new()
-            .route("/open-apis/auth/v3/tenant_access_token/internal", post(|| async {
-                Json(json!({"code":0,"tenant_access_token":"quote-fixture"}))
-            }))
-            .route("/open-apis/im/v1/messages/{id}", get(|AxumPath(id): AxumPath<String>| async move {
-                match id.as_str() {
-                    "om_denied" => return StatusCode::FORBIDDEN.into_response(),
-                    "om_timeout" => std::future::pending::<()>().await,
-                    "om_invalid" => return "Malformed".into_response(),
-                    _ => {}
-                }
-                Json(json!({"code":0,"data":{"items":[{
-                    "message_id":if id=="om_wrong_id" {"om_impostor"} else {&id},
-                    "chat_id":if id=="om_wrong_chat" {"oc_other"} else {"oc_fixture"},
-                    "deleted":id=="om_deleted",
-                    "msg_type":"text","sender":{"id":"cli_sender"},
-                    "body":{"content":"{\"text\":\"Never use this quote\"}"}
-                }]}})).into_response()
-            }));
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-
-        let cases = [
-            ("om_wrong_chat", "source_mismatch"),
-            ("om_wrong_id", "source_mismatch"),
-            ("om_denied", "permission_denied"),
-            ("om_timeout", "timeout"),
-            ("om_deleted", "deleted"),
-            ("om_invalid", "invalid_response"),
-        ];
-        for (parent, _) in cases {
-            assert!(app.db.ingest_routed_bot(&project.id, "cli_fixture", "oc_fixture",
-                &format!("reply_{parent}"), "Current user input",
-                &json!({"source":{"chat_type":"p2p","chat_id":"oc_fixture","message_type":"text","parent_id":parent}}))?.is_some());
-        }
-        ingest(&app, &project, "om_no_parent", "A plain input");
-        let turn = app.db.sync(|c| {
-            assert_eq!(work::sync_inbound(c)?, cases.len() + 1);
-            Ok(claim(c, &project.id)?.unwrap())
-        })?;
-        let prompt = prompt_context(&turn.checkpoint).unwrap();
-        assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), 1);
-        assert!(prompt.to_string().contains("A plain input"));
-        app.db.sync(|c| {
-            finish_turn(c, &turn.context, "Plain steering completed")?;
-            c.execute("UPDATE messages SET created_at=0 WHERE source_id='reply_om_timeout'", [])?;
-            let expired = claim(c, &project.id)?.unwrap();
-            let prompt = prompt_context(&expired.checkpoint).unwrap();
-            assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), 1);
-            assert!(prompt.to_string().contains("reply_om_timeout"));
-            finish_turn(c, &expired.context, "Expired quote does not hold delivery")
-        })?;
-        assert!(!prompt.to_string().contains("quoted_message"));
-
-        for (_, reason) in cases {
-            assert!(tokio::time::timeout(Duration::from_millis(2600), crate::feishu::prepare_quote(&app)).await??);
-            let messages = app.db.messages(&project.id).await?;
-            assert!(messages.iter().any(|m| m.attachment["quoted_message"]["reason"] == reason));
-        }
-        let messages = app.db.messages(&project.id).await?;
-        for (parent, reason) in cases {
-            let message = messages.iter().find(|m| m.source_id == format!("reply_{parent}")).unwrap();
-            let quote = &message.attachment["quoted_message"];
-            assert_eq!(quote["status"], "unavailable");
-            assert_eq!(quote["reason"], reason);
-            assert_eq!(quote["body"], "");
-            assert_eq!(message.content, "Current user input");
-            assert!(!crate::envelope::render(message, &json!({}), None).contains("<quoted_message"));
-        }
-        assert!(!crate::feishu::prepare_quote(&app).await?);
-        server.abort();
-        Ok(())
-    }
-
     #[tokio::test]
     async fn feishu_quote_cache_matches_exact_bot_chat_and_project() -> Result<()> {
         let (_dir, app, project) = fixture().await;
@@ -3581,425 +1714,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn langfuse_exports_private_metadata_without_waiting_for_the_collector() {
-        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
-        use base64::Engine;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        #[derive(Clone)]
-        struct Collector {
-            requests: tokio::sync::mpsc::UnboundedSender<(HeaderMap, Value)>,
-            model_calls: Arc<AtomicUsize>,
-        }
-        async fn collect(
-            State(state): State<Collector>,
-            headers: HeaderMap,
-            Json(body): Json<Value>,
-        ) -> Json<Value> {
-            state.requests.send((headers, body)).unwrap();
-            std::future::pending().await
-        }
-        async fn complete(State(state): State<Collector>) -> Json<Value> {
-            let message = if state.model_calls.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
-                json!({"role":"assistant","content":null,"tool_calls":[{
-                    "id":"call_fixture","type":"function",
-                    "function":{"name":"read_file","arguments":"{\"path\":\"private-file.txt\"}"}
-                }]})
-            } else {
-                json!({"role":"assistant","content":"private response body\nBearer fixture-model-secret"})
-            };
-            let finish = if message["tool_calls"].is_array() { "tool_calls" } else { "stop" };
-            Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
-                "choices":[{"index":0,"message":message,"finish_reason":finish}],
-                "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}))
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let host = format!("http://{}", listener.local_addr().unwrap());
-        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let state = Collector { requests, model_calls: Arc::new(AtomicUsize::new(0)) };
-        let router = Router::new()
-            .route("/api/public/otel/v1/traces", post(collect))
-            .route("/v1/chat/completions", post(complete))
-            .with_state(state);
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-
-        // Generate throwaway auth material at runtime. The fixture never uses a real key.
-        let public = uuid::Uuid::new_v4().simple().to_string();
-        let secret = uuid::Uuid::new_v4().simple().to_string();
-        let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{public}:{secret}")));
-        for mode in ["default", "disabled", "invalid", "stalled", "metadata_only", "content", "unreachable"] {
-            let dir = tempfile::tempdir().unwrap();
-            let store = dir.path().join("store");
-            if mode != "default" {
-                crate::config::private_dir(&store).unwrap();
-                let endpoint = match mode {
-                    "invalid" => format!("{host}/invalid"),
-                    "unreachable" => "http://127.0.0.1:0".into(),
-                    _ => host.clone(),
-                };
-                let mut config = json!({
-                    "enabled":mode!="disabled", "host":endpoint, "public_key":public, "secret_key":secret
-                });
-                if matches!(mode, "metadata_only" | "content") {
-                    config["include_content"] = json!(mode == "content");
-                }
-                crate::config::write_private(&store.join("langfuse.json"), &serde_json::to_vec(&config).unwrap()).unwrap();
-            }
-            let (app, project) = fixture_at(dir.path()).await;
-            assert_eq!(app.manager_telemetry.is_some(), matches!(mode, "stalled" | "metadata_only" | "content" | "unreachable"));
-            fs::write(Path::new(&project.path).join("private-file.txt"), "private file body fixture-tool-secret").unwrap();
-            let messages = if matches!(mode, "stalled" | "metadata_only" | "content") { 2 } else { 1 };
-            let input = format!("private user message\n{}\nUSER-TAIL\nsecret = fixture-user-secret",
-                "长正文样例。".repeat(if mode == "content" { 700 } else { 1 }));
-            for index in 0..messages {
-                ingest(&app, &project, &format!("om_private_{index}"), &input);
-            }
-            let mut turn = app.db.sync(|c| {
-                work::sync_inbound(c)?;
-                Ok(claim(c, &project.id)?.unwrap())
-            }).unwrap();
-            turn.config.base_url = format!("{host}/v1");
-            let run = turn.context.run.clone();
-            tokio::time::timeout(Duration::from_secs(2), drive(app.clone(), turn))
-                .await.expect("Manager must not wait for telemetry").unwrap();
-            assert_eq!(app.db.sync(|c| Ok(c.query_row(
-                "SELECT status FROM manager_runs WHERE id=?", [run], |row| row.get::<_,String>(0)
-            )?)).unwrap(), "complete");
-
-            if !matches!(mode, "stalled" | "metadata_only" | "content") {
-                assert!(tokio::time::timeout(Duration::from_millis(100), received.recv()).await.is_err());
-                continue;
-            }
-            let (headers, payload) = tokio::time::timeout(Duration::from_secs(2), received.recv())
-                .await.unwrap().unwrap();
-            assert!(headers["authorization"] == auth.as_str(), "Expected Basic authentication");
-            assert_eq!(headers["content-type"], "application/json");
-            let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
-            assert_eq!(spans.len(), 10);
-            let mut traces = HashSet::new();
-            for group in spans.chunks_exact(5) {
-                assert_eq!(group[0]["name"], "manager.interaction");
-                assert_eq!(group[0]["status"]["code"], 1);
-                let trace = group[0]["traceId"].as_str().unwrap();
-                assert_eq!(trace.len(), 32);
-                assert!(traces.insert(trace));
-                for span in &group[1..] {
-                    assert_eq!(span["traceId"], trace);
-                    assert_eq!(span["parentSpanId"], group[0]["spanId"]);
-                    assert_eq!(span["spanId"].as_str().unwrap().len(), 16);
-                    assert_eq!(span["status"]["code"], 1);
-                    let timestamp = |key: &str| span[key].as_str().unwrap().parse::<u128>().unwrap();
-                    assert!(timestamp("endTimeUnixNano") >= timestamp("startTimeUnixNano"));
-                }
-                assert_eq!(group[1]["name"], "manager.user_input");
-                assert_eq!(group[2]["name"], "manager.generation");
-                assert_eq!(group[3]["name"], "read_file");
-                assert_eq!(group[4]["name"], "manager.generation");
-                assert!(group[2]["attributes"].as_array().unwrap().contains(&json!({
-                    "key":"gen_ai.usage.input_tokens","value":{"intValue":"3"}
-                })));
-                assert!(group[2]["attributes"].as_array().unwrap().contains(&json!({
-                    "key":"gen_ai.request.model","value":{"stringValue":"fixture-manager"}
-                })));
-            }
-            let export = payload.to_string();
-            let debug = format!("{:?}", app.manager_telemetry);
-            for forbidden in [&*secret, &*public, "om_private", "private file body", "fixture-user-secret", "fixture-model-secret", "fixture-tool-secret"] {
-                assert!(!export.contains(forbidden), "Sensitive data must not be exported");
-                assert!(!debug.contains(forbidden), "Sensitive data must not appear in Debug");
-            }
-            let attribute = |index: usize, key: &str| spans[index]["attributes"].as_array().unwrap()
-                .iter().find(|a| a["key"] == key).and_then(|a| a["value"]["stringValue"].as_str())
-                .map(|value| serde_json::from_str::<String>(value).unwrap());
-            if mode == "content" {
-                for index in [0, 1, 2] {
-                    let body = attribute(index, "langfuse.observation.input").unwrap();
-                    assert!(body.contains("private user message"));
-                    assert!(body.contains("USER-TAIL"));
-                }
-                assert_eq!(attribute(3, "langfuse.observation.input").as_deref(), Some("private-file.txt"));
-                assert_eq!(attribute(3, "langfuse.observation.output").as_deref(), Some("ok"));
-                assert!(attribute(4, "langfuse.observation.output").unwrap().contains("private response body"));
-            } else {
-                assert!(!export.contains("langfuse.observation.input"));
-                assert!(!export.contains("langfuse.observation.output"));
-                assert!(!export.contains("private user message"));
-                assert!(!export.contains("private response body"));
-            }
-        }
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn debug_replies_echo_first_prompt_before_provider_without_outbox_records() {
-        use axum::{
-            Json, Router,
-            extract::{Path as RoutePath, State},
-            http::StatusCode,
-            routing::post,
-        };
-
-        type Journal = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
-        async fn auth() -> Json<Value> {
-            Json(json!({"code":0,"tenant_access_token":"fixture-token","expire":3600}))
-        }
-        async fn echo(
-            State(journal): State<Journal>,
-            RoutePath(anchor): RoutePath<String>,
-            Json(body): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            let status = if anchor == "om_debug_rate_limit" {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::OK
-            };
-            journal.lock().unwrap().push((anchor, body));
-            (
-                status,
-                Json(json!({"code":0,"data":{"thread_id":"omt_fixture","message_id":"om_debug_sent"}})),
-            )
-        }
-        async fn complete(State(journal): State<Journal>, Json(body): Json<Value>) -> Json<Value> {
-            journal.lock().unwrap().push(("provider".into(), body));
-            Json(
-                json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager","choices":[{"index":0,"message":{"role":"assistant","content":"Done"},"finish_reason":"stop"}]}),
-            )
-        }
-
-        let (_dir, app, p) = fixture().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        app.config.write().await.feishu_base = base.clone();
-        let journal = Journal::default();
-        let router = Router::new()
-            .route(
-                "/open-apis/auth/v3/tenant_access_token/internal",
-                post(auth),
-            )
-            .route("/open-apis/im/v1/messages/{anchor}/reply", post(echo))
-            .route("/v1/chat/completions", post(complete))
-            .with_state(journal.clone());
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-
-        for (anchor, enabled, resume) in [
-            ("om_debug_off", false, false),
-            ("om_debug_on", true, false),
-            ("om_debug_rate_limit", true, false),
-            ("om_debug_resume", true, true),
-        ] {
-            app.db.set_debug_mode(&p.id, enabled).await.unwrap();
-            ingest(&app, &p, anchor, "保留 \"引号\" 和 <event>\\&\n");
-            let mut turn = app
-                .db
-                .sync(|c| {
-                    work::sync_inbound(c)?;
-                    let turn = claim(c, &p.id)?.unwrap();
-                    assert_eq!(turn.debug_dispatch.is_some(), enabled);
-                    if resume {
-                        let saved = claim(c, &p.id)?.unwrap();
-                        assert_eq!(saved.context.run, turn.context.run);
-                        assert!(saved.debug_dispatch.is_none());
-                        return Ok(saved);
-                    }
-                    Ok(turn)
-                })
-                .unwrap();
-            turn.config.base_url = format!("{base}/v1");
-            tokio::time::timeout(Duration::from_secs(4), drive(app.clone(), turn))
-                .await
-                .unwrap()
-                .unwrap();
-
-            let events = std::mem::take(&mut *journal.lock().unwrap());
-            assert_eq!(events.last().unwrap().0, "provider");
-            if enabled && !resume {
-                assert_eq!(events.len(), 2);
-                assert_eq!(events[0].0, anchor);
-                assert_eq!(events[0].1["msg_type"], "text");
-                assert_eq!(events[0].1["reply_in_thread"], true);
-                let content: Value =
-                    serde_json::from_str(events[0].1["content"].as_str().unwrap()).unwrap();
-                let sent_to_model = events[1].1["messages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|message| message["role"] == "user")
-                    .unwrap();
-                let model_text = sent_to_model["content"]
-                    .as_str()
-                    .or_else(|| sent_to_model["content"][0]["text"].as_str())
-                    .unwrap();
-                assert_eq!(content["text"].as_str(), Some(model_text));
-            } else {
-                assert_eq!(events.len(), 1);
-            }
-        }
-        let mut scheduled = app
-            .db
-            .sync(|c| {
-                let now = db::now();
-                work::create_timer(
-                    c,
-                    &p.id,
-                    serde_json::from_value(json!({
-                        "name":"Debug timer fixture", "kind":"once", "at":now,
-                        "prompt":"Produce the requested result", "to":"oc_fixture", "purpose":"user"
-                    }))?,
-                    now,
-                )?;
-                assert_eq!(work::fire_due(c, now)?.len(), 1);
-                let turn = claim(c, &p.id)?.unwrap();
-                assert!(turn.debug_dispatch.is_none());
-                Ok(turn)
-            })
-            .unwrap();
-        scheduled.config.base_url = format!("{base}/v1");
-        tokio::time::timeout(Duration::from_secs(4), drive(app.clone(), scheduled))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(journal.lock().unwrap()[0].0, "provider");
-        assert_eq!(journal.lock().unwrap().len(), 1);
-        app.db
-            .sync(|c| {
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM messages WHERE direction='out'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    0
-                );
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM manager_failures", [], |r| r
-                        .get::<_, i64>(0))?,
-                    0
-                );
-                Ok(())
-            })
-            .unwrap();
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn manager_stops_ignored_terminal_observation_without_exhausting_model_turns() {
-        use axum::{Json, Router, extract::State, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-        async fn poll(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
-            let index = calls.fetch_add(1, Ordering::SeqCst);
-            Json(json!({
-                "id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager",
-                "choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
-                    {"id":format!("view-{index}"),"type":"function","function":{
-                        "name":"cli_view","arguments":json!({"generation":"g"}).to_string()
-                    }}
-                ]},"finish_reason":"tool_calls"}]
-            }))
-        }
-
-        let (dir, app, p) = fixture().await;
-        app.config.write().await.herdr_session = dir.path().to_string_lossy().into();
-        let socket = crate::herdr::socket_path(&app.config.read().await.clone()).unwrap();
-        let herdr = tokio::net::UnixListener::bind(socket).unwrap();
-        let polls = Arc::new(AtomicUsize::new(0));
-        let reads = polls.clone();
-        let project_id = p.id.clone();
-        let herdr_server = tokio::spawn(async move {
-            loop {
-                let (stream, _) = herdr.accept().await.unwrap();
-                let (read, mut write) = stream.into_split();
-                let line = BufReader::new(read).lines().next_line().await.unwrap().unwrap();
-                let request: Value = serde_json::from_str(&line).unwrap();
-                let result = match request["method"].as_str().unwrap() {
-                    "pane.get" => json!({"pane":{
-                        "pane_id":"pane","terminal_id":"terminal","workspace_id":"workspace",
-                        "tokens":{"hfb_owner":"dauerbot","hfb_project":project_id,
-                            "hfb_generation":"g","hfb_execution":"owned"}
-                    }}),
-                    "agent.get" => json!({"agent":{
-                        "pane_id":"pane","terminal_id":"terminal","workspace_id":"workspace","agent":"codex"
-                    }}),
-                    "pane.process_info" => json!({"process_info":{
-                        "foreground_processes":[{"name":"codex"}]
-                    }}),
-                    "pane.read" => {
-                        reads.fetch_add(1, Ordering::SeqCst);
-                        json!({"read":{"pane_id":"pane","text":"Stable terminal output"}})
-                    }
-                    method => panic!("Unexpected HERDR operation: {method}"),
-                };
-                let response = json!({"id":request["id"],"result":result}).to_string() + "\n";
-                write.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let model_calls = Arc::new(AtomicUsize::new(0));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
-        let router = Router::new().route("/v1/chat/completions", post(poll)).with_state(model_calls.clone());
-        let provider = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-
-        ingest(&app, &p, "om_terminal_stall", "Check the worker once");
-        let mut turn = app.db.sync(|c| {
-            c.execute("UPDATE projects SET generation='g',terminal='terminal',ready=1,execution=? WHERE id=?",
-                params![json!({"backend":"legacy","workspace_id":"workspace","pane_id":"pane",
-                    "terminal_id":"terminal","managed_name":"owned","generation":"g",
-                    "shell_pid":null,"launch_permit":"/tmp/fixture-only"}).to_string(), p.id])?;
-            work::sync_inbound(c)?;
-            Ok(claim(c, &p.id)?.unwrap())
-        }).unwrap();
-        turn.config.base_url = endpoint;
-        let run = turn.context.run.clone();
-        tokio::time::timeout(Duration::from_secs(10), drive(app.clone(), turn))
-            .await.unwrap().unwrap();
-        provider.abort();
-        herdr_server.abort();
-
-        assert_eq!(polls.load(Ordering::SeqCst), 4);
-        assert_eq!(model_calls.load(Ordering::SeqCst), 6);
-        app.db.sync(|c| {
-            let (status, error): (String, String) = c.query_row(
-                "SELECT status,error FROM manager_runs WHERE id=?", [&run],
-                |r| Ok((r.get(0)?, r.get(1)?)))?;
-            assert_eq!(status,"complete");
-            assert!(error.is_empty());
-            let stops: i64 = c.query_row(
-                "SELECT count(*) FROM manager_effects WHERE run_id=? AND json_extract(result,'$.reason')='terminal_output_unchanged'",
-                [&run], |r| r.get(0))?;
-            assert_eq!(stops, 3);
-            Ok(())
-        }).unwrap();
-    }
-
-    #[tokio::test]
-    async fn upgrade_yield_preserves_run_claims_and_stop_authority() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_upgrade", "Continue this task across upgrade");
-        let turn = app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            Ok(claim(c, &p.id)?.unwrap())
-        }).unwrap();
-        let run = turn.context.run.clone();
-        let checkpoint = turn.checkpoint.clone();
-        app.service.manager_gate.close_for_test().await.unwrap();
-        // The fixture provider is unreachable: yielding must not issue a request
-        // or settle/requeue the claimed input as a new task.
-        drive(app.clone(), turn).await.unwrap();
-        assert!(app.service.gate.enter().is_some());
-        let resumed = app.db.sync(|c| Ok(claim(c, &p.id)?.unwrap())).unwrap();
-        assert_eq!(resumed.context.run, run);
-        assert_eq!(resumed.checkpoint, checkpoint);
-        app.db.sync(|c| {
-            assert_eq!(c.query_row("SELECT count(*) FROM manager_input_claims WHERE run_id=?", [&run], |r| r.get::<_, i64>(0))?, 1);
-            stop(c, &p.id)?;
-            assert!(valid(c, &resumed.context).is_err());
-            assert_eq!(c.query_row("SELECT status FROM manager_runs WHERE id=?", [&run], |r| r.get::<_, String>(0))?, "stopped");
-            Ok(())
-        }).unwrap();
-    }
-    #[tokio::test]
     async fn image_capability_is_explicit_and_resets_when_provider_identity_changes() {
         let (_dir, app, p) = fixture().await;
         app.db.sync(|c| {
@@ -4007,7 +1721,7 @@ mod tests {
             assert_eq!(original["supports_images"], false);
             let configure = |model: &str, declared: Option<bool>| -> Result<Value> {
                 let current = public(c, &p.id)?;
-                save_provider(c, ConfigInput { base_url: current["base_url"].as_str().unwrap().into(), model: model.into(), api_key: None, clear_api_key: false, expected_revision: current["revision"].as_i64().unwrap(), supports_images: declared })
+                save_provider(c, ConfigInput { provider_kind: None, context_window: None, base_url: current["base_url"].as_str().unwrap().into(), model: model.into(), api_key: None, clear_api_key: false, expected_revision: current["revision"].as_i64().unwrap(), supports_images: declared })
             };
             assert_eq!(configure("fixture-vision-name-is-not-proof", None)?["supports_images"], false);
             assert_eq!(configure("fixture-vision-name-is-not-proof", Some(true))?["supports_images"], true);
@@ -4017,90 +1731,6 @@ mod tests {
             let current = public(c, &p.id)?;
             let changed: ConfigInput = serde_json::from_value(json!({"base_url":"http://127.0.0.1:8/v1","model":"different-model","expected_revision":current["revision"]}))?;
             assert_eq!(save_provider(c, changed)?["supports_images"], false);
-            Ok(())
-        }).unwrap();
-    }
-    #[tokio::test]
-    async fn prepared_image_claim_uses_fresh_host_metadata_and_plain_steering_does_not_wait() {
-        let (_dir, app, p) = fixture().await;
-        let id = app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture","om_pixels","Inspect picture",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p"},"resources":[{"kind":"image","file_key":"img_fixture","local_path":"/untrusted/body/spy.png"}]})).unwrap().unwrap();
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                assert!(claim(c, &p.id)?.is_none());
-                Ok(())
-            })
-            .unwrap();
-        ingest(&app, &p, "om_plain_after_pixels", "Change direction now");
-        let inline_checkpoint = app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            let plain = claim(c, &p.id)?.unwrap();
-            assert!(plain.checkpoint["images"].as_array().unwrap().is_empty());
-            finish_turn(c, &plain.context, "accepted steering")?;
-            let mut resource = crate::multimodal::fixture_resource(&app.dir, &p.id, &id);
-            resource["cache_source_id"] = json!("om_pixels");
-            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true'),'$.resources',json(?)) WHERE id=?",params![json!([resource]).to_string(),id])?;
-            let text_only = claim(c, &p.id)?.unwrap();
-            assert!(text_only.checkpoint["images"].as_array().unwrap().is_empty());
-            assert!(text_only.checkpoint.to_string().contains("image_capability_not_declared"));
-            let image_input: String = c.query_row("SELECT i.id FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id WHERE e.message_id=?", [&id], |r|r.get(0))?;
-            assert_eq!(c.query_row("SELECT status FROM manager_inputs WHERE id=?", [&image_input], |r|r.get::<_,String>(0))?, "processing");
-            let current = public(c,&p.id)?;
-            let config: ConfigInput = serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?;
-            save_provider(c,config)?;
-            let inline = claim(c,&p.id)?.unwrap();
-            assert_eq!(inline.checkpoint["images"].as_array().unwrap().len(),1);
-            assert_eq!(inline.checkpoint["images"][0]["message_id"],id);
-            assert!(!inline.checkpoint.to_string().contains("/untrusted/body/spy.png"));
-            assert_eq!(c.query_row("SELECT run_id FROM manager_input_claims WHERE input_id=?", [&image_input], |r|r.get::<_,String>(0))?, inline.context.run);
-            Ok(inline.checkpoint)
-        }).unwrap();
-        let rig_agent::run::AgentRunStep::CallModel {
-            mut prompt,
-            mut history,
-            ..
-        } = serde_json::from_value(inline_checkpoint["pending"].clone()).unwrap()
-        else {
-            panic!("initial model request")
-        };
-        let refs: Vec<crate::multimodal::ImageRef> =
-            serde_json::from_value(inline_checkpoint["images"].clone()).unwrap();
-        let decisions = crate::multimodal::hydrate(
-            &mut prompt,
-            &mut history,
-            &refs,
-            inline_checkpoint["image_input_digest"].as_str(),
-            true,
-        )
-        .await;
-        assert_eq!(decisions[0]["mode"], "image_part");
-        let encoded_prompt = serde_json::to_string(&prompt).unwrap();
-        assert!(encoded_prompt.contains(r#""type":"image""#));
-        assert!(encoded_prompt.contains("continuing_inputs"));
-    }
-    #[tokio::test]
-    async fn image_pixels_never_cross_the_newest_trusted_discussion_scope() {
-        let (_dir, app, p) = fixture().await;
-        let mut messages = Vec::new();
-        for (index, chat) in ["oc_first", "oc_second", "oc_second"]
-            .into_iter()
-            .enumerate()
-        {
-            let id = app.db.ingest_bot(&p.id,"cli_fixture",chat,&format!("om_{chat}_{index}"),"Inspect image",&json!({"source":{"chat_id":chat,"chat_type":"p2p"},"resources":[{"kind":"image","file_key":"img_fixture"}]})).unwrap().unwrap();
-            let mut resource = crate::multimodal::fixture_resource(&app.dir, &p.id, &id);
-            resource["cache_source_id"] = json!(format!("om_{chat}_{index}"));
-            app.db.sync(|c| { c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true'),'$.resources',json(?)) WHERE id=?",params![json!([resource]).to_string(),id])?;Ok(()) }).unwrap();
-            messages.push(id);
-        }
-        app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            let current = public(c,&p.id)?;
-            save_provider(c,serde_json::from_value(json!({"base_url":current["base_url"],"model":current["model"],"expected_revision":current["revision"],"supports_images":true}))?)?;
-            let turn = claim(c,&p.id)?.unwrap();
-            assert_eq!(turn.checkpoint["images"].as_array().unwrap().len(),2);
-            let ids = turn.checkpoint["images"].as_array().unwrap().iter().map(|image|image["message_id"].as_str().unwrap()).collect::<Vec<_>>();
-            assert!(ids.contains(&messages[1].as_str()) && ids.contains(&messages[2].as_str()) && !ids.contains(&messages[0].as_str()));
-            assert!(turn.checkpoint.to_string().contains("different_discussion_scope"));
             Ok(())
         }).unwrap();
     }
@@ -4145,9 +1775,9 @@ mod tests {
             c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true'),'$.resources',json(?)) WHERE id=?",params![json!(resources).to_string(),id])?;
             work::sync_inbound(c)?;
             let origin: String = c.query_row("SELECT id FROM work_events WHERE message_id=?",[&id],|r|r.get(0))?;
-            let (_,_,scope) = image_source(c,&p.id,&origin)?.unwrap();
+
             let mut data = json!({});
-            let refs = prepare_images(c,&p.id,Some(&origin),Some(&scope),true,0,&mut data)?;
+            let refs = prepare_images(c,&p.id,Some(&origin),&mut data)?;
             assert_eq!(refs.len(),crate::multimodal::MAX_IMAGES);
             let resources = data["user_input"]["resources"].as_array().unwrap();
             assert_eq!(resources[0]["image_delivery"]["reason"],"image_size_limit");
@@ -4160,1372 +1790,6 @@ mod tests {
             Ok(())
         }).unwrap();
     }
-    fn receipt_args(anchor: &str) -> MessageArgs {
-        MessageArgs {
-            to: "oc_fixture".into(),
-            text: "收到，我先核对现状再给你结论。".into(),
-            reply_to_message_id: Some(anchor.into()),
-            intent: Some(MessageIntent::Receipt),
-            source_event_id: None,
-        }
-    }
-    #[tokio::test]
-    async fn owned_single_and_full_batches_ignore_receipts_and_recover_effects_once() {
-        for count in [1, 3, 32] {
-            let (_dir, app, p) = fixture().await;
-            for n in 0..count {
-                ingest(&app, &p, &format!("om_owned_{n}"), &format!("ordered-{n}"));
-            }
-            let first = app
-                .db
-                .sync(|c| {
-                    work::sync_inbound(c)?;
-                    Ok(claim(c, &p.id)?.unwrap())
-                })
-                .unwrap();
-            let origin=app.db.sync(|c|Ok(c.query_row("SELECT origin_event_id FROM manager_inputs WHERE project_id=? ORDER BY rowid LIMIT 1",[&p.id],|r|r.get::<_,String>(0))?)).unwrap();
-            let call = ToolCall {
-                occurrence: "test:confirmed-delegate".into(),
-                name: "delegate".into(),
-                arguments: json!({"instructions":"one complete assignment","source_event_id":origin}),
-            };
-            let delegated = tool(&app, &first.context, call.clone()).await.unwrap();
-            let saved = first.checkpoint.clone();
-            app.db.sync(|c| {
-                assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",[],|r|r.get::<_,i64>(0))?,count);
-                assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='queued'",[],|r|r.get::<_,i64>(0))?,0);
-                let prompt=prompt_context(&first.checkpoint).unwrap();
-                let bodies=prompt["new_inputs"].as_array().unwrap().iter().map(|v|v["data"]["user_input"]["body"].as_str().unwrap()).collect::<Vec<_>>();
-                assert_eq!(bodies,(0..count).map(|n|format!("ordered-{n}")).collect::<Vec<_>>());
-                db::enqueue_out_request(c,&p.id,"cli_fixture","confirmed-fixture-reply","one result",json!({"to":"oc_fixture","reply_to_message_id":"om_owned_0"}))?;
-                for n in 0..4 {observation(c,&p.id,"worker_run",&format!("receipt-{n}"),"settled",Some(&origin),&json!({"kind":"worker_run","semantic_task_success":"unconfirmed"}))?;}
-                assert!(valid(c,&first.context).is_ok());
-                let same=claim(c,&p.id)?.unwrap();assert_eq!(same.context.run,first.context.run);assert_eq!(same.checkpoint,saved);
-                assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_run_inputs WHERE run_id=?",[&same.context.run],|r|r.get::<_,i64>(0))?,count);
-                // Process loss after a tool was reserved must preserve uncertainty, not replay it.
-                c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('interrupted-tool',?,'test:uncertain','delegate',?,'submitting')",params![first.context.run,json!({"instructions":"uncertain assignment","source_event_id":origin}).to_string()])?;
-                c.execute("UPDATE manager_runs SET owner='previous-host' WHERE id=?",[&first.context.run])?;
-                migrate(c,true)?;
-                let resumed=claim(c,&p.id)?.unwrap();assert_eq!(resumed.context.run,first.context.run);assert_eq!(resumed.checkpoint,saved);
-                assert_eq!(c.query_row("SELECT status FROM manager_effects WHERE id='interrupted-tool'",[],|r|r.get::<_,String>(0))?,"uncertain");
-                Ok(())
-            }).unwrap();
-            assert_eq!(tool(&app, &first.context, call).await.unwrap(), delegated);
-            let uncertain=tool(&app,&first.context,ToolCall{occurrence:"test:uncertain".into(),name:"delegate".into(),arguments:json!({"instructions":"uncertain assignment","source_event_id":origin})}).await.unwrap();
-            assert_eq!(uncertain["status"], "uncertain");
-            app.db
-                .sync(|c| {
-                    assert_eq!(
-                        c.query_row(
-                            "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                            [],
-                            |r| r.get::<_, i64>(0)
-                        )?,
-                        1
-                    );
-                    assert_eq!(
-                        c.query_row(
-                            "SELECT COUNT(*) FROM messages WHERE direction='out'",
-                            [],
-                            |r| r.get::<_, i64>(0)
-                        )?,
-                        1
-                    );
-                    finish_turn(c, &first.context, "original batch complete")?;
-                    assert_eq!(
-                        c.query_row(
-                            "SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",
-                            [],
-                            |r| r.get::<_, i64>(0)
-                        )?,
-                        count
-                    );
-                    let receipts = claim(c, &p.id)?.unwrap();
-                    assert_ne!(receipts.context.run, first.context.run);
-                    let prompt = prompt_context(&receipts.checkpoint).unwrap();
-                    assert_eq!(prompt["new_inputs"].as_array().unwrap().len(), 4);
-                    assert!(
-                        prompt["new_inputs"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .all(|v| v["kind"] == "worker"
-                                && v["data"]["semantic_task_success"] == "unconfirmed")
-                    );
-                    finish_turn(c, &receipts.context, "receipt evidence considered")?;
-                    assert!(claim(c, &p.id)?.is_none());
-                    Ok(())
-                })
-                .unwrap();
-        }
-    }
-    #[tokio::test]
-    async fn legacy_queued_working_members_are_adopted_atomically_without_new_claim() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_legacy_batch", "legacy request");
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let original = claim(c, &p.id)?.unwrap();
-                c.execute("DELETE FROM manager_input_claims", [])?;
-                c.execute("UPDATE manager_inputs SET status='queued'", [])?;
-                c.execute(
-                    "UPDATE manager_runs SET owner='legacy-host' WHERE id=?",
-                    [&original.context.run],
-                )?;
-                let resumed = claim(c, &p.id)?.unwrap();
-                assert_eq!(resumed.context.run, original.context.run);
-                assert_eq!(resumed.checkpoint, original.checkpoint);
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "processing"
-                );
-                assert_eq!(
-                    c.query_row("SELECT run_id FROM manager_input_claims", [], |r| r
-                        .get::<_, String>(0))?,
-                    original.context.run
-                );
-                finish_turn(c, &resumed.context, "legacy work continued")?;
-                assert!(claim(c, &p.id)?.is_none());
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn full_owned_batch_accepts_urgent_user_steering_without_claiming_it_twice() {
-        let (_dir, app, p) = fixture().await;
-        for n in 0..32 {
-            ingest(&app, &p, &format!("om_full_{n}"), &format!("old goal {n}"));
-        }
-        let first = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                Ok(claim(c, &p.id)?.unwrap())
-            })
-            .unwrap();
-        app.db
-            .sync(|c| {
-                for n in 0..40 {
-                    input(
-                        c,
-                        &p.id,
-                        &format!("worker-pending-{n}"),
-                        None,
-                        "worker",
-                        &json!({"status":"settled","semantic_task_success":"unconfirmed"}),
-                    )?;
-                }
-                assert!(valid(c, &first.context).is_ok());
-                Ok(())
-            })
-            .unwrap();
-        ingest(
-            &app,
-            &p,
-            "om_urgent_correction",
-            "Do not release; preserve the latest correction.",
-        );
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                assert!(valid(c, &first.context).is_err());
-                let next = claim(c, &p.id)?.unwrap();
-                let context = prompt_context(&next.checkpoint).unwrap();
-                assert_ne!(next.context.run, first.context.run);
-                assert_eq!(context["continuing_inputs"].as_array().unwrap().len(), 32);
-                assert_eq!(context["new_inputs"].as_array().unwrap().len(), 32);
-                assert_eq!(context["steering_priority"], true);
-                assert_eq!(
-                    context["new_inputs"].as_array().unwrap().last().unwrap()["data"]["user_input"]
-                        ["body"],
-                    "Do not release; preserve the latest correction."
-                );
-                let correction = context["latest_user_steering"]["source_event_id"]
-                    .as_str()
-                    .unwrap();
-                assert!(select_origin(c, &next.context, Some(correction)).is_ok());
-                let mut receipt = receipt_args("om_urgent_correction");
-                receipt.source_event_id = Some(correction.into());
-                assert!(enqueue_receipt(c, &next.context, "correction-receipt", &receipt)?.1);
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_input_claims WHERE run_id=?",
-                        [&next.context.run],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    64
-                );
-                finish_turn(c, &next.context, "continued goals with latest correction")?;
-                let rest = claim(c, &p.id)?.unwrap();
-                let context = prompt_context(&rest.checkpoint).unwrap();
-                assert_eq!(context["new_inputs"].as_array().unwrap().len(), 9);
-                assert_eq!(context["latest_user_steering"]["already_consumed"], true);
-                assert_eq!(
-                    context["latest_user_steering"]["data"]["user_input"]["body"],
-                    "Do not release; preserve the latest correction."
-                );
-                finish_turn(c, &rest.context, "remaining receipt batch")?;
-                assert!(claim(c, &p.id)?.is_none());
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn repeated_user_steering_pages_continuations_without_unbounded_context_or_loss() {
-        let (_dir, app, p) = fixture().await;
-        // Large trusted metadata makes unconstrained continuation growth exceed
-        // the real context ceiling after only a few interruptions.
-        for n in 0..32 {
-            app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",&format!("om_page_{n}"),&format!("original-{n}"),&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"extra_metadata":"m".repeat(2800)}})).unwrap();
-        }
-        let mut previous = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                Ok(claim(c, &p.id)?.unwrap())
-            })
-            .unwrap();
-        for round in 0..5 {
-            app.db
-                .sync(|c| {
-                    for n in 0..36 {
-                        input(
-                            c,
-                            &p.id,
-                            &format!("page-worker-{round}-{n}"),
-                            None,
-                            "worker",
-                            &json!({"kind":"worker_run","semantic_task_success":"unconfirmed"}),
-                        )?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-            ingest(
-                &app,
-                &p,
-                &format!("om_page_steer_{round}"),
-                &format!("latest-directive-{round}"),
-            );
-            previous=app.db.sync(|c|{
-                work::sync_inbound(c)?;assert!(valid(c,&previous.context).is_err());let next=claim(c,&p.id)?.unwrap();let context=prompt_context(&next.checkpoint).unwrap();
-                assert!(context["continuing_inputs"].as_array().unwrap().len()<=32);
-                assert!(context["new_inputs"].as_array().unwrap().len()<=32);
-                assert!(context.to_string().len()<=250000);
-                assert_eq!(context["new_inputs"].as_array().unwrap().last().unwrap()["data"]["user_input"]["body"],format!("latest-directive-{round}"));Ok(next)
-            }).unwrap();
-        }
-        app.db.sync(|c| {
-            // Many inputs have durable owners, but only one bounded page moves
-            // to the latest run. Unseen pages are not consumed or re-queued.
-            let owned:i64=c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",[],|r|r.get(0))?;
-            assert!(owned>64);
-            finish_turn(c,&previous.context,"latest steering applied")?;
-            assert!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",[],|r|r.get::<_,i64>(0))?>0);
-            for _ in 0..20 {
-                let Some(next)=claim(c,&p.id)? else {break};let context=prompt_context(&next.checkpoint).unwrap();
-                assert!(context.to_string().len()<=250000);
-                assert!(context["latest_user_steering"].to_string().contains("latest-directive-4"));
-                finish_turn(c,&next.context,"bounded continuation page consumed")?;
-            }
-            assert!(claim(c,&p.id)?.is_none());
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status IN ('queued','processing')",[],|r|r.get::<_,i64>(0))?,0);
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",[],|r|r.get::<_,i64>(0))?,32+5*37);Ok(())
-        }).unwrap();
-    }
-    #[tokio::test]
-    async fn continuation_journal_pages_evicted_uncertainty_and_rejects_unowned_inputs() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_journal", "original task");
-        app.db.sync(|c| {
-            work::sync_inbound(c)?;let original=claim(c,&p.id)?.unwrap();
-            let input_id:String=c.query_row("SELECT input_id FROM manager_input_claims WHERE run_id=?",[&original.context.run],|r|r.get(0))?;
-            let args=json!({"instructions":"original uncertain delegation"});
-            c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES('old-uncertain',?,'original','delegate',?,'uncertain',?)",params![original.context.run,args.to_string(),json!({"status":"uncertain","event_id":"not-safe-to-replay"}).to_string()])?;
-            for n in 0..40 {c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES(?,?,?,'read_file','{}','complete','{}')",params![format!("recent-{n}"),original.context.run,format!("read-{n}")])?;}
-            input(c,&p.id,"journal-user-steer",None,"user",&json!({"user_input":{"body":"inspect prior effects before continuing"}}))?;
-            let current=claim(c,&p.id)?.unwrap();let context=prompt_context(&current.checkpoint).unwrap();assert_eq!(context["continuing_inputs"][0]["input_id"],input_id);assert_eq!(context["continuing_inputs"][0]["journal_available"],true);
-            let recent=context["effect_evidence"].as_array().unwrap();assert!(!recent.iter().any(|x|x["effect_id"]=="old-uncertain"),"The regression must actually evict the old receipt from the legacy recent window");
-            let mut cursor=0;let mut found=false;let mut total=0;
-            loop {
-                let page=input_effect_journal(c,&current.context,WorkerStatusArgs{input_id:Some(input_id.clone()),after_effect:cursor,detail_offset:0},"current-inspection")?;
-                let effects=page["effects"].as_array().unwrap();assert!(effects.len()<=8);assert!(page.to_string().len()<100000);
-                for effect in effects {total+=1;if effect["effect_id"]=="old-uncertain" {found=true;assert_eq!(effect["status"],"uncertain");assert!(effect["result_chunk"].as_str().unwrap().contains("not-safe-to-replay"));}}
-                match page["next_effect_cursor"].as_i64(){Some(next)=>{assert!(next>cursor);cursor=next;},None=>break}
-            }
-            assert!(found);assert_eq!(total,41);
-            c.execute("INSERT INTO manager_inputs(id,project_id,kind,payload,status,created_at) VALUES('off-page-input',?,'user','{}','processing',1)",[&p.id])?;
-            c.execute("INSERT INTO manager_input_claims(input_id,run_id) VALUES('off-page-input',?)",[&original.context.run])?;
-            assert!(input_effect_journal(c,&current.context,WorkerStatusArgs{input_id:Some("off-page-input".into()),after_effect:0,detail_offset:0},"inspection").is_err());
-            assert!(input_effect_journal(c,&current.context,WorkerStatusArgs{input_id:Some("other-project-or-invented".into()),after_effect:0,detail_offset:0},"inspection").is_err());
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_effects WHERE name='delegate'",[],|r|r.get::<_,i64>(0))?,1,"Journal inspection must never replay the uncertain delegation");Ok(())
-        }).unwrap();
-    }
-    #[tokio::test]
-    async fn processing_inputs_obey_pause_and_stop() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_processing_stop", "preserve this instruction");
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let first = claim(c, &p.id)?.unwrap();
-                c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
-                assert!(claim(c, &p.id)?.is_none());
-                assert!(valid(c, &first.context).is_err());
-                c.execute("UPDATE projects SET paused=0 WHERE id=?", [&p.id])?;
-                assert_eq!(claim(c, &p.id)?.unwrap().context.run, first.context.run);
-                let tx = c.unchecked_transaction()?;
-                stop(&tx, &p.id)?;
-                tx.commit()?;
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "processing"
-                );
-                assert!(valid(c, &first.context).is_err());
-                assert_ne!(claim(c, &p.id)?.unwrap().context.run, first.context.run);
-                Ok(())
-            })
-            .unwrap();
-    }
-    async fn stalled_status_fixture() -> (
-        tempfile::TempDir,
-        Arc<App>,
-        Project,
-        Turn,
-        Arc<tokio::sync::Notify>,
-        Arc<tokio::sync::Notify>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let (dir, app, p) = fixture().await;
-        app.config.write().await.herdr_session = dir.path().to_string_lossy().into();
-        let config = app.config.read().await.clone();
-        let listener =
-            tokio::net::UnixListener::bind(crate::herdr::socket_path(&config).unwrap()).unwrap();
-        let arrived = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let seen = arrived.clone();
-        let permit = release.clone();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let line = BufReader::new(read)
-                .lines()
-                .next_line()
-                .await
-                .unwrap()
-                .unwrap();
-            let request: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(request["method"], "pane.list");
-            seen.notify_one();
-            permit.notified().await;
-            let response = json!({"id":request["id"],"result":{"panes":[]}}).to_string() + "\n";
-            let _ = write.write_all(response.as_bytes()).await;
-        });
-        ingest(
-            &app,
-            &p,
-            "om_slow_inventory",
-            "Inspect only; do not close anything",
-        );
-        let turn=app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            c.execute("INSERT INTO work_executions(generation,project_id,agent,terminal,status,last_activity,created_at,updated_at) VALUES('old-inspection',?,'codex','obsolete-terminal','exited',1,1,1)",[&p.id])?;
-            Ok(claim(c,&p.id)?.unwrap())
-        }).unwrap();
-        (dir, app, p, turn, arrived, release, server)
-    }
-    #[tokio::test]
-    async fn stalled_status_does_not_hold_stop_lock_or_publish_stale_observations() {
-        let (_dir, app, p, turn, arrived, release, server) = stalled_status_fixture().await;
-        let acting = app.clone();
-        let authority = turn.context.clone();
-        let inspection = tokio::spawn(async move {
-            tool(
-                &acting,
-                &authority,
-                ToolCall {
-                    occurrence: "stalled-status".into(),
-                    name: "worker_status".into(),
-                    arguments: json!({}),
-                },
-            )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
-            .await
-            .unwrap();
-        // The runtime request is still blocked. Stop must acquire the actual
-        // project mutex and complete, rather than waiting for the 3s budget.
-        app.db.sync(|c| {c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES('keep-uncertain',?,'prior-send','send_md','{}','uncertain','{}')",[&turn.context.run])?;Ok(())}).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), app.stop(&p.id))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!inspection.is_finished());
-        release.notify_one();
-        server.await.unwrap();
-        let result = inspection.await.unwrap().unwrap();
-        assert!(result["error"].is_string());
-        assert!(result.get("obsolete_executions").is_none());
-        app.db
-            .sync(|c| {
-                assert!(valid(c, &turn.context).is_err());
-                assert_eq!(
-                    c.query_row(
-                        "SELECT status FROM manager_effects WHERE id='keep-uncertain'",
-                        [],
-                        |r| r.get::<_, String>(0)
-                    )?,
-                    "uncertain"
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='processing'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    0
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn stalled_inventory_has_one_total_budget_and_never_claims_eligibility() {
-        let (_dir, app, p, turn, arrived, _release, server) = stalled_status_fixture().await;
-        let acting = app.clone();
-        let authority = turn.context.clone();
-        let inspection = tokio::spawn(async move {
-            tool(
-                &acting,
-                &authority,
-                ToolCall {
-                    occurrence: "bounded-status".into(),
-                    name: "worker_status".into(),
-                    arguments: json!({}),
-                },
-            )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
-            .await
-            .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(5), inspection)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(result["obsolete_executions"][0]["close_eligible"], false);
-        assert_eq!(
-            result["obsolete_executions"][0]["observation"],
-            "incomplete"
-        );
-        assert!(app.db.sync(|c| valid(c, &turn.context)).is_ok());
-        assert!(p.terminal.is_none());
-        server.abort();
-        let _ = server.await;
-    }
-    #[test]
-    fn prompt_keeps_receipt_cohesion_disclosure_exceptions_and_truthful_failures_together() {
-        // These are the explicitly requested policy invariants, not an LLM quality test.
-        for policy in [
-            "立刻独立调用一次 send_md",
-            "使用 intent=receipt 和可信消息锚点",
-            "在原会话回一句话，确认收到，并说明已开始的具体工作",
-            "如果还没开始实际工作，就如实说还没开始动，并点明下一步要做什么，不得假装已经开始",
-            "用 intent=result、intent=progress 或 intent=decision 回复时，先说明已开始的具体工作和当前做到哪一步",
-            "遵守下文的内部机制保密规则",
-            "Do not volunteer worker, subagent, delegate, Codex, AGY or CLI orchestration details",
-            "or expose event IDs, generation, session or receipt identifiers",
-            "不得发提问式解锁消息",
-            "遵守明确的静默要求、暂停和 Stop",
-            "不得等任务结束再确认",
-            "不得把确认和最终结果合并",
-            "第一条回复禁止写成长解释",
-            "不反复播报常规进度",
-            "intent=progress",
-            "Keep related work together by default",
-            "调研 A 和 B",
-            "并行开发互不依赖的 feature A、B、C",
-            "The user's natural-language organization overrides this default",
-            "Keep internal execution mechanisms private by default",
-            "The only exception is an explicit question about the architecture",
-            "is the user's actual task",
-            "Never hide failures, blockers, unfinished work or capability limits",
-        ] {
-            assert!(SYSTEM.contains(policy), "Missing policy: {policy}");
-        }
-        let mut failure = Failure::timeout();
-        failure.kind = "rate_limited".into();
-        for chinese in [false, true] {
-            let notice = failure_notice(&failure, 30_000, true, chinese);
-            assert!(!notice.contains("原生编程智能体"));
-            assert!(!notice.contains("native Agent"));
-            assert!(notice.contains("限流") || notice.contains("rate limited"));
-            assert!(notice.contains("保留") || notice.contains("saved"));
-        }
-    }
-    #[tokio::test]
-    async fn receipt_is_immutable_across_turns_and_does_not_redispatch_existing_states() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_receipt", "Please research A and B together.");
-        let (next, id, attachment) = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let first = claim(c, &p.id)?.unwrap();
-                let args = receipt_args("om_receipt");
-                let (id, fresh) = enqueue_receipt(c, &first.context, "original-effect", &args)?;
-                assert!(fresh);
-                let raw: String =
-                    c.query_row("SELECT attachment FROM messages WHERE id=?", [&id], |r| {
-                        r.get(0)
-                    })?;
-                let attachment: Value = serde_json::from_str(&raw)?;
-                input(
-                    c,
-                    &p.id,
-                    "new-observation",
-                    None,
-                    "user",
-                    &json!({"status":"working"}),
-                )?;
-                let next = claim(c, &p.id)?.unwrap();
-                assert_ne!(first.context.run, next.context.run);
-                // The original receipt retains authority when its model checkpoint is superseded.
-                validate_outbox(c, &p.id, &attachment)?;
-                Ok((next, id, attachment))
-            })
-            .unwrap();
-        for status in ["pending", "sent", "uncertain", "failed"] {
-            app.db
-                .sync(|c| {
-                    c.execute(
-                        "UPDATE messages SET status=? WHERE id=?",
-                        params![status, id],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
-            let result = tool(&app, &next.context, ToolCall {
-                occurrence: format!("regenerated-{status}"), name: "send_md".into(),
-                arguments: json!({"to":"oc_fixture","text":"Different regenerated wording", "reply_to_message_id":"om_different", "intent":"receipt"}),
-            }).await.unwrap();
-            assert_eq!(result["outbox_id"], id);
-            assert_eq!(result["status"], status);
-        }
-        app.db
-            .sync(|c| {
-                let (text, raw): (String, String) = c.query_row(
-                    "SELECT content,attachment FROM messages WHERE id=?",
-                    [&id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                assert_eq!(text, receipt_args("om_receipt").text);
-                assert_eq!(serde_json::from_str::<Value>(&raw)?, attachment);
-                assert_eq!(
-                    c.query_row(
-                        "SELECT count(*) FROM messages WHERE direction='out'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn receipts_are_source_scoped_and_reject_worker_local_or_foreign_targets() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_scope", "Task");
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                let mut args = receipt_args("om_scope");
-                args.to = "oc_foreign".into();
-                assert!(enqueue_receipt(c, &turn.context, "bad-target", &args).is_err());
-                args.to = "oc_fixture".into();
-                args.reply_to_message_id = Some("om_foreign".into());
-                assert!(enqueue_receipt(c, &turn.context, "bad-anchor", &args).is_err());
-                args.reply_to_message_id = Some("om_scope".into());
-                args.source_event_id = Some("invented-event".into());
-                assert!(enqueue_receipt(c, &turn.context, "bad-origin", &args).is_err());
-                args.source_event_id = None;
-                for kind in ["worker", "schedule"] {
-                    c.execute(
-                        "UPDATE manager_inputs SET kind=? WHERE project_id=?",
-                        params![kind, p.id],
-                    )?;
-                    assert!(enqueue_receipt(c, &turn.context, "non-user-ack", &args).is_err());
-                }
-                c.execute(
-                    "UPDATE manager_inputs SET kind='user' WHERE project_id=?",
-                    [&p.id],
-                )?;
-                c.execute(
-                    "UPDATE messages SET attachment='{}' WHERE direction='in' AND project_id=?",
-                    [&p.id],
-                )?;
-                assert!(enqueue_receipt(c, &turn.context, "local-ack", &args).is_err());
-                assert_eq!(
-                    c.query_row(
-                        "SELECT count(*) FROM messages WHERE direction='out'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    0
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn receipt_pause_takeover_and_stop_cannot_resurrect_a_consumed_inputs_pending_ack() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_stop_receipt", "Task");
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let first = claim(c, &p.id)?.unwrap();
-                let (id, _) = enqueue_receipt(
-                    c,
-                    &first.context,
-                    "receipt-effect",
-                    &receipt_args("om_stop_receipt"),
-                )?;
-                let raw: String =
-                    c.query_row("SELECT attachment FROM messages WHERE id=?", [&id], |r| {
-                        r.get(0)
-                    })?;
-                let attachment: Value = serde_json::from_str(&raw)?;
-                c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
-                assert!(validate_outbox(c, &p.id, &attachment).is_err());
-                c.execute(
-                    "UPDATE projects SET paused=0,generation='g' WHERE id=?",
-                    [&p.id],
-                )?;
-                work::set_takeover(c, &p.id, "g", true, db::now())?;
-                assert!(validate_outbox(c, &p.id, &attachment).is_err());
-                work::set_takeover(c, &p.id, "g", false, db::now())?;
-                finish_turn(c, &first.context, "done")?;
-                validate_outbox(c, &p.id, &attachment)?;
-                let tx = c.unchecked_transaction()?;
-                stop(&tx, &p.id)?;
-                tx.commit()?;
-                c.execute("UPDATE projects SET paused=0 WHERE id=?", [&p.id])?;
-                input(
-                    c,
-                    &p.id,
-                    "worker-after-stop",
-                    attachment["manager_receipt_origin"].as_str(),
-                    "worker",
-                    &json!({"status":"done"}),
-                )?;
-                let after_stop = claim(c, &p.id)?.unwrap();
-                let (same, dispatch) = enqueue_receipt(
-                    c,
-                    &after_stop.context,
-                    "late-receipt",
-                    &receipt_args("om_stop_receipt"),
-                )?;
-                assert_eq!(same, id);
-                assert!(!dispatch);
-                // Even if a later turn still references the original source, the stable failed
-                // outbox entry is never requeued and send_out will never dispatch it again.
-                assert_eq!(
-                    c.query_row("SELECT status FROM messages WHERE id=?", [&id], |r| r
-                        .get::<_, String>(0))?,
-                    "failed"
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT count(*) FROM messages WHERE direction='out'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn automatic_project_provider_failure_keeps_input_without_legacy_repair() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_automatic_provider", "process this later");
-        app.db.sync(|c| {
-            c.execute("UPDATE projects SET agent='auto' WHERE id=?", [&p.id])?;
-            work::sync_inbound(c)?;
-            let turn = claim(c,&p.id)?.unwrap();
-            failure(c,&turn.context,&Failure {
-                kind:"authorization".into(), http_status:Some(401), ..Failure::internal()
-            })?;
-            assert_eq!(public(c,&p.id)?["status"],"unavailable");
-            assert_eq!(c.query_row("SELECT count(*) FROM manager_inputs WHERE status='processing'",[],
-                |row|row.get::<_,i64>(0))?,1);
-            assert_eq!(c.query_row("SELECT count(*) FROM work_events WHERE source IN ('management','manager_worker')",[],
-                |row|row.get::<_,i64>(0))?,0);
-            Ok(())
-        }).unwrap();
-    }
-
-    #[tokio::test]
-    async fn turn_budget_failure_releases_manager_without_replaying_effects() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_budget", "first input");
-        let run = app.db.sync(|c| {
-            work::sync_inbound(c)?;
-            let turn = claim(c, &p.id)?.unwrap();
-            for (id, status) in [("delivered-effect", "complete"), ("uncertain-effect", "uncertain")] {
-                c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result)
-                    VALUES(?,?,?,'send_md',?,?,'{}')", params![id,turn.context.run,id,
-                        json!({"to":"oc_fixture","text":"sensitive-fixture"}).to_string(),status])?;
-            }
-            let error = Failure { kind:"turn_budget_exhausted".into(), retryable:true, ..Failure::internal() };
-            failure(c, &turn.context, &error)?;
-            assert!(valid(c, &turn.context).is_err());
-            let state = public(c, &p.id)?;
-            assert_eq!(state["status"], "ready");
-            assert_eq!(state["failure"]["kind"], "turn_budget_exhausted");
-            assert_eq!(state["failure"]["last_tool"]["tool"], "send_md");
-            assert_eq!(state["failure"]["last_tool"]["effect_status"], "uncertain");
-            assert!(!state.to_string().contains("sensitive-fixture"));
-            assert_eq!(c.query_row("SELECT status FROM manager_runs WHERE id=?",
-                [&turn.context.run], |row|row.get::<_,String>(0))?, "complete");
-            let committed = c.query_row("SELECT count(*) FROM manager_effects WHERE run_id=?",
-                [&turn.context.run], |row|row.get::<_,i64>(0))?;
-            assert_eq!(committed, 2);
-            assert!(claim(c, &p.id)?.is_none());
-            Ok(turn.context.run)
-        }).unwrap();
-        ingest(&app, &p, "om_budget_next", "second input");
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let next = claim(c, &p.id)?.unwrap();
-                assert_ne!(next.context.run, run);
-                assert_eq!(
-                    c.query_row("SELECT count(*) FROM manager_effects", [], |row| row
-                        .get::<_, i64>(0))?,
-                    2
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT count(*) FROM manager_effects WHERE status='uncertain'",
-                        [],
-                        |row| row.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn failures_are_incident_scoped_backoff_survives_observations_and_valid_response_recovers()
-     {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_retry", "请修复问题，保留输入");
-        let turn = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                Ok(claim(c, &p.id)?.unwrap())
-            })
-            .unwrap();
-        app.db.sync(|c| {
-            c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status,result) VALUES('uncertain-effect',?,'old','send_md','{}','uncertain','{}')",[&turn.context.run])?;
-            for attempt in 1..=4 {
-                failure(c,&turn.context,&Failure::timeout())?;
-                let state=public(c,&p.id)?;assert_eq!(state["failure"]["attempt"],attempt);
-                assert_eq!(c.query_row("SELECT COUNT(*) FROM messages WHERE json_extract(attachment,'$.manager_notice')=1",[],|r|r.get::<_,i64>(0))?,0);
-            }
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
-            let retry:i64=c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get(0))?;
-            input(c,&p.id,"observation-new",None,"worker",&json!({"status":"working"}))?;
-            assert_eq!(c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get::<_,i64>(0))?,retry);
-            assert!(claim(c,&p.id)?.is_none());
-            Ok(())
-        }).unwrap();
-        ingest(&app, &p, "om_retry_new", "补充新的要求");
-        let next = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let next = claim(c, &p.id)?.unwrap();
-                failure(c, &next.context, &Failure::timeout())?;
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM messages WHERE direction='out'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    0
-                );
-                Ok(next)
-            })
-            .unwrap();
-        let mut corrected = next.checkpoint.clone();
-        corrected["last_correction"] = json!({"kind":"invalid_response","http_status":200,"retryable":false,"elapsed_ms":21000,"output_tokens":4096,"finish_reason":"length"});
-        checkpoint(&app, &next.context, &corrected, false)
-            .await
-            .unwrap();
-        assert!(
-            !app.db
-                .sync(|c| Ok(public(c, &p.id)?["error"].as_str().unwrap().is_empty()))
-                .unwrap()
-        );
-        checkpoint(&app, &next.context, &corrected, true)
-            .await
-            .unwrap();
-        app.db
-            .sync(|c| {
-                let state = public(c, &p.id)?;
-                assert_eq!(state["error"], "");
-                assert!(state["failure"].is_null());
-                let raw: String = c.query_row(
-                    "SELECT error FROM manager_runs WHERE id=?",
-                    [&next.context.run],
-                    |r| r.get(0),
-                )?;
-                let retained: Value = serde_json::from_str(&raw)?;
-                assert_eq!(retained["last_failure"]["kind"], "timeout");
-                assert_eq!(retained["last_correction"]["kind"], "invalid_response");
-                assert_eq!(retained["last_correction"]["output_tokens"], 4096);
-                assert_eq!(
-                    c.query_row(
-                        "SELECT status FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, String>(0)
-                    )?,
-                    "cancelled"
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT status FROM manager_effects WHERE id='uncertain-effect'",
-                        [],
-                        |r| r.get::<_, String>(0)
-                    )?,
-                    "uncertain"
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    0
-                );
-                failure(c, &next.context, &Failure::timeout())?;
-                assert_eq!(public(c, &p.id)?["failure"]["attempt"], 1);
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM messages WHERE direction='out'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    0
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn permanent_failure_prepares_one_scoped_repair_without_forwarding_input_and_honors_controls()
-     {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_permanent", "ordinary-private-task-marker");
-        let turn = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                Ok(claim(c, &p.id)?.unwrap())
-            })
-            .unwrap();
-        app.db
-            .sync(|c| {
-                let mut error = Failure::internal();
-                error.kind = "context_rejected".into();
-                error.http_status = Some(400);
-                failure(c, &turn.context, &error)?;
-                failure(c, &turn.context, &error)?;
-                assert!(claim(c, &p.id)?.is_none());
-                let (id, raw): (String, String) = c.query_row(
-                    "SELECT id,payload FROM work_events WHERE source='management'",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                let payload: Value = serde_json::from_str(&raw)?;
-                assert!(payload["origin_event_id"].is_null());
-                assert!(payload["repair_incident"].is_string());
-                assert!(!raw.contains("ordinary-private-task-marker"));
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                c.execute(
-                    "UPDATE manager_config SET revision=revision+1 WHERE project_id=?",
-                    [&p.id],
-                )?;
-                let event = work::event(c, &p.id, &id)?;
-                assert!(!bind_event(c, &event, "generation")?);
-                assert_eq!(
-                    c.query_row("SELECT status FROM work_events WHERE id=?", [id], |r| {
-                        r.get::<_, String>(0)
-                    })?,
-                    "cancelled"
-                );
-                Ok(())
-            })
-            .unwrap();
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_controls", "preserve");
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
-                failure(c, &turn.context, &Failure::internal())?;
-                c.execute(
-                    "UPDATE projects SET paused=0,generation='g' WHERE id=?",
-                    [&p.id],
-                )?;
-                work::set_takeover(c, &p.id, "g", true, db::now())?;
-                failure(c, &turn.context, &Failure::internal())?;
-                work::set_takeover(c, &p.id, "g", false, db::now())?;
-                stop(c, &p.id)?;
-                failure(c, &turn.context, &Failure::internal())?;
-                assert_eq!(
-                    c.query_row("SELECT COUNT(*) FROM manager_failures", [], |r| r
-                        .get::<_, i64>(0))?,
-                    0
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    0
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn oversized_claim_preserves_input_and_schedules_bounded_native_repair_instead_of_forever_retry()
-     {
-        let (_dir, app, p) = fixture().await;
-        app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture","om_large_context","preserve the task",&json!({"source":{"chat_id":"oc_fixture","chat_type":"p2p","extra_metadata":"x".repeat(300000)}})).unwrap();
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                assert!(claim_or_repair(c, &p.id)?.is_none());
-                let state = public(c, &p.id)?;
-                assert_eq!(state["failure"]["kind"], "context_preparation");
-                assert_eq!(state["failure"]["retryable"], false);
-                assert!(claim_or_repair(c, &p.id)?.is_none());
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE source='management'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "queued"
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn only_current_repair_completion_wakes_one_fresh_probe_and_never_cancels_submitted_work()
-    {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_probe", "ordinary request");
-        app.db.sync(|c| {
-            work::sync_inbound(c)?;let first=claim(c,&p.id)?.unwrap();failure(c,&first.context,&Failure::internal())?;
-            let (id,task):(String,String)=c.query_row("SELECT id,task_id FROM work_events WHERE source='management'",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            c.execute("UPDATE work_events SET status='submitted' WHERE id=?",[&id])?;
-            c.execute("INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at,finished_at) VALUES('repair-run',?,?,?,'generation','settled',?,?,?)",params![p.id,task,id,db::now(),db::now(),db::now()])?;
-            worker_changed(c,&p.id)?;
-            assert_eq!(c.query_row("SELECT next_attempt_at FROM manager_config WHERE project_id=?",[&p.id],|r|r.get::<_,i64>(0))?,0);
-            let next=claim(c,&p.id)?.unwrap();assert_ne!(first.context.run,next.context.run);
-            failure(c,&next.context,&Failure::internal())?;
-            worker_changed(c,&p.id)?;
-            assert!(claim(c,&p.id)?.is_none());
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE id LIKE 'repair-probe-%'",[],|r|r.get::<_,i64>(0))?,1);
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source='management'",[],|r|r.get::<_,i64>(0))?,1);
-            recovered(c,&next.context)?;
-            assert_eq!(c.query_row("SELECT status FROM work_events WHERE id=?",[id],|r|r.get::<_,String>(0))?,"submitted");
-            assert_ne!(c.query_row("SELECT status FROM work_tasks WHERE id=?",[task],|r|r.get::<_,String>(0))?,"cancelled");
-            Ok(())
-        }).unwrap();
-    }
-    #[tokio::test]
-    async fn queued_incident_notices_are_fenced_by_recovery_pause_takeover_and_stop() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_notice", "request");
-        app.db.sync(|c| {
-            work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();
-            failure(c,&turn.context,&Failure::timeout())?;
-            assert_eq!(c.query_row("SELECT count(*) FROM messages WHERE direction='out'",[],|r|r.get::<_,i64>(0))?,0);
-            let mut actionable=Failure::internal();
-            actionable.kind="authorization".into();
-            failure(c,&turn.context,&actionable)?;
-            let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out'",[],|r|r.get(0))?;
-            let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
-            c.execute("UPDATE projects SET paused=1 WHERE id=?",[&p.id])?;assert!(validate_outbox(c,&p.id,&notice).is_err());
-            c.execute("UPDATE projects SET paused=0,generation='generation' WHERE id=?",[&p.id])?;
-            work::set_takeover(c,&p.id,"generation",true,db::now())?;assert!(validate_outbox(c,&p.id,&notice).is_err());
-            work::set_takeover(c,&p.id,"generation",false,db::now())?;
-            recovered(c,&turn.context)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
-            failure(c,&turn.context,&actionable)?;
-            let raw:String=c.query_row("SELECT attachment FROM messages WHERE direction='out' ORDER BY rowid DESC LIMIT 1",[],|r|r.get(0))?;
-            let notice:Value=serde_json::from_str(&raw)?;validate_outbox(c,&p.id,&notice)?;
-            stop(c,&p.id)?;assert!(validate_outbox(c,&p.id,&notice).is_err());
-            assert_eq!(c.query_row("SELECT status FROM work_tasks WHERE title='Management delegation'",[],|r|r.get::<_,String>(0))?,"cancelled");
-            Ok(())
-        }).unwrap();
-    }
-    #[tokio::test]
-    async fn stop_preserves_queued_inputs_without_dispatch_while_paused() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_before_stop", "preserve until resumed");
-        app.db
-            .sync(|c| {
-                crate::cli_switch::stopped(c, &p.id, &p.generation)?;
-                work::sync_inbound(c)?;
-                assert_eq!(
-                    c.query_row("SELECT status FROM manager_inputs", [], |r| r
-                        .get::<_, String>(0))?,
-                    "queued"
-                );
-                assert!(claim(c, &p.id)?.is_none());
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn off_batch_latest_user_control_preserves_its_tail_and_counts_toward_context_budget() {
-        for older_size in [20, 8000] {
-            let (_dir, app, p) = fixture().await;
-            for n in 0..32 {
-                ingest(
-                    &app,
-                    &p,
-                    &format!("om_tail_old_{n}"),
-                    &format!("old instruction {n}: {}", "x".repeat(older_size)),
-                );
-            }
-            let latest = format!(
-                "{}\n不要发布。Do not release or deploy.",
-                "latest control context ".repeat(150)
-            );
-            assert!(latest.len() > 2400);
-            ingest(&app, &p, "om_tail_latest", &latest);
-            app.db.sync(|c|{
-                work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();let context=prompt_context(&turn.checkpoint).unwrap();
-                let batch=context["new_inputs"].as_array().unwrap();assert!(!batch.is_empty()&&batch.len()<=32);
-                for (n,item) in batch.iter().enumerate(){assert!(item["data"]["user_input"]["body"].as_str().unwrap().starts_with(&format!("old instruction {n}: ")));}
-                assert_eq!(context["latest_user_steering"]["data"]["user_input"]["body"],latest);
-                assert_eq!(context["latest_user_steering"]["context_only_not_batch_member"],true);
-                assert_eq!(context["latest_user_steering"]["present_in_new_inputs"],false);
-                assert!(context.to_string().len()<=250000);
-                assert_eq!(c.query_row("SELECT i.status FROM manager_inputs i JOIN work_events e ON e.id=i.origin_event_id WHERE e.source_id='om_tail_latest'",[],|r|r.get::<_,String>(0))?,"queued");
-                if older_size==20 {assert_eq!(batch.len(),32);}else{assert!(batch.len()<32,"The complete mandatory control must share the same bounded context budget");}
-                Ok(())
-            }).unwrap();
-        }
-    }
-    #[tokio::test]
-    async fn exact_batch_completion_keeps_the_33rd_input_and_settles_managed_schedule() {
-        let (_dir, app, p) = fixture().await;
-        for n in 0..33 {
-            ingest(
-                &app,
-                &p,
-                &format!("om_{n}"),
-                &if n == 32 {
-                    "不要发版".to_owned()
-                } else {
-                    format!("bounded instruction {n}")
-                },
-            );
-        }
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let first = claim(c, &p.id)?.unwrap();
-            let prompt=prompt_context(&first.checkpoint).unwrap();assert_eq!(prompt["new_inputs"][0]["data"]["user_input"]["body"],"bounded instruction 0");assert_eq!(prompt["new_inputs"][31]["data"]["user_input"]["body"],"bounded instruction 31");assert_eq!(prompt["latest_user_steering"]["data"]["user_input"]["body"],"不要发版","Newest boundary remains mandatory even outside the FIFO batch");
-                finish_turn(c, &first.context, "")?;
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='consumed'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    32
-                );
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='queued'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    1
-                );
-                let second = claim(c, &p.id)?.unwrap();
-            assert!(prompt_context(&second.checkpoint).unwrap()["latest_user_steering"].to_string().contains("不要发版"),"Remaining old backlog must retain the newest explicit user boundary without inheriting its reply anchor");
-                finish_turn(c, &second.context, "completed bounded backlog")?;
-                assert!(claim(c, &p.id)?.is_none());
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM work_events WHERE status='consumed'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    33
-                );
-                Ok(())
-            })
-            .unwrap();
-        app.db
-            .sync(|c| {
-                let now = db::now();
-                work::create_timer(
-                    c,
-                    &p.id,
-                    work::TimerInput {
-                        name: "Managed repeat".into(),
-                        prompt: "inspect scheduled work".into(),
-                        kind: "interval".into(),
-                        at: None,
-                        interval_seconds: Some(1),
-                        cron: None,
-                        timezone: "UTC".into(),
-                        to: Some("oc_fixture".into()),
-                        purpose: "user".into(),
-                        request_id: None,
-                    },
-                    now,
-                )?;
-                let fired = work::fire_due(c, now + 1000)?;
-                assert_eq!(fired.len(), 1);
-                let turn = claim(c, &p.id)?.unwrap();
-                finish_turn(c, &turn.context, "")?;
-                assert_eq!(
-                    work::fire_due(c, now + 2000)?.len(),
-                    1,
-                    "Consumed managed timer must not suppress every future occurrence"
-                );
-                Ok(())
-            })
-            .unwrap();
-        let (_dir, app, p) = fixture().await;
-        for n in 0..12 {
-            ingest(&app, &p, &format!("om_budget_{n}"), &"x".repeat(80000));
-        }
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                let chosen: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM manager_run_inputs WHERE run_id=?",
-                    [&turn.context.run],
-                    |r| r.get(0),
-                )?;
-                assert!(chosen > 0 && chosen < 12);
-                finish_turn(c, &turn.context, "")?;
-                assert_eq!(
-                    c.query_row(
-                        "SELECT COUNT(*) FROM manager_inputs WHERE status='queued'",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )?,
-                    12 - chosen
-                );
-                assert!(
-                    claim(c, &p.id)?.is_some(),
-                    "The next fitting batch must continue automatically"
-                );
-                Ok(())
-            })
-            .unwrap();
-        let (_dir, app, p) = fixture().await;
-        ingest(
-            &app,
-            &p,
-            "om_large_body",
-            &"large original input ".repeat(25000),
-        );
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                let prompt = prompt_context(&turn.checkpoint).unwrap();
-                assert_eq!(prompt["new_inputs"][0]["data"]["full_input_retained"], true);
-                assert!(select_origin(c, &turn.context, None)?.is_some());
-                let bytes: i64 = c.query_row(
-                    "SELECT length(content) FROM messages WHERE source_id='om_large_body'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                assert!(
-                    bytes > 400000,
-                    "Only the model prompt preview may be bounded; original input stays intact"
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn fresh_input_fences_stale_effects_and_recovered_submissions_remain_uncertain() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_first", "initial instructions");
-        let turn = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                Ok(claim(c, &p.id)?.unwrap())
-            })
-            .unwrap();
-        ingest(&app, &p, "om_steer", "new steering");
-        app.db.sync(work::sync_inbound).unwrap();
-        let result = tool(
-            &app,
-            &turn.context,
-            ToolCall {
-                occurrence: "turn:1:call:0".into(),
-                name: "write_file".into(),
-                arguments: json!({"path":"stale.txt","content":"late effect"}),
-            },
-        )
-        .await;
-        assert!(result.is_err());
-        assert!(!Path::new(&p.path).join("stale.txt").exists());
-        app.db.sync(|c|{let next=claim(c,&p.id)?.unwrap();c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('uncertain-effect',?,'turn:1:call:0','delegate','{}','submitting')",[next.context.run])?;migrate(c,true)?;assert_eq!(c.query_row("SELECT status FROM manager_effects WHERE id='uncertain-effect'",[],|r|r.get::<_,String>(0))?,"uncertain");Ok(())}).unwrap();
-    }
-    fn prompt_context(value: &Value) -> Option<Value> {
-        match value {
-            Value::String(text) => serde_json::from_str::<Value>(text)
-                .ok()
-                .filter(|v| v.get("trusted_sources").is_some()),
-            Value::Array(all) => all.iter().find_map(prompt_context),
-            Value::Object(all) => all.values().find_map(prompt_context),
-            _ => None,
-        }
-    }
-    #[tokio::test]
-    async fn late_worker_result_keeps_its_actual_source_and_originless_results_do_not_guess() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_topic_A", "coding task A");
-        let origin_a = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                let origin = select_origin(c, &turn.context, None)?.unwrap();
-                intent(c, &p, "delegate-A", "work on A", Some(&origin), false)?;
-                finish_turn(c, &turn.context, "")?;
-                Ok(origin)
-            })
-            .unwrap();
-        ingest(&app, &p, "om_topic_B", "unrelated discussion B");
-        let origin_b = app
-            .db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                let origin = select_origin(c, &turn.context, None)?.unwrap();
-                finish_turn(c, &turn.context, "")?;
-                Ok(origin)
-            })
-            .unwrap();
-        app.db.sync(|c|{
-            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES('reply-A',?,'out','worker-reply-A','Already delivered A result','sent',?, ?,?)",params![p.id,json!({"to":"oc_fixture","reply_to_message_id":"om_topic_A","sent_message_id":"om_sent_A"}).to_string(),db::now(),db::now()])?;
-            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES('manager-own',?,'out','manager-own-reply','Do not loop this manager output','sent',?,?,?)",params![p.id,json!({"manager_effect":"owned"}).to_string(),db::now(),db::now()])?;
-            worker_changed(c,&p.id)?;worker_changed(c,&p.id)?;
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE kind='worker'",[],|r|r.get::<_,i64>(0))?,1);
-            let turn=claim(c,&p.id)?.unwrap();let prompt=prompt_context(&turn.checkpoint).unwrap();
-            assert_eq!(prompt["trusted_sources"][0]["message_id"],"om_topic_A");assert_eq!(prompt["trusted_sources"].as_array().unwrap().len(),1);
-            assert_eq!(select_origin(c,&turn.context,None)?.as_deref(),Some(origin_a.as_str()));assert!(select_origin(c,&turn.context,Some(&origin_b)).is_err());finish_turn(c,&turn.context,"")?;
-            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES('originless',?,'out','worker-notification','Independent notification','sent','{}',?,?)",params![p.id,db::now(),db::now()])?;worker_changed(c,&p.id)?;
-            let next=claim(c,&p.id)?.unwrap();assert_eq!(prompt_context(&next.checkpoint).unwrap()["trusted_sources"],json!([]));assert!(select_origin(c,&next.context,None)?.is_none());finish_turn(c,&next.context,"")?;Ok(())
-        }).unwrap();
-        ingest(&app, &p, "om_C", "thread C");
-        ingest(&app, &p, "om_D", "thread D");
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                let turn = claim(c, &p.id)?.unwrap();
-                assert!(select_origin(c, &turn.context, None).is_err());
-                let sources = prompt_context(&turn.checkpoint).unwrap()["trusted_sources"].clone();
-                let chosen = sources[0]["event_id"].as_str().unwrap();
-                assert_eq!(
-                    select_origin(c, &turn.context, Some(chosen))?.as_deref(),
-                    Some(chosen)
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-    #[tokio::test]
-    async fn task_worker_selection_does_not_request_a_project_transition() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_target_cli", "Use agy for this task");
-        let turn = app.db.sync(|c| { work::sync_inbound(c)?; Ok(claim(c, &p.id)?.unwrap()) }).unwrap();
-        let call = ToolCall { occurrence: "targeted-delegate".into(), name: "delegate".into(),
-            arguments: json!({"instructions":"selected CLI assignment","target_cli":"agy"}) };
-        let mut candidate = p.clone();
-        candidate.agent = "agy".into();
-        candidate.extra_args.clear();
-        let installed = crate::adapter::plain_worker_available(&candidate).await;
-        let receipt = tool(&app, &turn.context, call.clone()).await.unwrap();
-        assert_eq!(receipt["work_queued"], installed);
-        assert_eq!(tool(&app, &turn.context, call).await.unwrap(), receipt);
-        app.db.sync(|c| {
-            assert_eq!(db::project_by_key(c, &p.id)?.agent, "codex");
-            assert!(!crate::cli_switch::holds_input(c, &p.id)?);
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM cli_switch_requests",[],|r|r.get::<_,i64>(0))?,0);
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source IN ('management','manager_worker')",[],|r|r.get::<_,i64>(0))?,
-                i64::from(installed));
-            if installed {
-                assert_eq!(receipt["status"], "queued");
-                assert_eq!(receipt["assignment_pending"], true);
-                let event = work::event(c, &p.id, receipt["event_id"].as_str().unwrap())?;
-                assert_eq!(event.payload["expected_agent"], "agy");
-                assert!(event.payload["target_generation"].is_null());
-            } else {
-                assert_eq!(receipt["status"], "worker_unavailable");
-            }
-            Ok(())
-        }).unwrap();
-    }
-
     #[tokio::test]
     async fn independent_seats_claim_only_their_own_work_and_failure_is_fenced() {
         let (_dir, app, p) = fixture().await;
@@ -5563,225 +1827,6 @@ mod tests {
             assert_eq!(work::event(c,&parent.id,&later)?.status,"worker_waiting");
             Ok(())
         }).unwrap();
-    }
-
-    #[tokio::test]
-    async fn running_manager_supersedes_blocked_provider_before_its_response() {
-        use axum::{Json, Router, extract::State, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        #[derive(Clone)]
-        struct Provider {
-            requests: Arc<AtomicUsize>,
-            bodies: tokio::sync::mpsc::UnboundedSender<Value>,
-            release: Arc<tokio::sync::Notify>,
-        }
-        async fn respond(State(p): State<Provider>,Json(body):Json<Value>)->Json<Value> {
-            let index=p.requests.fetch_add(1,Ordering::SeqCst);
-            p.bodies.send(body).unwrap();
-            if index==0 {p.release.notified().await;}
-            let calls=if index==0 {json!([{"id":"stale-write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"stale-provider.txt\",\"content\":\"must not execute\"}"}}])}else{Value::Null};
-            Json(json!({"id":"fixture","object":"chat.completion","created":1,"model":"fixture-manager","choices":[{"index":0,"message":{"role":"assistant","content":if index==0{Value::Null}else{json!("Accepted the latest user correction")},"tool_calls":calls},"finish_reason":if index==0{"tool_calls"}else{"stop"}}]}))
-        }
-        let (_dir,app,p)=fixture().await;
-        let (send,mut bodies)=tokio::sync::mpsc::unbounded_channel();
-        let provider=Provider{requests:Arc::new(AtomicUsize::new(0)),bodies:send,release:Arc::new(tokio::sync::Notify::new())};
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
-        let router=Router::new().route("/v1/chat/completions",post(respond)).with_state(provider.clone());
-        let server=tokio::spawn(async move{axum::serve(listener,router).await.unwrap()});
-        app.db.sync(|c| {let current=public(c,&p.id)?;save_provider(c,ConfigInput{base_url:format!("http://{addr}/v1"),model:"fixture-manager".into(),api_key:None,clear_api_key:false,expected_revision:current["revision"].as_i64().unwrap(),supports_images:None})?;Ok(())}).unwrap();
-        let binding=crate::bot::Binding{project_id:p.id.clone(),app_id:"cli_fixture".into(),app_secret:"fixture-bot-secret".into()};
-        let input=|id:&str,text:&str|serde_json::to_vec(&json!({"header":{"app_id":"cli_fixture","event_type":"im.message.receive_v1"},"event":{"sender":{"sender_type":"user","sender_id":{"open_id":"ou_fixture"}},"message":{"message_id":id,"chat_id":"oc_fixture","chat_type":"p2p","message_type":"text","content":json!({"text":text}).to_string()}}})).unwrap();
-        crate::feishu::ingest(&app,&binding,&input("om_first_blocked","Start original task")).unwrap();
-        app.db.sync(|c| {work::sync_inbound(c)?;Ok(())}).unwrap();
-        let acting=app.clone();let host=tokio::spawn(async move{run(acting).await});
-        let first=tokio::time::timeout(Duration::from_secs(3),bodies.recv()).await.unwrap().unwrap();
-        assert!(first.to_string().contains("Start original task"));
-        let started=std::time::Instant::now();
-        crate::feishu::ingest(&app,&binding,&input("om_second_interrupt","Replace direction immediately")).unwrap();
-        app.db.sync(|c| {work::sync_inbound(c)?;Ok(())}).unwrap();
-        let second=tokio::time::timeout(Duration::from_secs(3),bodies.recv()).await.unwrap().unwrap();
-        eprintln!("manager_append_fixture_admission_to_provider_ms={}",started.elapsed().as_millis());
-        assert!(second.to_string().contains("Replace direction immediately"));
-        assert!(!Path::new(&p.path).join("stale-provider.txt").exists());
-        provider.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(3),async {
-            loop {
-                if app.db.sync(|c|Ok(c.query_row("SELECT COUNT(*) FROM manager_inputs WHERE project_id=? AND status IN ('queued','processing')",[&p.id],|r|r.get::<_,i64>(0))?)).unwrap()==0 {break;}
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }).await.unwrap();
-        app.shutdown.cancel();host.await.unwrap();server.abort();let _=server.await;
-        assert!(!Path::new(&p.path).join("stale-provider.txt").exists());
-        assert_eq!(app.db.sync(|c|Ok(c.query_row("SELECT COUNT(*) FROM manager_effects WHERE name='write_file'",[],|r|r.get::<_,i64>(0))?)).unwrap(),0);
-    }
-
-    #[tokio::test]
-    async fn delegate_waits_for_exact_selected_transition_and_abandoned_intents_do_not_block() {
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_transition", "code on selected Pi when ready");
-        let turn=app.db.sync(|c|{work::sync_inbound(c)?;c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,revision,holds_input) VALUES('selected-transition',?,'pi','preparing','source-generation',?,'revision',1)",params![p.id,db::now()])?;Ok(claim(c,&p.id)?.unwrap())}).unwrap();
-        let reply = tool(
-            &app,
-            &turn.context,
-            ToolCall {
-                occurrence: "turn:1:call:0".into(),
-                name: "delegate".into(),
-                arguments: json!({"instructions":"run the selected coding task"}),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(reply["status"], "held");
-        assert_eq!(reply["worker_agent"], "pi");
-        assert_eq!(reply["generation"], Value::Null);
-        app.db.sync(|c|{assert!(work::claim_next(c,&p.id,"old-generation",db::now())?.is_none());c.execute("UPDATE projects SET agent='pi',generation='selected-generation',terminal='immutable-pi',ready=1,execution=? WHERE id=?",params![json!({"mcp_registered":true,"cli_switch_request":"selected-transition"}).to_string(),p.id])?;c.execute("UPDATE cli_switch_requests SET phase='ready',holds_input=0 WHERE id='selected-transition'",[])?;let run=work::claim_next(c,&p.id,"selected-generation",db::now())?.unwrap();assert_eq!(run.generation,"selected-generation");let event=work::event(c,&p.id,&run.event_id)?;assert_eq!(event.payload["target_generation"],"selected-generation");Ok(())}).unwrap();
-        let (_dir, app, p) = fixture().await;
-        ingest(&app, &p, "om_obsolete", "preserve abandoned target intent");
-        let turn=app.db.sync(|c|{work::sync_inbound(c)?;c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,revision,holds_input) VALUES('abandoned',?,'pi','preparing','old',?,'revision',1)",params![p.id,db::now()])?;Ok(claim(c,&p.id)?.unwrap())}).unwrap();
-        let reply = tool(
-            &app,
-            &turn.context,
-            ToolCall {
-                occurrence: "turn:1:call:0".into(),
-                name: "delegate".into(),
-                arguments: json!({"instructions":"abandoned selected task"}),
-            },
-        )
-        .await
-        .unwrap();
-        app.db.sync(|c|{c.execute("UPDATE cli_switch_requests SET phase='cancelled',holds_input=0 WHERE id='abandoned'",[])?;assert!(work::claim_next(c,&p.id,"other-generation",db::now())?.is_none());assert_eq!(work::event(c,&p.id,reply["event_id"].as_str().unwrap())?.status,"failed");let current=db::project_by_key(c,&p.id)?;intent(c,&current,"fresh-source-task","new authorized source work",None,false)?;assert!(work::claim_next(c,&p.id,"other-generation",db::now())?.is_some());Ok(())}).unwrap();
-    }
-
-    #[tokio::test]
-    async fn delegated_resources_wait_for_original_preparation_without_blocking_later_steering() {
-        let (_dir, app, p) = fixture().await;
-        app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture","om_resource","inspect original image",&json!({"source":{"message_type":"post","chat_id":"oc_fixture","chat_type":"p2p"},"resources":[{"kind":"image","resource_key":"img_fixture"}]})).unwrap();
-        app.db
-            .sync(|c| {
-                work::sync_inbound(c)?;
-                assert!(claim(c, &p.id)?.is_none());
-                // A durable delegation created before this readiness gate must still
-                // obey the original resource fence after an upgrade or restart.
-                let origin: Option<String> = Some(c.query_row(
-                    "SELECT id FROM work_events WHERE source_id='om_resource'",
-                    [],
-                    |r| r.get(0),
-                )?);
-                intent(
-                    c,
-                    &p,
-                    "resource-delegate",
-                    "inspect full attached image",
-                    origin.as_deref(),
-                    false,
-                )?;
-                assert!(work::claim_next(c, &p.id, "generation", db::now())?.is_none());
-                Ok(())
-            })
-            .unwrap();
-        ingest(&app, &p, "om_later", "later unrelated plain instructions");
-        app.db.sync(|c|{work::sync_inbound(c)?;let turn=claim(c,&p.id)?.unwrap();let origins=c.prepare("SELECT i.origin_event_id FROM manager_inputs i JOIN manager_run_inputs b ON b.input_id=i.id WHERE b.run_id=?")?.query_map([&turn.context.run],|r|r.get::<_,Option<String>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;let later=c.query_row("SELECT id FROM work_events WHERE source_id='om_later'",[],|r|r.get::<_,String>(0))?;assert!(origins.contains(&Some(later)));c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true')) WHERE source_id='om_resource'",[])?;assert!(work::claim_next(c,&p.id,"generation",db::now())?.is_some());Ok(())}).unwrap();
-    }
-
-    #[tokio::test]
-    async fn resource_preparation_unblocks_consumed_origins_without_replaying_stale_workers() {
-        for stale_worker in [false, true] {
-            let (_dir, app, p) = fixture().await;
-            let message = app
-                .db
-                .ingest_bot(
-                    &p.id,
-                    "cli_fixture",
-                    "oc_fixture",
-                    "om_prior_delegation",
-                    "Inspect the attached evidence",
-                    &json!({
-                        "source":{"message_type":"image","chat_type":"p2p","chat_id":"oc_fixture"},
-                        "kind":"image",
-                        "file_key":"img_fixture"
-                    }),
-                )
-                .unwrap()
-                .unwrap();
-            let delegation = app
-                .db
-                .sync(|c| {
-                    work::sync_inbound(c)?;
-                    c.execute(
-                    "UPDATE projects SET terminal='fixture-pane',generation='generation' WHERE id=?",
-                    [&p.id],
-                )?;
-                    let source = work::event(c, &p.id, &message)?;
-                    assert_eq!(source.status, "managed");
-                    assert!(claim(c, &p.id)?.is_none());
-                    let current = db::project_by_key(c, &p.id)?;
-                    let delegation = intent(
-                        c,
-                        &current,
-                        "prior-delegation",
-                        "Inspect attached evidence",
-                        Some(&source.id),
-                        false,
-                    )?;
-                    assert_eq!(
-                        c.execute(
-                            "UPDATE manager_inputs SET status='consumed' WHERE origin_event_id=?",
-                            [&source.id],
-                        )?,
-                        1
-                    );
-                    settle_sources(c)?;
-                    assert_eq!(work::event(c, &p.id, &source.id)?.status, "managed");
-                    assert!(work::claim_next(c, &p.id, "generation", db::now())?.is_none());
-                    Ok(delegation)
-                })
-                .unwrap();
-
-            let original = app.db.message(&message).await.unwrap();
-            assert_eq!(original.status, "acknowledged");
-            assert!(original.attachment["resources_ready"].is_null());
-            app.db.sync(|c| {
-                let preparation = crate::feishu::begin_resource_preparation(c, &original)?
-                    .expect("a queued delegation owns the consumed input's resources");
-                assert!(crate::feishu::begin_resource_preparation(c, &original)?.is_none());
-                let resources = [json!({
-                    "kind":"image","file_key":"img_fixture","error":"Fixture resource unavailable"
-                })];
-                assert!(crate::feishu::finish_resource_preparation(
-                    c,
-                    &preparation,
-                    &resources,
-                    &json!({"members_status":"unavailable"}),
-                )?);
-                if stale_worker {
-                    c.execute(
-                        "UPDATE projects SET agent='agy',generation='replacement',native_session='other-session' WHERE id=?",
-                        [&p.id],
-                    )?;
-                    assert!(work::claim_next(c, &p.id, "replacement", db::now())?.is_none());
-                    let rejected = work::event(c, &p.id, &delegation)?;
-                    assert_eq!(rejected.status, "failed");
-                    assert!(rejected.error.contains("Worker identity changed"));
-                    let runs: u32 = c.query_row(
-                        "SELECT COUNT(*) FROM work_runs WHERE event_id=?",
-                        [&delegation],
-                        |row| row.get(0),
-                    )?;
-                    assert_eq!(runs, 0);
-                } else {
-                    let run = work::claim_next(c, &p.id, "generation", db::now())?.unwrap();
-                    assert_eq!(run.event_id, delegation);
-                }
-                Ok(())
-            }).unwrap();
-            let prepared = app.db.message(&message).await.unwrap();
-            assert_eq!(prepared.attachment["resources_ready"], true);
-            assert!(prepared.attachment["resource_preparation"].is_null());
-            assert_eq!(
-                prepared.attachment["resources"][0]["error"],
-                "Fixture resource unavailable"
-            );
-        }
     }
 
     #[test]

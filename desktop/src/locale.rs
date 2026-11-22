@@ -270,8 +270,8 @@ impl Language {
             "Project Agent" => "项目主智能体",
             "Declare image input support" => "声明支持图片输入",
             "Image input declared supported" => "已声明支持图片输入",
-            "Enable only when this exact endpoint and model support image input. Otherwise images remain explicit file references." => {
-                "仅在此接口和模型确实支持图片输入时启用；否则仅提供明确的图片文件引用。"
+            "Enable only when this endpoint, model, and protocol support image input. Otherwise images remain explicit file references." => {
+                "仅在此接口、模型和协议确实支持图片输入时启用；否则仅提供明确的图片文件引用。"
             }
             "Shared manager provider" => "全局管理智能体配置",
             "Every project uses this manager endpoint, model, and API key. Coding CLI login and settings stay separate." => "所有项目共用此管理智能体的服务地址、模型和 API 密钥。编码 CLI 的登录与设置保持独立。",
@@ -279,7 +279,14 @@ impl Language {
             "Configure the shared manager in Settings" => "前往设置配置全局管理智能体",
             "Manager model settings" => "管理模型设置",
             "Hide manager settings" => "收起管理模型设置",
-            "OpenAI-compatible endpoint" => "OpenAI 兼容接口地址",
+            "Provider endpoint" => "服务接口地址",
+            "Provider protocol" => "服务协议",
+            "OpenAI Chat Completions" => "OpenAI 聊天补全",
+            "OpenAI Responses" => "OpenAI 响应",
+            "Anthropic Messages" => "Anthropic 消息",
+            "Context window (tokens, optional)" => "上下文窗口（令牌数，可选）",
+            "Leave blank for automatic context detection." => "留空时自动检测上下文窗口。",
+            "Context window must be a whole number of at least 1024." => "上下文窗口必须是至少为 1024 的整数。",
             "Manager model" => "管理模型",
             "Manager API key" => "管理模型 API 密钥",
             "API key saved. Leave blank to keep it." => "API 密钥已保存，留空可保留现有密钥。",
