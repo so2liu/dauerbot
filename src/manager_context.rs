@@ -265,7 +265,11 @@ fn redact_text(text: &str) -> (String, bool) {
         let mut bearer = false;
         for token in line.split_inclusive(char::is_whitespace) {
             let trimmed = token.trim();
-            let cleaned = trimmed.trim_start_matches(['"', '\'', '(', '[']);
+            if trimmed.is_empty() {
+                output.push_str(token);
+                continue;
+            }
+            let cleaned = trimmed.trim_start_matches(['"', '\'', '`', '(', '[']);
             if bearer
                 || cleaned.starts_with("sk-")
                 || cleaned.starts_with("sk_")
@@ -285,7 +289,7 @@ fn redact_text(text: &str) -> (String, bool) {
             } else {
                 output.push_str(token);
             }
-            bearer = trimmed.eq_ignore_ascii_case("bearer");
+            bearer = cleaned.eq_ignore_ascii_case("bearer");
         }
     }
     (output, changed)
@@ -618,6 +622,15 @@ mod tests {
         assert!(changed);
         assert!(!redacted.contains("fixture-password"));
         assert!(!redacted.contains("fixture-token"));
+        for sample in [
+            "Bearer abcdefghijklmno",
+            "Bearer   abcdefghijklmno",
+            "\"Bearer abcdefghijklmno\"",
+        ] {
+            let (redacted, changed) = clean(sample);
+            assert!(changed, "{sample}");
+            assert!(!redacted.contains("abcdefghijklmno"), "{sample} -> {redacted}");
+        }
     }
     #[test]
     fn large_structured_context_is_redacted_by_field_before_display_truncation() {

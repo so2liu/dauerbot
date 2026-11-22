@@ -148,28 +148,33 @@ pub(super) async fn hydrate(history: Vec<Entry>, supports_images: bool) -> Resul
         mut message,
         images,
         ..
-    } in history
+    } in history.into_iter().rev()
     {
         if let Message::User { content } = &mut message {
-            for image in images {
+            let mut parts = Vec::with_capacity(images.len());
+            for image in images.into_iter().rev() {
                 let part = if !supports_images {
                     UserContent::text(
                         "[Image omitted: configured model has no declared image capability]",
                     )
                 } else if image.bytes <= remaining {
-                    remaining -= image.bytes;
-                    image
-                        .content()
-                        .await
-                        .unwrap_or_else(|_| UserContent::text("[Image unavailable]"))
+                    match image.content().await {
+                        Ok(part) => {
+                            remaining -= image.bytes;
+                            part
+                        }
+                        Err(_) => UserContent::text("[Image unavailable]"),
+                    }
                 } else {
-                    UserContent::text("[Image unavailable]")
+                    UserContent::text("[Image omitted: history image budget]")
                 };
-                content.push(part);
+                parts.push(part);
             }
+            content.extend(parts.into_iter().rev());
         }
         messages.push(message);
     }
+    messages.reverse();
     validate_canonical(&messages)?;
     Ok(messages)
 }
@@ -378,6 +383,57 @@ mod tests {
         });
         assert_eq!(compaction_cut(&history[..3], 7, 0), None);
         assert_eq!(compaction_cut(&history, 7, 0), Some(3));
+    }
+
+    #[tokio::test]
+    async fn newest_images_win_the_history_budget() {
+        use sha2::{Digest, Sha256};
+
+        let (_dir, app, project) = super::super::tests::fixture().await;
+        let resource = crate::multimodal::fixture_resource(&app.dir, &project.id, "image-message");
+        let root = std::path::Path::new(resource["cache_root"].as_str().unwrap());
+        let mut image =
+            ImageRef::from_resource(&project.id, "image-message", &resource, root).unwrap();
+        let mut bytes = std::fs::read(&image.path).unwrap();
+        image.bytes = crate::multimodal::MAX_IMAGE_BYTES;
+        bytes.resize(image.bytes as usize, 0);
+        image.sha256 = format!("{:x}", Sha256::digest(&bytes));
+        std::fs::write(&image.path, bytes).unwrap();
+
+        let messages = hydrate(
+            vec![
+                Entry {
+                    seq: 1,
+                    message: Message::user("older"),
+                    images: vec![image.clone(); 8],
+                },
+                Entry {
+                    seq: 2,
+                    message: Message::user("newest"),
+                    images: vec![image],
+                },
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+        let [
+            Message::User { content: older },
+            Message::User { content: newest },
+        ] = &messages[..]
+        else {
+            panic!("expected two user messages")
+        };
+        assert!(matches!(&older[0], UserContent::Text(text) if text.text == "older"));
+        assert!(matches!(&older[1], UserContent::Text(text)
+            if text.text == "[Image omitted: history image budget]"));
+        assert!(
+            older[2..]
+                .iter()
+                .all(|part| matches!(part, UserContent::Image(_)))
+        );
+        assert!(matches!(&newest[0], UserContent::Text(text) if text.text == "newest"));
+        assert!(matches!(&newest[1], UserContent::Image(_)));
     }
 
     #[tokio::test]

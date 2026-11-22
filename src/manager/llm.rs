@@ -198,10 +198,13 @@ fn proposal_definition() -> ToolDefinition {
         "effort",
         "category",
     ];
-    let properties = fields
+    let mut properties = fields
         .iter()
         .map(|field| ((*field).to_owned(), json!({"type":"string"})))
         .collect::<serde_json::Map<_, _>>();
+    properties.insert("category".into(), json!({
+        "type":"string","enum":["documentation","usability","reliability","tests","observability","maintainability"]
+    }));
     ToolDefinition::new(
         "propose_changes".try_into().expect("static tool name"),
         "Submit up to three structured project proposals for owner review.",

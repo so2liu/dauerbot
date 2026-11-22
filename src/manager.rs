@@ -652,16 +652,6 @@ struct WriteArgs {
     content: String,
     expected_sha256: Option<String>,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DelegateArgs {
-    instructions: String,
-    target_cli: Option<String>,
-    #[serde(default)]
-    generation: Option<String>,
-    #[serde(default)]
-    source_event_id: Option<String>,
-}
 fn read_file(root: &Path, args: FileArgs) -> Result<Value> {
     use std::os::unix::fs::OpenOptionsExt;
 

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 pub(super) fn sensitive_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains("library/application support/dev.herdr.feishu-bridge")
+    lower.contains("dev.herdr.feishu-bridge")
         || lower
             .split([
                 '/', '\\', ' ', '"', '\'', ':', '=', '\t', '\r', '\n', '`', '(', ')',
@@ -25,7 +25,6 @@ pub(super) fn sensitive_path(path: &str) -> bool {
                             | "langfuse.json"
                             | "credentials.json"
                             | "auth.json"
-                            | "config.json"
                             | "manager_provider_config"
                             | "bridge.sqlite3"
                             | "id_rsa"
@@ -39,7 +38,7 @@ pub(super) fn sensitive_path(path: &str) -> bool {
             })
 }
 
-fn token_like(token: &str) -> bool {
+fn known_token(token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
     [
         "sk-",
@@ -50,19 +49,62 @@ fn token_like(token: &str) -> bool {
         "asia",
         "aiza",
         "ya29",
-        "t-",
-        "u-",
         "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
         "github_pat_",
-        "xoxb-",
+        "xox",
         "eyj",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix) && token.len() >= 8)
+}
+
+fn token_like(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let tenant_token = (lower.starts_with("t-") || lower.starts_with("u-"))
+        && token.len() >= 16
+        && token.bytes().any(|b| b.is_ascii_digit());
+    let path_like = token.starts_with('/')
+        || token.contains('/') && !token.contains('+') && !token.ends_with('=');
+    let identifier = match token.len() {
+        40 => token.bytes().all(|b| b.is_ascii_hexdigit()),
+        36 => uuid::Uuid::parse_str(token).is_ok(),
+        _ => false,
+    };
+    known_token(token)
+        || tenant_token
         || (token.len() >= 32
+            && !path_like
+            && !identifier
             && token
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b)))
+                .any(|b| b.is_ascii_lowercase() || b.is_ascii_uppercase())
+            && (token.bytes().any(|b| b.is_ascii_digit())
+                || token.bytes().any(|b| b.is_ascii_lowercase())
+                    && token.bytes().any(|b| b.is_ascii_uppercase())))
+}
+
+fn basic_value(value: &str) -> bool {
+    use base64::Engine as _;
+    let token = value.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '(' | ')' | ',' | ';'));
+    if token.len() < 4
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b))
+    {
+        return false;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(token))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(token))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token));
+    decoded.is_ok_and(|bytes| {
+        bytes.contains(&b':') && bytes.iter().all(|b| matches!(b, 0x20..=0x7E))
+    })
 }
 
 pub(super) fn clean(text: &str, secrets: &[&str]) -> String {
@@ -122,9 +164,20 @@ fn clean_plain(text: &str, secrets: &[&str], depth: usize) -> String {
     for line in text.split_inclusive('\n') {
         let lower = line.to_ascii_lowercase();
         let normalized = lower.replace(['_', '-', ' ', '\t', '"', '\'', '\\'], "");
-        let credential_header = lower
-            .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .any(|word| word == "bearer" || word == "basic");
+        let credential_header = line
+            .split_whitespace()
+            .zip(line.split_whitespace().skip(1))
+            .any(|(scheme, value)| {
+                let scheme = scheme.trim_start_matches(['"', '\'', '`', '(']);
+                scheme.eq_ignore_ascii_case("basic") && basic_value(value)
+            });
+        if credential_header {
+            result.push_str("[redacted credential-bearing text]");
+            if line.ends_with('\n') {
+                result.push('\n');
+            }
+            continue;
+        }
         let credential_assignment = normalized.match_indices([':', '=']).any(|(end, _)| {
             crate::manager_context::SENSITIVE_FIELDS
                 .iter()
@@ -149,12 +202,7 @@ fn clean_plain(text: &str, secrets: &[&str], depth: usize) -> String {
                 .next()
                 .is_some_and(|authority| authority.contains('@'))
         });
-        if sensitive_path(line)
-            || credential_header
-            || credential_assignment
-            || credential_command
-            || credential_url
-        {
+        if sensitive_path(line) || credential_assignment || credential_command || credential_url {
             // Explicit credential context can continue across YAML blocks,
             // quoted values, or pasted file contents on subsequent lines.
             // Omit the remainder instead of guessing where the value ends.
@@ -171,7 +219,7 @@ fn clean_plain(text: &str, secrets: &[&str], depth: usize) -> String {
             }
             let token = &line[start..index];
             // A path or a pasted URL may contain a credential after a slash.
-            let protected = token_like(token) || token.split('/').any(token_like);
+            let protected = token_like(token) || token.split('/').any(known_token);
             result.push_str(if protected { "[redacted]" } else { token });
             if index < line.len() {
                 result.push(ch);
@@ -324,6 +372,13 @@ mod tests {
             "sk-fixture-secret",
             "pk-fixture-public",
             "Bearer fixture-short",
+            "Bearer abcdefghijklmno",
+            "Bearer   abcdefghijklmno",
+            "Basic Zm9vOmJhcg==",
+            "Authorization: Basic Zml4dHVyZTpzZWNyZXQ=",
+            "Authorization: Bearer fixture-token",
+            "ghp_fixtureToken123456",
+            "xoxp-fixture-token",
             "api_key = fixture-short",
             "app_secret=fixture-short",
             "secret_key = \"fixture-short!\"",
@@ -334,7 +389,8 @@ mod tests {
             "secret: fixture-short",
             "AKIAIOSFODNN7EXAMPLE",
             "AIzaSyFixtureValue",
-            "t-fixture-token",
+            "t-fixture-token-123456",
+            "v1DH53qT+j3Cpm6FeUk/PLbNMX3Aj4Tw==",
             "abcdef1234567890abcdef1234567890",
             "/private/.dauerbot/sessions/credentials.json",
             "~/.ssh/id_ed25519",
@@ -366,6 +422,18 @@ mod tests {
         let redacted = test_clean(yaml);
         assert!(redacted.starts_with("ordinary text"));
         assert!(!redacted.contains("first-part") && !redacted.contains("second-part"));
+    }
+
+    #[test]
+    fn preserves_benign_prose_and_project_paths() {
+        let text = "basic auth overview\n0123456789abcdef0123456789abcdef01234567\n550e8400-e29b-41d4-a716-446655440000\n/workspace/Package123456789012345678901234567890/config.json\nt-test, t-shirt, t-shirt-style and u-turn";
+        assert_eq!(test_clean(text), text);
+        let bearer_prose = test_clean("discussing bearer tokens\nfollowing line survives");
+        assert!(bearer_prose.contains("following line survives"));
+        assert!(!sensitive_path("project/config.json"));
+        assert!(sensitive_path("dev.herdr.feishu-bridge/config.json"));
+        let config = test_clean(r#"{"theme":"dark","password":"fixture-password"}"#);
+        assert!(config.contains("dark") && !config.contains("fixture-password"));
     }
 
     #[test]

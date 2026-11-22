@@ -11,6 +11,7 @@ const TTL: i64 = 7 * DAY;
 const DEFAULT_COOLDOWN: i64 = 14 * DAY / 1000;
 const MAX_PENDING: u32 = 5;
 const PROPOSAL_FIELDS: &str = "id,project_id,number,title,why_now,scope,not_doing,acceptance,risk,effort,category,status,created_at,decided_at,decided_by,execution_event_id,source_message_id";
+pub(crate) const REQUEST_BACKOFF_MS: i64 = 5 * 60 * 1000;
 const SETTINGS_FIELDS: &str = "project_id,enabled,cadence_seconds,pending_limit,cooldown_seconds,last_requested_at,owner_open_id,app_id,chat_id,revision";
 pub(crate) const PROJECT_READY_SQL: &str = "p.paused=0
     AND NOT EXISTS(SELECT 1 FROM work_leases l WHERE l.project_id=p.id AND l.generation=p.generation AND l.active=1)
@@ -247,10 +248,23 @@ pub(crate) fn dismiss_expired_publication(
 pub(crate) fn claim_due(c: &Connection, now: i64) -> Result<Option<Settings>> {
     let tx = c.unchecked_transaction()?;
     expire(&tx, now)?;
+    // A definitive delivery failure never reached Feishu, so remove those
+    // unpublished rows to free both pending slots and dedupe hashes for retry.
+    // Keep uncertain deliveries on the normal cadence because Feishu may have accepted them.
+    tx.execute(
+        "DELETE FROM proposals WHERE status='pending'
+         AND source_message_id IS NULL AND EXISTS(
+             SELECT 1 FROM messages m WHERE m.id=proposals.outbox_id AND m.status='failed')",
+        [],
+    )?;
     let target: Option<String> = tx.query_row(&format!(
         "SELECT p.id FROM autonomy_settings a JOIN projects p ON p.id=a.project_id
         JOIN project_bots b ON b.project_id=p.id
-        WHERE a.enabled=1 AND (a.last_requested_at IS NULL OR a.last_requested_at <= :now-max(a.cadence_seconds,86400)*1000)
+        WHERE a.enabled=1 AND (a.last_requested_at IS NULL OR a.last_requested_at <= :now-{REQUEST_BACKOFF_MS})
+          AND (a.last_saved_at IS NULL OR a.last_saved_at <= :now-max(a.cadence_seconds,86400)*1000
+               OR EXISTS(SELECT 1 FROM messages m WHERE m.project_id=p.id AND m.direction='out'
+                 AND m.source_id='autonomy-'||p.id||'-'||a.last_saved_at
+                 AND m.status='failed' AND m.updated_at<=:now-{REQUEST_BACKOFF_MS}))
           AND {PROJECT_READY_SQL} AND {CAN_REQUEST} ORDER BY a.last_requested_at NULLS FIRST,p.id LIMIT 1"),
         rusqlite::named_params!{":now": now}, |r| r.get(0)).optional()?;
     let claim = if let Some(project) = target {
@@ -377,102 +391,26 @@ fn normalized(value: &str) -> String {
 }
 
 fn acceptable(draft: &Draft) -> bool {
-    const BLOCKED: &[&str] = &[
-        "release",
-        "publish",
-        "deploy",
-        "git push",
-        "git tag",
-        "upload",
-        "credential",
-        "secret",
-        "api key",
-        "api_key",
-        "authentication",
-        "login",
-        "notari",
-        "signature",
-        "delete",
-        "erase",
-        "purge",
-        "drop table",
-        "rm -",
-        "ssh",
-        "cross-machine",
-        "other user",
-        "external account",
-        "another machine",
-        "global cli",
-        "force-push",
-        "发版",
-        "发布",
-        "部署",
-        "打标签",
-        "打 tag",
-        "上传",
-        "凭据",
-        "密钥",
-        "认证",
-        "登录",
-        "删除",
-        "清空",
-        "清除",
-        "卸载",
-        "解绑",
-        "移除历史",
-        "跨机器",
-        "其他用户",
-        "公证",
-        "签名",
-    ];
-    let contains_blocked = |value: &str| {
-        let normalized = normalized(value);
-        BLOCKED.iter().any(|term| normalized.contains(term))
-    };
-    let exclusions_safe = draft
-        .not_doing
-        .split(['\n', ';', '；', '.', '。', ',', '，'])
-        .all(|clause| {
-            let clause = normalized(clause.trim_start_matches([' ', '-', '*', '•']));
-            !contains_blocked(&clause)
-                || [
-                    "no ", "do not ", "don't ", "never ", "exclude ", "不", "禁止", "排除",
-                ]
-                .iter()
-                .any(|prefix| clause.starts_with(prefix))
-        });
-    exclusions_safe
-        && matches!(
-            draft.category.as_str(),
-            "documentation"
-                | "usability"
-                | "reliability"
-                | "tests"
-                | "observability"
-                | "maintainability"
-        )
-        && [
-            &draft.title,
-            &draft.why_now,
-            &draft.scope,
-            &draft.not_doing,
-            &draft.acceptance,
-            &draft.risk,
-            &draft.effort,
-        ]
-        .iter()
-        .all(|value| !value.trim().is_empty() && value.chars().count() <= 1000)
+    matches!(
+        draft.category.as_str(),
+        "documentation"
+            | "usability"
+            | "reliability"
+            | "tests"
+            | "observability"
+            | "maintainability"
+    ) && [
+        &draft.title,
+        &draft.why_now,
+        &draft.scope,
+        &draft.not_doing,
+        &draft.acceptance,
+        &draft.risk,
+        &draft.effort,
+    ]
+    .iter()
+    .all(|value| !value.trim().is_empty() && value.chars().count() <= 1000)
         && draft.title.chars().count() <= 120
-        && [
-            &draft.title,
-            &draft.why_now,
-            &draft.scope,
-            &draft.acceptance,
-            &draft.risk,
-            &draft.effort,
-        ]
-        .iter()
-        .all(|value| !contains_blocked(value))
 }
 
 pub(crate) fn save_batch(
@@ -712,11 +650,13 @@ mod tests {
     }
 
     #[test]
-    fn exclusions_accept_explicit_prohibitions_and_reject_blocked_actions() {
+    fn proposal_validation_checks_structure_without_filtering_words() {
         let mut proposal = draft("Guide");
         proposal.not_doing = "Do not deploy; 禁止发版".into();
         assert!(acceptable(&proposal));
         proposal.not_doing = "No feature work; deploy the service".into();
+        assert!(acceptable(&proposal));
+        proposal.category = "unknown".into();
         assert!(!acceptable(&proposal));
     }
 
@@ -755,12 +695,12 @@ mod tests {
             let enabled = configure(c, "project", update(true), now)?;
             assert_eq!(configure(c, "project", update(true), now)?, enabled);
             let claim = claim_due(c, now)?.unwrap();
-            assert!(claim_due(c, now + DAY - 1)?.is_none());
+            assert!(claim_due(c, now + REQUEST_BACKOFF_MS - 1)?.is_none());
             assert!(save_batch(c, &claim, vec![draft("Overflow"); 4], now).is_err());
             let first = save_batch(
                 c,
                 &claim,
-                vec![draft("Guide"), draft("Deploy application"), draft("Other")],
+                vec![draft("Guide"), draft("Deploy application")],
                 now,
             )?;
             assert_eq!(first.len(), 2);

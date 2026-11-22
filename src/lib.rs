@@ -1407,10 +1407,10 @@ impl App {
             event.id,
             run.id,
             xml(&event.source),
-            if event.message_id.is_some() {
-                "steer"
-            } else {
-                "scheduled_run"
+            match event.source.as_str() {
+                "management" | "manager_worker" => "delegation",
+                "timer" => "scheduled_run",
+                _ => "message",
             },
             body
         );

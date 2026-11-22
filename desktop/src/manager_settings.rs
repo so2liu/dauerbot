@@ -193,7 +193,7 @@ impl ManagerSettings {
                             Ok(config) => {
                                 this.config = config;
                                 this.fill_inputs = true;
-                                this.clear_inputs = reply.changing;
+                                this.clear_inputs = true;
                                 this.dirty = false;
                                 this.message = if reply.changing {
                                     "Manager settings saved".into()
@@ -412,7 +412,7 @@ impl Render for ManagerSettings {
                             this.request("PUT",Some(body),cx);
                         })))
                     .child(Button::new("reload-manager-config").small().child(control_label(self.language.text("Reload"))).disabled(busy)
-                        .on_click(cx.listener(|this,_,_,cx|{this.clear_inputs=true;this.request("GET",None,cx);})))
+                        .on_click(cx.listener(|this,_,_,cx|{this.request("GET",None,cx);})))
                     .child(Button::new("clear-manager-key").small().child(control_label(self.language.text("Clear saved API key")))
                         .disabled(busy||revision.is_none()||self.config["has_api_key"]!=true||self.dirty)
                         .on_click(cx.listener(|this,_,_,cx|{
