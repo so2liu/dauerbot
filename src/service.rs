@@ -523,13 +523,14 @@ pub async fn abort(app: &Arc<App>, id: &str) -> Result<Receipt> {
         !r.owner_committed,
         "Ownership has already committed; use the committed service status"
     );
+    app.service.gate.reopen();
+    app.service.manager_gate.reopen();
     if let Some(mut candidate) = slot.take() {
         if candidate.child.try_wait()?.is_none() {
             candidate.child.kill().await?;
         }
         candidate.child.wait().await?;
     }
-    app.service.gate.reopen();
     r.phase = "aborted".into();
     app.service.persist(r)
 }
@@ -998,6 +999,7 @@ pub async fn standby(
             && receipt.candidate_pid == std::process::id(),
         "Ownership journal does not authorize this process"
     );
+    // Only the journal-authorized owner can recover abandoned records.
     let app = if committed == 2 {
         App::new(dir.clone(), cfg)?
     } else {
@@ -1354,8 +1356,31 @@ mod tests {
         service.manager_gate.close_until(deadline).await.unwrap();
         service.gate.close_until(deadline).await.unwrap();
     }
+    #[tokio::test]
+    async fn abort_reopens_both_admission_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().into(), Config::default()).unwrap();
+        app.service
+            .persist(Receipt {
+                activation_id: "fixture".into(),
+                phase: "draining".into(),
+                ..Receipt::default()
+            })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        app.service.gate.close_until(deadline).await.unwrap();
+        app.service
+            .manager_gate
+            .close_until(deadline)
+            .await
+            .unwrap();
+        assert_eq!(abort(&app, "fixture").await.unwrap().phase, "aborted");
+        assert!(app.service.gate.enter().is_some());
+        assert!(app.service.manager_gate.enter().is_some());
+    }
+
     #[test]
-    fn clean_handover_and_readonly_preflight_do_not_reclassify_live_effects() {
+    fn handover_open_recovers_abandoned_records_after_preflight() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::default();
         cfg.save(dir.path()).unwrap();
@@ -1363,7 +1388,18 @@ mod tests {
         let db = Db::open(&path).unwrap();
         db.sync(|c|{
             c.execute("INSERT INTO projects(id,name,path,agent,created_at,mcp_token) VALUES('p','p','','custom',0,'token')",[])?;
-            c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('m','p','out','source','content','sending',0,0)",[])?;
+            c.execute_batch("INSERT INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at)
+                VALUES('m','p','out','source','content','sending','{}',0,0),
+                ('incoming','p','in','attachment','','queued',json_object('resource_preparation','abandoned'),0,0);
+                INSERT INTO discussion_progress_requests(project_id,request_id,app_id,recipient,scope,anchor,content,status)
+                VALUES('p','progress','bot','chat','scope','anchor','content','sending');
+                INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at)
+                VALUES('run','p',0,0,json_object('channel_id','local:default'),'working','previous-owner',0);
+                INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status)
+                VALUES('effect','run','close','close_agent','{}','submitting');
+                INSERT INTO manager_close_audit(effect_id,project_id,manager_run,target_generation,terminal_id,reason,status,created_at,updated_at)
+                VALUES('effect','p','run','old','terminal','fixture','checking',0,0);
+                INSERT INTO manager_detached_effects(effect_id,project_id,channel_id) VALUES('effect','p','local:default');")?;
             Ok(())
         }).unwrap();
         assert!(
@@ -1371,8 +1407,27 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+        db.sync(|c| {
+            assert_eq!(
+                c.query_row("SELECT status FROM manager_effects", [], |r| r
+                    .get::<_, String>(0))?,
+                "submitting"
+            );
+            Ok(())
+        })
+        .unwrap();
         drop(db);
         let clean = Db::open_handover(&path).unwrap();
+        clean.sync(|c| {
+            for table in ["discussion_progress_requests", "manager_effects", "manager_close_audit"] {
+                let status = c.query_row(&format!("SELECT status FROM {table}"), [], |r| r.get::<_, String>(0))?;
+                assert_eq!(status, "uncertain", "{table}");
+            }
+            assert_eq!(c.query_row("SELECT count(*) FROM manager_detached_effects", [], |r| r.get::<_, i64>(0))?, 1);
+            assert!(c.query_row("SELECT json_extract(attachment,'$.resource_preparation') IS NULL FROM messages WHERE id='incoming'", [], |r| r.get::<_, bool>(0))?);
+            assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?, 7);
+            Ok(())
+        }).unwrap();
         assert_eq!(
             clean
                 .sync(|c| Ok(

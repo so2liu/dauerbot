@@ -57,24 +57,32 @@ fn guard(c: &Connection, p: &Project, generation: &str, terminal: &str) -> Resul
     )?;
     ensure!(!bound, "A current project or task worker still binds this execution");
     ensure!(
-        !p.paused && !work::has_takeover(c, &p.id, &p.generation)?,
+        !p.paused && !work::has_project_takeover(c, &p.id)?,
         "Management is paused or under user takeover"
     );
     ensure!(
         !crate::cli_switch::latest(c, &p.id)?.is_some_and(|r| r.holds_input),
         "A CLI transition still owns execution delivery"
     );
-    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND (finished_at IS NULL OR status NOT IN ('settled','completed','cancelled','interrupted','failed'))) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','worker_waiting','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR json_extract(payload,'$.target_generation') IS NULL)) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status IN ('queued','processing') AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
+    let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM work_runs WHERE project_id=?1 AND generation=?2 AND (finished_at IS NULL OR status NOT IN ('settled','completed','cancelled','interrupted','failed'))) OR EXISTS(SELECT 1 FROM work_leases WHERE project_id=?1 AND generation=?2 AND active=1) OR EXISTS(SELECT 1 FROM work_events WHERE project_id=?1 AND status IN ('queued','worker_waiting','submitting','submitted','uncertain') AND (json_extract(payload,'$.target_generation')=?2 OR id IN (SELECT event_id FROM work_runs WHERE project_id=?1 AND generation=?2))) OR EXISTS(SELECT 1 FROM manager_inputs WHERE project_id=?1 AND status IN ('queued','processing') AND (json_extract(payload,'$.generation')=?2 OR json_extract(payload,'$.worker_run.generation')=?2 OR json_extract(payload,'$.run_id') IN (SELECT id FROM work_runs WHERE project_id=?1 AND generation=?2)))", params![p.id,generation], |r| r.get(0))?;
     ensure!(
         !active,
         "Pending or uncertain work still refers to this execution"
     );
-    let pending_messages:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?1 AND ((direction='out' AND status IN ('queued','pending','sending','submitting','uncertain')) OR (direction='in' AND status='queued'))) OR EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=?1 AND i.status IN ('queued','processing') AND NOT EXISTS(SELECT 1 FROM manager_input_claims own JOIN manager_runs r ON r.id=own.run_id WHERE own.input_id=i.id AND r.status='working'))",[&p.id],|r|r.get(0))?;
+    let pending_messages:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE project_id=?1 AND ((direction='out' AND status IN ('queued','pending','sending','submitting','uncertain')) OR (direction='in' AND status='queued' AND json_extract(attachment,'$.target_generation')=?2))) OR EXISTS(SELECT 1 FROM manager_inputs i WHERE i.project_id=?1 AND i.status='processing' AND NOT EXISTS(SELECT 1 FROM manager_input_claims own JOIN manager_runs r ON r.id=own.run_id WHERE own.input_id=i.id AND r.status='working'))",params![p.id,generation],|r|r.get(0))?;
     ensure!(
         !pending_messages,
         "Unresolved input or message effects prevent a proven-safe close"
     );
-    let uncertain: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=?1 AND e.status='uncertain') OR EXISTS(SELECT 1 FROM manager_close_audit WHERE project_id=?1 AND status IN ('submitting','uncertain'))", [&p.id], |r|r.get(0))?;
+    let uncertain: bool = c.query_row("SELECT EXISTS(
+        SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id
+        WHERE r.project_id=?1 AND e.status='uncertain'
+          AND (COALESCE(NULLIF(json_extract(e.result,'$.generation'),''),
+                        NULLIF(json_extract(e.arguments,'$.generation'),''),
+                        CASE WHEN e.name IN ('cli_send_keys','steer_worker') THEN json_extract(r.checkpoint,'$.target_generation') END)=?2
+               OR json_extract(e.arguments,'$.terminal_id')=?3))
+        OR EXISTS(SELECT 1 FROM manager_close_audit WHERE project_id=?1
+          AND target_generation=?2 AND terminal_id=?3 AND status IN ('submitting','uncertain'))", params![p.id,generation,terminal], |r|r.get(0))?;
     ensure!(
         !uncertain,
         "Uncertain management effects require inspection before closure"
@@ -280,7 +288,7 @@ mod tests {
         for legacy in [false, true] {
             let (_dir, app, p) = fixture().await;
             let path = app.dir.join("bridge.sqlite3");
-            let before=app.db.sync(|c| {
+            let mut expected=app.db.sync(|c| {
                 if legacy {
                     // Reconstruct the actually shipped constraints in a private
                     // production store, then reopen through Db's outer transaction.
@@ -299,9 +307,14 @@ mod tests {
                 audit_rows(c)
             }).unwrap();
             drop(app);
+            for row in &mut expected {
+                if row[7] == rusqlite::types::Value::Text("checking".into()) {
+                    row[7] = rusqlite::types::Value::Text("uncertain".into());
+                }
+            }
             let db = db::Db::open_handover(&path).unwrap();
             db.sync(|c| {
-                assert_eq!(audit_rows(c)?, before);
+                assert_eq!(audit_rows(c)?, expected);
                 assert_eq!(
                     c.query_row("SELECT note FROM manager_turn_notes", [], |r| r
                         .get::<_, String>(0))?,
@@ -627,6 +640,23 @@ mod tests {
             assert!(guard(c,&p,OLD,"old-terminal").is_ok());Ok(())
         }).unwrap();
     }
+    #[tokio::test]
+    async fn obsolete_close_ignores_unrelated_queued_inputs_and_uncertain_effects() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_inputs(id,project_id,kind,payload,channel_id,created_at)
+                VALUES('unrelated',?,'user','{}','another-channel',1)", [&p.id])?;
+            c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status)
+                VALUES('history','close-run','previous','cli_send_keys',json_object('generation',?),'uncertain')", [CURRENT])?;
+            c.execute("INSERT INTO manager_close_audit(effect_id,project_id,manager_run,target_generation,terminal_id,reason,status,created_at,updated_at)
+                VALUES('history',?,'close-run',?,'other-terminal','fixture','uncertain',1,1)", params![p.id,CURRENT])?;
+            guard(c, &p, OLD, "old-terminal")?;
+            c.execute("UPDATE manager_effects SET arguments=json_object('generation',?) WHERE id='history'", [OLD])?;
+            assert!(guard(c, &p, OLD, "old-terminal").is_err());
+            Ok(())
+        }).unwrap();
+    }
+
     #[tokio::test]
     async fn uncertain_close_stays_audited_without_a_second_dispatch() {
         let (_dir, app, p) = fixture().await;

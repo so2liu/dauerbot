@@ -40,13 +40,14 @@ async fn has_uncertain_input(
             manager::valid(c, &authority)?;
             Ok(c.query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM manager_effects
-                    WHERE run_id=? AND id!=? AND name IN ('cli_send_keys','steer_worker')
-                      AND status IN ('submitting','uncertain')
+                    SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id
+                    WHERE r.project_id=? AND e.id!=? AND e.name IN ('cli_send_keys','steer_worker')
+                      AND e.status IN ('submitting','uncertain')
                       AND COALESCE(NULLIF(json_extract(result,'$.generation'),''),
-                                   NULLIF(json_extract(arguments,'$.generation'),''),?)=?
+                                   NULLIF(json_extract(arguments,'$.generation'),''),
+                                   NULLIF(json_extract(r.checkpoint,'$.target_generation'),''))=?
                 )",
-                rusqlite::params![authority.run, effect, generation, generation],
+                rusqlite::params![authority.project, effect, generation],
                 |row| row.get(0),
             )?)
         })
@@ -71,7 +72,7 @@ fn current(c: &Connection, authority: &manager::Context, generation: &str) -> Re
         "CLI input is held by a transition; wait for supervised recovery"
     );
     ensure!(
-        !work::has_takeover(c, &project.id, generation)?,
+        !work::has_takeover(c, &project.id, &project.generation)?,
         "Native input is under explicit user control"
     );
     Ok(project)
@@ -122,6 +123,22 @@ pub(crate) async fn send(
     if args.generation.is_empty() {
         args.generation = project(app, authority, "", false).await?.generation;
     }
+    // Persist the resolved target for recovery, including implicit auto-worker
+    // sends whose run checkpoint has no primary generation.
+    let target = args.generation.clone();
+    let id = effect.to_owned();
+    let context = authority.clone();
+    app.db
+        .call(move |c| {
+            manager::valid(c, &context)?;
+            c.execute(
+                "UPDATE manager_effects SET arguments=json_set(arguments,'$.generation',?)
+            WHERE id=? AND run_id=? AND status='submitting'",
+                rusqlite::params![target, id, context.run],
+            )?;
+            Ok(())
+        })
+        .await?;
     let denial = |reason, message| with_generation(stopped(reason, message), &args.generation);
     if has_uncertain_input(app, authority, effect, &args.generation).await? {
         return Ok(denial(
@@ -344,6 +361,26 @@ mod tests {
             c.execute("INSERT INTO cli_switch_requests(id,project_id,target,phase,generation,created_at,holds_input) VALUES('switch',?,'agy','recovery_exhausted','g',0,0)", [&project.id])?;
             Ok(())
         }).unwrap();
+        app.db.sync(|c| {
+            c.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES('previous',?,0,0,'{}','superseded',?,0)", rusqlite::params![project.id,manager::owner()])?;
+            c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES('history','previous','turn:1:call:0','cli_send_keys',json_object('generation','old'),'uncertain')", [])?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            super::has_uncertain_input(&app, &authority, "effect", "old")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !super::has_uncertain_input(&app, &authority, "history", "old")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !super::has_uncertain_input(&app, &authority, "effect", "g")
+                .await
+                .unwrap()
+        );
         let result = super::send(
             &app,
             &authority,

@@ -383,17 +383,27 @@ impl App {
         self.stop_inner_mode(p, true).await
     }
     async fn stop_inner_mode(&self, p: &Project, cancel_intake: bool) -> Result<()> {
-        let worker_stop = if cancel_intake {manager_workers::stop_all(self, p).await} else {Ok(())};
-        if p.terminal.is_some() {
-            let cfg = self.config.read().await.clone();
-            herdr::stop(&cfg, p).await?;
+        let worker_stop = if cancel_intake {
+            manager_workers::stop_all(self, p).await
+        } else {
+            Ok(())
+        };
+        let primary_stop = async {
+            if p.terminal.is_some() {
+                let cfg = self.config.read().await.clone();
+                herdr::stop(&cfg, p).await?;
+            }
+            let id = p.id.clone();
+            let generation_id = p.generation.clone();
+            self.db
+                .call(move |c| cli_switch::stopped_mode(c, &id, &generation_id, cancel_intake))
+                .await
         }
-        let id = p.id.clone();
-        let generation_id = p.generation.clone();
-        self.db
-            .call(move |c| cli_switch::stopped_mode(c, &id, &generation_id, cancel_intake))
-            .await?;
-        worker_stop
+        .await;
+        match (primary_stop, worker_stop) {
+            (Err(primary), Err(workers)) => Err(anyhow::anyhow!("{primary:#}. {workers:#}")),
+            (primary, workers) => primary.and(workers),
+        }
     }
     pub async fn switch_agent(self: &Arc<Self>, key: &str, agent: &str) -> Result<Project> {
         self.switch_agent_mode(key, agent, false).await
@@ -408,10 +418,13 @@ impl App {
             bail!("Choose Codex, Claude Code, Pi, or Antigravity")
         }
         let p = self.db.project(key).await?;
-        anyhow::ensure!(p.agent != "auto", "Automatic projects choose a CLI per task");
         let lock = self.project_lock(&p.id).await;
         let _guard = lock.lock().await;
         let p = self.db.project(&p.id).await?;
+        anyhow::ensure!(
+            p.agent != "auto",
+            "Automatic projects choose a CLI per task"
+        );
         anyhow::ensure!(
             !standby_only || p.terminal.is_none(),
             "This project has started working. Switch its CLI when it is in standby."
@@ -629,16 +642,9 @@ impl App {
             }
             Err(e) => {
                 let text = e.to_string();
-                // A network failure may occur after Feishu accepted the request.
-                let status = if (text.starts_with("Feishu API") && !text.starts_with("Feishu API 5"))
-                    || text.starts_with("Project")
-                    || text.starts_with("File")
-                    || text.starts_with("Markdown")
-                    || text.starts_with("Configure")
-                {
-                    "failed"
-                } else {
-                    "uncertain"
+                let status = match e {
+                    feishu::SendError::Precondition(_) | feishu::SendError::Rejected(_) => "failed",
+                    feishu::SendError::Uncertain(_) => "uncertain",
                 };
                 self.db.state(&m.id, status, &text).await?;
             }
@@ -1558,7 +1564,7 @@ impl App {
         let app = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::select! {_=app.shutdown.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
+                tokio::select! {_=app.shutdown.cancelled()=>break,_=app.notify.notified()=>{},_=tokio::time::sleep(Duration::from_secs(2))=>{}}
                 let Some(_permit) = app.service.gate.enter() else {
                     continue;
                 };

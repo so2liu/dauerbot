@@ -70,8 +70,7 @@ pub(crate) fn seat(c: &Connection, parent: &Project, generation: &str) -> Result
 pub(crate) fn controls(c: &Connection, p: &Project) -> Result<()> {
     ensure!(!p.paused, "Resume this project before delegating work");
     ensure!(
-        !c.query_row("SELECT EXISTS(SELECT 1 FROM work_leases WHERE project_id=? AND active=1)",
-            [&p.id], |row| row.get::<_, bool>(0))?,
+        !work::has_project_takeover(c, &p.id)?,
         "Terminal input is taken over by the user"
     );
     ensure!(

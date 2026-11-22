@@ -402,7 +402,11 @@ fn input(
     )? == 1 && kind == "user" {
         c.execute("UPDATE manager_channels SET retry_at=0 WHERE project_id=? AND channel_id=?",
             params![project,channel_id])?;
-        c.execute("UPDATE manager_config SET next_attempt_at=0 WHERE project_id=?", [project])?;
+        c.execute("UPDATE manager_config SET next_attempt_at=0 WHERE project_id=?
+            AND NOT (next_attempt_at=9223372036854775807 AND EXISTS(
+                SELECT 1 FROM manager_failures WHERE project_id=manager_config.project_id
+                AND json_extract(diagnostic,'$.kind') IN ('authorization','model_unavailable')
+            ))", [project])?;
     }
     Ok(())
 }
@@ -422,7 +426,7 @@ pub(crate) fn valid(c: &Connection, ctx: &Context) -> Result<Project> {
         "Management input or policy changed; effect cancelled"
     );
     ensure!(
-        !work::has_takeover(c, &p.id, &p.generation)?,
+        !work::has_project_takeover(c, &p.id)?,
         "Native input is under explicit user control"
     );
     let run_channel = c.query_row(
@@ -706,7 +710,16 @@ fn read_file(root: &Path, args: FileArgs) -> Result<Value> {
     Ok(result)
 }
 
+#[cfg(test)]
 fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
+    write_file_checked(root, args, || Ok(()))
+}
+
+fn write_file_checked(
+    root: &Path,
+    args: WriteArgs,
+    validate: impl Fn() -> Result<()>,
+) -> Result<Value> {
     use std::io::ErrorKind;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -733,6 +746,7 @@ fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
             (target, Some(permissions))
         }
         Err(error) if error.kind() == ErrorKind::NotFound && args.expected_sha256.is_none() => {
+            validate()?;
             fs::create_dir_all(parent)?;
             (path, None)
         }
@@ -740,6 +754,7 @@ fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
     };
     if permissions.is_none() && fs::symlink_metadata(&target).is_ok_and(|m| m.is_symlink()) {
         // Creating through a dangling link must leave the link itself in place.
+        validate()?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -759,6 +774,7 @@ fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
             file.as_file().set_permissions(permissions)?;
         }
         file.as_file().sync_all()?;
+        validate()?;
         file.persist(target)?;
     }
     Ok(
@@ -772,9 +788,10 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
                 WHERE g.revision=? AND p.paused=0 AND NOT ({PROVIDER_CONFIGURED}))"),
             params![project, revision], |row| row.get(0),
         )?;
-        let p = db::project_by_key(c, project)?;
-        ensure!(allowed && !work::has_takeover(c, project, &p.generation)?,
-            "The manager configuration notice is no longer active");
+        ensure!(
+            allowed && !work::has_project_takeover(c, project)?,
+            "The manager configuration notice is no longer active"
+        );
     }
     if let Some(origin) = attachment["manager_receipt_origin"].as_str() {
         let allowed: bool = c.query_row(
@@ -786,9 +803,8 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
             allowed,
             "The receipt's user source was stopped or superseded"
         );
-        let p = db::project_by_key(c, project)?;
         ensure!(
-            !work::has_takeover(c, project, &p.generation)?,
+            !work::has_project_takeover(c, project)?,
             "Management reply is held by user takeover"
         );
         return Ok(());
@@ -799,9 +815,8 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
             allowed,
             "Management notice no longer belongs to an active incident"
         );
-        let p = db::project_by_key(c, project)?;
         ensure!(
-            !work::has_takeover(c, project, &p.generation)?,
+            !work::has_project_takeover(c, project)?,
             "Management notice is held by user takeover"
         );
     }
@@ -810,9 +825,8 @@ pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Res
     };
     let allowed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id JOIN manager_config m ON m.project_id=r.project_id JOIN projects p ON p.id=m.project_id WHERE e.id=? AND r.project_id=? AND r.status IN ('working','complete') AND r.revision=m.revision AND r.input_revision=m.input_revision AND p.paused=0)",params![effect,project],|r|r.get(0))?;
     ensure!(allowed, "Management reply was superseded or stopped");
-    let p = db::project_by_key(c, project)?;
     ensure!(
-        !work::has_takeover(c, project, &p.generation)?,
+        !work::has_project_takeover(c, project)?,
         "Management reply is held by user takeover"
     );
     Ok(())
@@ -1183,7 +1197,7 @@ fn provider_unavailable(c: &Connection, project: &str) -> Result<bool> {
         return Ok(false);
     }
     let p = db::project_by_key(c, project)?;
-    if p.paused || work::has_takeover(c, project, &p.generation)? {
+    if p.paused || work::has_project_takeover(c, project)? {
         return Ok(true);
     }
     let Some(binding) = crate::bot::get(c, project)? else {
@@ -1288,56 +1302,6 @@ fn failure_notice(error: &Failure, delay: i64, repair: bool, chinese: bool) -> S
         error.summary()
     )
 }
-// Record only host-known field names and result flags. Tool arguments and
-// results can contain arbitrary user data, credentials, or provider addresses.
-fn last_tool_summary(c: &Connection, run: &str) -> Result<Option<Value>> {
-    Ok(c.query_row(
-        "SELECT name, occurrence, status, arguments, result FROM manager_effects
-         WHERE run_id=? ORDER BY rowid DESC LIMIT 1",
-        [run],
-        |row| {
-            let args: Value = serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default();
-            let result: Value = serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
-            let fields = [
-                "generation",
-                "input_id",
-                "source_event_id",
-                "target_cli",
-                "reply_to_message_id",
-                "to",
-                "path",
-                "instructions",
-                "segments",
-            ]
-            .into_iter()
-            .filter(|key| args.get(*key).is_some())
-            .collect::<Vec<_>>();
-            let outcome = result["status"].as_str().filter(|value| {
-                matches!(
-                    *value,
-                    "sent"
-                        | "queued"
-                        | "held"
-                        | "submitted"
-                        | "uncertain"
-                        | "written"
-                        | "observation_stopped"
-                )
-            });
-            Ok(
-                json!({"tool":row.get::<_, String>(0)?, "occurrence":row.get::<_, String>(1)?,
-                "argument_fields":fields, "target_cli":args["target_cli"].as_str()
-                    .filter(|cli| matches!(*cli,"codex"|"claude"|"agy"|"pi")),
-                "segment_count":args["segments"].as_array().map(Vec::len),
-                "effect_status":row.get::<_, String>(2)?, "result_status":outcome,
-                "has_error":result["error"].as_str().is_some_and(|error| !error.is_empty()),
-                "has_dispatch_error":result["dispatch_error"].is_string()}),
-            )
-        },
-    )
-    .optional()?)
-}
-
 fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
     let tx = c.unchecked_transaction()?;
     let Ok(p) = valid(&tx, ctx) else {
@@ -1357,26 +1321,13 @@ fn failure(c: &Connection, ctx: &Context, error: &Failure) -> Result<()> {
     } else {
         i64::MAX
     };
-    let exhausted = error.kind == "turn_budget_exhausted";
-    let mut diagnostic = json!({"incident_id":incident,"attempt":attempts,"kind":error.kind,"http_status":error.http_status,"retryable":error.retryable,"elapsed_ms":error.elapsed_ms,"output_tokens":error.output_tokens,"finish_reason":error.finish_reason,"failed_at":db::now(),"next_attempt_at":if error.retryable{Some(next_attempt)}else{None}});
-    if exhausted {
-        diagnostic["last_tool"] = json!(last_tool_summary(&tx, &ctx.run)?);
-    }
+    let diagnostic = json!({"incident_id":incident,"attempt":attempts,"kind":error.kind,"http_status":error.http_status,"retryable":error.retryable,"elapsed_ms":error.elapsed_ms,"output_tokens":error.output_tokens,"finish_reason":error.finish_reason,"failed_at":db::now(),"next_attempt_at":if error.retryable{Some(next_attempt)}else{None}});
     let diagnostic = diagnostic.to_string();
     tx.execute("INSERT INTO manager_failures(project_id,revision,incident_id,attempts,diagnostic,notified) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision,incident_id=excluded.incident_id,attempts=excluded.attempts,diagnostic=excluded.diagnostic,notified=excluded.notified,repair_probe=CASE WHEN manager_failures.incident_id=excluded.incident_id THEN manager_failures.repair_probe ELSE 0 END",params![ctx.project,ctx.revision,incident,attempts,diagnostic,notified])?;
     tx.execute(
-        "UPDATE manager_runs SET error=json_set(CASE WHEN json_valid(error) THEN error ELSE '{}' END,'$.last_failure',json(?)) WHERE id=?",
-        params![diagnostic, ctx.run],
+        "UPDATE manager_runs SET status='failed',error=? WHERE id=? AND status='working'",
+        params![serde_json::to_string(error)?, ctx.run],
     )?;
-    if exhausted {
-        // End this batch so its saved tool effects cannot be admitted a second
-        // time. Unclaimed inputs and outstanding delegations retain their state.
-        close_turn(&tx, ctx)?;
-        tx.execute("UPDATE manager_config SET error='',next_attempt_at=? WHERE project_id=?",
-            params![next_attempt, ctx.project])?;
-        tx.commit()?;
-        return Ok(());
-    }
     tx.execute(
         "UPDATE manager_config SET error=?,next_attempt_at=? WHERE project_id=?",
         params![error.summary(), next_attempt, ctx.project],
