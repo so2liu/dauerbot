@@ -192,16 +192,40 @@ fn start(turn: &Turn, config: &ProviderConfig, root: &Path) -> Result<tokio::pro
     Ok(child)
 }
 
-async fn images(turn: &Turn) -> Vec<Value> {
+async fn prepare_prompt(turn: &Turn, supports_images: bool) -> Result<Value> {
+    let mut prompt: Value = serde_json::from_str(&turn.prompt)?;
     let mut images = Vec::new();
+    let mut delivery = Vec::new();
     for source in &turn.images {
-        if let Ok(UserContent::Image(image)) = source.content().await
+        let mut attachment = json!({
+            "source_message_id": source.source_message_id,
+            "cache_message_id": source.message_id,
+            "local_path": source.path,
+        });
+        if supports_images
+            && let Ok(UserContent::Image(image)) = source.content().await
             && let DocumentSourceKind::Base64(data) = image.data
         {
+            attachment["mode"] = json!("image_part");
+            attachment["image_index"] = json!(images.len());
             images.push(json!({"type":"image","data":data,"mimeType":source.media_type}));
+        } else {
+            attachment["mode"] = json!("path_only");
+            attachment["reason"] = if supports_images {
+                json!("cache_verification_failed")
+            } else {
+                json!("image_capability_not_declared")
+            };
+            attachment["note"] = json!(
+                "No image pixels were attached for this reference. Do not claim to have viewed it."
+            );
         }
+        delivery.push(attachment);
     }
-    images
+    if !delivery.is_empty() {
+        prompt["pi_image_delivery"] = json!(delivery);
+    }
+    Ok(json!({"type":"prompt","message":prompt.to_string(),"images":images}))
 }
 
 pub(super) async fn drive(
@@ -242,11 +266,11 @@ async fn run(
         .tempdir_in("/tmp")?;
     let root = temporary.path();
     let listener = UnixListener::bind(root.join("tools.sock"))?;
-    let images = images(turn).await;
+    let request = prepare_prompt(turn, config.supports_images).await?;
     turn.started = true;
     checkpoint(app, ctx, &json!({"pi":turn}), false).await?;
     let mut child = start(turn, config, root)?;
-    let result = rpc(app, ctx, config, turn, &listener, &mut child, images).await;
+    let result = rpc(app, ctx, config, &listener, &mut child, request).await;
     // Reap Pi before discarding its private socket and configuration.
     let _ = child.kill().await;
     result
@@ -256,10 +280,9 @@ async fn rpc(
     app: &Arc<App>,
     ctx: &Context,
     config: &ProviderConfig,
-    turn: &Turn,
     listener: &UnixListener,
     child: &mut tokio::process::Child,
-    images: Vec<Value>,
+    request: Value,
 ) -> Result<&'static str> {
     let mut stdin = child.stdin.take().context("Missing Pi input")?;
     let mut stdout = BufReader::new(child.stdout.take().context("Missing Pi output")?).lines();
@@ -280,7 +303,6 @@ async fn rpc(
         "Pi did not select the configured Manager provider"
     );
     ensure!(current(app, ctx).await, "Management turn superseded");
-    let request = json!({"type":"prompt","message":turn.prompt,"images":images});
     tokio::time::timeout(
         Duration::from_secs(10),
         stdin.write_all(format!("{request}\n").as_bytes()),
@@ -342,6 +364,39 @@ mod tests {
     use super::*;
     use axum::{Json, Router, http::HeaderMap, response::IntoResponse, routing::post};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn pi_prompt_identifies_missing_pixels_and_the_surviving_attachment() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let refs = ["gone", "ok"].map(|id| {
+            let resource = crate::multimodal::fixture_resource(dir.path(), "project", id);
+            let root = PathBuf::from(resource["cache_root"].as_str().unwrap());
+            ImageRef::from_resource("project", id, &resource, &root)
+        });
+        let [gone, ok] = refs;
+        let gone = gone?;
+        std::fs::remove_file(&gone.path)?;
+        let request = prepare_prompt(
+            &Turn {
+                executable: PathBuf::new(),
+                prompt: r#"{"current":"inspect both"}"#.into(),
+                images: vec![gone, ok?],
+                started: false,
+            },
+            true,
+        )
+        .await?;
+        assert_eq!(request["images"].as_array().unwrap().len(), 1);
+        let prompt: Value = serde_json::from_str(request["message"].as_str().unwrap())?;
+        let delivery = &prompt["pi_image_delivery"];
+        assert_eq!(prompt["current"], "inspect both");
+        assert_eq!(delivery[0]["source_message_id"], "om_gone");
+        assert_eq!(delivery[0]["reason"], "cache_verification_failed");
+        assert!(delivery[0]["image_index"].is_null());
+        assert_eq!(delivery[1]["source_message_id"], "om_ok");
+        assert_eq!(delivery[1]["image_index"], 0);
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires an explicitly selected installed Pi executable"]
