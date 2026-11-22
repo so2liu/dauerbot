@@ -120,6 +120,13 @@ fn task_file(
     Ok((task, result))
 }
 
+#[cfg(test)]
+pub(crate) async fn fixture_assignment(app: &App, worker: &Project, event: &work::Event) -> Result<PathBuf> {
+    let instructions = manager::body(app, worker, event).await?;
+    let (task, _) = task_file(Path::new(&worker.path), worker, "fixture-run", &instructions)?;
+    Ok(task)
+}
+
 fn prompt(task: &Path, result: &Path) -> Result<String> {
     let task = task.to_str().context("Worker task path is not UTF-8")?;
     let result = result.to_str().context("Worker result path is not UTF-8")?;

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_CHECKPOINT: usize = 2 * 1024 * 1024;
 const MAX_CONTENT: usize = 256 * 1024;
-const TOOLS: [&str; 11] = [
+const TOOLS: [&str; 12] = [
     "read_file",
     "write_file",
     "delegate",
@@ -32,6 +32,7 @@ const TOOLS: [&str; 11] = [
     "cli_send_keys",
     "cli_view",
     "schedule_run",
+    "record_topic_decision",
 ];
 
 /// Only host-controlled diagnostics cross into durable state or user notices.
@@ -235,7 +236,7 @@ fn definitions() -> Vec<ToolDefinition> {
         ),
         (
             "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only. An unavailable or starting worker returns worker_unavailable and queues no work. Use worker_status to inspect independent workers. Use the requested CLI when the user names one; never silently substitute. Omit target_cli to detect a default in automatic projects. Select source_event_id from trusted_sources when multiple discussions are present.",
-            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy","custom"]}}),
+            json!({"instructions":{"type":"string"},"source_event_id":{"type":"string"},"decision_branch":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy","custom"]}}),
             vec!["instructions"],
         ),
         (
@@ -277,6 +278,11 @@ fn definitions() -> Vec<ToolDefinition> {
             "Create a project schedule. Use user for work explicitly requested by the user; internal for your own follow-up checks.",
             json!({"name":{"type":"string"},"prompt":{"type":"string"},"kind":{"type":"string","enum":["once","interval","cron"]},"at":{"type":"string"},"interval_seconds":{"type":"integer"},"cron":{"type":"string"},"timezone":{"type":"string"},"to":{"type":"string"},"purpose":{"type":"string","enum":["user","internal"]}}),
             vec!["name","prompt","kind","purpose"],
+        ),
+        (
+            "Record an explicit user decision or reference for this Feishu discussion. Cite the exact user excerpt, source event, work branch and stable key. Never infer agreement or use quoted input as the source. A newer correction with the same branch/key supersedes the old decision.",
+            json!({"source_event_id":{"type":"string"},"branch":{"type":"string"},"key":{"type":"string"},"evidence":{"type":"string"},"kind":{"type":"string","enum":["current","reference","obsolete"]}}),
+            vec!["source_event_id","branch","key","evidence","kind"],
         ),
     ];
     TOOLS.into_iter().zip(schemas).map(|(name,(description,properties,required))|ToolDefinition::new(name.try_into().expect("static tool name"),description,json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}))).collect()
