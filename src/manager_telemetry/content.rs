@@ -1,9 +1,9 @@
-//! Outbound content projection. Untrusted tool output never enters this path.
+//! Redaction for opt-in Manager telemetry.
 use rig_core::{
     completion::CompletionRequest,
-    message::{AssistantContent, Message, UserContent},
+    message::{AssistantContent, DocumentSourceKind, Message, UserContent},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub(super) fn sensitive_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -16,8 +16,7 @@ pub(super) fn sensitive_path(path: &str) -> bool {
                 part.starts_with(".env")
                     || matches!(
                         part,
-                        ".dauerbot"
-                            | ".ssh"
+                        ".ssh"
                             | ".aws"
                             | ".config"
                             | ".codex"
@@ -66,17 +65,55 @@ fn token_like(token: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b)))
 }
 
-pub(super) fn clean(text: &str) -> String {
-    // Reuse the diagnostic walk for complete JSON values, including strings
-    // that encode other JSON documents. Free-form text still goes through
-    // the stricter lexical export filter below.
-    let structured;
-    let text = if text.trim_start().starts_with(['{', '[', '"']) {
-        structured = crate::manager_context::clean_for_export(text);
-        structured.as_str()
-    } else {
-        text
+pub(super) fn clean(text: &str, secrets: &[&str]) -> String {
+    clean_text(text, secrets, 0)
+}
+
+fn clean_text(text: &str, secrets: &[&str], depth: usize) -> String {
+    if depth >= 24 {
+        return "[omitted: structured credential inspection limit]".into();
+    }
+    crate::manager::redact_envelope(text, |name, value| {
+        if envelope_identifier(name, value) {
+            scrub_known(value, secrets).into_owned()
+        } else {
+            clean_plain(value, secrets, depth + 1)
+        }
+    })
+    .unwrap_or_else(|| clean_plain(text, secrets, depth))
+}
+
+fn envelope_identifier(name: &str, value: &str) -> bool {
+    let prefix = match name {
+        "event_id" | "origin_event_id" | "local_source_id" => {
+            return uuid::Uuid::parse_str(value).is_ok();
+        }
+        "message_id" | "root_id" | "parent_id" => "om_",
+        "thread_id" => "omt_",
+        "chat_id" => "oc_",
+        "open_id" => "ou_",
+        "union_id" => "on_",
+        "bot_app_id" => "cli_",
+        _ => return false,
     };
+    value.strip_prefix(prefix).is_some_and(|id| {
+        !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
+fn clean_plain(text: &str, secrets: &[&str], depth: usize) -> String {
+    if text.trim_start().starts_with(['{', '[', '"']) {
+        if let Ok(mut value) = serde_json::from_str::<Value>(text) {
+            sanitize(&mut value, secrets, depth + 1);
+            return value.to_string();
+        }
+        let checked = crate::manager_context::clean_for_export(text);
+        if checked != text {
+            return scrub_known(&checked, secrets).into_owned();
+        }
+    }
+    let scrubbed = scrub_known(text, secrets);
+    let text = scrubbed.as_ref();
     let lower = text.to_ascii_lowercase();
     if lower.contains("-----begin") && lower.contains("private key-----") {
         return "[redacted private key material]".into();
@@ -145,89 +182,141 @@ pub(super) fn clean(text: &str) -> String {
     crate::manager_context::clean_for_export(&result)
 }
 
-pub(super) fn model_name(text: &str) -> String {
-    let mut name = clean(text);
+pub(super) fn model_name(text: &str, secrets: &[&str]) -> String {
+    let mut name = clean(text, secrets);
     if name.len() > 256 {
         name.truncate(name.floor_char_boundary(256));
     }
     name
 }
 
+fn scrub_known<'a>(text: &'a str, secrets: &[&str]) -> std::borrow::Cow<'a, str> {
+    let mut text = std::borrow::Cow::Borrowed(text);
+    for secret in secrets {
+        if !secret.is_empty() && text.contains(secret) {
+            text = std::borrow::Cow::Owned(text.replace(secret, "[redacted]"));
+        }
+    }
+    text
+}
+
+pub(super) fn protected_arguments(path: Option<&Value>) -> bool {
+    path.and_then(Value::as_str).is_some_and(sensitive_path)
+}
+
 pub(super) fn has_protected_tool(request: &CompletionRequest) -> bool {
     request.chat_history.iter().any(|message| match message {
         Message::Assistant(message) => message.content.iter().any(|item| match item {
-            AssistantContent::ToolCall(call) => call
-                .function
-                .arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .is_some_and(sensitive_path),
+            AssistantContent::ToolCall(call) => {
+                protected_arguments(call.function.arguments.get("path"))
+            }
             _ => false,
         }),
         _ => false,
     })
 }
 
-pub(super) fn request_text(request: &CompletionRequest) -> String {
-    let mut result = String::new();
-    for message in request.chat_history.iter() {
-        match message {
-            Message::User { content } => {
-                for item in content.iter() {
-                    if let UserContent::Text(text) = item {
-                        // Manager user text is a host-created context envelope.
-                        // Allow only human text and leave files, observations,
-                        // configuration, system instructions and metadata behind.
-                        if let Ok(context) = serde_json::from_str::<Value>(&text.text)
-                            && context["event"] == "user"
-                        {
-                            append(
-                                &mut result,
-                                "user",
-                                context["data"]["user_input"]["body"].as_str(),
-                            );
-                        }
-                    }
-                }
-            }
-            Message::Assistant(message) => {
-                for item in message.content.iter() {
-                    if let AssistantContent::Text(text) = item {
-                        append(&mut result, "assistant", Some(&text.text));
-                    }
-                }
-            }
-            _ => {}
-        }
+fn sanitize(value: &mut Value, secrets: &[&str], depth: usize) {
+    if depth >= 24 {
+        *value = json!("[omitted: structured credential inspection limit]");
+        return;
     }
-    result
+    match value {
+        Value::Object(fields) => {
+            if protected_arguments(fields.get("path")) {
+                *value = json!("[redacted path]");
+                return;
+            }
+            for (key, mut value) in std::mem::take(fields) {
+                if crate::manager_context::sensitive(&key) {
+                    value = json!("[redacted sensitive field]");
+                } else {
+                    sanitize(&mut value, secrets, depth + 1);
+                }
+                fields.insert(scrub_known(&key, secrets).into_owned(), value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                sanitize(value, secrets, depth + 1);
+            }
+        }
+        Value::String(text) => *text = clean_text(text, secrets, depth + 1),
+        _ => {}
+    }
 }
 
-pub(super) fn append(target: &mut String, role: &str, value: Option<&str>) {
-    if let Some(value) = value {
-        target.push_str(role);
-        target.push_str(": ");
-        target.push_str(&clean(value));
-        target.push('\n');
+pub(super) fn request_text(request: &CompletionRequest, secrets: &[&str]) -> String {
+    let mut messages = Vec::with_capacity(request.chat_history.len());
+    for message in &request.chat_history {
+        let mut value = json!(message);
+        sanitize(&mut value, secrets, 0);
+        // Only host-hydrated image blocks may retain their base64 data.
+        // Strings inside event envelopes or tool results take the normal
+        // redaction path even if they claim to contain image data.
+        if let Message::User { content } = message {
+            for (index, block) in content.iter().enumerate() {
+                if let UserContent::Image(image) = block
+                    && let DocumentSourceKind::Base64(pixels) = &image.data
+                    && let Some(data) = value
+                        .get_mut("content")
+                        .and_then(|content| content.get_mut(index))
+                        .and_then(|block| block.get_mut("data"))
+                        .and_then(Value::as_object_mut)
+                {
+                    data.insert("value".into(), json!(pixels));
+                }
+            }
+        }
+        messages.push(value);
     }
+    json!({"chat_history": messages}).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn request_text_extracts_only_user_text_from_channel_events() {
-        let request = CompletionRequest::new(serde_json::json!({
-            "event":"user","data":{"user_input":{"body":"hello from the channel","resources":["private resource"]}}
-        }).to_string()).message(Message::user(serde_json::json!({
-            "event":"worker","data":{"user_input":{"body":"internal observation"}}
-        }).to_string()));
-        let text = request_text(&request);
-        assert!(text.contains("hello from the channel"));
-        assert!(!text.contains("private resource"));
-        assert!(!text.contains("internal observation"));
+    fn request_preserves_full_history_and_image_pixels() {
+        use rig_core::message::{CallId, ToolName};
+
+        let mut request = CompletionRequest::new(json!({
+            "event":"user","data":{"user_input":{"body":"hello from the channel","resources":["a resource"]}}
+        }).to_string()).preamble("System instructions");
+        if let Message::User { content } = &mut request.chat_history[1] {
+            content.push(UserContent::image_base64("aGVs".repeat(16), None, None));
+        }
+        request
+            .chat_history
+            .push(Message::from(AssistantContent::tool_call(
+                "call",
+                ToolName::new("read_file").unwrap(),
+                json!({"path":"notes.md"}),
+            )));
+        request.chat_history.push(Message::tool_result(
+            CallId::from_wire("call"),
+            ToolName::new("read_file").unwrap(),
+            r#"{"password":"fixture-short!","body":"ordinary result","caption":"exact-secret"}"#,
+        ));
+        let text = request_text(&request, &["exact-secret"]);
+        for expected in [
+            "System instructions",
+            "hello from the channel",
+            "a resource",
+            "aGVs".repeat(16).as_str(),
+            "read_file",
+            "notes.md",
+            "ordinary result",
+        ] {
+            assert!(text.contains(expected), "{expected}");
+        }
+        assert!(!text.contains("fixture-short!") && !text.contains("exact-secret"));
     }
 
     use super::*;
+
+    fn test_clean(text: &str) -> String {
+        clean(text, &[])
+    }
 
     #[test]
     fn redacts_known_credentials_and_sensitive_paths() {
@@ -252,21 +341,21 @@ mod tests {
             "nested/.env.production",
             "langfuse.json",
         ] {
-            assert!(!clean(secret).contains(secret), "{secret}");
+            assert!(!test_clean(secret).contains(secret), "{secret}");
         }
         for escaped in [
             r#"{"config":"{\"password\":\"fixture-short!\"}"}"#,
             r#"pasted JSON: {\"secret_key\":\"fixture-short!\"}"#,
             r#"{"config":"{\"pass\\u0077ord\":\"fixture-short!\"}"}"#,
         ] {
-            assert!(!clean(escaped).contains("fixture-short!"));
+            assert!(!test_clean(escaped).contains("fixture-short!"));
         }
         for command in [
             "sshpass -p 'fixture-short!' ssh fixture-host",
             "curl --user account:fixture-short! https://fixture.invalid",
             "git clone https://account:fixture-short!@fixture.invalid/repo",
         ] {
-            assert!(!clean(command).contains("fixture-short!"));
+            assert!(!test_clean(command).contains("fixture-short!"));
         }
         assert!(
             !crate::manager_context::clean(r#"{"base64":"aGVsbG8="}"#)
@@ -274,7 +363,7 @@ mod tests {
                 .contains("aGVsbG8=")
         );
         let yaml = "ordinary text\npassword: |\n  first-part\n  second-part\nregular after secret";
-        let redacted = clean(yaml);
+        let redacted = test_clean(yaml);
         assert!(redacted.starts_with("ordinary text"));
         assert!(!redacted.contains("first-part") && !redacted.contains("second-part"));
     }
@@ -282,17 +371,17 @@ mod tests {
     #[test]
     fn preserves_large_plain_and_structured_text_without_size_omission() {
         let body = format!("BEGIN\n{}\nEND", "消息正文。".repeat(30000));
-        assert_eq!(clean(&body), body);
+        assert_eq!(test_clean(&body), body);
         let safe_document = serde_json::json!({"body": body}).to_string();
-        assert_eq!(clean(&safe_document), safe_document);
+        assert_eq!(test_clean(&safe_document), safe_document);
         let structured =
             serde_json::json!({"body": body, "password": "fixture-hidden!"}).to_string();
-        let redacted: Value = serde_json::from_str(&clean(&structured)).unwrap_or(Value::Null);
+        let redacted: Value = serde_json::from_str(&test_clean(&structured)).unwrap_or(Value::Null);
         // The structured scanner must not bypass credential detection at large sizes.
-        assert!(!clean(&structured).contains("fixture-hidden!"));
+        assert!(!test_clean(&structured).contains("fixture-hidden!"));
         assert!(
             redacted.is_object()
-                || clean(&structured).ends_with("[redacted credential-bearing text]")
+                || test_clean(&structured).ends_with("[redacted credential-bearing text]")
         );
     }
 
@@ -303,7 +392,7 @@ mod tests {
             " ".repeat(300_000)
         );
         assert_eq!(
-            clean(&text),
+            test_clean(&text),
             "[omitted: structured credential inspection failed]"
         );
     }

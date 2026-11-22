@@ -154,7 +154,7 @@ pub(crate) const SENSITIVE_FIELDS: &[&str] = &[
     "tenantaccesstoken",
 ];
 
-fn sensitive(key: &str) -> bool {
+pub(crate) fn sensitive(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace(['-', '_', ' '], "");
     SENSITIVE_FIELDS.contains(&key.as_str())
 }
@@ -309,6 +309,12 @@ fn clean_with_budget(text: &str, remaining: Option<usize>) -> (String, bool) {
 fn inspect_text(text: &str, depth: usize, budget: &mut RedactionBudget) -> String {
     if depth >= MAX_REDACTION_DEPTH || !budget.reserve(text.len()) {
         return budget.omit();
+    }
+    if let Some(redacted) = crate::manager::redact_envelope(text, |_, value| {
+        inspect_text(value, depth + 1, budget)
+    }) {
+        budget.changed |= redacted != text;
+        return redacted;
     }
     if (budget.remaining.is_none() || text.len() <= MAX_STRUCTURED_BYTES)
         && let Ok(mut value) = serde_json::from_str::<Value>(text)

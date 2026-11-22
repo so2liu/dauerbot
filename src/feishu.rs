@@ -1,5 +1,5 @@
 use crate::{App, bot::Binding, config::Config, db};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use open_lark::ws_client::{
     CardActionTrigger, CardActionTriggerHandler, CardActionTriggerResponse, CardToast,
     EventDispatcherHandler, EventHandler, LarkWsClient,
@@ -141,7 +141,11 @@ pub async fn send(app: &App, p: &db::Project, m: &db::Message) -> Result<SendRec
         ensure_card(card)?;
         ("interactive", card.clone())
     } else if let Some(path) = m.attachment["path"].as_str() {
-        let path = allowed_file(p, Path::new(path), &app.dir)?;
+        let path = if m.attachment["manager_effect"].is_string() {
+            manager_file(p, Path::new(path))?
+        } else {
+            allowed_file(p, Path::new(path), &app.dir)?
+        };
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.len() == 0 || metadata.len() > MAX_FILE {
             bail!("File size must be greater than 0 and at most 100 MB");
@@ -341,6 +345,26 @@ pub async fn send_debug_reply(
         }
     }
     Ok(())
+}
+
+pub(crate) fn expand_home(path: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix("~")
+        && let Some(dirs) = directories::BaseDirs::new()
+    {
+        return if rest.as_os_str().is_empty() {
+            dirs.home_dir().to_path_buf()
+        } else {
+            dirs.home_dir().join(rest)
+        };
+    }
+    path.to_path_buf()
+}
+
+pub(crate) fn manager_file(p: &db::Project, path: &Path) -> Result<PathBuf> {
+    let expanded = expand_home(path);
+    let path = std::fs::canonicalize(Path::new(&p.path).join(expanded))?;
+    ensure!(std::fs::metadata(&path)?.is_file(), "Send a regular file");
+    Ok(path)
 }
 
 pub fn allowed_file(p: &db::Project, path: &Path, data_dir: &Path) -> Result<PathBuf> {

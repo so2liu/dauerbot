@@ -155,21 +155,18 @@ fn append_inputs(
         )?;
         if !previously_ingested {
             let mut data = prompt_input(&raw, origin.as_deref())?;
-            if let Some(source) = origin.as_deref() {
-                data["platform"] = trusted_source(c, project, source)?;
-                attach_quote(c, project, Some(source), &mut data, &mut 24000)?;
-            }
+            let source = origin.as_deref()
+                .map(|source| trusted_source(c, project, source))
+                .transpose()?
+                .unwrap_or(Value::Null);
+            attach_quote(c, project, origin.as_deref(), &mut data, &mut 24000)?;
             let images = prepare_images(c, project, origin.as_deref(), &mut data)?;
-            session::append(
-                c,
-                project,
-                channel_id,
-                &Message::user(json!({"event":kind,"data":data}).to_string()),
-                &images,
-            )?;
+            let envelope = event::event_envelope(&id, origin.as_deref(), &kind, data, source);
+            session::append(c, project, channel_id, &Message::user(envelope), &images)?;
+            let seq = c.last_insert_rowid();
             c.execute(
-                "INSERT INTO manager_ingested_inputs(input_id) VALUES(?)",
-                [&id],
+                "INSERT INTO manager_ingested_inputs(input_id,message_seq) VALUES(?,?)",
+                params![id, seq],
             )?;
         }
         own_input(c, run, &id)?;
@@ -215,6 +212,21 @@ async fn interruption(app: &App, context: &Context, channel: &str, ingress_seq: 
     }
 }
 
+fn telemetry_inputs(
+    c: &Connection,
+    run: &str,
+    includes_content: bool,
+) -> Result<Vec<(String, Option<String>)>> {
+    Ok(c.prepare(
+        "SELECT i.id,CASE WHEN ? THEN json_extract(m.message_json,'$.content[0].text') END
+         FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id
+         JOIN manager_ingested_inputs x ON x.input_id=i.id
+         LEFT JOIN manager_session_messages m ON m.seq=x.message_seq
+         WHERE b.run_id=? AND i.kind='user' ORDER BY i.rowid LIMIT 64",
+    )?.query_map(params![includes_content,run], |row| Ok((row.get(0)?,row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> Result<()> {
     let context = &turn.context;
     if let Some(debug) = &turn.debug {
@@ -239,17 +251,13 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
     let mut trace = if let Some(exporter) = &app.manager_telemetry {
         let run = context.run.clone();
         let includes_content = exporter.includes_content();
-        let inputs = app.db.call(move |c| {
-            Ok(c.prepare(
-                "SELECT i.id,CASE WHEN ? AND json_valid(i.payload) THEN json_extract(i.payload,'$.user_input.body') END
-                 FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id
-                 WHERE b.run_id=? AND i.kind='user' ORDER BY i.rowid LIMIT 64",
-            )?.query_map(params![includes_content,run], |row| Ok((row.get(0)?,row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        }).await;
+        let inputs = app.db.call(move |c| telemetry_inputs(c, &run, includes_content)).await;
         match inputs {
             Ok(inputs) if !inputs.is_empty() => Some(crate::manager_telemetry::Trace::new(
                 exporter.clone(),
+                &context.project,
+                channel,
+                &turn.config.api_key,
                 inputs,
             )),
             Ok(_) => None,
@@ -268,7 +276,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
     let mut recover_overflow = false;
     let mut index = 0;
     let mut compactions = 0;
-    while index < 32 {
+    loop {
         let snapshot = memory::read(workspace).await.ok();
         let run = context.clone();
         let key = channel.to_owned();
@@ -407,10 +415,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
         observation.finish("provider_responded");
         if let Some(mut span) = span.take() {
             span.response(response.usage);
-            span.assistant(response.choice.iter().filter_map(|part| match part {
-                rig_core::message::AssistantContent::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            }));
+            span.assistant(response.choice.iter());
             span.finish("ok");
         }
         drop(span);
@@ -510,12 +515,16 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
             };
             if let Some(trace) = &mut trace {
                 let mut span = trace.span("manager.tool", "tool");
-                span.tool_input(name, &Value::Object(call.function.arguments.clone()));
-                span.tool_outcome(if result.get("error").is_some() {
-                    "failed"
-                } else {
-                    "ok"
-                });
+                span.tool(
+                    name,
+                    &Value::Object(call.function.arguments.clone()),
+                    &result,
+                    if tool_result_failed(&result) {
+                        "failed"
+                    } else {
+                        "ok"
+                    },
+                );
             }
             results.push((call.id.clone(), call.function.name.clone(), result));
         }
@@ -536,11 +545,7 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
                         .map(|(id, name, result)| {
                             let mut part = tool_result_message(id, name, result.to_string());
                             if let rig_core::message::UserContent::ToolResult(value) = &mut part {
-                                value.is_error = result.get("error").is_some()
-                                    || matches!(
-                                        result["status"].as_str(),
-                                        Some("failed" | "uncertain" | "skipped_due_to_steering")
-                                    );
+                                value.is_error = tool_result_failed(&result);
                             }
                             part
                         })
@@ -572,12 +577,6 @@ async fn drive(app: Arc<App>, turn: &Turn, channel: &str, workspace: &Path) -> R
             return Ok(());
         }
     }
-    Err(Failure {
-        kind: "turn_budget_exhausted".into(),
-        retryable: true,
-        ..Failure::internal()
-    }
-    .into())
 }
 
 pub(super) async fn run(app: Arc<App>) {
@@ -671,6 +670,17 @@ async fn run_channel(app: Arc<App>, project: &str, channel: &str) -> Result<()> 
         }
         Ok(())
     }).await
+}
+
+fn tool_result_failed(result: &Value) -> bool {
+    result
+        .get("error")
+        .is_some_and(|error| error.as_str() != Some(""))
+        || result["dispatch_error"].is_string()
+        || matches!(
+            result["status"].as_str(),
+            Some("failed" | "uncertain" | "skipped_due_to_steering")
+        )
 }
 
 #[cfg(test)]
@@ -878,6 +888,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feishu_envelope_is_shared_by_transcript_and_telemetry() -> Result<()> {
+        let (_dir, app, project) = super::super::tests::fixture().await;
+        let body = "Review <code> & \"quotes\" provider<&credential";
+        let id = app.db.ingest_bot(
+            &project.id, "cli_fixture", "oc_fixture", "om_0123456789abcdef0123456789abcdef", body,
+            &json!({
+                "source": {
+                    "chat_id": "oc_fixture", "chat_type": "p2p", "message_type": "text",
+                    "sender": {"open_id": "ou_fixture", "name": "A & B"},
+                    "root_id": "om_root", "thread_id": "omt_fixture", "parent_id": "om_parent",
+                    "mention_all": false
+                },
+                "quoted_message": {"status": "ok", "message_id": "om_parent", "content": "<parent>"},
+            }),
+        )?.unwrap();
+        app.db.sync(|c| {
+            work::sync_inbound(c)?;
+            route_event(c, &id)?;
+            let channel = "feishu:cli_fixture:oc_fixture";
+            let Turn { context, .. } = claim(c, &project.id, channel, None)?.unwrap();
+            let transcript = session::load(c, &project.id, channel)?;
+            let Message::User { content } = &transcript.last().unwrap().message else {
+                panic!("expected a user message");
+            };
+            let Some(rig_core::message::UserContent::Text(text)) = content.iter().next() else {
+                panic!("expected an input envelope");
+            };
+            let xml = &text.text;
+            assert!(xml.starts_with(&format!(
+                "<dauerbot_event event_id=\"{id}\" kind=\"user\" source=\"feishu\">"
+            )));
+            for field in [
+                "<bot_app_id>cli_fixture</bot_app_id>", "<chat_id>oc_fixture</chat_id>",
+                "<message_id>om_0123456789abcdef0123456789abcdef</message_id>", "<root_id>om_root</root_id>",
+                "<thread_id>omt_fixture</thread_id>", "<open_id>ou_fixture</open_id>",
+                "<name>A &amp; B</name>", "<quoted_message>",
+                "<content>&lt;parent&gt;</content>",
+                "<body>Review &lt;code&gt; &amp; &quot;quotes&quot; provider&lt;&amp;credential</body>",
+            ] {
+                assert_eq!(xml.matches(field).count(), 1, "{xml}");
+            }
+            assert!(!xml.contains("trusted_source") && !xml.contains("platform"));
+            let inputs = telemetry_inputs(c, &context.run, true)?;
+            assert_eq!(inputs, [(id.clone(), Some(xml.clone()))]);
+            assert_eq!(telemetry_inputs(c, &context.run, false)?, [(id.clone(), None)]);
+            crate::manager_telemetry::assert_input_export(
+                inputs,
+                &xml.replace("provider&lt;&amp;credential", "[redacted]"),
+            );
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
     async fn detachment_and_recovery_emit_one_durable_wake() {
         let (_dir, app, project) = super::super::tests::fixture().await;
         app.db.sync(|c| {
@@ -902,30 +966,27 @@ mod tests {
         let (tx, mut sends) = mpsc::unbounded_channel::<Request>();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         app.config.write().await.feishu_base = format!("http://{}", listener.local_addr().unwrap());
-        let router =
-            Router::new()
-                .route(
-                    "/open-apis/auth/v3/tenant_access_token/internal",
-                    post(|| async {
-                        Json(json!({"code":0,"tenant_access_token":"fixture-token","expire":3600}))
-                    }),
-                )
-                .route(
-                    "/open-apis/im/v1/files",
-                    post(|| async { Json(json!({"code":0,"data":{"file_key":"fixture-file"}})) }),
-                )
-                .route(
-                    "/open-apis/im/v1/messages",
-                    post(
-                        |State(tx): State<mpsc::UnboundedSender<Request>>,
-                         Json(body): Json<Value>| async move {
-                            let (respond, response) = oneshot::channel();
-                            tx.send((body, respond)).unwrap();
-                            Json(response.await.unwrap())
-                        },
-                    ),
-                )
-                .with_state(tx);
+        let send = post(
+            |State(tx): State<mpsc::UnboundedSender<Request>>, Json(body): Json<Value>| async move {
+                let (respond, response) = oneshot::channel();
+                tx.send((body, respond)).unwrap();
+                Json(response.await.unwrap())
+            },
+        );
+        let router = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(|| async {
+                    Json(json!({"code":0,"tenant_access_token":"fixture-token","expire":3600}))
+                }),
+            )
+            .route(
+                "/open-apis/im/v1/files",
+                post(|| async { Json(json!({"code":0,"data":{"file_key":"fixture-file"}})) }),
+            )
+            .route("/open-apis/im/v1/messages", send.clone())
+            .route("/open-apis/im/v1/messages/om_first/reply", send)
+            .with_state(tx);
         let transport = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
@@ -973,17 +1034,17 @@ mod tests {
         assert!(
             wake["messages"]
                 .to_string()
-                .contains("background_tool_result")
+                .contains("<background_tool_result>")
         );
         respond.send(reply(Value::Null, json!([
-            {"id":"file","type":"function","function":{"name":"send_file","arguments":json!({"to":"oc_a","path":"result.txt"}).to_string()}}
+            {"id":"file","type":"function","function":{"name":"send_file","arguments":json!({"to":"oc_a","path":"result.txt","reply_to_message_id":"om_first"}).to_string()}}
         ]))).unwrap();
         let (file, respond) = receive(&mut sends).await;
-        assert_eq!(file["receive_id"], "oc_a");
+        assert_eq!(file["reply_in_thread"], true);
         assert_eq!(file["msg_type"], "file");
         assert!(file["content"].as_str().unwrap().contains("fixture-file"));
         respond
-            .send(json!({"code":0,"data":{"message_id":"om_file","chat_id":"oc_a"}}))
+            .send(json!({"code":0,"data":{"message_id":"om_file","chat_id":"oc_a","root_id":"om_first","thread_id":"omt_fixture"}}))
             .unwrap();
         let (_, respond) = receive(&mut model_requests).await;
         respond
@@ -991,6 +1052,23 @@ mod tests {
             .unwrap();
         app.shutdown.cancel();
         manager.await.unwrap();
+        app.db
+            .sync(|c| {
+                let result: String = c.query_row(
+                    "SELECT result FROM manager_effects WHERE name='send_file'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let result: Value = serde_json::from_str(&result)?;
+                assert_eq!(result["status"], "sent");
+                assert_eq!(result["reply_to_message_id"], "om_first");
+                assert_eq!(result["root_id"], "om_first");
+                assert_eq!(result["thread_id"], "omt_fixture");
+                assert!(result.get("error").is_none());
+                assert!(!tool_result_failed(&result));
+                Ok(())
+            })
+            .unwrap();
         provider.abort();
         transport.abort();
     }

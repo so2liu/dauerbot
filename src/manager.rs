@@ -1,6 +1,8 @@
 //! Restricted management actor. Native CLI authority stays in the worker.
 pub(crate) mod llm;
 mod agent;
+mod event;
+pub(crate) use event::redact_envelope;
 mod tools;
 mod channel;
 mod memory;
@@ -20,7 +22,7 @@ use std::{
     collections::HashSet,
     fs,
     io::{Read, Write},
-    path::{Component, Path},
+    path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -652,153 +654,87 @@ struct DelegateArgs {
     #[serde(default)]
     source_event_id: Option<String>,
 }
-fn file_parent(root: &Path, path: &str) -> Result<(fs::File, std::ffi::CString)> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+fn read_file(root: &Path, path: &str) -> Result<Value> {
     use std::os::unix::fs::OpenOptionsExt;
-    ensure!(
-        !path.is_empty() && !Path::new(path).is_absolute(),
-        "Use a relative workspace path"
-    );
-    let parts = Path::new(path)
-        .components()
-        .map(|part| match part {
-            Component::Normal(v) => Ok(v.to_owned()),
-            _ => bail!("Workspace traversal is not allowed"),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ensure!(
-        parts.iter().all(|v| {
-            let name = v.to_string_lossy().to_ascii_lowercase();
-            !matches!(
-                name.as_str(),
-                ".dauerbot" | ".codex" | ".claude" | ".gemini" | ".pi" | ".ssh" | ".git"
-            ) && name != ".env"
-                && !name.starts_with(".env.")
-        }),
-        "Private state and credential paths are unavailable"
-    );
-    let mut dir = fs::OpenOptions::new()
+
+    const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+    let resolved = root.join(crate::feishu::expand_home(Path::new(path)));
+    let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(root)?;
-    for part in &parts[..parts.len() - 1] {
-        let part = std::ffi::CString::new(part.as_encoded_bytes())?;
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                part.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        ensure!(
-            fd >= 0,
-            "Workspace directory is missing or not a regular directory"
-        );
-        dir = unsafe { fs::File::from_raw_fd(fd) };
-    }
-    Ok((
-        dir,
-        std::ffi::CString::new(parts.last().unwrap().as_encoded_bytes())?,
-    ))
-}
-fn read_at(dir: &fs::File, name: &std::ffi::CStr) -> Result<Vec<u8>> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    ensure!(fd >= 0, "Workspace file is unavailable");
-    let file = unsafe { fs::File::from_raw_fd(fd) };
-    let meta = file.metadata()?;
+        .custom_flags(libc::O_NONBLOCK)
+        .open(resolved)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "Read a regular file");
     ensure!(
-        meta.is_file() && meta.len() <= 262144,
-        "Read a regular file up to 256 KiB"
+        metadata.len() <= MAX_READ_BYTES,
+        "File exceeds the 8 MiB read limit"
     );
     let mut bytes = Vec::new();
-    file.take(262145).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 262144, "File grew beyond the read bound");
-    Ok(bytes)
-}
-fn read_file(root: &Path, path: &str) -> Result<Value> {
-    let (dir, name) = file_parent(root, path)?;
-    let bytes = read_at(&dir, &name)?;
+    file.take(MAX_READ_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_READ_BYTES,
+        "File exceeds the 8 MiB read limit"
+    );
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let content = String::from_utf8(bytes).context("Read UTF-8 files only")?;
-    let result = json!({"path":path,"content":content,"sha256":hash});
-    ensure!(
-        result.to_string().len() <= 240000,
-        "File content exceeds the management tool response bound; delegate larger files to the coding worker"
-    );
-    Ok(result)
+    Ok(json!({"path":path,"content":content,"sha256":hash}))
 }
+
 fn write_file(root: &Path, args: WriteArgs) -> Result<Value> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = 0o600;
-    ensure!(
-        args.content.len() <= 262144,
-        "Writes are limited to 256 KiB"
-    );
-    let (dir, name) = file_parent(root, &args.path)?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = root.join(crate::feishu::expand_home(Path::new(&args.path)));
+    let parent = path.parent().context("File path has no parent")?;
+    let (target, permissions) = match fs::canonicalize(&path) {
+        Ok(target) => {
+            let metadata = fs::metadata(&target)?;
+            ensure!(metadata.is_file(), "Write a regular file");
+            if let Some(expected) = &args.expected_sha256 {
+                let mut file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&target)?;
+                ensure!(file.metadata()?.is_file(), "Write a regular file");
+                let mut hash = Sha256::new();
+                std::io::copy(&mut file, &mut hash)?;
+                ensure!(
+                    *expected == format!("{:x}", hash.finalize()),
+                    "File changed; expected_sha256 does not match"
+                );
+            }
+            let permissions = fs::Permissions::from_mode(metadata.permissions().mode() & 0o777);
+            (target, Some(permissions))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound && args.expected_sha256.is_none() => {
+            fs::create_dir_all(parent)?;
+            (path, None)
+        }
+        Err(error) => return Err(error.into()),
     };
-    if fd >= 0 {
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-        ensure!(file.metadata()?.is_file(), "Write regular files only");
-        permissions = file.metadata()?.permissions().mode() & 0o777;
-        drop(file);
-        let old = read_at(&dir, &name)?;
-        ensure!(
-            args.expected_sha256.as_deref() == Some(format!("{:x}", Sha256::digest(&old)).as_str()),
-            "File changed; read it and supply expected_sha256 before replacing"
-        );
-    } else {
-        ensure!(
-            std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
-                && args.expected_sha256.is_none(),
-            "File is unavailable or expected content disappeared"
-        );
-    }
-    let temporary = std::ffi::CString::new(format!(".dauerbot-write-{}", db::id()))?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            temporary.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    ensure!(fd >= 0, "Cannot prepare workspace write");
-    let result = (|| -> Result<()> {
-        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    if permissions.is_none() && fs::symlink_metadata(&target).is_ok_and(|m| m.is_symlink()) {
+        // Creating through a dangling link must leave the link itself in place.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&target)?;
+        ensure!(file.metadata()?.is_file(), "Write a regular file");
         file.write_all(args.content.as_bytes())?;
-        file.set_permissions(fs::Permissions::from_mode(permissions))?;
+        file.set_len(args.content.len() as u64)?;
         file.sync_all()?;
-        ensure!(
-            unsafe {
-                libc::renameat(
-                    dir.as_raw_fd(),
-                    temporary.as_ptr(),
-                    dir.as_raw_fd(),
-                    name.as_ptr(),
-                )
-            } == 0,
-            "Cannot publish workspace write"
-        );
-        Ok(())
-    })();
-    if result.is_err() {
-        unsafe { libc::unlinkat(dir.as_raw_fd(), temporary.as_ptr(), 0) };
+    } else {
+        let mut file =
+            tempfile::NamedTempFile::new_in(target.parent().context("File path has no parent")?)?;
+        file.write_all(args.content.as_bytes())?;
+        if let Some(permissions) = permissions {
+            file.as_file().set_permissions(permissions)?;
+        }
+        file.as_file().sync_all()?;
+        file.persist(target)?;
     }
-    result?;
     Ok(
         json!({"path":args.path,"sha256":format!("{:x}",Sha256::digest(args.content.as_bytes())),"status":"written"}),
     )
@@ -1036,7 +972,7 @@ fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
     let e = work::event(c, project, id)?;
     if e.source == "autonomy" {
         return Ok(json!({"event_id":id,"source_kind":"autonomy","proposal_id":e.payload["proposal_id"],
-            "message_id":e.payload["anchor"],"to":e.payload["to"]}));
+            "message_id":e.payload["anchor"],"bot_app_id":e.payload["app_id"],"to":e.payload["to"]}));
     }
     if let Some(message) = e.message_id {
         let raw: String = c.query_row(
@@ -1046,7 +982,7 @@ fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
         )?;
         let a: Value = serde_json::from_str(&raw)?;
         Ok(if e.source == "feishu" {
-            let mut trusted = json!({"event_id":id,"source_kind":"feishu","message_id":e.source_id,"source":a["source"]});
+            let mut trusted = json!({"event_id":id,"source_kind":"feishu","message_id":e.source_id,"bot_app_id":a["bot_app_id"],"source":a["source"]});
             if let Some(group) = crate::feishu::cached_group_context(c, project, &a)? {
                 trusted["group_context"] = group;
             }
@@ -1055,7 +991,7 @@ fn trusted_source(c: &Connection, project: &str, id: &str) -> Result<Value> {
             json!({"event_id":id,"source_kind":e.source,"local_source_id":e.source_id})
         })
     } else {
-        Ok(json!({"event_id":id,"source_kind":e.source,"to":e.payload["to"]}))
+        Ok(json!({"event_id":id,"source_kind":e.source,"to":e.payload["to"],"timer_id":e.payload["timer_id"],"scheduled_at":e.payload["scheduled_at"],"purpose":e.payload["purpose"]}))
     }
 }
 fn prompt_input(raw: &str, event_id: Option<&str>) -> Result<Value> {
@@ -1209,11 +1145,7 @@ fn prepare_images(
             images.push(verified?);
         }
     }
-    if !resources.is_empty() {
-        data["user_input"]["attachment_details"] = json!(resources.iter()
-            .map(crate::envelope::attachment_text).collect::<Vec<_>>());
-    }
-    data["user_input"]["resources"] = json!(resources);
+    data["user_input"]["resources"] = json!((!resources.is_empty()).then_some(resources));
     Ok(images)
 }
 fn provider_unavailable(c: &Connection, project: &str) -> Result<bool> {
@@ -1832,69 +1764,43 @@ mod tests {
     }
 
     #[test]
-    fn file_capabilities_reject_private_case_aliases_and_symlinks_and_preserve_executability() {
+    fn file_tools_follow_standard_paths_and_check_explicit_hashes() {
         use std::os::unix::fs::{PermissionsExt, symlink};
+
         let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("secret"), "private").unwrap();
-        symlink(outside.path(), dir.path().join("escape")).unwrap();
-        for path in [
-            "../secret",
-            "escape/secret",
-            ".DAUERBOT/sessions/key",
-            ".SSH/id_rsa",
-            ".Env.production",
-            "/tmp/outside",
-        ] {
-            assert!(read_file(dir.path(), path).is_err());
-            assert!(
-                write_file(
-                    dir.path(),
-                    WriteArgs {
-                        path: path.into(),
-                        content: "changed".into(),
-                        expected_sha256: None
-                    }
-                )
-                .is_err()
-            );
-        }
-        assert_eq!(
-            fs::read_to_string(outside.path().join("secret")).unwrap(),
-            "private"
-        );
-        fs::write(dir.path().join("oversized.txt"), "x".repeat(256000)).unwrap();
-        assert!(
-            read_file(dir.path(), "oversized.txt").is_err(),
-            "Oversized tool results must fail before poisoning a durable model checkpoint"
-        );
-        let path = dir.path().join("run.sh");
-        fs::write(&path, "old").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let old = read_file(dir.path(), "run.sh").unwrap();
-        assert!(
+        let root = dir.path().join("workspace");
+        let skill = ".dauerbot/skills/example/SKILL.md";
+        let absolute = root.join(skill);
+        let write = |path: &str, content: &str, expected_sha256| {
             write_file(
-                dir.path(),
+                &root,
                 WriteArgs {
-                    path: "run.sh".into(),
-                    content: "new".into(),
-                    expected_sha256: None
-                }
+                    path: path.into(),
+                    content: content.into(),
+                    expected_sha256,
+                },
             )
-            .is_err()
-        );
-        write_file(
-            dir.path(),
-            WriteArgs {
-                path: "run.sh".into(),
-                content: "new".into(),
-                expected_sha256: old["sha256"].as_str().map(str::to_owned),
-            },
+        };
+
+        let large = "a".repeat(300_000);
+        let first = write(skill, &large, None).unwrap();
+        assert_eq!(read_file(&root, skill).unwrap()["content"], large);
+        fs::set_permissions(&absolute, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("skill-link");
+        symlink(&absolute, &link).unwrap();
+        assert_eq!(read_file(&root, "../skill-link").unwrap()["sha256"], first["sha256"]);
+        assert!(write("../skill-link", "wrong", Some("stale hash".into())).is_err());
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), large);
+        write(
+            link.to_str().unwrap(),
+            "checked replacement",
+            first["sha256"].as_str().map(str::to_owned),
         )
         .unwrap();
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), "checked replacement");
+        write(absolute.to_str().unwrap(), "unchecked replacement", None).unwrap();
+        assert_eq!(fs::read_to_string(&link).unwrap(), "unchecked replacement");
+        assert_eq!(fs::metadata(&absolute).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(fs::symlink_metadata(link).unwrap().is_symlink());
     }
 }

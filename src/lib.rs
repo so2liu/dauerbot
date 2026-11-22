@@ -1573,7 +1573,8 @@ impl App {
 }
 
 fn xml(text: &str) -> String {
-    text.replace('&', "&amp;")
+    text.replace(|ch| !matches!(ch, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}'), "\u{FFFD}")
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")

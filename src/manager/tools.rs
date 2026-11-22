@@ -35,7 +35,6 @@ struct SendText {
 struct SendFile {
     to: String,
     path: String,
-    caption: Option<String>,
     reply_to_message_id: Option<String>,
 }
 
@@ -99,14 +98,6 @@ async fn perform(
             proposal_run(c, &context.run)
         })
         .await?;
-    if approved_proposal
-        && !matches!(
-            call.name.as_str(),
-            "delegate" | "worker_status" | "send_md" | "read_file"
-        )
-    {
-        bail!("Tool is unavailable for an approved proposal");
-    }
     let p = app.db.project(&ctx.project).await?;
     match call.name.as_str() {
         "read_file" => {
@@ -121,8 +112,8 @@ async fn perform(
             let a: DelegateArgs = serde_json::from_value(call.arguments)?;
             let steer = call.name == "steer_worker";
             ensure!(
-                !a.instructions.trim().is_empty() && a.instructions.len() <= 1048576,
-                "Worker instructions must contain 1 to 1048576 bytes"
+                !a.instructions.trim().is_empty(),
+                "Worker instructions are empty"
             );
             if steer && (p.agent == "auto" || a.generation.is_some()) {
                 ensure!(
@@ -284,7 +275,7 @@ async fn perform(
         "cli_view" => {
             drop(guard);
             let args: crate::manager_terminal::ViewArgs = serde_json::from_value(call.arguments)?;
-            crate::manager_terminal::view(app, ctx, args, effect).await
+            crate::manager_terminal::view(app, ctx, args).await
         }
         "close_agent" => {
             let args: crate::manager_close::CloseArgs = serde_json::from_value(call.arguments)?;
@@ -317,29 +308,14 @@ async fn perform(
                 (a.to, a.text, a.reply_to_message_id, None)
             } else {
                 let a: SendFile = serde_json::from_value(call.arguments)?;
-                let path = crate::feishu::allowed_file(&p, Path::new(&a.path), &app.dir)?;
-                let root = fs::canonicalize(&p.path)?;
-                if let Ok(relative) = path.strip_prefix(&root) {
-                    file_parent(&root, &relative.to_string_lossy())?;
-                } else {
-                    ensure!(
-                        path.starts_with(app.dir.join("files").join(&p.id)),
-                        "Only workspace files and downloaded attachments are available"
-                    );
-                }
-                (
-                    a.to,
-                    a.caption.unwrap_or_default(),
-                    a.reply_to_message_id,
-                    Some(path),
-                )
+                let path = crate::feishu::manager_file(&p, Path::new(&a.path))?;
+                (a.to, String::new(), a.reply_to_message_id, Some(path))
             };
             crate::feishu::recipient_type(&to)?;
             ensure!(
                 !text.trim().is_empty() || path.is_some(),
                 "Message content is empty"
             );
-            ensure!(text.len() <= 131072, "Message is too large");
             let context = ctx.clone();
             let request = effect.to_owned();
             let message = app
@@ -383,9 +359,19 @@ async fn perform(
             drop(guard);
             let send_error = app.send_out(&message).await.err().map(|e| e.to_string());
             let m = app.db.message(&message).await?;
-            Ok(
-                json!({"message_id":m.attachment["sent_message_id"],"status":m.status,"outbox_id":m.id,"error":m.error,"dispatch_error":send_error}),
-            )
+            let mut result = json!({
+                "message_id": m.attachment["sent_message_id"],
+                "root_id": m.attachment["sent_root_id"].as_str().filter(|id| !id.is_empty()),
+                "thread_id": m.attachment["sent_thread_id"].as_str().filter(|id| !id.is_empty()),
+                "reply_to_message_id": m.attachment["resolved_reply_to_message_id"],
+                "status": m.status,
+                "outbox_id": m.id,
+                "dispatch_error": send_error,
+            });
+            if !m.error.is_empty() {
+                result["error"] = json!(m.error);
+            }
+            Ok(result)
         }
         _ => bail!("This management tool is not available"),
     }
@@ -451,19 +437,23 @@ pub(super) fn settle_detached_run(c: &Connection, run: &str) -> Result<()> {
 }
 
 pub(crate) fn definitions() -> Vec<ToolDefinition> {
+    let reply_to = json!({
+        "type": "string",
+        "description": "Feishu message ID to reply to in its topic, such as the message_id in the relevant incoming <dauerbot_event> metadata. Omit for a top-level message to the recipient."
+    });
     let schemas = [
         (
-            "Read a bounded UTF-8 project file; returns content and sha256.",
+            "Read a UTF-8 file up to 8 MiB; returns content and sha256. Relative paths start at the project workspace.",
             json!({"path":{"type":"string"}}),
             vec!["path"],
         ),
         (
-            "Write a project file. Existing files require their last-read expected_sha256.",
+            "Write a file and create missing parent directories. Relative paths start at the project workspace. Supply expected_sha256 to check existing content before writing.",
             json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":"string"}}),
             vec!["path", "content"],
         ),
         (
-            "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only; optional source_event_id selects a specific incoming platform.event_id from this channel.",
+            "Delegate coding to a native CLI worker in this project; returns a durable receipt. Optional target_cli selects a worker for this task only; optional source_event_id selects the event_id attribute of a specific incoming user <dauerbot_event> from this channel.",
             json!({"instructions":{"type":"string"},"target_cli":{"type":"string","enum":["codex","claude","pi","agy","custom"]},"source_event_id":{"type":"string"}}),
             vec!["instructions"],
         ),
@@ -478,13 +468,13 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
             vec!["instructions"],
         ),
         (
-            "Send Markdown to a recipient, optionally as a reply.",
-            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":{"type":"string"}}),
+            "Send Markdown to a recipient or Feishu topic.",
+            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":reply_to}),
             vec!["to", "text"],
         ),
         (
-            "Send a workspace file or downloaded attachment, optionally as a reply.",
-            json!({"to":{"type":"string"},"path":{"type":"string"},"caption":{"type":"string"},"reply_to_message_id":{"type":"string"}}),
+            "Send a regular file to a recipient or Feishu topic. Relative paths start at the project workspace. Use send_md with the same anchor for accompanying text in a topic.",
+            json!({"to":{"type":"string"},"path":{"type":"string"},"reply_to_message_id":reply_to}),
             vec!["to", "path"],
         ),
         (
@@ -494,7 +484,7 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
         ),
         (
             "Send an ordered, compact text/key sequence, with each segment exactly {text: string} or {key: string} to the current project's owned CLI. Use generation from worker_status. Text is UTF-8 with LF unchanged; keys are separate segments. Text never implies a key. Keys: enter, tab, esc, backspace, delete, up/down/left/right, home/end, pageup/pagedown, space; ctrl/alt/shift modifiers and modified letters, for example alt+m. Unknown keys fail before sending. Use cli_view to inspect results; a submitted sequence does not prove task completion. Do not repeat uncertain input.",
-            json!({"generation":{"type":"string"},"segments":{"type":"array","minItems":1,"maxItems":32,"items":{"oneOf":[{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false},{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}]}}}),
+            json!({"generation":{"type":"string"},"segments":{"type":"array","minItems":1,"items":{"oneOf":[{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false},{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}]}}}),
             vec!["segments"],
         ),
         (

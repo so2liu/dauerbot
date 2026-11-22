@@ -4,6 +4,7 @@ Uses only scripted local HTTP replies and private fixture processes; never a rea
 model account, native login or live Dauerbot data directory.
 """
 import argparse
+import xml.etree.ElementTree as ET
 import importlib.util
 import json
 import os
@@ -245,15 +246,28 @@ def run_checks(h):
             assert isinstance(block["truncated"], bool)
     h.checks.append("read-only context API exposes ordered logical requests with explicit limitations and no fixture authentication")
 
+    skill = h.workspace / ".dauerbot" / "skills" / "fixture" / "SKILL.md"
+    outside_link = h.run / "skill-link.md"
+    outside_target = h.run / "outside-skill.md"
+    outside_link.symlink_to(outside_target)
+    skill.parent.mkdir(parents=True)
+    skill.symlink_to(outside_target)
+    start = len(MODEL.requests)
     MODEL.script(
-        {"tool": "write_file", "arguments": {"path": "../escape.txt", "content": "must stay in workspace"}},
-        {"tool": "send_md", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_boundary", "text": "boundary-denial-recovered"}},
+        {"tool": "write_file", "arguments": {"path": ".dauerbot/skills/fixture/SKILL.md", "content": "manager skill fixture"}},
+        {"tool": "read_file", "arguments": {"path": "../skill-link.md"}},
+        {"tool": "send_file", "arguments": {"to": "oc_fixture", "reply_to_message_id": "om_manager_boundary", "path": str(outside_link)}},
         {"text": "Done."},
     )
-    fixture.FIXTURE.emit(fixture.message("om_manager_boundary", "Exercise a rejected file effect and continue the conversation."))
-    fixture.wait_for(lambda: any("boundary-denial-recovered" in m["content"] for m in fixture.FIXTURE.messages), "denied file effect prevented normal manager recovery")
-    assert not (h.run / "escape.txt").exists()
-    h.checks.append("workspace escape denied through real model tool protocol without ending subsequent messaging")
+    fixture.FIXTURE.emit(fixture.message("om_manager_boundary", "Write and read a project skill through a symlink, then send it."))
+    fixture.wait_for(lambda: any(m.get("msg_type") == "file" and m.get("fixture_reply_to") == "om_manager_boundary" for m in fixture.FIXTURE.messages), "manager did not send the skill through the absolute symlink")
+    assert skill.read_text() == "manager skill fixture"
+    assert any(
+        message["role"] == "tool" and "manager skill fixture" in message["content"]
+        for request in MODEL.requests[start:] for message in request["messages"]
+    ), "Manager did not receive the read_file result"
+    assert b"manager skill fixture" in fixture.FIXTURE.uploads[-1]
+    h.checks.append("Manager reads and writes project skills and sends them through absolute symlinks")
 
     # Pause an in-flight request, then send fresh input before its stale tool call
     # returns. The delayed response must never admit a workspace write.
@@ -313,6 +327,26 @@ def run_checks(h):
         assert rows("SELECT count(*) FROM manager_run_inputs WHERE input_id=?", (input_id,))[0][0] == 1
     assert MODEL.waiting.wait(10), "post-delegation provider request did not start"
     before_restart = MODEL.requests[-1]["messages"]
+    batch_events = []
+    for message in before_restart:
+        if message["role"] != "user":
+            continue
+        content = message["content"]
+        texts = [content] if isinstance(content, str) else [
+            part["text"] for part in content if part["type"] == "text"
+        ]
+        batch_events.extend(
+            ET.fromstring(text) for text in texts
+            if text.startswith("<dauerbot_event ") and "Owned FIFO batch instruction" in text
+        )
+    assert [event.findtext("body") for event in batch_events] == [
+        f"Owned FIFO batch instruction {number}" for number in range(3)
+    ], batch_events
+    for number, event in enumerate(batch_events):
+        assert event.tag == "dauerbot_event" and event.attrib == {
+            "event_id": batch_ids[number][0], "kind": "user", "source": "feishu",
+        }, event.attrib
+        assert event.findtext("metadata/message_id") == f"om_manager_batch_{number}"
     assert before_restart[-1]["role"] == "tool"
     assert before_restart[-2]["tool_calls"][0]["function"]["name"] == "delegate"
     # Lose the process while the provider request is still in flight.

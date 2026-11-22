@@ -1,6 +1,7 @@
 mod content;
 
 use reqwest::{Client, Url, redirect::Policy};
+use rig_core::{completion::CompletionRequest, message::AssistantContent};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,6 +16,8 @@ use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_SPANS: usize = 256;
+const TRACE_NAME: &str = "manager.interaction";
+const OBSERVATION_OUTPUT: &str = "langfuse.observation.output";
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -137,6 +140,7 @@ impl Exporter {
             .client
             .post(self.endpoint.clone())
             .basic_auth(&self.settings.public_key, Some(&self.settings.secret_key))
+            .header("x-langfuse-ingestion-version", "4")
             .json(&payload)
             .send()
             .await;
@@ -201,6 +205,9 @@ fn trace_id(input: &str) -> String {
 pub(crate) struct Trace {
     exporter: Exporter,
     inputs: Vec<(String, Option<String>)>,
+    session: String,
+    provider_key: String,
+    root_output: Option<Value>,
     protected_tool_seen: bool,
     started: u128,
     ended: u128,
@@ -212,14 +219,28 @@ pub(crate) struct Trace {
 }
 
 impl Trace {
-    pub(crate) fn new(exporter: Exporter, mut inputs: Vec<(String, Option<String>)>) -> Self {
+    pub(crate) fn new(
+        exporter: Exporter,
+        project: &str,
+        channel: &str,
+        provider_key: &str,
+        mut inputs: Vec<(String, Option<String>)>,
+    ) -> Self {
+        let secrets = [
+            exporter.settings.public_key.as_str(),
+            exporter.settings.secret_key.as_str(),
+            provider_key,
+        ];
         for (_, body) in &mut inputs {
             *body = body
                 .take()
                 .filter(|_| exporter.includes_content())
-                .map(|raw| content::clean(&raw));
+                .map(|raw| content::clean(&raw, &secrets));
         }
         Self {
+            session: trace_id(&json!(["dauerbot.manager", project, channel]).to_string()),
+            provider_key: provider_key.into(),
+            root_output: None,
             protected_tool_seen: false,
             exporter,
             inputs,
@@ -231,6 +252,14 @@ impl Trace {
             outcome: "interrupted",
             export_on_drop: true,
         }
+    }
+
+    fn secrets(&self) -> [&str; 3] {
+        [
+            &self.exporter.settings.public_key,
+            &self.exporter.settings.secret_key,
+            &self.provider_key,
+        ]
     }
 
     pub(crate) fn finish(&mut self, outcome: &'static str) {
@@ -248,37 +277,60 @@ impl Trace {
 
     fn payload(&self) -> Value {
         let end = self.ended.max(self.started);
+        let context = [
+            text("langfuse.trace.name", TRACE_NAME),
+            text("langfuse.session.id", &self.session),
+            text("langfuse.version", env!("CARGO_PKG_VERSION")),
+            number(
+                "langfuse.trace.metadata.batch_size",
+                self.inputs.len() as u64,
+            ),
+            number("langfuse.trace.metadata.dropped_spans", self.dropped as u64),
+        ];
         let spans: Vec<_> = self
             .inputs
             .iter()
             .flat_map(|(id, body)| {
                 let trace_id = trace_id(id);
-                let mut root = json!({
-                    "traceId":trace_id,"spanId":self.root,"name":"manager.interaction","kind":1,
-                    "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":end.to_string(),
-                    "status":status(self.outcome),"attributes":[
-                        text("langfuse.observation.type","span"),
-                        text("dauerbot.outcome",self.outcome),
-                        number("dauerbot.batch_size",self.inputs.len() as u64),
-                        number("dauerbot.dropped_spans",self.dropped as u64)
-                    ]
-                });
-                let mut admitted = json!({
-                "spanId":span_id(),"name":"manager.user_input","kind":1,
-                "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":self.started.to_string(),
-                "status":{"code":1},"attributes":[text("langfuse.observation.type","span")]
-            });
-            if let Some(body) = body {
-                for span in [&mut root, &mut admitted] {
-                    span["attributes"].as_array_mut().expect("span attributes")
-                        .push(observation_content("langfuse.observation.input", body));
+                let mut root_attributes = vec![
+                    text("langfuse.observation.type", "span"),
+                    text("langfuse.observation.metadata.outcome", self.outcome),
+                ];
+                let mut admitted_attributes = vec![text("langfuse.observation.type", "span")];
+                if let Some(body) = body {
+                    let input = observation_content("langfuse.observation.input", body);
+                    root_attributes.push(input.clone());
+                    admitted_attributes.push(input);
                 }
-            }
-            std::iter::once(root).chain(std::iter::once(admitted).chain(self.spans.iter().cloned()).map(move |mut span| {
-                    span["traceId"] = json!(trace_id);
-                    span["parentSpanId"] = json!(self.root);
-                    span
-                }))
+                if self.outcome == "ok" {
+                    root_attributes.extend(self.root_output.iter().cloned());
+                }
+                let root = json!({
+                    "spanId":self.root,"name":TRACE_NAME,"kind":1,
+                    "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":end.to_string(),
+                    "status":status(self.outcome),"attributes":root_attributes
+                });
+                let admitted = json!({
+                    "spanId":span_id(),"name":"manager.user_input","kind":1,
+                    "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":self.started.to_string(),
+                    "status":{"code":1},"attributes":admitted_attributes
+                });
+                let context = &context;
+                std::iter::once(root)
+                    .chain(std::iter::once(admitted))
+                    .chain(self.spans.iter().cloned())
+                    .enumerate()
+                    .map(move |(index, mut span)| {
+                        span["traceId"] = json!(trace_id);
+                        if index != 0 {
+                            span["parentSpanId"] = json!(self.root);
+                        }
+                        span["attributes"]
+                            .as_array_mut()
+                            .expect("span attributes")
+                            .extend_from_slice(context);
+                        span
+                    })
             })
             .collect();
         json!({"resourceSpans":[{
@@ -302,6 +354,9 @@ impl Drop for Trace {
         };
         let trace = Self {
             exporter: self.exporter.clone(),
+            session: std::mem::take(&mut self.session),
+            provider_key: String::new(),
+            root_output: self.root_output.take(),
             protected_tool_seen: false,
             inputs: std::mem::take(&mut self.inputs),
             root: std::mem::take(&mut self.root),
@@ -331,76 +386,79 @@ impl Span<'_> {
         if !self.trace.exporter.includes_content() {
             return;
         }
-        let clean = content::clean(value);
+        let clean = content::clean(value, &self.trace.secrets());
         if !clean.is_empty() {
             self.attributes.push(observation_content(key, &clean));
         }
     }
 
-    pub(crate) fn request(&mut self, request: &rig_core::completion::CompletionRequest) {
+    pub(crate) fn request(&mut self, request: &CompletionRequest) {
         if !self.trace.exporter.includes_content() {
             return;
         }
-        // A subsequent model call could quote an unmarked value from a
-        // protected file even though we omit the tool's raw result.
+        // Later model calls could quote unmarked values from protected files.
         self.trace.protected_tool_seen |= content::has_protected_tool(request);
         if !self.trace.protected_tool_seen {
-            self.capture(
+            self.attributes.push(observation_content(
                 "langfuse.observation.input",
-                &content::request_text(request),
-            );
+                &content::request_text(request, &self.trace.secrets()),
+            ));
         }
     }
 
-    pub(crate) fn assistant(&mut self, output: impl Iterator<Item = impl AsRef<str>>) {
+    pub(crate) fn assistant<'a>(&mut self, output: impl Iterator<Item = &'a AssistantContent>) {
         if !self.trace.exporter.includes_content() || self.trace.protected_tool_seen {
             return;
         }
-        let mut projected = String::new();
-        for part in output {
-            content::append(&mut projected, "assistant", Some(part.as_ref()));
-        }
-        self.capture("langfuse.observation.output", &projected);
-    }
-
-    pub(crate) fn tool_input(&mut self, name: &str, arguments: &Value) {
-        if !self.trace.exporter.includes_content() || self.trace.protected_tool_seen {
-            return;
-        }
-        match name {
-            "read_file" | "write_file" | "send_file" => {
-                if let Some(path) = arguments["path"].as_str() {
-                    let display = if content::sensitive_path(path) {
-                        self.trace.protected_tool_seen = true;
-                        "[redacted path]"
-                    } else {
-                        path
-                    };
-                    self.capture("langfuse.observation.input", display);
+        let mut final_response = true;
+        let parts = output
+            .filter(|part| match part {
+                AssistantContent::ToolCall(_) => {
+                    final_response = false;
+                    true
                 }
+                AssistantContent::Text(_) => true,
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            let clean = content::clean(&json!(parts).to_string(), &self.trace.secrets());
+            let attribute = observation_content(OBSERVATION_OUTPUT, &clean);
+            if final_response {
+                self.trace.root_output = Some(attribute.clone());
             }
-            "send_md" | "delegate" | "steer_worker" => {
-                let field = if name == "send_md" {
-                    "text"
-                } else {
-                    "instructions"
-                };
-                if let Some(value) = arguments[field].as_str() {
-                    self.capture("langfuse.observation.input", value);
-                }
-            }
-            _ => {}
+            self.attributes.push(attribute);
         }
     }
 
-    pub(crate) fn tool_outcome(&mut self, outcome: &'static str) {
-        self.capture("langfuse.observation.output", outcome);
+    pub(crate) fn tool(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        result: &Value,
+        outcome: &'static str,
+    ) {
         self.finish(outcome);
+        if !self.trace.exporter.includes_content() || self.trace.protected_tool_seen {
+            return;
+        }
+        self.trace.protected_tool_seen = content::protected_arguments(arguments.get("path"));
+        if self.trace.protected_tool_seen {
+            self.capture("langfuse.observation.input", "[redacted path]");
+            return;
+        }
+        self.capture(
+            "langfuse.observation.input",
+            &json!({"name": name, "arguments": arguments}).to_string(),
+        );
+        self.capture(OBSERVATION_OUTPUT, &result.to_string());
     }
 
     pub(crate) fn model(&mut self, model: &str) {
-        self.attributes
-            .push(text("gen_ai.request.model", &content::model_name(model)));
+        self.attributes.push(text(
+            "gen_ai.request.model",
+            &content::model_name(model, &self.trace.secrets()),
+        ));
     }
 
     pub(crate) fn response(&mut self, usage: rig_core::completion::Usage) {
@@ -409,10 +467,12 @@ impl Span<'_> {
                 .push(number("gen_ai.usage.input_tokens", input));
         }
         if let Some(tokens) = usage.cached_input_tokens {
-            self.attributes.push(number("gen_ai.usage.cache_read.input_tokens", tokens));
+            self.attributes
+                .push(number("gen_ai.usage.cache_read.input_tokens", tokens));
         }
         if let Some(tokens) = usage.cache_creation_input_tokens {
-            self.attributes.push(number("gen_ai.usage.cache_creation.input_tokens", tokens));
+            self.attributes
+                .push(number("gen_ai.usage.cache_creation.input_tokens", tokens));
         }
         if let Some(output) = usage.output_tokens {
             self.attributes
@@ -437,7 +497,8 @@ impl Drop for Span<'_> {
             .unwrap_or_default();
         self.info["endTimeUnixNano"] = json!(now().max(start).to_string());
         self.info["status"] = status(self.outcome);
-        self.attributes.push(text("dauerbot.outcome", self.outcome));
+        self.attributes
+            .push(text("langfuse.observation.metadata.outcome", self.outcome));
         self.info["attributes"] = json!(std::mem::take(&mut self.attributes));
         self.trace.spans.push(self.info.take());
     }
@@ -452,11 +513,39 @@ fn text(key: &str, value: &str) -> Value {
 }
 
 fn observation_content(key: &str, redacted: &str) -> Value {
+    if redacted.starts_with("<dauerbot_event")
+        || (redacted.starts_with(['{', '['])
+            && serde_json::from_str::<serde::de::IgnoredAny>(redacted).is_ok())
+    {
+        return text(key, redacted);
+    }
     text(key, &json!(redacted).to_string())
 }
 
 fn number(key: &str, value: u64) -> Value {
     json!({"key":key,"value":{"intValue":value.min(i64::MAX as u64).to_string()}})
+}
+
+#[cfg(test)]
+pub(crate) fn assert_input_export(inputs: Vec<(String, Option<String>)>, expected: &str) {
+    let exporter = Exporter::configured(Settings {
+        enabled: true,
+        include_content: true,
+        public_key: "fixture-public".into(),
+        secret_key: "fixture-secret".into(),
+        ..Settings::default()
+    }).unwrap().unwrap();
+    let mut trace = Trace::new(exporter, "project", "channel", "provider<&credential", inputs);
+    trace.export_on_drop = false;
+    let payload = trace.payload();
+    let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
+    assert_eq!(spans.len(), 2);
+    for (span, name) in spans.iter().zip(["manager.interaction", "manager.user_input"]) {
+        assert_eq!(span["name"], name);
+        assert!(span["attributes"].as_array().unwrap().contains(&text(
+            "langfuse.observation.input", expected,
+        )), "{span}");
+    }
 }
 
 #[cfg(test)]
@@ -476,50 +565,129 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        let user = format!("USER-BEGIN\n{}\nUSER-END", "用户正文。".repeat(10000));
+        let user = format!(
+            "<dauerbot_event event_id=\"fixture\" kind=\"user\" source=\"local\">\n  <body>USER-BEGIN\n{}\nUSER-END</body>\n</dauerbot_event>",
+            "用户正文。".repeat(10000)
+        );
         let reply = format!("REPLY-BEGIN\n{}\nREPLY-END", "助手正文。".repeat(10000));
         let mut trace = Trace::new(
             exporter,
+            "project",
+            "channel",
+            "provider-credential",
             vec![
                 ("one".into(), Some(user.clone())),
                 ("two".into(), Some(user.clone())),
             ],
         );
         trace.export_on_drop = false;
+        let assistant = AssistantContent::text(&reply);
         trace
             .span("manager.generation", "generation")
-            .assistant(std::iter::once(&reply));
+            .assistant(std::iter::once(&assistant));
+        trace.finish("ok");
         let payload = trace.payload();
         let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
             .unwrap();
         assert_eq!(spans.len(), 6);
-        for group in spans.chunks_exact(3) {
-            for span in &group[..2] {
-                let attributes = span["attributes"].as_array().unwrap();
-                let entry = attributes
-                    .iter()
-                    .find(|attribute| attribute["key"] == "langfuse.observation.input")
-                    .unwrap();
-                assert_eq!(
-                    serde_json::from_str::<String>(entry["value"]["stringValue"].as_str().unwrap())
-                        .unwrap(),
-                    user
-                );
-            }
-            let entry = group[2]["attributes"]
+        let attribute = |span: &Value, key: &str| {
+            span["attributes"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|attribute| attribute["key"] == "langfuse.observation.output")
-                .unwrap();
-            assert_eq!(
-                serde_json::from_str::<String>(entry["value"]["stringValue"].as_str().unwrap())
-                    .unwrap(),
-                format!("assistant: {reply}\n")
-            );
+                .find(|attribute| attribute["key"] == key)
+                .map(|attribute| attribute["value"].clone())
+        };
+        assert_ne!(spans[0]["traceId"], spans[3]["traceId"]);
+        for group in spans.chunks_exact(3) {
+            assert!(group[0].get("parentSpanId").is_none());
+            for span in &group[1..] {
+                assert_eq!(span["parentSpanId"], group[0]["spanId"]);
+                assert_eq!(span["traceId"], group[0]["traceId"]);
+            }
+            for span in group {
+                assert_eq!(
+                    attribute(span, "langfuse.session.id").unwrap()["stringValue"],
+                    trace.session
+                );
+                assert_eq!(
+                    attribute(span, "langfuse.trace.name").unwrap()["stringValue"],
+                    TRACE_NAME
+                );
+            }
+            for span in &group[..2] {
+                let input = attribute(span, "langfuse.observation.input").unwrap();
+                assert_eq!(input["stringValue"].as_str().unwrap(), user);
+            }
+            for span in [&group[0], &group[2]] {
+                let output = attribute(span, OBSERVATION_OUTPUT).unwrap();
+                assert_eq!(
+                    output["stringValue"].as_str().unwrap(),
+                    json!([{"type":"text","text":reply}]).to_string()
+                );
+            }
         }
         assert!(!payload.to_string().contains("[truncated]"));
+    }
+
+    #[test]
+    fn debug_spans_keep_safe_tool_fields_and_redact_configured_keys() {
+        use rig_core::message::ToolName;
+
+        let exporter = Exporter::configured(Settings {
+            enabled: true,
+            include_content: true,
+            public_key: "fixture-public".into(),
+            secret_key: "fixture-secret".into(),
+            ..Settings::default()
+        })
+        .unwrap()
+        .unwrap();
+        let mut trace = Trace::new(
+            exporter,
+            "project",
+            "channel",
+            "short-provider!",
+            vec![(
+                "input".into(),
+                Some(json!({"event":"user","data":{"body":"fixture-secret"}}).to_string()),
+            )],
+        );
+        trace.export_on_drop = false;
+        let arguments = json!({"to":"recipient","path":"image.png","caption":"Safe caption",
+            "reply_to_message_id":"original-message","token":"short-token!"});
+        let call = AssistantContent::tool_call(
+            "call-id",
+            ToolName::new("send_file").unwrap(),
+            arguments.clone(),
+        );
+        trace
+            .span("manager.generation", "generation")
+            .assistant([&AssistantContent::text("Before the tool"), &call].into_iter());
+        trace.span("manager.tool", "tool").tool(
+            "send_file",
+            &arguments,
+            &json!({"message_id":"sent-file-id", "details":"short-provider!"}),
+            "ok",
+        );
+        let payload = trace.payload().to_string();
+        for expected in [
+            "recipient",
+            "image.png",
+            "Safe caption",
+            "original-message",
+            "Before the tool",
+            "call-id",
+            "sent-file-id",
+            "user",
+        ] {
+            assert!(payload.contains(expected), "{expected}");
+        }
+        for credential in ["fixture-secret", "short-token!", "short-provider!"] {
+            assert!(!payload.contains(credential));
+        }
+        assert!(trace.root_output.is_none());
     }
 
     #[test]
@@ -533,17 +701,31 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        let mut trace = Trace::new(exporter, vec![("input".into(), None)]);
+        let mut trace = Trace::new(
+            exporter,
+            "project",
+            "channel",
+            "provider-credential",
+            vec![("input".into(), None)],
+        );
         trace.export_on_drop = false;
-        trace
-            .span("read_file", "tool")
-            .tool_input("read_file", &json!({"path":"private/.env.production"}));
+        trace.span("read_file", "tool").tool(
+            "read_file",
+            &json!({"path":"private/.env.production"}),
+            &json!({"content":"unmarked short value"}),
+            "ok",
+        );
+        let assistant = AssistantContent::text("unmarked short value");
         trace
             .span("manager.generation", "generation")
-            .assistant(std::iter::once("unmarked short value"));
-        trace
-            .span("send_md", "tool")
-            .tool_input("send_md", &json!({"text":"unmarked short value"}));
+            .assistant(std::iter::once(&assistant));
+        trace.finish("ok");
+        trace.span("send_md", "tool").tool(
+            "send_md",
+            &json!({"text":"unmarked short value"}),
+            &json!({"status":"ok"}),
+            "ok",
+        );
         let exported = trace.payload().to_string();
         assert!(exported.contains("[redacted path]"));
         assert!(!exported.contains(".env"));
@@ -585,7 +767,11 @@ mod tests {
                 let reply = secret.clone();
                 let router = Router::new().route(
                     "/api/public/otel/v1/traces",
-                    post(async move || (StatusCode::FORBIDDEN, reply)),
+                    post(async move |headers: axum::http::HeaderMap| {
+                        assert_eq!(headers["x-langfuse-ingestion-version"], "4");
+                        assert_eq!(headers["content-type"], "application/json");
+                        (StatusCode::FORBIDDEN, reply)
+                    }),
                 );
                 let server =
                     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

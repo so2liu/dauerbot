@@ -4,7 +4,6 @@ use anyhow::{Result, ensure};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 
 #[derive(Deserialize)]
@@ -23,141 +22,33 @@ pub(crate) struct ViewArgs {
     pub generation: String,
 }
 
-// Leave room in the Manager turn for decisions and reporting, even if the
-// terminal keeps changing. This budget survives actor checkpoint recovery.
-const MAX_TERMINAL_CALLS: i64 = 10;
-const MAX_INPUT_CALLS: i64 = 4;
-const MAX_UNCHANGED_POLLS: i64 = 3;
-
 fn stopped(reason: &str, message: &str) -> Value {
     json!({"status":"observation_stopped","reason":reason,"stop_polling":true,"message":message})
 }
 
-struct TerminalHistory {
-    calls: i64,
-    inputs: i64,
-    last_screen: Option<String>,
-    unchanged_polls: i64,
-    stopped: Option<Value>,
-    turn: String,
-    uncertain_input: bool,
-}
-
-impl TerminalHistory {
-    fn load(c: &Connection, run: &str, effect: &str, generation: &str) -> Result<Self> {
-        let occurrence: String = c.query_row(
-            "SELECT occurrence FROM manager_effects WHERE run_id=? AND id=?",
-            rusqlite::params![run, effect],
-            |row| row.get(0),
-        )?;
-        let mut history = Self {
-            calls: 0,
-            inputs: 0,
-            last_screen: None,
-            unchanged_polls: 0,
-            stopped: None,
-            turn: model_turn(&occurrence).to_owned(),
-            uncertain_input: false,
-        };
-        let mut statement = c.prepare(
-            "SELECT name,status,json_extract(result,'$.status'),json_extract(result,'$.reason'),
-                json_extract(result,'$.message'),json_extract(result,'$.screen_fingerprint'),
-                json_extract(result,'$.unchanged_polls'),COALESCE(NULLIF(json_extract(result,'$.generation'),''),NULLIF(json_extract(arguments,'$.generation'),'')),
-                occurrence,json_extract(result,'$.ignored_attempt')
-             FROM manager_effects WHERE run_id=? AND id!=? AND name IN ('cli_view','cli_send_keys','steer_worker')
-             ORDER BY rowid DESC LIMIT ?",
-        )?;
-        let mut rows = statement.query(rusqlite::params![run, effect, MAX_TERMINAL_CALLS])?;
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(0)?;
-            let status: String = row.get(1)?;
-            let same_generation = row
-                .get::<_, Option<String>>(7)?
-                .as_deref()
-                .is_none_or(|previous| previous == generation);
-            history.calls += 1;
-            if matches!(name.as_str(), "cli_send_keys" | "steer_worker") {
-                history.inputs += 1;
-                history.uncertain_input |=
-                    same_generation && matches!(status.as_str(), "submitting" | "uncertain");
-            }
-            if same_generation
-                && history.stopped.is_none()
-                && row.get::<_, Option<String>>(2)?.as_deref() == Some("observation_stopped")
-            {
-                let reason: String = row.get(3)?;
-                let message: String = row.get(4)?;
-                let previous_occurrence: String = row.get(8)?;
-                let ignored_attempt = row.get::<_, Option<i64>>(9)?.unwrap_or_default()
-                    + i64::from(model_turn(&previous_occurrence) != history.turn);
-                let mut denied = stopped(&reason, &message);
-                denied["ignored_attempt"] = json!(ignored_attempt);
-                denied["ignored_terminal_stop"] = json!(ignored_attempt >= 2);
-                history.stopped = Some(denied);
-            } else if history.last_screen.is_none()
-                && name == "cli_view"
-                && row.get::<_, Option<String>>(7)?.as_deref() == Some(generation)
-            {
-                history.last_screen = row.get(5)?;
-                history.unchanged_polls = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
-            }
-        }
-        Ok(history)
-    }
-
-    fn stop(&self) -> Option<Value> {
-        self.stopped.clone().or_else(|| {
-            (self.calls >= MAX_TERMINAL_CALLS).then(|| {
-                stopped("terminal_budget_exhausted",
-                    "Terminal call budget exhausted for this turn. Stop polling and either report or switch strategy.")
-            })
-        })
-    }
-
-    fn observe(&self, mut screen: Value) -> Value {
-        let text = screen["text"].as_str().unwrap_or_default();
-        // Timestamps and screen geometry are outside the rendered text.
-        // Ignore incidental whitespace while still observing textual changes.
-        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let fingerprint = format!("{:x}", Sha256::digest(normalized.as_bytes()));
-        let unchanged_polls = if self.last_screen.as_deref() == Some(fingerprint.as_str()) {
-            self.unchanged_polls + 1
-        } else {
-            0
-        };
-        screen["screen_fingerprint"] = json!(fingerprint);
-        screen["unchanged_polls"] = json!(unchanged_polls);
-        if unchanged_polls >= MAX_UNCHANGED_POLLS {
-            return stopped(
-                "terminal_output_unchanged",
-                &format!(
-                    "Terminal output unchanged for {unchanged_polls} polls. Stop polling and either report or switch strategy."
-                ),
-            );
-        }
-        screen
-    }
-}
-
-fn model_turn(occurrence: &str) -> &str {
-    occurrence
-        .rsplit_once(":call:")
-        .map_or(occurrence, |(turn, _)| turn)
-}
-
-async fn history(
+async fn has_uncertain_input(
     app: &Arc<App>,
     authority: &manager::Context,
     effect: &str,
     generation: &str,
-) -> Result<TerminalHistory> {
+) -> Result<bool> {
     let authority = authority.clone();
     let effect = effect.to_owned();
     let generation = generation.to_owned();
     app.db
         .call(move |c| {
             manager::valid(c, &authority)?;
-            TerminalHistory::load(c, &authority.run, &effect, &generation)
+            Ok(c.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM manager_effects
+                    WHERE run_id=? AND id!=? AND name IN ('cli_send_keys','steer_worker')
+                      AND status IN ('submitting','uncertain')
+                      AND COALESCE(NULLIF(json_extract(result,'$.generation'),''),
+                                   NULLIF(json_extract(arguments,'$.generation'),''),?)=?
+                )",
+                rusqlite::params![authority.run, effect, generation, generation],
+                |row| row.get(0),
+            )?)
         })
         .await
 }
@@ -232,20 +123,10 @@ pub(crate) async fn send(
         args.generation = project(app, authority, "", false).await?.generation;
     }
     let denial = |reason, message| with_generation(stopped(reason, message), &args.generation);
-    let history = history(app, authority, effect, &args.generation).await?;
-    if let Some(denied) = history.stop() {
-        return Ok(with_generation(denied, &args.generation));
-    }
-    if history.uncertain_input {
+    if has_uncertain_input(app, authority, effect, &args.generation).await? {
         return Ok(denial(
             "terminal_input_uncertain",
             "Previous terminal input may already have been submitted. Inspect existing evidence and do not replay it.",
-        ));
-    }
-    if history.inputs >= MAX_INPUT_CALLS {
-        return Ok(denial(
-            "terminal_input_budget_exhausted",
-            "Terminal input budget exhausted for this turn. Use a different strategy.",
         ));
     }
     let project_id = authority.project.clone();
@@ -400,47 +281,28 @@ fn uncertain(project: &Project, confirmed: usize, message: &str) -> Value {
 pub(crate) async fn view(
     app: &Arc<App>,
     authority: &manager::Context,
-    args: ViewArgs,
-    effect: &str,
+    mut args: ViewArgs,
 ) -> Result<Value> {
     let config = app.config.read().await.clone();
-    view_with(app, authority, args, effect, move |project| async move {
-        herdr::terminal_control::screen(&config, &project).await
-    })
-    .await
-}
-
-async fn view_with<O, OF>(
-    app: &Arc<App>,
-    authority: &manager::Context,
-    mut args: ViewArgs,
-    effect: &str,
-    observe: O,
-) -> Result<Value>
-where
-    O: FnOnce(Project) -> OF,
-    OF: std::future::Future<Output = Result<Value>>,
-{
     if args.generation.is_empty() {
         args.generation = project(app, authority, "", false).await?.generation;
     }
-    let history = history(app, authority, effect, &args.generation).await?;
-    if let Some(denied) = history.stop() {
-        return Ok(with_generation(denied, &args.generation));
-    }
     let initial = project(app, authority, &args.generation, false).await?;
-    let screen = tokio::time::timeout(Duration::from_secs(3), observe(initial.clone()))
-        .await
-        .map_err(|_| anyhow::anyhow!("CLI screen inspection timed out"))?
-        .map_err(|_| {
-            anyhow::anyhow!("Current CLI screen identity or transport could not be verified")
-        })?;
+    let screen = tokio::time::timeout(
+        Duration::from_secs(3),
+        herdr::terminal_control::screen(&config, &initial),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CLI screen inspection timed out"))?
+    .map_err(|_| {
+        anyhow::anyhow!("Current CLI screen identity or transport could not be verified")
+    })?;
     let fresh = project(app, authority, &args.generation, false).await?;
     ensure!(
         fresh.terminal == initial.terminal && fresh.native_session == initial.native_session,
         "The bound terminal changed during inspection"
     );
-    Ok(with_generation(history.observe(screen), &args.generation))
+    Ok(with_generation(screen, &args.generation))
 }
 
 #[cfg(test)]
@@ -452,86 +314,6 @@ mod tests {
         db::{self, ProjectInput},
         manager, work,
     };
-
-    #[tokio::test]
-    async fn repeated_unchanged_terminal_views_stop_before_using_the_turn_budget() {
-        use serde_json::json;
-        let dir = tempfile::tempdir().unwrap();
-        let app = App::new(dir.path().join("store"), Config::default()).unwrap();
-        let project = app
-            .db
-            .create(ProjectInput {
-                name: "unchanged terminal".into(),
-                path: dir.path().to_string_lossy().into(),
-                agent: "codex".into(),
-                chat_id: String::new(),
-                native_session: String::new(),
-                extra_args: vec![],
-            })
-            .await
-            .unwrap();
-        let authority = manager::Context {
-            project: project.id.clone(),
-            run: "run".into(),
-            revision: 0,
-            input_revision: 0,
-        };
-        app.db.sync(|c| {
-            c.execute("INSERT INTO manager_runs(id,project_id,revision,input_revision,checkpoint,status,owner,created_at) VALUES('run',?,0,0,'{}','working',?,0)", rusqlite::params![project.id,manager::owner()])?;
-            c.execute("UPDATE projects SET generation='g',terminal='term',ready=1 WHERE id=?", [&project.id])?;
-            Ok(())
-        }).unwrap();
-
-        let mut actual_polls = 0;
-        for turn in 0..7 {
-            let effect = format!("effect-{turn}");
-            let occurrence = format!("turn:{turn}:call:0");
-            app.db.sync(|c| {
-                c.execute("INSERT INTO manager_effects(id,run_id,occurrence,name,arguments,status) VALUES(?,'run',?,'cli_view','{}','submitting')", rusqlite::params![effect, occurrence])?;
-                Ok(())
-            }).unwrap();
-            let value = super::view_with(
-                &app,
-                &authority,
-                super::ViewArgs {
-                    generation: "g".into(),
-                },
-                &effect,
-                |_| {
-                    actual_polls += 1;
-                    let text = if turn % 2 == 0 {
-                        "Stable screen"
-                    } else {
-                        "Stable  screen  "
-                    };
-                    async move { Ok(json!({"text": text, "generation": "g", "captured_at": turn})) }
-                },
-            )
-            .await
-            .unwrap();
-            if turn < 3 {
-                assert_eq!(value["unchanged_polls"], turn);
-            } else {
-                assert_eq!(value["status"], "observation_stopped");
-                assert_eq!(value["reason"], "terminal_output_unchanged");
-                assert_eq!(value["stop_polling"], true);
-                assert_eq!(value["ignored_terminal_stop"] == true, turn >= 5);
-            }
-            app.db
-                .sync(|c| {
-                    c.execute(
-                        "UPDATE manager_effects SET status='complete',result=? WHERE id=?",
-                        rusqlite::params![value.to_string(), effect],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
-        }
-        assert_eq!(
-            actual_polls, 4,
-            "calls after the stop marker never reach the backend"
-        );
-    }
 
     #[tokio::test]
     async fn exhausted_transition_returns_structured_input_refusal_before_terminal_io() {

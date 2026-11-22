@@ -74,15 +74,6 @@ fn guard(c: &Connection, p: &Project, generation: &str, terminal: &str) -> Resul
         !pending_messages,
         "Unresolved input or message effects prevent a proven-safe close"
     );
-    let timers: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM work_timers WHERE project_id=? AND enabled=1)",
-        [&p.id],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        !timers,
-        "Enabled project schedules prevent an unambiguous close"
-    );
     let uncertain: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=?1 AND e.status='uncertain') OR EXISTS(SELECT 1 FROM manager_close_audit WHERE project_id=?1 AND status IN ('submitting','uncertain'))", [&p.id], |r|r.get(0))?;
     ensure!(
         !uncertain,
@@ -147,12 +138,8 @@ pub(crate) async fn close(
     args: CloseArgs,
 ) -> Result<Value> {
     ensure!(
-        args.generation.len() <= 128 && args.terminal_id.len() <= 128,
-        "Execution identity exceeds its bound"
-    );
-    ensure!(
-        args.task_finished && !args.reason.trim().is_empty() && args.reason.len() <= 2000,
-        "Confirm semantic task completion and give a bounded close reason"
+        args.task_finished && !args.reason.trim().is_empty(),
+        "Confirm semantic task completion and give a close reason"
     );
     let project = p.clone();
     let run_id = authority.run.clone();
@@ -608,7 +595,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn current_targets_pending_work_and_enabled_schedules_are_retained() {
+    async fn current_targets_and_unresolved_work_are_retained_with_schedules_enabled() {
         let (_dir, app, p) = fixture().await;
         app.db.sync(|c|{
             work::begin_execution(c,&p.id,CURRENT,1)?;
@@ -619,8 +606,7 @@ mod tests {
             assert!(guard(c,&p,OLD,"old-terminal").is_err());
             c.execute("UPDATE work_events SET status='consumed' WHERE id='pending-event'",[])?;
             c.execute("INSERT INTO work_timers(id,project_id,task_id,name,prompt,kind,interval_seconds,timezone,enabled,created_at,updated_at) VALUES('timer',?,'pending-task','test','test','interval',60,'UTC',1,1,1)",[&p.id])?;
-            assert!(guard(c,&p,OLD,"old-terminal").is_err());
-            c.execute("UPDATE work_timers SET enabled=0 WHERE id='timer'",[])?;
+            assert!(guard(c,&p,OLD,"old-terminal").is_ok());
             c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES('native-out',?,'out','native-send','fixture','uncertain',1,1)",[&p.id])?;
             assert!(guard(c,&p,OLD,"old-terminal").is_err());Ok(())
         }).unwrap();
