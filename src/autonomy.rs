@@ -248,13 +248,14 @@ pub(crate) fn dismiss_expired_publication(
 pub(crate) fn claim_due(c: &Connection, now: i64) -> Result<Option<Settings>> {
     let tx = c.unchecked_transaction()?;
     expire(&tx, now)?;
-    // A definitive delivery failure frees the pending slots. Keep uncertain
-    // deliveries on the normal cadence because Feishu may have accepted them.
+    // A definitive delivery failure never reached Feishu, so remove those
+    // unpublished rows to free both pending slots and dedupe hashes for retry.
+    // Keep uncertain deliveries on the normal cadence because Feishu may have accepted them.
     tx.execute(
-        "UPDATE proposals SET status='expired',decided_at=? WHERE status='pending'
+        "DELETE FROM proposals WHERE status='pending'
          AND source_message_id IS NULL AND EXISTS(
              SELECT 1 FROM messages m WHERE m.id=proposals.outbox_id AND m.status='failed')",
-        [now],
+        [],
     )?;
     let target: Option<String> = tx.query_row(&format!(
         "SELECT p.id FROM autonomy_settings a JOIN projects p ON p.id=a.project_id

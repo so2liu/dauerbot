@@ -245,7 +245,7 @@ mod tests {
             assert!(claim(c, now + 1)?.is_none());
             let retry_at = now + autonomy::REQUEST_BACKOFF_MS;
             let request = claim(c, retry_at)?.expect("failed publication only uses the short backoff");
-            publish(c,&request.settings,request.provider_revision,Submission { proposals: drafts.into() },retry_at)?;
+            publish(c,&request.settings,request.provider_revision,Submission { proposals: drafts.clone().into() },retry_at)?;
             let (count, batches): (u32, u32) = c.query_row(
                 "SELECT count(*),count(DISTINCT outbox_id) FROM proposals WHERE status='pending'",
                 [], |r| Ok((r.get(0)?,r.get(1)?)),
@@ -265,8 +265,11 @@ mod tests {
             let failed_at = retry_at + 1;
             c.execute("UPDATE messages SET status='failed',updated_at=? WHERE direction='out'", [failed_at])?;
             assert!(claim(c, failed_at + autonomy::REQUEST_BACKOFF_MS - 1)?.is_none());
-            assert!(claim(c, failed_at + autonomy::REQUEST_BACKOFF_MS)?.is_some());
+            let retry = claim(c, failed_at + autonomy::REQUEST_BACKOFF_MS)?
+                .expect("failed publication frees retry after short backoff");
             assert_eq!(c.query_row("SELECT count(*) FROM proposals WHERE status='pending'",[],|r|r.get::<_,u32>(0))?,0);
+            publish(c, &retry.settings, retry.provider_revision, Submission { proposals: drafts.into() }, failed_at + autonomy::REQUEST_BACKOFF_MS)?;
+            assert_eq!(c.query_row("SELECT count(*) FROM proposals WHERE status='pending'",[],|r|r.get::<_,u32>(0))?,2);
             Ok(())
         })
     }
