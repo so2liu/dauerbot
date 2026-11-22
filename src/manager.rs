@@ -2864,14 +2864,17 @@ mod tests {
         }).unwrap();
         let finish = |turn: &Turn| app.db.sync(|c| finish_turn(c,&turn.context,"")).unwrap();
         let mut correction = String::new();
-        for (id, root, branch, key, kind, evidence) in [
+        let mut cases = vec![
             ("om_old","om_topic","florence","year","current","年代定 1320"),
             ("om_other","om_other_topic","florence","year","current","别的话题保密决定 1900"),
             ("om_reference","om_topic","florence","reference","reference","York 只供参考"),
             ("om_branch","om_topic","other-florence","year","current","独立分支 1080"),
-            ("om_correct","om_topic","florence","year","current","年代改为 1324 / 1325"),
             ("om_no_york","om_topic","florence","opening","current","不要约克"),
-        ] {
+        ];
+        let older_years: Vec<_> = (0..11).map(|i| (format!("om_year_{i}"), format!("年代暂定 {}", 1300+i))).collect();
+        cases.extend(older_years.iter().map(|(id,text)|(id.as_str(),"om_topic","florence","year","current",text.as_str())));
+        cases.push(("om_correct","om_topic","florence","year","current","年代改为 1324 / 1325"));
+        for (id, root, branch, key, kind, evidence) in cases {
             let origin=insert(id,root,evidence);
             let turn=claim_turn();
             let result=tool(&app,&turn.context,ToolCall {
@@ -2911,10 +2914,10 @@ mod tests {
         assert_eq!(context["topic_decisions"]["origin_event_id"],current);
         assert!(!context["prior_conversation"].to_string().contains("年代改为"));
         let decisions=context["topic_decisions"]["decisions"].as_array().unwrap();
-        assert_eq!(decisions.len(),5);
+        assert_eq!(decisions.len(),10);
         assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="年代改为 1324 / 1325" && x["source_event_id"]==correction && x["source_message_id"]=="om_correct"));
         assert!(decisions.iter().any(|x|x["category"]=="current" && x["user_evidence"]=="不要约克"));
-        assert!(decisions.iter().any(|x|x["category"]=="obsolete" && x["user_evidence"]=="年代定 1320"));
+        assert!(decisions.iter().any(|x|x["category"]=="obsolete" && x["user_evidence"].as_str().unwrap().starts_with("年代暂定")));
         assert!(decisions.iter().any(|x|x["branch"]=="other-florence" && x["category"]=="current"));
         assert!(decisions.iter().filter(|x|x.to_string().contains("York")).all(|x|x["category"]=="reference"));
         assert!(!wire.to_string().contains("别的话题保密决定"));
