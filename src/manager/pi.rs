@@ -8,6 +8,9 @@ use anyhow::{Context as _, Result, bail, ensure};
 use rig_core::message::{DocumentSourceKind, UserContent};
 use serde::{Deserialize, Serialize};
 use std::{
+    fs::{OpenOptions, Permissions},
+    io::Read,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -61,11 +64,23 @@ impl Turn {
             "Invalid Manager project identity"
         );
         let path = root.join(".dauerbot").join("manager-pi").join(&project.id);
-        let executable = match std::fs::read_to_string(path) {
-            Ok(raw) => PathBuf::from(raw.trim()),
+        let selector = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        ensure!(
+            selector.metadata()?.is_file(),
+            "Pi selector is not a regular file"
+        );
+        let mut raw = String::new();
+        selector.take(4097).read_to_string(&mut raw)?;
+        ensure!(raw.len() <= 4096, "Pi executable selector is oversized");
+        let executable = PathBuf::from(raw.trim());
         ensure!(
             executable.is_absolute(),
             "Select an absolute Pi executable path"
@@ -213,7 +228,10 @@ async fn run(
     turn: &mut Turn,
 ) -> Result<&'static str> {
     ensure!(!turn.started, "Interrupted Pi run requires recovery");
-    let temporary = tempfile::Builder::new().prefix("dbpi").tempdir_in("/tmp")?;
+    let temporary = tempfile::Builder::new()
+        .prefix("dbpi")
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")?;
     let root = temporary.path();
     let listener = UnixListener::bind(root.join("tools.sock"))?;
     let images = images(turn).await;
@@ -258,7 +276,11 @@ async fn rpc(
         "Management turn superseded"
     );
     let request = json!({"type":"prompt","message":turn.prompt,"images":images});
-    stdin.write_all(format!("{request}\n").as_bytes()).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stdin.write_all(format!("{request}\n").as_bytes()),
+    )
+    .await??;
     let deadline = tokio::time::sleep(Duration::from_secs(300));
     tokio::pin!(deadline);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -494,7 +516,7 @@ mod tests {
             assert_eq!(sent, 1);
             Ok(())
         })?;
-        let event = app.db.sync(|c| {
+        let mut event = app.db.sync(|c| {
             let id: String = c.query_row(
                 "SELECT id FROM work_events WHERE source='management' AND project_id=?",
                 [&project.id],
@@ -502,7 +524,12 @@ mod tests {
             )?;
             crate::work::event(c, &project.id, &id)
         })?;
-        let assignment = crate::worker_task::fixture_assignment(&app, &project, &event).await?;
+        let mut worker = project.clone();
+        worker.generation = "pi-fixture-worker".into();
+        worker.native_session.clear();
+        worker.mcp_token.clear();
+        event.payload["target_generation"] = json!(worker.generation);
+        let assignment = crate::worker_task::fixture_assignment(&app, &worker, &event).await?;
         let task = std::fs::read_to_string(assignment)?;
         assert!(
             task.contains("Confirmed scope 1324")
