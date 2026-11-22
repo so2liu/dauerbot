@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.14 — 2026-11-22
+
+### Fixed
+
+- Let Manager run multiple independent workers of the same CLI within a project. The default has no application concurrency cap. An optional per-project, per-CLI cap queues assignments until a worker can take them. Workers share the project directory. (#172)
+- Give Agents readable Feishu attachment metadata, verified cache paths or failure reasons, and an optional lark-cli download command for an authorized profile. Cache files, audio, and video from the current or directly quoted message. With ffmpeg and ffprobe available, include a video preview frame at 20% of its duration. Image-capable Manager models receive it as an image, and native terminals receive its local path. (#173)
+
 ## 0.6.13 — 2026-11-22
 
 ### Added
