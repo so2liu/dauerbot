@@ -362,8 +362,6 @@ mod tests {
             marker_dir.join(&project.id),
             executable.as_os_str().as_encoded_bytes(),
         )?;
-        let mut turn = claim()?;
-        assert!(turn.checkpoint["pi"].is_object());
         let steps = [
             (
                 "write_file",
@@ -391,7 +389,7 @@ mod tests {
                 Json(json!({"code":0,"tenant_access_token":"fixture-tenant","expire":7200}))
             }))
             .route("/open-apis/im/v1/messages/{message}/reply", post(|| async {
-                Json(json!({"code":0,"data":{"message_id":"om_fake_sent"}}))
+                Json(json!({"code":0,"data":{"message_id":"om_fake_sent","thread_id":"omt_fixture","root_id":"om_topic","parent_id":"om_current","chat_id":"oc_fixture"}}))
             }))
             .route("/v1/chat/completions", post(move |headers:HeaderMap, Json(body):Json<Value>| {
                 assert_eq!(headers["authorization"], "Bearer private-manager-key");
@@ -418,7 +416,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         app.config.write().await.feishu_base = endpoint.clone();
-        turn.config.base_url = format!("{endpoint}/v1");
+        app.db.sync(|c| {
+            let settings = super::super::public(c, &project.id)?;
+            super::super::save_provider(
+                c,
+                serde_json::from_value(json!({
+                    "base_url":format!("{endpoint}/v1"),
+                    "model":settings["model"], "expected_revision":settings["revision"],
+                }))?,
+            )?;
+            Ok(())
+        })?;
+        let turn = claim()?;
+        assert!(turn.checkpoint["pi"].is_object());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let run = turn.context.run.clone();
         let outcome = tokio::time::timeout(
