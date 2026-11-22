@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.18 — 2026-11-23
+
+### Changed
+
+- Migrate Manager Langfuse OTLP export to ingestion v4 with per-observation session context, single-trace turn attribution across batched events, worker/timer/proposal wake and compaction telemetry, full opt-in debug content preserving verified base64 images, and narrower credential redaction that keeps benign prose and fail-closed `Bearer`/`Basic` scrubbing intact. (#183, #185)
+- Wrap Manager inbound events and synced project memory in structured XML envelopes (`<dauerbot_event>` and `<project_memory>`) mirrored verbatim to Langfuse debug telemetry. (#183)
+- Remove host-side Manager file path denylists, workspace containment gates, and artificial tool/turn ceilings in favor of prompt-guided context and chunked `read_file` pagination (`offset`/`limit`), while preserving the finite non-shell tool allowlist, separate Manager credentials, and host authority boundaries. (#183)
+- Improve Manager context and autonomy: newest-first 16 MiB image hydration budget, symlinked `AGENTS.md` loading, head-memory-preserving compaction, structured proposal schema validation without keyword blocklists, strict per-tool input schemas, and legacy primary `steer_worker` support. (#185)
+
+### Fixed
+
+- Fence Manager admission, tool execution, and delivery against `auto`-project takeover, fix attachment-readiness steering interruption, scope `close_agent`/`cli_send_keys` uncertainty per target, recover stranded in-flight handover records on the authorized incoming daemon without schema changes, surface persistent Manager provider failures with backoff, release `project_lock` during file/CLI probes while serializing `write_file` authority checks, and classify Feishu delivery errors cleanly. (#184)
+- Fix `send_file` topic routing metadata and false `"error": ""` tool error flags, clean up definitively failed proposal cards before retry, and preserve Desktop Manager settings inputs when Reload fails. (#183, #185)
+
 ## 0.6.17 — 2026-11-22
 
 ### Changed
