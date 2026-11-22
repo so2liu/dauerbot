@@ -29,13 +29,14 @@ struct Source {
     order: i64,
 }
 
-fn source(c: &Connection, project: &str, origin: &str) -> Result<Option<Source>> {
-    let row = c.query_row(
-        "SELECT m.source_id,m.content,m.attachment,m.rowid
+fn source(c: &Connection, project: &str, origin: &str, include_body: bool) -> Result<Option<Source>> {
+    let row = c.prepare_cached(
+        "SELECT m.source_id,CASE WHEN ?3 THEN m.content ELSE '' END,m.attachment,m.rowid
          FROM work_events e JOIN messages m ON m.id=e.message_id AND m.project_id=e.project_id
          JOIN project_bots b ON b.project_id=e.project_id AND b.app_id=json_extract(m.attachment,'$.bot_app_id')
-         WHERE e.project_id=? AND e.id=? AND e.source='feishu' AND m.direction='in'",
-        params![project, origin],
+         WHERE e.project_id=?1 AND e.id=?2 AND e.source='feishu' AND m.direction='in'",
+    )?.query_row(
+        params![project, origin, include_body],
         |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get::<_, i64>(3)?)),
     ).optional()?;
     let Some((message_id, body, raw, order)) = row else {
@@ -62,6 +63,10 @@ fn source(c: &Connection, project: &str, origin: &str) -> Result<Option<Source>>
         body,
         order,
     }))
+}
+
+pub(super) fn discussion(c: &Connection, project: &str, origin: &str) -> Result<Option<String>> {
+    Ok(source(c, project, origin, false)?.map(|source| source.scope))
 }
 
 pub(super) fn migrate(c: &Connection) -> Result<()> {
@@ -91,7 +96,7 @@ pub(super) fn record(c: &Connection, project: &str, input: Record) -> Result<Val
         !evidence.is_empty() && evidence.len() <= 512,
         "Use a short exact user excerpt"
     );
-    let source = source(c, project, &input.source_event_id)?
+    let source = source(c, project, &input.source_event_id, true)?
         .context("Decision requires an inbound message from the project's bound bot")?;
     ensure!(
         source.body.contains(evidence),
@@ -113,7 +118,7 @@ pub(super) fn context(
     origin: &str,
     branch: Option<&str>,
 ) -> Result<Value> {
-    let Some(source) = source(c, project, origin)? else {
+    let Some(source) = source(c, project, origin, false)? else {
         return Ok(Value::Null);
     };
     scoped_context(c, project, origin, &source.scope, branch)
@@ -129,7 +134,7 @@ pub(super) fn batch(
     let mut contexts = Vec::new();
     let mut remaining = budget.min(4096).saturating_sub(32);
     for origin in origins {
-        let Some(source) = source(c, project, &origin)? else {
+        let Some(source) = source(c, project, &origin, false)? else {
             continue;
         };
         if !scopes.insert(source.scope.clone()) {
