@@ -1952,12 +1952,11 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 );
             }
         }
-        if pi_scope.is_some() {
-            if latest_steering["present_in_new_inputs"] != true
-                && latest_steering["present_in_continuing_inputs"] != true
-            {
-                latest_steering = Value::Null;
-            }
+        if pi_scope.is_some()
+            && latest_steering["present_in_new_inputs"] != true
+            && latest_steering["present_in_continuing_inputs"] != true
+        {
+            latest_steering = Value::Null;
         }
         let origin = if origins.len() == 1 {
             origins.iter().next().cloned()

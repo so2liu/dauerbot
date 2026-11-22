@@ -18,7 +18,7 @@ pub(in crate::manager) fn migrate(c: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS manager_pi_sessions(
             project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             scope TEXT NOT NULL, snapshot TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL,
-            digest TEXT NOT NULL, PRIMARY KEY(project_id,scope)
+            digest TEXT NOT NULL, run_id TEXT NOT NULL, PRIMARY KEY(project_id,scope)
         )",
     )?;
     Ok(())
@@ -30,21 +30,42 @@ pub(super) struct Snapshot {
     id: String,
     pub(super) session_id: String,
     digest: String,
+    pub(super) stale: bool,
 }
 
 pub(super) fn lookup(c: &Connection, project: &str, scope: &str) -> Result<Option<Snapshot>> {
-    Ok(c.query_row(
-        "SELECT snapshot,session_id,digest FROM manager_pi_sessions WHERE project_id=? AND scope=?",
+    let row = c.query_row(
+        "SELECT s.snapshot,s.session_id,s.digest,r.rowid FROM manager_pi_sessions s
+         LEFT JOIN manager_runs r ON r.id=s.run_id AND r.project_id=s.project_id AND r.status='complete'
+         WHERE s.project_id=? AND s.scope=?",
         params![project, scope],
-        |r| {
-            Ok(Snapshot {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                digest: r.get(2)?,
-            })
-        },
-    )
-    .optional()?)
+        |r| Ok((Snapshot { id: r.get(0)?, session_id: r.get(1)?, digest: r.get(2)?, stale: false },
+                r.get::<_, Option<i64>>(3)?)),
+    ).optional()?;
+    let Some((mut snapshot, watermark)) = row else {
+        return Ok(None);
+    };
+    snapshot.stale = true;
+    if let Some(watermark) = watermark {
+        snapshot.stale = false;
+        let mut statement = c.prepare(
+            "SELECT DISTINCT i.origin_event_id
+             FROM manager_runs r JOIN manager_run_inputs b ON b.run_id=r.id
+             JOIN manager_inputs i ON i.id=b.input_id AND i.project_id=r.project_id
+             WHERE r.project_id=? AND r.status='complete' AND r.rowid>? AND i.origin_event_id IS NOT NULL",
+        )?;
+        let mut rows = statement.query(params![project, watermark])?;
+        while let Some(row) = rows.next()? {
+            let origin: String = row.get(0)?;
+            if super::super::topic_decisions::discussion(c, project, &origin)?.as_deref()
+                == Some(scope)
+            {
+                snapshot.stale = true;
+                break;
+            }
+        }
+    }
+    Ok(Some(snapshot))
 }
 
 pub(super) fn directory(data: &Path) -> Result<PathBuf> {
@@ -91,6 +112,10 @@ fn inspect(path: &Path, expected_id: &str, cwd: &Path) -> Result<BufReader<File>
 }
 
 pub(super) fn stage(root: &Path, snapshot: &Snapshot, staged: &Path) -> Result<()> {
+    ensure!(
+        !snapshot.stale,
+        "Host discussion advanced after the Pi snapshot"
+    );
     let mut src = inspect(&path(root, &snapshot.id)?, &snapshot.session_id, root)?;
     let mut dst = OpenOptions::new()
         .write(true)
@@ -139,6 +164,7 @@ pub(super) fn publish(root: &Path, staged: &Path, session_id: String) -> Result<
         id,
         session_id,
         digest: format!("{:x}", hash.finalize()),
+        stale: false,
     })
 }
 
@@ -152,9 +178,9 @@ pub(super) fn finish(
     let tx = c.unchecked_transaction()?;
     super::super::valid(&tx, ctx)?;
     tx.execute(
-        "INSERT INTO manager_pi_sessions(project_id,scope,snapshot,session_id,digest) VALUES(?,?,?,?,?)
-         ON CONFLICT(project_id,scope) DO UPDATE SET snapshot=excluded.snapshot,session_id=excluded.session_id,digest=excluded.digest",
-        params![ctx.project, scope, next.id, next.session_id, next.digest],
+        "INSERT INTO manager_pi_sessions(project_id,scope,snapshot,session_id,digest,run_id) VALUES(?,?,?,?,?,?)
+         ON CONFLICT(project_id,scope) DO UPDATE SET snapshot=excluded.snapshot,session_id=excluded.session_id,digest=excluded.digest,run_id=excluded.run_id",
+        params![ctx.project, scope, next.id, next.session_id, next.digest, ctx.run],
     )?;
     super::super::close_turn(&tx, ctx, note)?;
     super::super::recovered(&tx, ctx)?;

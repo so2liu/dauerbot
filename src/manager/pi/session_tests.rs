@@ -679,3 +679,116 @@ async fn pi_persistent_session_does_not_replay_active_interrupted_turn() -> Resu
     );
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires an explicitly selected installed Pi executable"]
+async fn pi_persistent_session_reloads_intervening_rust_turns_only_in_same_discussion() -> Result<()>
+{
+    let provider = ProviderFixture::start().await?;
+    let (_dir, app, project, _) = configured(&provider).await?;
+    insert(
+        &app,
+        &project,
+        "om_switch_open",
+        "om_switch_root",
+        "omt_switch_thread",
+        "PI-SWITCH-OPEN: start an ongoing task.",
+    )?;
+    provider
+        .claim_and_drive(
+            app.clone(),
+            &project,
+            [ModelReply::Text("PI-SWITCH-ANSWER: original assumptions.")],
+        )
+        .await?;
+    let initial = snapshots(&app, &project)?
+        .pop()
+        .context("original Pi session")?;
+    let selector = app
+        .dir
+        .join(".dauerbot")
+        .join("manager-pi")
+        .join(&project.id);
+    let selector_bytes = std::fs::read(&selector)?;
+
+    let rust_turn = |message, root, body, note| -> Result<()> {
+        std::fs::remove_file(&selector)?;
+        insert(&app, &project, message, root, "omt_switch_thread", body)?;
+        app.db.sync(|c| {
+            crate::work::sync_inbound(c)?;
+            let turn = super::super::claim(c, &project.id)?.context("built-in Manager turn")?;
+            assert!(turn.checkpoint["pi"].is_null());
+            finish_turn(c, &turn.context, note)
+        })?;
+        std::fs::write(&selector, &selector_bytes)?;
+        Ok(())
+    };
+    rust_turn(
+        "om_switch_foreign",
+        "om_other_root",
+        "PI-SWITCH-FOREIGN: unrelated Rust input.",
+        "PI-SWITCH-FOREIGN-ANSWER: unrelated Rust answer.",
+    )?;
+    insert(
+        &app,
+        &project,
+        "om_switch_resume",
+        "om_switch_root",
+        "omt_switch_thread",
+        "PI-SWITCH-RESUME: resume normally.",
+    )?;
+    let (_, resumed) = provider
+        .claim_and_drive(
+            app.clone(),
+            &project,
+            [ModelReply::Text(
+                "PI-SWITCH-RESUMED-ANSWER: retained same discussion.",
+            )],
+        )
+        .await?;
+    let resumed_messages = resumed[0]["messages"].to_string();
+    assert!(resumed_messages.contains("PI-SWITCH-ANSWER: original assumptions."));
+    assert!(!resumed_messages.contains("PI-SWITCH-FOREIGN"));
+    assert!(!resumed_messages.contains(RECOVERY));
+    assert_eq!(
+        snapshots(&app, &project)?.pop().unwrap().session_id,
+        initial.session_id
+    );
+
+    rust_turn(
+        "om_switch_correction",
+        "om_switch_root",
+        "PI-SWITCH-CORRECTION: change the original assumptions.",
+        "PI-SWITCH-CORRECTION-ANSWER: the Rust Manager acknowledged the correction.",
+    )?;
+    insert(
+        &app,
+        &project,
+        "om_switch_after_rust",
+        "om_switch_root",
+        "omt_switch_thread",
+        "PI-SWITCH-AFTER-RUST: now continue using the correction.",
+    )?;
+    let (_, recovered) = provider
+        .claim_and_drive(
+            app.clone(),
+            &project,
+            [ModelReply::Text(
+                "PI-SWITCH-FINAL: understood the intervening Rust turn.",
+            )],
+        )
+        .await?;
+    let recovered_messages = recovered[0]["messages"].to_string();
+    assert!(recovered_messages.contains("PI-SWITCH-CORRECTION: change the original assumptions."));
+    assert!(recovered_messages.contains("PI-SWITCH-CORRECTION-ANSWER"));
+    assert!(recovered_messages.contains(RECOVERY));
+    assert!(!recovered_messages.contains("PI-SWITCH-FOREIGN"));
+    assert_ne!(
+        snapshots(&app, &project)?.pop().unwrap().session_id,
+        initial.session_id
+    );
+    eprintln!(
+        "Switching to Rust for another discussion did not disturb the Pi session. A settled same-discussion Rust correction was reloaded before starting a new Pi session."
+    );
+    Ok(())
+}
