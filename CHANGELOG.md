@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.16 — 2026-11-22
+
+### Added
+
+- Let managed projects opt in to a restricted Pi runtime with nine host-authorized tools and separate Manager provider credentials. (#178)
+- Resume the Pi Manager conversation per trusted discussion and let Pi compact its native history. The daemon retains input ownership and effect receipts. (#179)
+
+### Fixed
+
+- Scope Manager history sampling to the active Feishu discussion while preserving fresh steering. (#177)
+
 ## 0.6.15 — 2026-11-22
 
 ### Fixed
