@@ -5083,15 +5083,28 @@ mod tests {
         let turn = app.db.sync(|c| { work::sync_inbound(c)?; Ok(claim(c, &p.id)?.unwrap()) }).unwrap();
         let call = ToolCall { occurrence: "targeted-delegate".into(), name: "delegate".into(),
             arguments: json!({"instructions":"selected CLI assignment","target_cli":"agy"}) };
+        let mut candidate = p.clone();
+        candidate.agent = "agy".into();
+        candidate.extra_args.clear();
+        let installed = crate::adapter::plain_worker_available(&candidate).await;
         let receipt = tool(&app, &turn.context, call.clone()).await.unwrap();
-        assert_eq!(receipt["status"], "worker_unavailable");
-        assert_eq!(receipt["work_queued"], false);
+        assert_eq!(receipt["work_queued"], installed);
         assert_eq!(tool(&app, &turn.context, call).await.unwrap(), receipt);
         app.db.sync(|c| {
             assert_eq!(db::project_by_key(c, &p.id)?.agent, "codex");
             assert!(!crate::cli_switch::holds_input(c, &p.id)?);
             assert_eq!(c.query_row("SELECT COUNT(*) FROM cli_switch_requests",[],|r|r.get::<_,i64>(0))?,0);
-            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source IN ('management','manager_worker')",[],|r|r.get::<_,i64>(0))?,0);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM work_events WHERE source IN ('management','manager_worker')",[],|r|r.get::<_,i64>(0))?,
+                i64::from(installed));
+            if installed {
+                assert_eq!(receipt["status"], "queued");
+                assert_eq!(receipt["assignment_pending"], true);
+                let event = work::event(c, &p.id, receipt["event_id"].as_str().unwrap())?;
+                assert_eq!(event.payload["expected_agent"], "agy");
+                assert!(event.payload["target_generation"].is_null());
+            } else {
+                assert_eq!(receipt["status"], "worker_unavailable");
+            }
             Ok(())
         }).unwrap();
     }
