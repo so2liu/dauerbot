@@ -118,23 +118,25 @@ pub(super) fn context(
     };
     // One explicit branch for a worker. The Manager may see separate branches,
     // with the branches kept distinct and no implicit winner picked by the host.
+    // An old task anchor selects the discussion, not an older version of its
+    // decisions. Already enqueued task payloads keep their frozen snapshot.
     let mut statement = c.prepare(
         "WITH decisions AS (
             SELECT d.branch,d.decision_key,
                 CASE WHEN d.kind='current' AND EXISTS(SELECT 1 FROM manager_topic_decisions newer
                     WHERE newer.project_id=d.project_id AND newer.scope=d.scope AND newer.branch=d.branch
                     AND newer.decision_key=d.decision_key AND newer.source_order>d.source_order
-                    AND newer.source_order<=?3 AND newer.kind IN ('current','obsolete'))
+                    AND newer.kind IN ('current','obsolete'))
                 THEN 'obsolete' ELSE d.kind END AS category,
                 d.source_event,d.source_message,d.source_order,d.evidence
             FROM manager_topic_decisions d
-            WHERE d.project_id=?1 AND d.scope=?2 AND d.source_order<=?3 AND (?4 IS NULL OR d.branch=?4)
+            WHERE d.project_id=?1 AND d.scope=?2 AND (?3 IS NULL OR d.branch=?3)
          )
          SELECT branch,decision_key,category,source_event,source_message,evidence
          FROM decisions ORDER BY CASE category WHEN 'current' THEN 0 WHEN 'reference' THEN 1 ELSE 2 END,
          source_order DESC,branch,decision_key LIMIT 10",
     )?;
-    let entries = statement.query_map(params![project,source.scope,source.order,branch], |r| {
+    let entries = statement.query_map(params![project,source.scope,branch], |r| {
         let kind: String = r.get(2)?;
         Ok(json!({"branch":r.get::<_,String>(0)?,"key":r.get::<_,String>(1)?,
             "category":kind,"source_event_id":r.get::<_,String>(3)?,"source_message_id":r.get::<_,String>(4)?,

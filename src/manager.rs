@@ -2864,6 +2864,7 @@ mod tests {
         }).unwrap();
         let finish = |turn: &Turn| app.db.sync(|c| finish_turn(c,&turn.context,"")).unwrap();
         let mut correction = String::new();
+        let mut original = String::new();
         let mut cases = vec![
             ("om_old","om_topic","florence","year","current","年代定 1320"),
             ("om_other","om_other_topic","florence","year","current","别的话题保密决定 1900"),
@@ -2884,6 +2885,7 @@ mod tests {
             assert_eq!(result["status"],"recorded");
             assert_eq!(result["source_event_id"],origin);
             if id=="om_correct" { correction=origin; }
+            else if id=="om_old" { original=origin; }
             finish(&turn);
         }
         for index in 0..10 {
@@ -2891,6 +2893,10 @@ mod tests {
             let turn=claim_turn();
             finish(&turn);
         }
+        let resumed = app.db.sync(|c| topic_decisions::context(c,&p.id,&original,Some("florence")))?;
+        assert_eq!(resumed["origin_event_id"],original);
+        assert!(resumed["decisions"].as_array().unwrap().iter().any(|entry|
+            entry["key"]=="year" && entry["category"]=="current" && entry["source_event_id"]==correction));
         let current=insert("om_followup","om_topic","继续 Florence 主线");
         let mut turn=claim_turn();
         let seen=Arc::new(std::sync::Mutex::new(None));
