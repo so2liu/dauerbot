@@ -48,6 +48,7 @@ pub(crate) fn uses_manager(c: &Connection, project: &str) -> Result<bool> {
 }
 pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     topic_decisions::migrate(c)?;
+    pi::session::migrate(c)?;
     c.execute_batch("CREATE TABLE IF NOT EXISTS standalone_projects(
         project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
     )")?;
@@ -1732,7 +1733,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
             tx.commit()?;
             return Ok(None);
         }
-        let history=tx.prepare("SELECT e.name,e.status,e.result,e.id FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=? ORDER BY e.rowid DESC LIMIT 32")?.query_map([project],|r|Ok(json!({"effect_id":r.get::<_,String>(3)?,"tool":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"result_summary":r.get::<_,String>(2)?.chars().take(2000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut history=tx.prepare("SELECT e.name,e.status,e.result,e.id FROM manager_effects e JOIN manager_runs r ON r.id=e.run_id WHERE r.project_id=? ORDER BY e.rowid DESC LIMIT 32")?.query_map([project],|r|Ok(json!({"effect_id":r.get::<_,String>(3)?,"tool":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?,"result_summary":r.get::<_,String>(2)?.chars().take(2000).collect::<String>()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut instructions = json!({});
         for path in ["AGENTS.md", "HANDOFF.md"] {
             if let Ok(file) = read_file(Path::new(&p.path), path) {
@@ -1746,7 +1747,52 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 );
             }
         }
-        let latest=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {prepared} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
+        let mut latest=if proposal_only { None } else { tx.query_row(&format!("SELECT id,origin_event_id,kind,payload FROM manager_inputs WHERE project_id=? AND status='queued' AND kind='user' AND {prepared} ORDER BY rowid DESC LIMIT 1"),[project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? };
+        let pi_executable = pi::Turn::executable(tx.path(), &p)?;
+        let mut pi_scope = None;
+        let mut pi_steers_across_topics = false;
+        if pi_executable.is_some() && !proposal_only {
+            let discussion = |input: &InputRow| -> Result<Option<String>> {
+                input.1.as_deref().map(|origin| topic_decisions::discussion(&tx, project, origin))
+                    .transpose().map(Option::flatten)
+            };
+            let steering = latest.as_ref().filter(|_| !continuing.is_empty());
+            let selected = steering.or(candidates.first()).or(continuing.first());
+            if let Some(selected) = selected {
+                pi_scope = discussion(selected)?;
+                pi_steers_across_topics = steering.is_some();
+                let mut page = Vec::new();
+                for item in candidates {
+                    if discussion(&item)? != pi_scope {
+                        if steering.is_none() { break; }
+                        continue;
+                    }
+                    page.push(item);
+                }
+                candidates = page;
+                let mut owned = Vec::new();
+                for item in continuing {
+                    if discussion(&item)? == pi_scope {
+                        owned.push(item);
+                    }
+                }
+                continuing = owned;
+                if let Some(item) = latest.as_ref()
+                    && discussion(item)? != pi_scope
+                {
+                    latest = None;
+                }
+                // A preempting control can be outside the FIFO page or belong
+                // to a different discussion from the previously owned work.
+                if candidates.is_empty() && let Some(item) = latest.as_ref() {
+                    candidates.push(item.clone());
+                }
+                if pi_scope.is_some() {
+                    // Only input-scoped journals are available to this session.
+                    history.clear();
+                }
+            }
+        }
         // A new trusted user source selects the discussion; otherwise retain only
         // the selected, still-owned user objective, never consumed conversation history.
         let image_scope = latest
@@ -1761,7 +1807,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         // User steering may interrupt an owned batch; observations never do. Reserve
         // one of the 32 NEW claim slots for that control input, without reordering
         // ordinary fresh batches or changing their persisted input order.
-        let steering_priority = !continuing.is_empty() && latest.is_some();
+        let steering_priority = (pi_steers_across_topics || !continuing.is_empty()) && latest.is_some();
         let mut ordered = candidates;
         if steering_priority && let Some(latest) = latest {
             ordered.retain(|item| item.0 != latest.0);
@@ -1776,7 +1822,11 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         let mut trusted_sources = Vec::new();
         let latest_steering = match &latest_context {
             Some((id, origin, raw, status)) => {
-                json!({"input_id":id,"source_event_id":origin,"history_only_not_reply_target":status=="consumed","already_consumed":status=="consumed","context_only_not_batch_member":true,"data":prompt_input(raw,origin.as_deref())?})
+                let mut steering = json!({"input_id":id,"source_event_id":origin,"history_only_not_reply_target":status=="consumed","already_consumed":status=="consumed","context_only_not_batch_member":true});
+                if pi_scope.is_none() {
+                    steering["data"] = prompt_input(raw, origin.as_deref())?;
+                }
+                steering
             }
             None => Value::Null,
         };
@@ -1902,6 +1952,13 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 );
             }
         }
+        if pi_scope.is_some() {
+            if latest_steering["present_in_new_inputs"] != true
+                && latest_steering["present_in_continuing_inputs"] != true
+            {
+                latest_steering = Value::Null;
+            }
+        }
         let origin = if origins.len() == 1 {
             origins.iter().next().cloned()
         } else {
@@ -1982,7 +2039,7 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
                 &mut quote_budget,
             )?;
         }
-        if !context["latest_user_steering"].is_null()
+        if pi_scope.is_none() && !context["latest_user_steering"].is_null()
             && let Some((_, origin, _, _)) = &latest_context
         {
             attach_quote(
@@ -2031,8 +2088,8 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         } else {
             None
         };
-        let checkpoint = match pi::Turn::select(tx.path(), &p, &prompt, &images)? {
-            Some(checkpoint) => checkpoint,
+        let checkpoint = match pi_executable {
+            Some(executable) => pi::Turn::checkpoint(executable, prompt, images, pi_scope),
             None => manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?,
         };
         let run = db::id();

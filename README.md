@@ -123,7 +123,9 @@ New input can interrupt an in-flight manager model request. The daemon owns inpu
 
 A managed project can run its model loop in Pi 1.5.1 or a compatible Pi CLI. In the daemon data directory, create `.dauerbot/manager-pi/<project-id>` containing the absolute path to the trusted Pi executable outside the project workspace. The selector applies to newly claimed Manager runs. Remove it to select the built-in runtime for subsequent runs. The project stays in managed mode and retains the same Manager provider and native coding worker.
 
-The daemon launches Pi in an isolated directory with private settings, no session file, no native CLI credentials, and only the nine Manager tools registered by Dauerbot. File changes, delegation, messaging and scheduling still pass through the daemon's existing authority and effect journal. Each claimed run starts an isolated Pi conversation from the daemon's scoped context. Service handover waits for an active Pi run to settle. A Pi process or daemon interruption keeps input and effect receipts for recovery. A fresh input uses the existing Manager supersession rules. To switch away after an interrupted run, remove the selector before the next user input.
+Pi runs with private settings, separate Manager credentials, and the nine tools registered by Dauerbot. The daemon owns input claims and all tool effects. Pi resumes its own conversation for each trusted project, receiving bot, chat, and discussion. Sessions live in the private daemon directory. Pi receives the current host envelope and manages compaction of earlier native turns. Input without a trusted discussion uses an ephemeral session.
+
+The daemon settles the input and publishes the completed Pi transcript together. Service handover waits for the active run to settle. An interrupted run preserves input and effect receipts for recovery, and an unreadable transcript starts a fresh discussion session with a recorded recovery notice. To switch away after an interrupted run, remove the selector before the next user input.
 
 ## CLI and HERDR sessions
 

@@ -3,7 +3,7 @@ import { createConnection } from "node:net";
 import { join } from "node:path";
 
 export default function (pi: any) {
-    const tools = JSON.parse(readFileSync(join(process.cwd(), "tools.json"), "utf8"));
+    const tools = JSON.parse(readFileSync(join(process.env.DAUERBOT_PI_BRIDGE!, "tools.json"), "utf8"));
     const names = new Set(tools.map((tool: any) => tool.name));
     pi.on("tool_call", (event: any) => {
         if (!names.has(event.toolName)) return { block: true, reason: "Tool is outside the Manager allowlist" };
@@ -21,7 +21,7 @@ export default function (pi: any) {
             executionMode: "sequential",
             async execute(occurrence: string, args: unknown, signal: AbortSignal) {
                 const value = await new Promise<unknown>((resolve, reject) => {
-                    const socket = createConnection("tools.sock");
+                    const socket = createConnection(join(process.env.DAUERBOT_PI_BRIDGE!, "tools.sock"));
                     socket.setEncoding("utf8");
                     const abort = () => socket.destroy(new Error("Manager tool cancelled"));
                     signal?.addEventListener("abort", abort, { once: true });

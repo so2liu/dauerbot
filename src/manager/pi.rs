@@ -1,4 +1,6 @@
 //! Pi owns the model/tool loop. The daemon retains all tool and delivery authority.
+pub(super) mod session;
+
 use super::{
     App, Context, Failure, ProviderConfig, ToolCall, Value, checkpoint, current, finish_turn, json,
     manager_loop, tool,
@@ -40,15 +42,15 @@ pub(super) struct Turn {
     prompt: String,
     images: Vec<ImageRef>,
     started: bool,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 impl Turn {
-    pub(super) fn select(
+    pub(super) fn executable(
         database: Option<&str>,
         project: &crate::db::Project,
-        prompt: &str,
-        images: &[ImageRef],
-    ) -> Result<Option<Value>> {
+    ) -> Result<Option<PathBuf>> {
         let Some(root) = database
             .filter(|path| !path.is_empty())
             .and_then(|path| Path::new(path).parent())
@@ -88,12 +90,23 @@ impl Turn {
         let executable = executable.canonicalize()?;
         let workspace = Path::new(&project.path).canonicalize()?;
         ensure!(
+            !root.canonicalize()?.starts_with(&workspace),
+            "Pi Manager state must be outside the project workspace"
+        );
+        ensure!(
             executable.is_file() && !executable.starts_with(workspace),
             "Select a trusted Pi executable outside the project workspace"
         );
-        Ok(Some(
-            json!({"pi": Self { executable, prompt: prompt.into(), images: images.to_vec(), started: false }}),
-        ))
+        Ok(Some(executable))
+    }
+
+    pub(super) fn checkpoint(
+        executable: PathBuf,
+        prompt: String,
+        images: Vec<ImageRef>,
+        scope: Option<String>,
+    ) -> Value {
+        json!({"pi": Self { executable, prompt, images, started: false, scope }})
     }
 }
 
@@ -125,10 +138,16 @@ async fn tool_request(mut stream: UnixStream, app: &Arc<App>, ctx: &Context) -> 
     Ok(())
 }
 
-fn start(turn: &Turn, config: &ProviderConfig, root: &Path) -> Result<tokio::process::Child> {
+fn start(
+    turn: &Turn,
+    config: &ProviderConfig,
+    root: &Path,
+    cwd: &Path,
+    staged: Option<&Path>,
+) -> Result<tokio::process::Child> {
     config.validate()?;
     let agent = root.join("agent");
-    std::fs::create_dir(&agent)?;
+    std::fs::create_dir_all(&agent)?;
     let mut definitions = manager_loop::definitions();
     definitions.retain(|tool| TOOLS.contains(&tool.name.as_str()));
     ensure!(
@@ -148,8 +167,14 @@ fn start(turn: &Turn, config: &ProviderConfig, root: &Path) -> Result<tokio::pro
     std::fs::write(root.join("tools.json"), serde_json::to_vec(&definitions)?)?;
     let extension = root.join("manager.ts");
     std::fs::write(&extension, include_str!("pi_extension.ts"))?;
-    let child = Command::new(&turn.executable)
-        .current_dir(root)
+    let mut command = Command::new(&turn.executable);
+    if let Some(staged) = staged {
+        command.arg("--session").arg(staged);
+    } else {
+        command.arg("--no-session");
+    }
+    let child = command
+        .current_dir(cwd)
         .env_clear()
         .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .env("HOME", root)
@@ -160,10 +185,10 @@ fn start(turn: &Turn, config: &ProviderConfig, root: &Path) -> Result<tokio::pro
         .env("TMPDIR", root)
         .env("PI_CODING_AGENT_DIR", agent)
         .env("DAUERBOT_PI_KEY", &config.api_key)
+        .env("DAUERBOT_PI_BRIDGE", root)
         .args([
             "--mode",
             "rpc",
-            "--no-session",
             "--offline",
             "--no-approve",
             "--no-builtin-tools",
@@ -192,8 +217,28 @@ fn start(turn: &Turn, config: &ProviderConfig, root: &Path) -> Result<tokio::pro
     Ok(child)
 }
 
-async fn prepare_prompt(turn: &Turn, supports_images: bool) -> Result<Value> {
+async fn prepare_prompt(
+    turn: &Turn,
+    supports_images: bool,
+    resumed: bool,
+    recovery: bool,
+) -> Result<Value> {
     let mut prompt: Value = serde_json::from_str(&turn.prompt)?;
+    if resumed {
+        for key in [
+            "prior_conversation",
+            "manager_decisions",
+            "topic_history_truncation",
+        ] {
+            prompt
+                .as_object_mut()
+                .context("Invalid Pi prompt")?
+                .remove(key);
+        }
+    }
+    if recovery {
+        prompt["pi_session_recovery"] = json!(session::RECOVERY);
+    }
     let mut images = Vec::new();
     let mut delivery = Vec::new();
     for source in &turn.images {
@@ -264,26 +309,97 @@ async fn run(
         .prefix("dbpi")
         .permissions(Permissions::from_mode(0o700))
         .tempdir_in("/tmp")?;
-    let root = temporary.path();
+    let root = temporary.path().canonicalize()?;
     let listener = UnixListener::bind(root.join("tools.sock"))?;
-    let request = prepare_prompt(turn, config.supports_images).await?;
+    let state_dir = turn
+        .scope
+        .as_ref()
+        .map(|_| session::directory(&app.dir))
+        .transpose()?;
+    let old = if let Some(scope) = turn.scope.clone() {
+        let project = ctx.project.clone();
+        app.db
+            .call(move |c| session::lookup(c, &project, &scope))
+            .await?
+    } else {
+        None
+    };
+    let staged = state_dir.as_ref().map(|_| root.join("turn.jsonl"));
+    let cwd = state_dir.as_deref().unwrap_or(&root);
+    let mut recovery = false;
+    let mut expected = None;
+    if let (Some(old), Some(staged)) = (&old, &staged) {
+        if session::stage(cwd, old, staged).is_ok() {
+            expected = Some(old.session_id.as_str());
+        } else {
+            discard_staged(staged)?;
+            recovery = true;
+        }
+    }
+    let (mut child, mut stdin, mut stdout, session_id) = loop {
+        let mut child = start(turn, config, &root, cwd, staged.as_deref())?;
+        match handshake(&mut child, config, staged.as_deref(), expected).await {
+            Ok((stdin, stdout, id)) => break (child, stdin, stdout, id),
+            Err(error) => {
+                let _ = child.kill().await;
+                if expected.take().is_none() {
+                    return Err(error);
+                }
+                discard_staged(staged.as_deref().context("Missing staged session")?)?;
+                recovery = true;
+            }
+        }
+    };
+    let request =
+        prepare_prompt(turn, config.supports_images, expected.is_some(), recovery).await?;
     turn.started = true;
     checkpoint(app, ctx, &json!({"pi":turn}), false).await?;
-    let mut child = start(turn, config, root)?;
-    let result = rpc(app, ctx, config, &listener, &mut child, request).await;
-    // Reap Pi before discarding its private socket and configuration.
+    let result = rpc(app, ctx, &listener, &mut stdin, &mut stdout, request).await;
     let _ = child.kill().await;
-    result
+    let note = result?;
+    let note = if recovery {
+        format!("{}\n{note}", session::RECOVERY)
+    } else {
+        note
+    };
+    let Some(_permit) = app.service.gate.enter() else {
+        return Ok("yielded");
+    };
+    let context = ctx.clone();
+    if let (Some(scope), Some(dir), Some(staged), Some(id)) =
+        (turn.scope.clone(), state_dir, staged, session_id)
+    {
+        let snapshot = session::publish(&dir, &staged, id)?;
+        app.db
+            .call(move |c| session::finish(c, &context, &scope, &snapshot, &note))
+            .await?;
+        if let Some(old) = old {
+            session::remove(&dir, &old);
+        }
+    } else {
+        app.db
+            .call(move |c| finish_turn(c, &context, &note))
+            .await?;
+    }
+    Ok("complete")
 }
 
-async fn rpc(
-    app: &Arc<App>,
-    ctx: &Context,
-    config: &ProviderConfig,
-    listener: &UnixListener,
+fn discard_staged(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+type PiOutput = tokio::io::Lines<BufReader<tokio::process::ChildStdout>>;
+
+async fn handshake(
     child: &mut tokio::process::Child,
-    request: Value,
-) -> Result<&'static str> {
+    config: &ProviderConfig,
+    staged: Option<&Path>,
+    expected: Option<&str>,
+) -> Result<(tokio::process::ChildStdin, PiOutput, Option<String>)> {
     let mut stdin = child.stdin.take().context("Missing Pi input")?;
     let mut stdout = BufReader::new(child.stdout.take().context("Missing Pi output")?).lines();
     stdin.write_all(b"{\"type\":\"get_state\"}\n").await?;
@@ -302,6 +418,31 @@ async fn rpc(
             && model["api"] == "openai-completions",
         "Pi did not select the configured Manager provider"
     );
+    let id = if let Some(staged) = staged {
+        let id = state["data"]["sessionId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("Pi did not return a session ID")?;
+        ensure!(
+            expected.is_none_or(|expected| expected == id)
+                && state["data"]["sessionFile"].as_str().map(Path::new) == Some(staged),
+            "Pi restored an unexpected session"
+        );
+        Some(id.to_owned())
+    } else {
+        None
+    };
+    Ok((stdin, stdout, id))
+}
+
+async fn rpc(
+    app: &Arc<App>,
+    ctx: &Context,
+    listener: &UnixListener,
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut PiOutput,
+    request: Value,
+) -> Result<String> {
     ensure!(current(app, ctx).await, "Management turn superseded");
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -335,6 +476,10 @@ async fn rpc(
                     Some("agent_end") => {
                         let messages = event["messages"].as_array().context("Pi returned no messages")?;
                         let output = messages.iter().rev().find(|message| message["role"] == "assistant").context("Pi returned no answer")?;
+                        if event["willRetry"] == true {
+                            note = None;
+                            continue;
+                        }
                         ensure!(output["stopReason"] == "stop", "Pi did not complete its answer");
                         note = Some(output["content"].as_array().into_iter().flatten()
                             .filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n"));
@@ -348,15 +493,7 @@ async fn rpc(
             }
         }
     }
-    let note = note.context("Pi settled without a completed answer")?;
-    let Some(_permit) = app.service.gate.enter() else {
-        return Ok("yielded");
-    };
-    let context = ctx.clone();
-    app.db
-        .call(move |c| finish_turn(c, &context, &note))
-        .await?;
-    Ok("complete")
+    note.context("Pi settled without a completed answer")
 }
 
 #[cfg(test)]
@@ -382,8 +519,11 @@ mod tests {
                 prompt: r#"{"current":"inspect both"}"#.into(),
                 images: vec![gone, ok?],
                 started: false,
+                scope: None,
             },
             true,
+            false,
+            false,
         )
         .await?;
         assert_eq!(request["images"].as_array().unwrap().len(), 1);
@@ -602,3 +742,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod session_tests;
