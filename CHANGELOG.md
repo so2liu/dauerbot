@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.17 — 2026-11-22
+
+### Changed
+
+- Replace the external Pi Manager bridge and stateless history truncation with a pure-Rust Manager built on `rig-core`, maintaining durable append-only per-channel transcripts for LLM prompt-cache stability and token-aware canonical compaction. (#181)
+- Sync shared `AGENTS.md` project memory across channels on demand via content hash watermarks without waking idle channels or mutating earlier history. (#181)
+- Support OpenAI Chat Completions, OpenAI Responses (`store: false`), and Anthropic Messages in Manager settings with optional context-window overrides, fast steer cancellation, gate-held detached tool settlement, and explicit host-validated `source_event_id` delegation. (#181)
+
 ## 0.6.16 — 2026-11-22
 
 ### Added
