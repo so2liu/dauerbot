@@ -1,4 +1,5 @@
 //! Restricted management actor. Native CLI authority stays in the worker.
+mod pi;
 mod topic_decisions;
 mod topic_history;
 use crate::{
@@ -2030,7 +2031,10 @@ fn claim(c: &Connection, project: &str) -> Result<Option<Turn>> {
         } else {
             None
         };
-        let checkpoint = manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?;
+        let checkpoint = match pi::Turn::select(tx.path(), project, &prompt, &images)? {
+            Some(checkpoint) => checkpoint,
+            None => manager_loop::begin_with_images(prompt, SYSTEM.into(), images)?,
+        };
         let run = db::id();
         tx.execute(
             "UPDATE manager_runs SET status='superseded' WHERE project_id=? AND status='working'",
@@ -2250,6 +2254,9 @@ async fn drive_turn(
                 current(&app, &turn.context).await,
                 "Management turn superseded"
             );
+        }
+        if let Some(pi) = turn.checkpoint.get("pi").cloned() {
+            return pi::drive(app, &turn.context, &turn.config, pi).await;
         }
         let cancel = CancellationToken::new();
         let step = {
@@ -2723,7 +2730,7 @@ mod tests {
         assert_eq!(named_cli("Use codex for the fix and have claude review it"), None);
     }
 
-    async fn fixture() -> (tempfile::TempDir, Arc<App>, Project) {
+    pub(super) async fn fixture() -> (tempfile::TempDir, Arc<App>, Project) {
         let dir = tempfile::tempdir().unwrap();
         let (app, project) = fixture_at(dir.path()).await;
         (dir, app, project)

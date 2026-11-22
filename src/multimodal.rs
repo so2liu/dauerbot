@@ -116,7 +116,7 @@ impl ImageRef {
         })
     }
 
-    async fn content(&self) -> Result<UserContent> {
+    pub(crate) async fn content(&self) -> Result<UserContent> {
         ensure!(
             !tokio::fs::symlink_metadata(&self.cache_root)
                 .await?
