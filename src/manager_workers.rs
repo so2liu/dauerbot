@@ -305,10 +305,10 @@ pub(crate) async fn select(app: &App, p: &Project, target: &str) -> Result<Selec
         controls(c, &parent)?;
         current_seat(c, &parent, &name)
     }).await?;
-    if let Some(seat) = seat {
-        if seat.state == "unavailable" {
-            return Ok(unavailable(target, &seat.error));
-        }
+    if let Some(seat) = seat
+        && seat.state == "unavailable"
+    {
+        return Ok(unavailable(target, &seat.error));
     }
     if !adapter::plain_worker_available(&candidate(p, target)).await {
         return Ok(unavailable(target, "Worker command unavailable; choose an installed CLI"));
