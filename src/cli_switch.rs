@@ -1712,7 +1712,8 @@ impl App {
                 if stale_agy_retry_allowed(&current, &r)
                     && !current.paused
                     && !work::has_takeover(c, &id, &current.generation)?
-                    && r.source["stale_agy_retry"].is_null()
+                    && (r.source["stale_agy_retry"]["generation"] != current.generation
+                        || r.source["stale_agy_retry"]["terminal"] != json!(current.terminal))
                 {
                     c.execute(
                         "UPDATE cli_switch_requests SET source=json_set(source,'$.stale_agy_retry',json(?)) WHERE id=?",
@@ -2516,7 +2517,7 @@ mod tests {
     async fn explicit_agy_retry_fences_the_exact_unready_generation() {
         let (_dir, app, p) = fixture().await;
         app.db.sync(|c| {
-            c.execute("UPDATE projects SET agent='agy',ready=0 WHERE id=?", [&p.id])?;
+            c.execute("UPDATE projects SET agent='agy',ready=0,execution=json_set(execution,'$.model_selection',NULL) WHERE id=?", [&p.id])?;
             let r = ensure_repair_request(c, &p.id)?;
             suspend_recovery(c, &r.id)?;
             Ok(())
@@ -2535,13 +2536,31 @@ mod tests {
         })).await.unwrap());
         assert_eq!(app.db.project(&p.id).await.unwrap().generation, p.generation);
         assert!(!app.db.sync(|c| stale_agy_retiring(c, &p.id, &p.generation)).unwrap());
+
+        app.db.sync(|c| {
+            c.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.stale_agy_retry.observed_at',1) WHERE id=?", [&r.id])?;
+            Ok(())
+        }).unwrap();
+        app.request_cli_repair(&p.id).await.unwrap();
+        let same = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(same.source["stale_agy_retry"]["observed_at"], 1);
+
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET generation='new-gen',terminal='new-pane' WHERE id=?", [&p.id])?;
+            c.execute("UPDATE cli_switch_requests SET recovery_generation='new-gen' WHERE id=?", [&r.id])?;
+            Ok(())
+        }).unwrap();
+        app.request_cli_repair(&p.id).await.unwrap();
+        let fresh = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(fresh.id, r.id);
+        assert_eq!(fresh.source["stale_agy_retry"], json!({"generation":"new-gen","terminal":"new-pane"}));
     }
 
     #[tokio::test]
     async fn agy_retirement_fence_yields_to_operator_and_late_registration() {
         let (_dir, app, p) = fixture().await;
         app.db.sync(|c| {
-            c.execute("UPDATE projects SET agent='agy',ready=0 WHERE id=?", [&p.id])?;
+            c.execute("UPDATE projects SET agent='agy',ready=0,execution=json_set(execution,'$.model_selection',NULL) WHERE id=?", [&p.id])?;
             Ok(())
         }).unwrap();
         let p = app.request_cli_repair(&p.id).await.unwrap();

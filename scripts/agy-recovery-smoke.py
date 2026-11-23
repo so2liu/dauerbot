@@ -110,6 +110,12 @@ def run(binary, herdr, base):
         (base / name).mkdir()
     (home / ".profile").write_text(f'export PATH="{bindir}:$PATH"\n')
     build_shim(bindir, base)
+    # The daemon prepends the runtime bin after login-shell setup. Keep that
+    # directory private so a machine-installed AGY cannot replace the shim.
+    private_herdr = bindir / "herdr"
+    shutil.copyfile(herdr, private_herdr)
+    private_herdr.chmod(0o700)
+    herdr = private_herdr
     env = {
         "HOME": str(home), "SHELL": "/bin/sh", "PATH": f"{bindir}:/usr/bin:/bin",
         "XDG_CONFIG_HOME": str(base / "xdg"), "XDG_STATE_HOME": str(base / "state"),
@@ -138,7 +144,7 @@ def run(binary, herdr, base):
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=60) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             raise RuntimeError(f"{path}: {error.read().decode()}") from error
@@ -188,8 +194,9 @@ def run(binary, herdr, base):
         (base / "old-generation").write_text(old_generation)
         pending, uncertain = "om_fixture_pending", "om_fixture_uncertain"
         fixture.emit(smoke.message(pending, "Deliver this queued input once"), app_id)
+        smoke.wait_for(lambda: pending in events(), "queued fixture input was not journaled")
         fixture.emit(smoke.message(uncertain, "Do not replay this uncertain input"), app_id)
-        smoke.wait_for(lambda: {pending, uncertain} <= events().keys(), "fixture inputs were not journaled")
+        smoke.wait_for(lambda: uncertain in events(), "uncertain fixture input was not journaled")
         with sqlite3.connect(data / "bridge.sqlite3", timeout=10) as db:
             for table in ("messages", "work_events"):
                 assert db.execute(
