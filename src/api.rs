@@ -1110,6 +1110,10 @@ async fn register(
                     .db
                     .call(move |c| {
                         authorize_generation(c, &admission_authority, &current.id)?;
+                        anyhow::ensure!(
+                            !crate::cli_switch::stale_agy_retiring(c, &current.id, &current.generation)?,
+                            "The stale AGY execution is retiring"
+                        );
                         crate::repair_lane::admit(c, &current, &record)
                     })
                     .await?;
@@ -1155,6 +1159,8 @@ async fn register(
             // normal-readiness result after the native observation.
             let repair_exists:bool=tx.query_row("SELECT json_type(execution,'$.repair_lane') IS NOT NULL FROM projects WHERE id=?",[&p.id],|r|r.get(0))?;
             anyhow::ensure!(!repair_exists,"Session became repair-only; retry registration");
+            anyhow::ensure!(!crate::cli_switch::stale_agy_retiring(&tx,&p.id,&input.generation)?,
+                "The stale AGY execution is retiring");
             let changed=tx.execute("UPDATE projects SET ready=1,native_session=CASE WHEN ?1='' THEN native_session ELSE ?1 END,execution=json_set(CASE WHEN ?1!='' AND execution!='null' THEN json_set(execution,'$.native_confirmed',json('true')) ELSE execution END,'$.mcp_registered',json('true')) WHERE id=?2 AND generation=?3 AND terminal=?4",rusqlite::params![native,p.id,input.generation,terminal])?;
             anyhow::ensure!(changed==1,"Session identity changed; reconnect MCP");
             if !native.is_empty(){work::set_native_session(&tx,&p.id,&input.generation,&native,db::now())?;}

@@ -1285,15 +1285,15 @@ pub fn finish_execution(
         // An interrupted execution does not establish whether its submitted effects happened.
         c.execute("UPDATE work_runs SET status='uncertain',error=?,updated_at=? WHERE project_id=? AND generation=? AND status IN ('submitting','submitted','running')",
           params![error,now,project,generation])?;
-        c.execute("UPDATE work_events SET status='uncertain',error=?,updated_at=? WHERE id IN(
+        c.execute("UPDATE work_events SET status='uncertain',error=?,updated_at=? WHERE status!='uncertain' AND id IN(
           SELECT event_id FROM work_runs WHERE project_id=? AND generation=? AND status='uncertain')",params![error,now,project,generation])?;
         c.execute(
-            "UPDATE messages SET status='uncertain',error=?,updated_at=? WHERE id IN(
+            "UPDATE messages SET status='uncertain',error=?,updated_at=? WHERE status!='uncertain' AND id IN(
           SELECT e.message_id FROM work_events e JOIN work_runs r ON r.event_id=e.id
           WHERE r.project_id=? AND r.generation=? AND r.status='uncertain')",
             params![error, now, project, generation],
         )?;
-        c.execute("UPDATE work_tasks SET status='uncertain',updated_at=? WHERE id IN(
+        c.execute("UPDATE work_tasks SET status='uncertain',updated_at=? WHERE status!='uncertain' AND id IN(
           SELECT task_id FROM work_runs WHERE project_id=? AND generation=? AND status='uncertain')",params![now,project,generation])?;
         crate::manager::worker_changed(c, project)?;
         Ok(())
