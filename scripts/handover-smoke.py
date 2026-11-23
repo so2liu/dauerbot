@@ -249,6 +249,14 @@ def main():
             new_state = api("/state")
             assert new_state["service_activation"]["owner_pid"] == ready["candidate_pid"]
             assert new_state["api_protocol"] == state["api_protocol"]
+            with sqlite3.connect(dbpath) as c:
+                assert c.execute("SELECT status FROM messages WHERE source_id='inflight-fixture'").fetchone()[0] == "uncertain"
+            emit_to(candidate_connection, "after-commit")
+            emit_to(old_connection, "old-relay-after-commit")
+            assert count("warm-relay") == count("after-commit") == count("old-relay-after-commit") == 1
+            process.wait(timeout=10)
+            assert process.returncode == 0
+            checks.append("same listener/port/token transfers to expected PID; abandoned effect metadata remains uncertain; old ingress relays before drain exit")
             for name, (route, identity) in recovery.items():
                 before = api(route)["project"]
                 assert (before["generation"],before["terminal"]) == identity
@@ -284,14 +292,6 @@ def main():
                     assert c.execute("SELECT count(*) FROM work_attention WHERE project_id=? AND generation=? AND reason='agent_update_recovery'",
                                      [after["id"],identity[0]]).fetchone()[0] == 1
             checks.append("successor preserves live contract 1 and automatically recovers missing and incompatible executions without replaying queued or uncertain input")
-            with sqlite3.connect(dbpath) as c:
-                assert c.execute("SELECT status FROM messages WHERE source_id='inflight-fixture'").fetchone()[0] == "uncertain"
-            emit_to(candidate_connection, "after-commit")
-            emit_to(old_connection, "old-relay-after-commit")
-            assert count("warm-relay") == count("after-commit") == count("old-relay-after-commit") == 1
-            process.wait(timeout=10)
-            assert process.returncode == 0
-            checks.append("same listener/port/token transfers to expected PID; abandoned effect metadata remains uncertain; old ingress relays before drain exit")
             status = api(f"/service/activation/status?activation_id={id}")
             assert status["owner_committed"] and status["phase"] == "serving"
             before=fixture.FIXTURE.connects
