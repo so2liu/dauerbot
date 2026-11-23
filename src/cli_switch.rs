@@ -2504,10 +2504,8 @@ mod tests {
             let current = db::project_by_key(c, &p.id)?;
             assert!(current.terminal.is_none());
             assert_eq!(current.native_session, p.native_session);
-            assert_eq!(c.query_row(
-                "SELECT status FROM work_events WHERE message_id='update-pending'",
-                [], |row| row.get::<_, String>(0)
-            )?, "queued");
+            assert_eq!(work::event(c, &p.id, "update-pending")?.status, "managed");
+            assert!(work::claim_steering(c, &p.id, "repair-generation", 4)?.is_none());
             Ok(())
         }).unwrap();
     }
