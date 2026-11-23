@@ -34,25 +34,6 @@ pub fn generation_contract(execution: &Value) -> Option<u64> {
     }
 }
 
-/// Admission runs on the authenticated owner's snapshot before activation. It
-/// does not open the database, mutate readiness or replace a native execution.
-pub fn check_activation(projects: &[Value], target_api: u64) -> Result<()> {
-    for project in projects.iter().filter(|p| p["terminal"].is_string()) {
-        let execution = &project["execution"];
-        anyhow::ensure!(
-            generation_contract(execution).is_some(),
-            "Project {} has an unsupported Agent MCP contract; keep the current service running",
-            project["name"].as_str().unwrap_or("unknown")
-        );
-        anyhow::ensure!(
-            execution.get("mcp_contract").is_some() || target_api == 7,
-            "Project {} uses a published MCP startup probe requiring public API 7; keep the current service running",
-            project["name"].as_str().unwrap_or("unknown")
-        );
-    }
-    Ok(())
-}
-
 #[derive(Clone)]
 pub struct BridgeMcp {
     credentials: Credentials,

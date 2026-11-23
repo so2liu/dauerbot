@@ -290,6 +290,9 @@ pub(crate) fn stopped_mode(
     }
     if cancel_intake {
         tx.execute("UPDATE feishu_group_intake SET status='cancelled' WHERE project_id=? AND status='pending'",[project])?;
+        tx.execute("UPDATE work_attention SET status='resolved',resolved_at=?1,last_seen=?1
+            WHERE project_id=?2 AND reason=?3 AND status='open'",
+            params![db::now(), project, crate::UPDATE_RECOVERY])?;
     }
     work::finish_execution(
         &tx,

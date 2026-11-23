@@ -729,7 +729,8 @@ pub async fn launch_execution(_config: &Config, p: &Project, _argv: &[String]) -
 async fn execution_registry(
     config: &Config,
     p: &Project,
-    execution: &ExecutionRef,
+    terminal_id: &str,
+    managed_name: Option<&str>,
 ) -> Result<Option<BTreeMap<String, Value>>> {
     let list = rpc(config, "workspace.list", json!({})).await?;
     let workspaces = list["workspaces"]
@@ -771,9 +772,9 @@ async fn execution_registry(
                 pane["workspace_id"] == id,
                 "Incomplete HERDR workspace registry"
             );
-            if terminal == execution.terminal_id
-                || pane["tokens"]["hfb_generation"] == p.generation
-                || pane["tokens"]["hfb_execution"] == execution.managed_name
+            if terminal == terminal_id
+                || (!p.generation.is_empty() && pane["tokens"]["hfb_generation"] == p.generation)
+                || managed_name.is_some_and(|name| pane["tokens"]["hfb_execution"] == name)
             {
                 return Ok(None);
             }
@@ -806,10 +807,11 @@ async fn vanished_execution(
     {
         return Ok(false);
     }
-    let Some(first) = execution_registry(config, p, execution).await? else {
+    let name = Some(execution.managed_name.as_str());
+    let Some(first) = execution_registry(config, p, &execution.terminal_id, name).await? else {
         return Ok(false);
     };
-    let Some(second) = execution_registry(config, p, execution).await? else {
+    let Some(second) = execution_registry(config, p, &execution.terminal_id, name).await? else {
         return Ok(false);
     };
     ensure!(
@@ -825,6 +827,36 @@ async fn vanished_execution(
             || (children["state"] != "active"
                 && (!p.execution["child_adapter"].is_string()
                     || children["state"] == "quiescent"))))
+}
+
+pub(crate) async fn retire_for_update(config: &Config, p: &Project) -> Result<()> {
+    if ExecutionRef::from_project(p).is_ok() {
+        return stop(config, p).await;
+    }
+    let terminal = p.terminal.as_deref().filter(|id| !id.is_empty())
+        .context("No immutable terminal identity is available")?;
+    ensure!(
+        p.execution.get("terminal_id").is_none_or(|id| id == terminal)
+            && p.execution.get("generation").is_none_or(|id| id == &p.generation)
+            && p.execution.get("backend").is_none_or(|backend| backend == "legacy"),
+        "Saved HERDR identities disagree"
+    );
+    let root_absent = || p.terminal_pid.is_none_or(|pid| root_has_exited(Some(pid)))
+        && p.execution.get("shell_pid").is_none_or(|pid| pid.is_null() || root_has_exited(pid.as_i64()));
+    let children_absent = || {
+        let children = crate::native_children::observe(p, crate::db::now());
+        children["state"] != "active"
+            && (!p.execution["child_adapter"].is_string() || children["state"] == "quiescent")
+    };
+    let name = p.execution["managed_name"].as_str().filter(|name| !name.is_empty());
+    ensure!(root_absent() && children_absent(), "Saved Agent processes may still be running");
+    let first = execution_registry(config, p, terminal, name).await?;
+    let second = execution_registry(config, p, terminal, name).await?;
+    ensure!(
+        first.is_some() && first == second && root_absent() && children_absent(),
+        "HERDR could not verify that the saved execution is absent"
+    );
+    Ok(())
 }
 fn vanished_record(execution: &ExecutionRef) -> Value {
     json!({"state":"finished","vanished_execution":true,"execution":execution})

@@ -441,13 +441,6 @@ async fn ensure_service(
                 signed,
                 "Updating the background service requires a trusted installed Dauerbot app. Use --data-dir for an independent development instance."
             );
-            let projects = state["projects"]
-                .as_array()
-                .context("The current app did not provide its session state")?;
-            herdr_feishu_bridge::mcp::check_activation(
-                projects,
-                herdr_feishu_bridge::api::PROTOCOL,
-            )?;
             herdr_feishu_bridge::update::record_service(data, &state)?;
             if state["service_activation"]["capability"] == 1 {
                 let id = uuid::Uuid::new_v4().to_string();
