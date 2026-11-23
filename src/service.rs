@@ -650,7 +650,8 @@ pub async fn commit(app: &Arc<App>, id: &str) -> Result<Receipt> {
         }).await.context("Candidate validation exceeded the drain deadline")??;
         ensure!(
             valid["phase"] == "validated",
-            "Candidate is no longer ready"
+            "{}",
+            valid["error"].as_str().unwrap_or("Candidate is no longer ready")
         );
         let mut owned=r.clone();
         owned.phase="committing".into();owned.owner_committed=true;owned.owner_epoch=crate::db::id();
@@ -829,10 +830,10 @@ pub fn preflight(dir: &Path) -> Result<Value> {
         );
         conn.execute("VACUUM INTO ?", [snapshot.to_string_lossy().as_ref()])?;
         let db = Db::open(&snapshot)?;
-        let projects=db.sync(|c|{
-            Ok(c.prepare("SELECT name,execution,terminal FROM projects")?.query_map([],|r|Ok(json!({"name":r.get::<_,String>(0)?,"execution":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or_default(),"terminal":r.get::<_,Option<String>>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?)
+        db.sync(|c| {
+            c.prepare("SELECT execution,terminal FROM projects")?;
+            Ok(())
         })?;
-        crate::mcp::check_activation(&projects, api::PROTOCOL)?;
         ensure!(
             cfg.port > 0 && cfg.token.len() >= 32,
             "Invalid service configuration"
@@ -916,13 +917,6 @@ pub async fn standby(
         )?;
         let fingerprint = fingerprint_with_order(&snapshot, &cfg, insertion_order)?;
         let db = Db::open(&snapshot)?;
-        let projects = db
-            .projects()
-            .await?
-            .into_iter()
-            .map(|p| json!(p))
-            .collect::<Vec<_>>();
-        crate::mcp::check_activation(&projects, api::PROTOCOL)?;
         let bindings = db.bots().await?;
         let warm = feishu::warm_ingress(cfg.clone(), bindings).await?;
         send(
@@ -930,13 +924,13 @@ pub async fn standby(
             json!({"phase":"transport_ready","fingerprint":fingerprint}),
         )
         .await?;
-        Ok::<_, anyhow::Error>(warm)
+        Ok::<_, anyhow::Error>((warm, fingerprint, insertion_order))
     }
     .await;
     for suffix in ["", "-wal", "-shm"] {
         let _ = fs::remove_file(format!("{}{suffix}", snapshot.display()));
     }
-    let mut warm = match result {
+    let (mut warm, prepared_fingerprint, insertion_order) = match result {
         Ok(warm) => warm,
         Err(error) => {
             let _ = send(
@@ -963,12 +957,19 @@ pub async fn standby(
                     .await?;
                     return Ok(());
                 }
-                let c = rusqlite::Connection::open_with_flags(
-                    dir.join("bridge.sqlite3"),
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                let projects=c.prepare("SELECT execution,terminal FROM projects")?.query_map([],|r|Ok(json!({"execution":serde_json::from_str::<Value>(&r.get::<_,String>(0)?).unwrap_or_default(),"terminal":r.get::<_,Option<String>>(1)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-                crate::mcp::check_activation(&projects, api::PROTOCOL)?;
+                let validation = (|| -> Result<()> {
+                    let current: Config = serde_json::from_slice(&fs::read(dir.join("config.json"))?)?;
+                    ensure!(
+                        fingerprint_with_order(&dir.join("bridge.sqlite3"), &current, insertion_order)?
+                            == prepared_fingerprint,
+                        "Project or bot configuration changed; prepare the upgrade again"
+                    );
+                    Ok(())
+                })();
+                if let Err(error) = validation {
+                    send(&mut control, json!({"phase":"failed","error":error.to_string()})).await?;
+                    return Ok(());
+                }
                 send(&mut control, json!({"phase":"validated"})).await?;
             }
             Ok(v) if v["command"] == "commit" || v["command"] == "recover" => {

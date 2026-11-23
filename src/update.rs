@@ -644,6 +644,7 @@ pub fn inherit_service_protocol(data: &Path, db: &crate::db::Db) -> Result<()> {
             c.execute(
                 "UPDATE projects SET execution=json_set(execution,'$.api_protocol',?1)
                 WHERE id=?2 AND generation=?3 AND terminal=?4 AND execution!='null'
+                AND json_extract(execution,'$.terminal_id')=terminal
                 AND json_extract(execution,'$.api_protocol') IS NULL",
                 rusqlite::params![
                     i64::try_from(protocol)?,

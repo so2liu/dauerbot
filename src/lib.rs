@@ -51,6 +51,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
+const UPDATE_RECOVERY: &str = "agent_update_recovery";
 pub const UPDATE_RESUME_NOTICE: &str = "The background service changed its Agent protocol. Choose Recover Agent after update to restart only this Agent and resume its saved native session. Queued messages and uncertain results are preserved.";
 pub const UPDATE_FRESH_NOTICE: &str = "The background service changed its Agent protocol. Choose Recover Agent after update to restart only this Agent. A fresh session will start because no native session ID was saved. Queued messages and uncertain results are preserved.";
 
@@ -151,15 +152,62 @@ impl App {
             Self::update_required(&p),
             "This Agent does not need update recovery"
         );
-        self.stop_inner_mode(&p, false).await?;
-        let recovered = self
-            .start_inner(&p.id, !p.native_session.is_empty())
-            .await?;
-        let id = p.id;
-        let generation = p.generation;
+        self.recover_update_locked(&p, &p.generation).await
+    }
+    async fn recover_update_locked(self: &Arc<Self>, p: &Project, previous: &str) -> Result<Project> {
+        let id = p.id.clone();
+        let generation = p.generation.clone();
+        anyhow::ensure!(!p.paused, "Resume the project to continue automatic Agent recovery");
+        let switching = self.db.call(move |c| {
+            anyhow::ensure!(
+                !work::has_takeover(c, &id, &generation)?,
+                "Automatic Agent recovery waits for terminal input control"
+            );
+            Ok(cli_switch::latest(c, &id)?.as_ref().is_some_and(cli_switch::blocks_worker))
+        }).await?;
+        let contract_value = |key| p.execution.get(key).map_or_else(
+            || "missing".into(),
+            |value| value.as_u64().map_or_else(|| "invalid".into(), |number| number.to_string()),
+        );
+        let message = format!(
+            "Project {} (MCP contract {}, execution API {}): Dauerbot will retry verification and restart only this Agent, resuming its saved session if available.",
+            p.name, contract_value("mcp_contract"), contract_value("api_protocol")
+        );
+        let id = p.id.clone();
+        let previous = previous.to_owned();
+        let marker = previous.clone();
+        self.db.call(move |c| {
+            work::upsert_attention(c, &id, &marker, UPDATE_RECOVERY, &message, "", db::now())?;
+            Ok(())
+        }).await?;
+        let resume_transition = if p.terminal.is_some() {
+            let cfg = self.config.read().await.clone();
+            let verified = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                herdr::retire_for_update(&cfg, p, switching),
+            ).await.context("HERDR Agent verification timed out")?;
+            if verified.as_ref().is_err_and(herdr::runtime_missing) {
+                herdr::ensure_server(&cfg).await?;
+                return Err(verified.unwrap_err());
+            }
+            verified?;
+            let previous = p.clone();
+            self.db.call(move |c| cli_switch::retire_after_update(c, &previous)).await?
+        } else {
+            switching
+        };
+        let recovered = if resume_transition {
+            self.notify.notify_one();
+            self.db.project(&p.id).await?
+        } else {
+            self.start_inner(&p.id, !p.native_session.is_empty()).await?
+        };
+        let id = p.id.clone();
         self.db
             .call(move |c| {
-                work::resolve_attention_reason(c, &id, &generation, "update_required", db::now())?;
+                for reason in [UPDATE_RECOVERY, "update_required"] {
+                    work::resolve_attention_reason(c, &id, &previous, reason, db::now())?;
+                }
                 Ok(())
             })
             .await?;
@@ -818,21 +866,26 @@ impl App {
         if p.agent == "auto" {
             return Ok(());
         }
-        if self.advance_cli_switch(&p, None, None).await? {
+        let id = p.id.clone();
+        let update_retry = self.db.call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row(
+                "SELECT generation,last_seen FROM work_attention WHERE project_id=? AND reason=? AND status='open' ORDER BY last_seen DESC LIMIT 1",
+                rusqlite::params![id, UPDATE_RECOVERY],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            ).optional()?)
+        }).await?;
+        if Self::update_required(&p) || (p.terminal.is_none() && update_retry.is_some()) {
+            self.set_phase(&p, "update_required", Value::Null).await;
+            if !p.paused
+                && update_retry.as_ref().is_none_or(|(_, last)| db::now() - last >= 5_000)
+            {
+                let previous = update_retry.as_ref().map_or(p.generation.as_str(), |(generation, _)| generation);
+                self.recover_update_locked(&p, previous).await?;
+            }
             return Ok(());
         }
-        if Self::update_required(&p) {
-            self.attention(
-                &p,
-                "update_required",
-                if p.native_session.is_empty() {
-                    UPDATE_FRESH_NOTICE
-                } else {
-                    UPDATE_RESUME_NOTICE
-                },
-            )
-            .await?;
-            self.set_phase(&p, "update_required", Value::Null).await;
+        if self.advance_cli_switch(&p, None, None).await? {
             return Ok(());
         }
         let id = p.id.clone();

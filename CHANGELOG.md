@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Keep signed updates from getting stuck on a stale or incompatible Agent MCP record. After handover, automatically verify and recover only the affected Agent, preserving its saved session and pending input without touching unidentified terminals.
+
 ## 0.6.18 — 2026-11-23
 
 ### Changed

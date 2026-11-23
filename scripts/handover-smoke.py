@@ -131,6 +131,16 @@ def main():
             api("/service/activation/abort", {"activation_id":id})
             checks.append("configuration snapshot fence prevents stale project/bot preparation from committing")
             id, ready = prepare()
+            with sqlite3.connect(dbpath) as c:
+                c.execute("UPDATE projects SET terminal='changed-terminal',generation='changed-generation' WHERE id=?", [project["id"]])
+            failed = api("/service/activation/commit", {"activation_id":id})
+            assert failed["phase"] == "failed" and not failed["owner_committed"], failed
+            assert api("/state")["service_activation"]["owner_pid"] == process.pid
+            api("/service/activation/abort", {"activation_id":id})
+            with sqlite3.connect(dbpath) as c:
+                c.execute("UPDATE projects SET terminal=NULL,generation='' WHERE id=?", [project["id"]])
+            checks.append("a terminal and generation change after prepare cannot transfer ownership")
+            id, ready = prepare()
             os.kill(ready["candidate_pid"], signal.SIGKILL)
             time.sleep(.1)
             try:
@@ -167,6 +177,33 @@ def main():
                     native.append((api(f"/projects/{p['id']}")["project"],workspace))
             if native:
                 emit_to(old_connection, "om_handover_gate")
+            recovery = {}
+            for name in ("empty", "legacy-api", "unsupported-live", "supported-live", "ambiguous"):
+                workspace = run / name
+                workspace.mkdir()
+                item = api("/projects", {"name":name, "path":str(workspace), "agent":"custom",
+                                         "extra_args":["/bin/sh","-c",'printf "%s" "$1" > resume-marker; exec /bin/sleep 120',
+                                                       "fixture","{native_session}"]})
+                route = f"/projects/{item['id']}"
+                api(route+"/pause", {"paused":True})
+                if name.endswith("-live"):
+                    api(route+"/start", {})
+                with sqlite3.connect(dbpath) as c:
+                    if name in ("empty", "legacy-api"):
+                        execution = {} if name == "empty" else {"api_protocol":6}
+                        c.execute("UPDATE projects SET terminal=?,generation=?,execution=? WHERE id=?",
+                                  ["missing-"+name,"saved-"+name,json.dumps(execution),item["id"]])
+                    if name == "ambiguous":
+                        c.execute("UPDATE projects SET terminal=?,generation='unknown-generation',execution='{}' WHERE id=?",
+                                  [recovery["supported-live"][1][1],item["id"]])
+                    if name == "unsupported-live":
+                        c.execute("UPDATE projects SET execution=json_set(execution,'$.mcp_contract',2) WHERE id=?", [item["id"]])
+                    c.execute("UPDATE projects SET native_session=? WHERE id=?", ["native-"+name,item["id"]])
+                    c.executemany(
+                        "INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES(?,?,'in',?,'fixture',?,0,0)",
+                        [(name+"-"+status,item["id"],name+"-"+status,status) for status in ("queued","uncertain")],
+                    )
+                    recovery[name] = (route, c.execute("SELECT generation,terminal FROM projects WHERE id=?", [item["id"]]).fetchone())
             id, ready = prepare()
             # Deliberately verify a clean handover does not run crash recovery
             # against live in-flight metadata merely by preparing/opening a copy.
@@ -220,6 +257,41 @@ def main():
             process.wait(timeout=10)
             assert process.returncode == 0
             checks.append("same listener/port/token transfers to expected PID; abandoned effect metadata remains uncertain; old ingress relays before drain exit")
+            for name, (route, identity) in recovery.items():
+                before = api(route)["project"]
+                assert (before["generation"],before["terminal"]) == identity
+                assert before["native_session"] == "native-"+name
+                if name == "supported-live":
+                    continue
+                api(route+"/pause", {"paused":False})
+                if name == "ambiguous":
+                    def recovery_attempted():
+                        with sqlite3.connect(dbpath) as c:
+                            return c.execute("SELECT occurrences FROM work_attention WHERE project_id=? AND reason='agent_update_recovery'",
+                                             [before["id"]]).fetchone()
+                    fixture.wait_for(recovery_attempted, "unknown presence was not queued for supervised recovery")
+                    current = api(route)["project"]
+                    assert (current["generation"],current["terminal"]) == identity
+                    supported = api(recovery["supported-live"][0])["project"]
+                    assert supported["terminal"] == identity[1]
+                    legacy_rpc("pane.get", {"pane_id":supported["execution"]["pane_id"]})
+                    api(route+"/pause", {"paused":True})
+                    continue
+                def restarted():
+                    current = api(route)["project"]
+                    return current if current["generation"] != identity[0] and current["execution"] and current["execution"].get("mcp_contract") == 1 else None
+                after = fixture.wait_for(restarted, "successor did not recover "+name, timeout=30)
+                assert after["native_session"] == "native-"+name
+                marker = run / name / "resume-marker"
+                fixture.wait_for(lambda: marker.exists() and marker.read_text() == "native-"+name,
+                                 "replacement Agent did not receive the saved native session argument")
+                with sqlite3.connect(dbpath) as c:
+                    assert dict(c.execute("SELECT source_id,status FROM messages WHERE source_id IN (?,?)",
+                                          [name+"-queued",name+"-uncertain"])) == {
+                        name+"-queued":"queued",name+"-uncertain":"uncertain"}
+                    assert c.execute("SELECT count(*) FROM work_attention WHERE project_id=? AND generation=? AND reason='agent_update_recovery'",
+                                     [after["id"],identity[0]]).fetchone()[0] == 1
+            checks.append("successor preserves live contract 1 and automatically recovers missing and incompatible executions without replaying queued or uncertain input")
             status = api(f"/service/activation/status?activation_id={id}")
             assert status["owner_committed"] and status["phase"] == "serving"
             before=fixture.FIXTURE.connects
