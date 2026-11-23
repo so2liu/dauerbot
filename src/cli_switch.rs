@@ -13,6 +13,7 @@ use std::{path::PathBuf, sync::Arc};
 
 const BUDGET_MS: i64 = 180_000;
 const RECOVERY_BUDGET_MS: i64 = 3 * BUDGET_MS;
+const AGY_LOGIN_RECHECK_MS: i64 = 1_000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -204,6 +205,9 @@ pub fn ensure_repair_request(c: &Connection, project: &str) -> Result<Request> {
     } else {
         json!({"agent":agent,"native_session":native,"extra_args":serde_json::from_str::<Value>(&args).unwrap_or(json!([])),"generation":generation})
     };
+    if let Some(source) = source.as_object_mut() {
+        source.remove("stale_agy_retry");
+    }
     // Runtime repair preserves both sides of a previous cross-CLI switch:
     // the original repair owner and the current target's native conversation.
     if source.get("selection").is_none() {
@@ -404,6 +408,62 @@ fn notify_manager(c: &Connection, id: &str, state: &str, error: &str) -> Result<
         |row| row.get(0),
     )?;
     crate::manager::observe_cli_transition(c, &project, id, state, error)
+}
+
+fn stale_agy_retry_allowed(p: &Project, r: &Request) -> bool {
+    p.agent == "agy"
+        && r.target == p.agent
+        && !p.ready
+        && p.execution["mcp_registered"] != true
+        && !App::update_required(p)
+        && !p.generation.is_empty()
+        && p.terminal.is_some()
+        && p.execution.get("repair_lane").is_none()
+        && target_selection_matches(r, &p.execution)
+        && matches!(
+            r.phase.as_str(),
+            "recovery_exhausted"
+                | "recovery_pending"
+                | "recovery_starting"
+                | "failed"
+                | "startup_failed"
+        )
+        && (r.generation == p.generation
+            || r.recovery_generation == p.generation
+            || p.execution["cli_switch_request"] == r.id)
+}
+
+fn authorize_stale_agy_retirement(c: &Connection, p: &Project, r: &Request) -> Result<bool> {
+    let tx = c.unchecked_transaction()?;
+    let current = db::project_by_key(&tx, &p.id)?;
+    let Some(latest) = latest(&tx, &p.id)? else {
+        return Ok(false);
+    };
+    if current.paused
+        || current.generation != p.generation
+        || current.terminal != p.terminal
+        || current.terminal_pid != p.terminal_pid
+        || current.execution != p.execution
+        || current.native_session != p.native_session
+        || latest.id != r.id
+        || latest.phase != r.phase
+        || latest.source != r.source
+        || !active(&latest)
+        || !stale_agy_retry_allowed(&current, &latest)
+        || work::has_takeover(&tx, &p.id, &p.generation)?
+    {
+        return Ok(false);
+    }
+    tx.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.stale_agy_retry.retiring',json('true')) WHERE id=?", [&r.id])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+pub(crate) fn stale_agy_retiring(c: &Connection, project: &str, generation: &str) -> Result<bool> {
+    Ok(latest(c, project)?.is_some_and(|r| {
+        let retry = &r.source["stale_agy_retry"];
+        blocks_worker(&r) && retry["generation"] == generation && retry["retiring"] == true
+    }))
 }
 
 fn recovery_budget_spent(request: &Request) -> bool {
@@ -1648,6 +1708,18 @@ impl App {
         self.db
             .call(move |c| {
                 let r = ensure_repair_request(c, &id)?;
+                let current = db::project_by_key(c, &id)?;
+                if stale_agy_retry_allowed(&current, &r)
+                    && !current.paused
+                    && !work::has_takeover(c, &id, &current.generation)?
+                    && (r.source["stale_agy_retry"]["generation"] != current.generation
+                        || r.source["stale_agy_retry"]["terminal"] != json!(current.terminal))
+                {
+                    c.execute(
+                        "UPDATE cli_switch_requests SET source=json_set(source,'$.stale_agy_retry',json(?)) WHERE id=?",
+                        params![json!({"generation":current.generation,"terminal":current.terminal}).to_string(),r.id],
+                    )?;
+                }
                 if r.phase == "recovery_exhausted" {
                     c.execute("UPDATE cli_switch_requests SET phase='recovery_pending',holds_input=1,phase_started_at=?,next_attempt_at=0,recovery_attempts=0,source=json_set(source,'$.recovery_budget_started_at',?) WHERE id=?",
                         params![db::now(),db::now(),r.id])?;
@@ -1669,6 +1741,135 @@ impl App {
             .await?;
         self.notify.notify_one();
         self.db.project(&p.id).await
+    }
+
+    pub(crate) async fn advance_stale_agy_retry(
+        &self,
+        p: &Project,
+        cfg: &Config,
+        record: &Value,
+    ) -> Result<bool> {
+        if p.agent != "agy" || p.paused || p.terminal.is_none() {
+            return Ok(false);
+        }
+        let id = p.id.clone();
+        let generation = p.generation.clone();
+        let request = self.db.call(move |c| {
+            if work::has_takeover(c, &id, &generation)? {
+                return Ok(None);
+            }
+            Ok(latest(c, &id)?.filter(active))
+        }).await?;
+        if let Some(request) = request {
+            self.retry_stale_agy(p, &request, cfg, record).await
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Called under the project lock, before generic recovery can send input
+    /// or fall back to a different CLI.
+    async fn retry_stale_agy(
+        &self,
+        p: &Project,
+        r: &Request,
+        cfg: &Config,
+        record: &Value,
+    ) -> Result<bool> {
+        let retry = &r.source["stale_agy_retry"];
+        if !stale_agy_retry_allowed(p, r)
+            || retry["generation"] != p.generation
+            || retry["terminal"] != json!(p.terminal)
+        {
+            return Ok(false);
+        }
+        let retiring = retry["retiring"] == true;
+        if !retiring && recovery_budget_spent(r) {
+            return Ok(false);
+        }
+        let now = db::now();
+        if now < r.next_attempt_at {
+            return Ok(true);
+        }
+        let closed = retiring && record["vanished_execution"] == true
+            && herdr::ExecutionRef::from_project(p).ok().is_some_and(|expected| {
+                serde_json::to_value(expected).is_ok_and(|expected| record["execution"] == expected)
+            });
+        if !retiring && !herdr::stale_agy_login(cfg, p, record).await {
+            if retry["observed_at"].is_number() {
+                let id = r.id.clone();
+                self.db.call(move |c| {
+                    c.execute("UPDATE cli_switch_requests SET source=json_remove(source,'$.stale_agy_retry.observed_at') WHERE id=?", [&id])?;
+                    Ok(())
+                }).await?;
+            }
+            return Ok(false);
+        }
+        // Require a second verified observation after a real retry interval.
+        // Repeated button presses cannot shorten this interval.
+        let Some(first) = retry["observed_at"].as_i64() else {
+            let id = r.id.clone();
+            self.db.call(move |c| {
+                c.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.stale_agy_retry.observed_at',?) WHERE id=?", params![now,id])?;
+                Ok(())
+            }).await?;
+            self.defer_cli_recovery(
+                r,
+                "Rechecking the owned AGY login prompt before restarting.",
+            )
+            .await?;
+            return Ok(true);
+        };
+        if now.saturating_sub(first) < AGY_LOGIN_RECHECK_MS {
+            return Ok(true);
+        }
+        let current = p.clone();
+        let request = r.clone();
+        if !self
+            .db
+            .call(move |c| authorize_stale_agy_retirement(c, &current, &request))
+            .await?
+        {
+            return Ok(true);
+        }
+        if !closed {
+            match herdr::retire_stale_agy_login(cfg, p).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let id = r.id.clone();
+                    self.db.call(move |c| {
+                        c.execute("UPDATE cli_switch_requests SET source=json_remove(source,'$.stale_agy_retry.observed_at','$.stale_agy_retry.retiring') WHERE id=?", [&id])?;
+                        Ok(())
+                    }).await?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    self.defer_cli_recovery(
+                        r,
+                        &format!("Verifying stale AGY login execution closure: {error}"),
+                    ).await?;
+                    return Ok(true);
+                }
+            }
+        }
+        let id = p.id.clone();
+        let generation = p.generation.clone();
+        let rid = r.id.clone();
+        const NOTICE: &str =
+            "Retired the stale AGY login execution. Restarting AGY with its saved conversation.";
+        self.db.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            ensure!(stale_agy_retiring(&tx, &id, &generation)?, "AGY retirement authority changed");
+            work::finish_execution(&tx,&id,&generation,"stopped","Stale AGY login execution retired",db::now())?;
+            ensure!(tx.execute("UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=?",params![id,generation])?==1,"AGY generation changed during recovery");
+            phase(&tx, &rid, "starting", NOTICE)?;
+            tx.commit()?;
+            Ok(())
+        }).await?;
+        self.set_phase(p, "recovering_cli", json!({"diagnostic":NOTICE}))
+            .await;
+        self.notify.notify_one();
+        Ok(true)
     }
 
     /// Used while constructing an execution, before its launch permit opens.
@@ -2278,7 +2479,8 @@ impl App {
         if current.paused || takeover {
             return Ok(());
         }
-        let resume = r.source["runtime_target"]["agent"] == current.agent
+        let resume = (r.source["runtime_target"]["agent"] == current.agent
+            || (r.source["stale_agy_retry"]["retiring"] == true && current.agent == "agy"))
             && !current.native_session.is_empty();
         if let Err(e) = self.start_inner(&p.id, resume).await {
             self.fail_cli_start(r,&format!("The CLI selection was saved, but startup failed: {e}. Workspace files and saved input are preserved.")).await?;
@@ -2311,6 +2513,75 @@ mod tests {
         app.db.sync(|c|{c.execute("UPDATE projects SET generation='old-gen',terminal='old-pane',ready=1,execution='{\"api_protocol\":7,\"mcp_contract\":1}' WHERE id=?",[&p.id])?;work::begin_execution(c,&p.id,"old-gen",0)?;Ok(())}).unwrap();
         (dir, app.clone(), app.db.project(&p.id).await.unwrap())
     }
+    #[tokio::test]
+    async fn explicit_agy_retry_fences_the_exact_unready_generation() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET agent='agy',ready=0,execution=json_set(execution,'$.model_selection',NULL) WHERE id=?", [&p.id])?;
+            let r = ensure_repair_request(c, &p.id)?;
+            suspend_recovery(c, &r.id)?;
+            Ok(())
+        }).unwrap();
+        let p = app.request_cli_repair(&p.id).await.unwrap();
+        let r = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(r.phase, "recovery_pending");
+        assert!(r.holds_input);
+        assert_eq!(r.source["stale_agy_retry"]["generation"], p.generation);
+        assert_eq!(r.source["stale_agy_retry"]["terminal"], json!(p.terminal));
+
+        // Without an owned live observation, even an armed retry cannot
+        // establish the first sample or claim retirement.
+        assert!(!app.retry_stale_agy(&p, &r, &Config::default(), &json!({
+            "state":"live","status":{"state":"blocked"},"tokens":{"hfb_owner":"other"}
+        })).await.unwrap());
+        assert_eq!(app.db.project(&p.id).await.unwrap().generation, p.generation);
+        assert!(!app.db.sync(|c| stale_agy_retiring(c, &p.id, &p.generation)).unwrap());
+
+        app.db.sync(|c| {
+            c.execute("UPDATE cli_switch_requests SET source=json_set(source,'$.stale_agy_retry.observed_at',1) WHERE id=?", [&r.id])?;
+            Ok(())
+        }).unwrap();
+        app.request_cli_repair(&p.id).await.unwrap();
+        let same = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(same.source["stale_agy_retry"]["observed_at"], 1);
+
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET generation='new-gen',terminal='new-pane' WHERE id=?", [&p.id])?;
+            c.execute("UPDATE cli_switch_requests SET recovery_generation='new-gen' WHERE id=?", [&r.id])?;
+            Ok(())
+        }).unwrap();
+        app.request_cli_repair(&p.id).await.unwrap();
+        let fresh = app.db.sync(|c| Ok(latest(c, &p.id)?.unwrap())).unwrap();
+        assert_eq!(fresh.id, r.id);
+        assert_eq!(fresh.source["stale_agy_retry"], json!({"generation":"new-gen","terminal":"new-pane"}));
+    }
+
+    #[tokio::test]
+    async fn agy_retirement_fence_yields_to_operator_and_late_registration() {
+        let (_dir, app, p) = fixture().await;
+        app.db.sync(|c| {
+            c.execute("UPDATE projects SET agent='agy',ready=0,execution=json_set(execution,'$.model_selection',NULL) WHERE id=?", [&p.id])?;
+            Ok(())
+        }).unwrap();
+        let p = app.request_cli_repair(&p.id).await.unwrap();
+        app.db.sync(|c| {
+            let r = latest(c, &p.id)?.unwrap();
+            c.execute("UPDATE projects SET paused=1 WHERE id=?", [&p.id])?;
+            assert!(!authorize_stale_agy_retirement(c, &p, &r)?);
+            c.execute("UPDATE projects SET paused=0 WHERE id=?", [&p.id])?;
+            work::set_takeover(c, &p.id, &p.generation, true, db::now())?;
+            assert!(!authorize_stale_agy_retirement(c, &p, &r)?);
+            work::set_takeover(c, &p.id, &p.generation, false, db::now())?;
+            c.execute("UPDATE projects SET ready=1,execution=json_set(execution,'$.mcp_registered',json('true')) WHERE id=?", [&p.id])?;
+            assert!(!authorize_stale_agy_retirement(c, &p, &r)?);
+            c.execute("UPDATE projects SET ready=0,execution=json_remove(execution,'$.mcp_registered') WHERE id=?", [&p.id])?;
+            stopped_mode(c, &p.id, &p.generation, true)?;
+            assert!(!authorize_stale_agy_retirement(c, &p, &r)?);
+            assert!(!stale_agy_retiring(c, &p.id, &p.generation)?);
+            Ok(())
+        }).unwrap();
+    }
+
     fn requested(c: &Connection, p: &Project) -> Result<Request> {
         c.execute("UPDATE cli_switch_requests SET phase='requested',nonce='fresh',baseline='old',sequence=10,revision=? WHERE project_id=?",params![revision(c,&p.id)?,p.id])?;
         Ok(latest(c, &p.id)?.unwrap())

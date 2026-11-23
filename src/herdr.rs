@@ -649,6 +649,7 @@ async fn close_matching_pane(config: &Config, expected: &Value) -> Result<()> {
     };
     if current["terminal_id"] != expected["terminal_id"]
         || current["workspace_id"] != expected["workspace_id"]
+        || (!expected["tokens"].is_null() && current["tokens"] != expected["tokens"])
     {
         bail!("HERDR cleanup identity changed; the pane was preserved");
     }
@@ -1408,6 +1409,40 @@ pub async fn stop(config: &Config, p: &Project) -> Result<()> {
     let execution = ExecutionRef::from_project(p)?;
     rpc(config, "pane.close", json!({"pane_id":execution.pane_id})).await?;
     Ok(())
+}
+
+fn agy_login_prompt(text: &str) -> bool {
+    text.contains("You are currently not signed in") && text.contains("Select login method")
+}
+
+fn agy_login_process_owned(p: &Project, record: &Value) -> bool {
+    p.agent == "agy"
+        && record["pid"].as_i64().is_some_and(|pid| pid > 0)
+        && ExecutionRef::from_project(p)
+            .is_ok_and(|execution| execution.shell_pid == record["pid"].as_i64())
+        && recovery_foreground_quiescent(p, record)
+        && (!p.execution["child_adapter"].is_string() || record["children"]["state"] == "quiescent")
+}
+
+pub(crate) async fn stale_agy_login(config: &Config, p: &Project, record: &Value) -> bool {
+    agy_login_process_owned(p, record)
+        && screen(config, p, 0).await.is_ok_and(|text| agy_login_prompt(&text))
+}
+
+pub(crate) async fn retire_stale_agy_login(config: &Config, p: &Project) -> Result<bool> {
+    let execution = ExecutionRef::from_project(p)?;
+    let record = observe(config, p).await?;
+    if record["vanished_execution"] == true {
+        return Ok(true);
+    }
+    check_pane_ownership(p, &record)?;
+    if !agy_login_prompt(&screen(config, p, 0).await?) {
+        return Ok(false);
+    }
+    ensure!(agy_login_process_owned(p, &record), "AGY foreground or child activity changed");
+    close_matching_pane(config, &record).await?;
+    ensure!(vanished_execution(config, p, &execution).await?, "Waiting for verified AGY execution closure");
+    Ok(true)
 }
 
 pub async fn screen(config: &Config, p: &Project, lines: u32) -> Result<String> {

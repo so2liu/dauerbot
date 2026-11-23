@@ -993,6 +993,9 @@ impl App {
             rt.core = "connected".into();
             rt.core_error.clear();
         }
+        if self.advance_stale_agy_retry(&p, &cfg, &record).await? {
+            return Ok(());
+        }
         if repair_lane::descriptor(&p).is_some() {
             self.advance_cli_switch(&p, Some(&cfg), Some(&record))
                 .await?;
