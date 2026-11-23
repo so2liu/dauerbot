@@ -52,6 +52,8 @@ use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
 const UPDATE_RECOVERY: &str = "agent_update_recovery";
+pub const UPDATE_RESUME_NOTICE: &str = "The background service changed its Agent protocol. Choose Recover Agent after update to restart only this Agent and resume its saved native session. Queued messages and uncertain results are preserved.";
+pub const UPDATE_FRESH_NOTICE: &str = "The background service changed its Agent protocol. Choose Recover Agent after update to restart only this Agent. A fresh session will start because no native session ID was saved. Queued messages and uncertain results are preserved.";
 
 #[derive(Default, Serialize)]
 pub struct Runtime {

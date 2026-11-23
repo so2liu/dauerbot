@@ -178,10 +178,12 @@ def main():
             if native:
                 emit_to(old_connection, "om_handover_gate")
             recovery = {}
-            for name in ("empty", "legacy-api", "unsupported-live", "supported-live"):
+            for name in ("empty", "legacy-api", "unsupported-live", "supported-live", "ambiguous"):
                 workspace = run / name
                 workspace.mkdir()
-                item = api("/projects", {"name":name, "path":str(workspace), "agent":"custom", "extra_args":["/bin/sleep","120"]})
+                item = api("/projects", {"name":name, "path":str(workspace), "agent":"custom",
+                                         "extra_args":["/bin/sh","-c",'printf "%s" "$1" > resume-marker; exec /bin/sleep 120',
+                                                       "fixture","{native_session}"]})
                 route = f"/projects/{item['id']}"
                 api(route+"/pause", {"paused":True})
                 if name.endswith("-live"):
@@ -191,6 +193,9 @@ def main():
                         execution = {} if name == "empty" else {"api_protocol":6}
                         c.execute("UPDATE projects SET terminal=?,generation=?,execution=? WHERE id=?",
                                   ["missing-"+name,"saved-"+name,json.dumps(execution),item["id"]])
+                    if name == "ambiguous":
+                        c.execute("UPDATE projects SET terminal=?,generation='unknown-generation',execution='{}' WHERE id=?",
+                                  [recovery["supported-live"][1][1],item["id"]])
                     if name == "unsupported-live":
                         c.execute("UPDATE projects SET execution=json_set(execution,'$.mcp_contract',2) WHERE id=?", [item["id"]])
                     c.execute("UPDATE projects SET native_session=? WHERE id=?", ["native-"+name,item["id"]])
@@ -251,11 +256,27 @@ def main():
                 if name == "supported-live":
                     continue
                 api(route+"/pause", {"paused":False})
+                if name == "ambiguous":
+                    def recovery_attempted():
+                        with sqlite3.connect(dbpath) as c:
+                            return c.execute("SELECT occurrences FROM work_attention WHERE project_id=? AND reason='agent_update_recovery'",
+                                             [before["id"]]).fetchone()
+                    fixture.wait_for(recovery_attempted, "unknown presence was not queued for supervised recovery")
+                    current = api(route)["project"]
+                    assert (current["generation"],current["terminal"]) == identity
+                    supported = api(recovery["supported-live"][0])["project"]
+                    assert supported["terminal"] == identity[1]
+                    legacy_rpc("pane.get", {"pane_id":supported["execution"]["pane_id"]})
+                    api(route+"/pause", {"paused":True})
+                    continue
                 def restarted():
                     current = api(route)["project"]
                     return current if current["generation"] != identity[0] and current["execution"] and current["execution"].get("mcp_contract") == 1 else None
                 after = fixture.wait_for(restarted, "successor did not recover "+name, timeout=30)
                 assert after["native_session"] == "native-"+name
+                marker = run / name / "resume-marker"
+                fixture.wait_for(lambda: marker.exists() and marker.read_text() == "native-"+name,
+                                 "replacement Agent did not receive the saved native session argument")
                 with sqlite3.connect(dbpath) as c:
                     assert dict(c.execute("SELECT source_id,status FROM messages WHERE source_id IN (?,?)",
                                           [name+"-queued",name+"-uncertain"])) == {

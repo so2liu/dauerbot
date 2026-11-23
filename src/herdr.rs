@@ -731,6 +731,7 @@ async fn execution_registry(
     p: &Project,
     terminal_id: &str,
     managed_name: Option<&str>,
+    unknown_pane_address: Option<&str>,
 ) -> Result<Option<BTreeMap<String, Value>>> {
     let list = rpc(config, "workspace.list", json!({})).await?;
     let workspaces = list["workspaces"]
@@ -773,6 +774,7 @@ async fn execution_registry(
                 "Incomplete HERDR workspace registry"
             );
             if terminal == terminal_id
+                || unknown_pane_address.is_some_and(|address| pane_id == address || pane_id == terminal_id)
                 || (!p.generation.is_empty() && pane["tokens"]["hfb_generation"] == p.generation)
                 || managed_name.is_some_and(|name| pane["tokens"]["hfb_execution"] == name)
             {
@@ -808,10 +810,10 @@ async fn vanished_execution(
         return Ok(false);
     }
     let name = Some(execution.managed_name.as_str());
-    let Some(first) = execution_registry(config, p, &execution.terminal_id, name).await? else {
+    let Some(first) = execution_registry(config, p, &execution.terminal_id, name, None).await? else {
         return Ok(false);
     };
-    let Some(second) = execution_registry(config, p, &execution.terminal_id, name).await? else {
+    let Some(second) = execution_registry(config, p, &execution.terminal_id, name, None).await? else {
         return Ok(false);
     };
     ensure!(
@@ -850,8 +852,9 @@ pub(crate) async fn retire_for_update(config: &Config, p: &Project) -> Result<()
     };
     let name = p.execution["managed_name"].as_str().filter(|name| !name.is_empty());
     ensure!(root_absent() && children_absent(), "Saved Agent processes may still be running");
-    let first = execution_registry(config, p, terminal, name).await?;
-    let second = execution_registry(config, p, terminal, name).await?;
+    let address = p.execution["pane_id"].as_str().or(Some(terminal));
+    let first = execution_registry(config, p, terminal, name, address).await?;
+    let second = execution_registry(config, p, terminal, name, address).await?;
     ensure!(
         first.is_some() && first == second && root_absent() && children_absent(),
         "HERDR could not verify that the saved execution is absent"
