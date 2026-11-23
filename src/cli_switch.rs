@@ -355,6 +355,32 @@ fn retire_vanished(c: &Connection, p: &Project, r: &Request) -> Result<bool> {
     Ok(true)
 }
 
+pub(crate) fn retire_after_update(c: &Connection, p: &Project) -> Result<bool> {
+    let tx = c.unchecked_transaction()?;
+    let current = db::project_by_key(&tx, &p.id)?;
+    ensure!(
+        current.generation == p.generation && current.terminal == p.terminal
+            && current.terminal_pid == p.terminal_pid && current.execution == p.execution
+            && !current.paused && !work::has_takeover(&tx, &p.id, &p.generation)?,
+        "Agent authority changed during update recovery"
+    );
+    work::finish_execution(&tx, &p.id, &p.generation, "stopped", "Agent retired after an MCP contract update", db::now())?;
+    tx.execute(
+        "UPDATE projects SET terminal=NULL,terminal_pid=NULL,generation='',ready=0,execution='null' WHERE id=? AND generation=?",
+        params![p.id, p.generation],
+    )?;
+    let switching = latest(&tx, &p.id)?.filter(blocks_worker);
+    if let Some(request) = &switching {
+        phase(&tx, &request.id, "recovery_pending", "The previous MCP execution is gone; restoring the saved CLI transition without releasing pending input")?;
+        tx.execute(
+            "UPDATE cli_switch_requests SET holds_input=1,recovery_attempts=0,source=json_set(source,'$.recovery_budget_started_at',?1) WHERE id=?2",
+            params![db::now(),request.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(switching.is_some())
+}
+
 fn phase(c: &Connection, id: &str, value: &str, error: &str) -> Result<()> {
     c.execute(
         "UPDATE cli_switch_requests SET phase_started_at=CASE WHEN phase!=? THEN ? ELSE phase_started_at END,phase=?,error=?,next_attempt_at=0 WHERE id=?",
@@ -2458,6 +2484,32 @@ mod tests {
         c.execute("INSERT INTO messages(id,project_id,direction,source_id,content,status,created_at,updated_at) VALUES(?,?,'in',?,'pending direction','queued',?,?)",params![id,p.id,id,now,now])?;
         work::sync_inbound(c)?;
         Ok(())
+    }
+    #[tokio::test]
+    async fn update_retirement_rearms_exhausted_switch_without_releasing_pending_input() {
+        let (_dir, app, p) = fixture().await;
+        app.request_cli_switch(&p.id, "agy").await.unwrap();
+        app.db.sync(|c| {
+            c.execute(
+                "UPDATE cli_switch_requests SET phase='recovery_exhausted',holds_input=0 WHERE project_id=?",
+                [&p.id],
+            )?;
+            queue(c, &p, "update-pending", 3)?;
+            let saved = latest(c, &p.id)?.unwrap();
+            assert!(retire_after_update(c, &p)?);
+            let recovered = latest(c, &p.id)?.unwrap();
+            assert_eq!(recovered.id, saved.id);
+            assert_eq!(recovered.phase, "recovery_pending");
+            assert!(recovered.holds_input);
+            let current = db::project_by_key(c, &p.id)?;
+            assert!(current.terminal.is_none());
+            assert_eq!(current.native_session, p.native_session);
+            assert_eq!(c.query_row(
+                "SELECT status FROM messages WHERE id='update-pending'",
+                [], |row| row.get::<_, String>(0)
+            )?, "queued");
+            Ok(())
+        }).unwrap();
     }
     #[tokio::test]
     async fn vanished_execution_retirement_preserves_native_pending_and_uncertain_effects() {

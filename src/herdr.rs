@@ -831,9 +831,27 @@ async fn vanished_execution(
                     || children["state"] == "quiescent"))))
 }
 
-pub(crate) async fn retire_for_update(config: &Config, p: &Project) -> Result<()> {
-    if ExecutionRef::from_project(p).is_ok() {
-        return stop(config, p).await;
+pub(crate) async fn retire_for_update(config: &Config, p: &Project, switching: bool) -> Result<()> {
+    if let Ok(execution) = ExecutionRef::from_project(p) {
+        let record = observe(config, p).await?;
+        if record["vanished_execution"] == true {
+            return Ok(());
+        }
+        if record["state"] == "finished" {
+            stop(config, p).await?;
+        } else {
+            check_pane_ownership(p, &record)?;
+            ensure!(
+                !switching || recovery_foreground_quiescent(p, &record),
+                "Waiting for the CLI transition's foreground work before recovering the Agent"
+            );
+            close_matching_pane(config, &record).await?;
+        }
+        ensure!(
+            vanished_execution(config, p, &execution).await?,
+            "Waiting to verify that the old Agent has stopped"
+        );
+        return Ok(());
     }
     let terminal = p.terminal.as_deref().filter(|id| !id.is_empty())
         .context("No immutable terminal identity is available")?;

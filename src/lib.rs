@@ -158,12 +158,12 @@ impl App {
         let id = p.id.clone();
         let generation = p.generation.clone();
         anyhow::ensure!(!p.paused, "Resume the project to continue automatic Agent recovery");
-        self.db.call(move |c| {
+        let switching = self.db.call(move |c| {
             anyhow::ensure!(
-                !work::has_takeover(c, &id, &generation)? && !cli_switch::holds_input(c, &id)?,
-                "Automatic Agent recovery waits for terminal input control and CLI transitions"
+                !work::has_takeover(c, &id, &generation)?,
+                "Automatic Agent recovery waits for terminal input control"
             );
-            Ok(())
+            Ok(cli_switch::latest(c, &id)?.as_ref().is_some_and(cli_switch::blocks_worker))
         }).await?;
         let contract_value = |key| p.execution.get(key).map_or_else(
             || "missing".into(),
@@ -180,24 +180,28 @@ impl App {
             work::upsert_attention(c, &id, &marker, UPDATE_RECOVERY, &message, "", db::now())?;
             Ok(())
         }).await?;
-        if p.terminal.is_some() {
+        let resume_transition = if p.terminal.is_some() {
             let cfg = self.config.read().await.clone();
             let verified = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                herdr::retire_for_update(&cfg, p),
+                herdr::retire_for_update(&cfg, p, switching),
             ).await.context("HERDR Agent verification timed out")?;
             if verified.as_ref().is_err_and(herdr::runtime_missing) {
                 herdr::ensure_server(&cfg).await?;
                 return Err(verified.unwrap_err());
             }
             verified?;
-            let id = p.id.clone();
-            let generation = p.generation.clone();
-            self.db.call(move |c| cli_switch::stopped_mode(c, &id, &generation, false)).await?;
-        }
-        let recovered = self
-            .start_inner(&p.id, !p.native_session.is_empty())
-            .await?;
+            let previous = p.clone();
+            self.db.call(move |c| cli_switch::retire_after_update(c, &previous)).await?
+        } else {
+            switching
+        };
+        let recovered = if resume_transition {
+            self.notify.notify_one();
+            self.db.project(&p.id).await?
+        } else {
+            self.start_inner(&p.id, !p.native_session.is_empty()).await?
+        };
         let id = p.id.clone();
         self.db
             .call(move |c| {
@@ -862,9 +866,6 @@ impl App {
         if p.agent == "auto" {
             return Ok(());
         }
-        if self.advance_cli_switch(&p, None, None).await? {
-            return Ok(());
-        }
         let id = p.id.clone();
         let update_retry = self.db.call(move |c| {
             use rusqlite::OptionalExtension as _;
@@ -882,6 +883,9 @@ impl App {
                 let previous = update_retry.as_ref().map_or(p.generation.as_str(), |(generation, _)| generation);
                 self.recover_update_locked(&p, previous).await?;
             }
+            return Ok(());
+        }
+        if self.advance_cli_switch(&p, None, None).await? {
             return Ok(());
         }
         let id = p.id.clone();
