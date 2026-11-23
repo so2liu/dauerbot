@@ -2505,7 +2505,7 @@ mod tests {
             assert!(current.terminal.is_none());
             assert_eq!(current.native_session, p.native_session);
             assert_eq!(c.query_row(
-                "SELECT status FROM messages WHERE id='update-pending'",
+                "SELECT status FROM work_events WHERE message_id='update-pending'",
                 [], |row| row.get::<_, String>(0)
             )?, "queued");
             Ok(())
