@@ -446,9 +446,11 @@ pub fn sync_inbound(c: &Connection) -> Result<usize> {
               VALUES(?,?,?,?,?,?,?)",params![id,project,content.chars().take(100).collect::<String>(),content,task_state,created,updated])?;
             let mut context: Value = serde_json::from_str(&attachment).unwrap_or(Value::Null);
             if let Some(fields) = context.as_object_mut() {
-                // Quotes are read from the original message at claim or render time.
+                // Quotes and preceding history are read from the original message at claim or render time.
                 fields.remove("quoted_message");
                 fields.remove("quote_pending");
+                fields.remove("preceding_messages");
+                fields.remove("preceding_pending");
             }
             let payload = json!({"content":content,"attachment":context,"legacy_status":status});
             let kind = if source.starts_with("local-") {

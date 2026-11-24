@@ -116,7 +116,12 @@ fn clean_text(text: &str, secrets: &[&str], depth: usize) -> String {
         return "[omitted: structured credential inspection limit]".into();
     }
     crate::manager::redact_envelope(text, |name, value| {
-        if envelope_identifier(name, value) {
+        if name == "sender"
+            && let Some((label, id)) = value.strip_suffix(')').and_then(|value| value.rsplit_once('('))
+            && envelope_identifier("open_id", id)
+        {
+            format!("{}({})", clean_plain(label, secrets, depth + 1), scrub_known(id, secrets))
+        } else if envelope_identifier(name, value) {
             scrub_known(value, secrets).into_owned()
         } else {
             clean_plain(value, secrets, depth + 1)
@@ -127,13 +132,13 @@ fn clean_text(text: &str, secrets: &[&str], depth: usize) -> String {
 
 fn envelope_identifier(name: &str, value: &str) -> bool {
     let prefix = match name {
-        "event_id" | "origin_event_id" | "local_source_id" => {
+        "event_id" | "origin_event_id" | "local_source_id" | "worker_generation" => {
             return uuid::Uuid::parse_str(value).is_ok();
         }
-        "message_id" | "root_id" | "parent_id" => "om_",
+        "message_id" | "root_id" | "parent_id" | "sent_message_id" | "reply_to_message_id" => "om_",
         "thread_id" => "omt_",
-        "chat_id" => "oc_",
-        "open_id" => "ou_",
+        "chat_id" | "sent_chat_id" => "oc_",
+        "open_id" | "sender" => "ou_",
         "union_id" => "on_",
         "bot_app_id" => "cli_",
         _ => return false,
@@ -323,6 +328,12 @@ pub(super) fn request_text(request: &CompletionRequest, secrets: &[&str]) -> Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn envelope_keeps_feishu_identifiers_and_redacts_sender_credentials() {
+        let xml = r#"<dauerbot_event event_id="2dfef1b8-357f-4e6a-b301-d039ff8e5174" kind="user" source="feishu" thread_id="omt_0123456789abcdef0123456789abcdef" chat_id="oc_0123456789abcdef0123456789abcdef" sender="fixture-secret(ou_0123456789abcdef0123456789abcdef)"><quoted_message message_id="om_0123456789abcdef0123456789abcdef"><body>fixture-secret</body></quoted_message></dauerbot_event>"#;
+        assert_eq!(clean(xml, &["fixture-secret"]), xml.replace("fixture-secret", "[redacted]"));
+    }
+
     #[test]
     fn request_preserves_full_history_and_image_pixels() {
         use rig_core::message::{CallId, ToolName};

@@ -490,18 +490,19 @@ const RESOURCE_ELIGIBLE: &str = "EXISTS(
     ))
 )";
 
-// Both direct and verified quoted references own their respective Feishu message IDs.
+// Direct, quoted and preceding resources keep their own Feishu message IDs.
 const HAS_RESOURCES: &str = "(json_extract(m.attachment,'$.file_key') IS NOT NULL
     OR json_array_length(m.attachment,'$.resources')>0
-    OR json_array_length(m.attachment,'$.quoted_message.resources')>0)";
+    OR json_array_length(m.attachment,'$.quoted_message.resources')>0
+    OR EXISTS(SELECT 1 FROM json_each(m.attachment,'$.preceding_messages.items') AS item
+              WHERE json_array_length(item.value,'$.resources')>0))";
 
-// Give only the reply waiting for a direct-parent lookup a short head start.
-// Unrelated steer items remain eligible; a backed-up quote queue never holds
-// its own reply indefinitely.
+// Give messages waiting for context a short head start without blocking unrelated input.
 pub(crate) fn preparation_pending() -> String {
     let quote_cutoff = db::now().saturating_sub(2_000);
     format!("(({HAS_RESOURCES} AND COALESCE(json_extract(m.attachment,'$.resources_ready'),0)!=1)
-        OR (json_extract(m.attachment,'$.quote_pending')=1 AND m.created_at>{quote_cutoff}))")
+        OR ((json_extract(m.attachment,'$.quote_pending')=1 OR json_extract(m.attachment,'$.preceding_pending')=1)
+            AND m.created_at>{quote_cutoff}))")
 }
 
 fn quote_resource_owner(attachment: &Value) -> Option<&str> {
@@ -512,9 +513,22 @@ fn quote_resource_owner(attachment: &Value) -> Option<&str> {
     })
 }
 
+pub(crate) fn preceding_resource_owner<'a>(attachment: &Value, resource: &'a Value) -> Option<&'a str> {
+    let context = &attachment["preceding_messages"];
+    let id = resource["message_id"].as_str().filter(|id| !id.is_empty())?;
+    (context["status"] == "ok"
+        && context["items"].as_array()?.iter().any(|item| {
+            item["message_id"] == id
+                && item["resources"].as_array().is_some_and(|resources| {
+                    resource["file_key"].is_string()
+                        && resources.iter().any(|entry| entry["file_key"] == resource["file_key"])
+                })
+        })).then_some(id)
+}
+
 fn direct_resources(attachment: &Value) -> Vec<Value> {
     let mut resources: Vec<_> = attachment["resources"].as_array().into_iter().flatten()
-        .filter(|resource| resource["quoted"] != true && resource["frame_seconds"].is_null())
+        .filter(|resource| resource["quoted"] != true && resource["preceding"] != true && resource["frame_seconds"].is_null())
         .cloned().collect();
     if resources.is_empty() && attachment["file_key"].is_string() {
         resources.push(json!({"file_key":attachment["file_key"],"file_name":attachment["file_name"],
@@ -554,6 +568,17 @@ pub(crate) fn attachment_resources(attachment: &Value, source_id: &str) -> Vec<V
             resource["quoted"] = json!(true);
             resource
         }));
+    }
+    for item in attachment["preceding_messages"]["items"].as_array().into_iter().flatten() {
+        for entry in item["resources"].as_array().into_iter().flatten() {
+            let mut resource = entry.clone();
+            resource["message_id"] = item["message_id"].clone();
+            resource["chat_id"] = attachment["source"]["chat_id"].clone();
+            resource["preceding"] = json!(true);
+            if preceding_resource_owner(attachment, &resource).is_some() {
+                resources.push(resource);
+            }
+        }
     }
     resources
 }
@@ -752,6 +777,8 @@ async fn download_resource(
     let kind = resource["kind"].as_str().unwrap_or("file");
     let source_id = if resource["quoted"] == true {
         quote_resource_owner(&m.attachment).context("Quoted resource owner is unavailable")?
+    } else if resource["preceding"] == true {
+        preceding_resource_owner(&m.attachment, resource).context("Preceding resource owner is unavailable")?
     } else {
         &m.source_id
     };
@@ -864,7 +891,7 @@ async fn prepare_frame(
     cache.publish()?;
     Ok((frame.duration, json!({"kind":"image","file_name":"video-preview-20-percent.png",
         "file_key":resource["file_key"],"message_id":resource["message_id"],"chat_id":resource["chat_id"],
-        "quoted":resource["quoted"],"frame_seconds":frame.timestamp,"duration_seconds":frame.duration,
+        "quoted":resource["quoted"],"preceding":resource["preceding"],"frame_seconds":frame.timestamp,"duration_seconds":frame.duration,
         "local_path":cache.path,"cache_root":cache.root,"cache_project_id":message.project_id,
         "cache_message_id":message.id,"cache_source_id":resource["message_id"],
         "sha256":format!("{:x}",Sha256::digest(&frame.bytes)),"bytes":frame.bytes.len(),"media_type":"image/png"})))
@@ -980,7 +1007,7 @@ pub fn ingest(app: &Arc<App>, binding: &Binding, payload: &[u8]) -> Result<()> {
                 state["error"] = json!("");
             }
         }
-        if inserted.is_some() && attachment["source"]["parent_id"].is_string() {
+        if inserted.is_some() {
             app.quote_notify.notify_one();
         }
         app.notify.notify_one();
@@ -1044,6 +1071,7 @@ pub(crate) fn cached_quote(
             return quote(parent, Some(bot), Some(kind), &body, None);
         }
         let source = &attachment["source"];
+        let body = render_mentions(&body, &source["mentions"]);
         let mut result = quote(parent, source["sender"]["open_id"].as_str(),
             source["message_type"].as_str(), &body, None);
         result["resources"] = json!(direct_resources(&attachment).into_iter().map(|r| {
@@ -1064,11 +1092,14 @@ fn remote_quote(
     if item["deleted"] == true {
         return Err("deleted");
     }
-    let sender = item["sender"]["id"].as_str().ok_or("invalid_response")?;
+    let sender = item["sender"]["id"].as_str();
     let kind = item["msg_type"].as_str().ok_or("invalid_response")?;
-    let content: Value =
+    let content: Value = if matches!(kind, "text" | "post" | "image" | "file" | "audio" | "video" | "media" | "sticker") {
         serde_json::from_str(item["body"]["content"].as_str().ok_or("invalid_response")?)
-            .map_err(|_| "invalid_response")?;
+            .map_err(|_| "invalid_response")?
+    } else {
+        Value::Null
+    };
     let mut resources = Vec::new();
     let body = match kind {
         "text" => content["text"]
@@ -1079,7 +1110,7 @@ fn remote_quote(
             let post = post_document(&content);
             let mut body = post["title"].as_str().unwrap_or_default().to_owned();
             body.push('\n');
-            collect_post(&post["content"], &mut body, &mut resources);
+            collect_post(&post["content"], &item["mentions"], &mut body, &mut resources);
             body.trim().replace("[image]", "[image] image.png")
         }
         "image" => "[image] image.png".into(),
@@ -1089,41 +1120,22 @@ fn remote_quote(
                 content["file_name"].as_str().unwrap_or_default()
             )
         }
-        _ => return Err("unsupported_message_type"),
+        _ => format!("[{kind}]"),
     };
     if let Some(key) = content["file_key"].as_str().or(content["image_key"].as_str()) {
         resources.push(resource_reference(&content, kind, &json!(key)));
     }
-    let mut result = quote(parent, Some(sender), Some(kind), &body, None);
+    let mut result = quote(parent, sender, Some(kind), &render_mentions(&body, &item["mentions"]), None);
+    result["create_time"] = item["create_time"].clone();
     result["resources"] = json!(resources);
     Ok(result)
 }
 
-async fn fetch_quote(
+async fn fetch_im_messages_page(
     app: &App,
-    message: &db::Message,
-    parent: &str,
-    chat: &str,
-    bot: &str,
+    token: &str,
+    url: reqwest::Url,
 ) -> std::result::Result<Value, &'static str> {
-    let binding = app
-        .db
-        .bot(&message.project_id)
-        .await
-        .map_err(|_| "binding_unavailable")?;
-    if binding.app_id != bot {
-        return Err("binding_unavailable");
-    }
-    let token = token(app, &binding)
-        .await
-        .map_err(|_| "authentication_failed")?;
-    let base = app.config.read().await.feishu_base.clone();
-    let mut url = reqwest::Url::parse(&format!("{base}/open-apis/im/v1/messages/"))
-        .map_err(|_| "invalid_endpoint")?;
-    url.path_segments_mut()
-        .map_err(|_| "invalid_endpoint")?
-        .pop_if_empty()
-        .push(parent);
     let mut response = app
         .http
         .get(url)
@@ -1145,12 +1157,110 @@ async fn fetch_quote(
         bytes.extend_from_slice(&chunk);
     }
     let result: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_response")?;
+    if matches!(result["code"].as_i64(), Some(230002 | 99991672)) {
+        return Err("permission_denied");
+    }
     if result["code"].as_i64() != Some(0) {
         return Err("api_rejected");
     }
-    let items = result["data"]["items"]
-        .as_array()
-        .ok_or("invalid_response")?;
+    Ok(result["data"].clone())
+}
+
+async fn fetch_quote(
+    app: &App,
+    message: &db::Message,
+    parent: &str,
+    chat: &str,
+    bot: &str,
+) -> std::result::Result<Value, &'static str> {
+    let binding = app
+        .db
+        .bot(&message.project_id)
+        .await
+        .map_err(|_| "binding_unavailable")?;
+    if binding.app_id != bot {
+        return Err("binding_unavailable");
+    }
+    let token = token(app, &binding)
+        .await
+        .map_err(|_| "authentication_failed")?;
+    let base = app.config.read().await.feishu_base.clone();
+    if parent.is_empty() {
+        let thread = message.attachment["source"]["thread_id"]
+            .as_str()
+            .filter(|id| !id.is_empty());
+        let (container_type, container) = thread.map_or(("chat", chat), |id| ("thread", id));
+        let current_time = timestamp_millis(&message.attachment["source"]["create_time"]);
+        let end_time = (container_type == "chat")
+            .then_some(current_time)
+            .flatten()
+            .filter(|ms| *ms >= 0)
+            .map(|ms| ((ms / 1000) + 1).to_string());
+        let mut page_token: Option<String> = None;
+        let mut seen_current = false;
+        let mut preceding = Vec::new();
+        for _ in 0..5 {
+            let mut url = reqwest::Url::parse(&format!("{base}/open-apis/im/v1/messages"))
+                .map_err(|_| "invalid_endpoint")?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                pairs
+                    .append_pair("container_id_type", container_type)
+                    .append_pair("container_id", container)
+                    .append_pair("sort_type", "ByCreateTimeDesc")
+                    .append_pair("page_size", "10");
+                if let Some(end_time) = &end_time {
+                    pairs.append_pair("end_time", end_time);
+                }
+                if let Some(page_token) = &page_token {
+                    pairs.append_pair("page_token", page_token);
+                }
+            }
+            let data = fetch_im_messages_page(app, &token, url).await?;
+            let items = data["items"].as_array().ok_or("invalid_response")?;
+            for item in items {
+                if item["message_id"] == message.source_id {
+                    seen_current = true;
+                    preceding.clear();
+                    continue;
+                }
+                if item["deleted"] == true {
+                    continue;
+                }
+                let eligible = seen_current
+                    || timestamp_millis(&item["create_time"])
+                        .zip(current_time)
+                        .is_some_and(|(time, cutoff)| time <= cutoff);
+                if !eligible {
+                    continue;
+                }
+                if let Some(id) = item["message_id"].as_str()
+                    && let Ok(parsed) = remote_quote(item, id, chat)
+                {
+                    preceding.push(parsed);
+                    if preceding.len() == 3 {
+                        break;
+                    }
+                }
+            }
+            if preceding.len() == 3 || data["has_more"] != true {
+                break;
+            }
+            let Some(next) = data["page_token"].as_str().filter(|t| !t.is_empty()) else {
+                break;
+            };
+            page_token = Some(next.to_owned());
+        }
+        preceding.reverse();
+        return Ok(json!({"status":"ok","items":preceding}));
+    }
+    let mut url = reqwest::Url::parse(&format!("{base}/open-apis/im/v1/messages"))
+        .map_err(|_| "invalid_endpoint")?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid_endpoint")?
+        .push(parent);
+    let data = fetch_im_messages_page(app, &token, url).await?;
+    let items = data["items"].as_array().ok_or("invalid_response")?;
     match items.as_slice() {
         [item] => remote_quote(item, parent, chat),
         [] => Err("not_found"),
@@ -1161,7 +1271,7 @@ async fn fetch_quote(
 pub(crate) async fn prepare_quote(app: &App) -> Result<bool> {
     use rusqlite::OptionalExtension;
     let id: Option<String> = app.db.call(|c| {
-        Ok(c.query_row("SELECT id FROM messages WHERE direction='in' AND json_extract(attachment,'$.quote_pending')=1 ORDER BY rowid LIMIT 1", [], |r| r.get(0)).optional()?)
+        Ok(c.query_row("SELECT id FROM messages WHERE direction='in' AND (json_extract(attachment,'$.quote_pending')=1 OR json_extract(attachment,'$.preceding_pending')=1) ORDER BY rowid LIMIT 1", [], |r| r.get(0)).optional()?)
     }).await?;
     let Some(id) = id else { return Ok(false) };
     let message = app.db.message(&id).await?;
@@ -1171,41 +1281,51 @@ pub(crate) async fn prepare_quote(app: &App) -> Result<bool> {
     let bot = message.attachment["bot_app_id"]
         .as_str()
         .unwrap_or_default();
+    let preceding = message.attachment["preceding_pending"] == true;
     let result =
-        if !parent.starts_with("om_")
+        if (!preceding && (!parent.starts_with("om_")
             || parent.len() > 128
-            || !parent.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            || !parent.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') || parent == message.source_id))
             || chat.is_empty()
             || bot.is_empty()
-            || parent == message.source_id
         {
             Err("invalid_source")
         } else {
             tokio::time::timeout(
                 Duration::from_secs(2),
-                fetch_quote(app, &message, parent, chat, bot),
+                fetch_quote(app, &message, if preceding { "" } else { parent }, chat, bot),
             )
             .await
             .unwrap_or(Err("timeout"))
         };
-    let result = result.unwrap_or_else(|reason| quote(parent, None, None, "", Some(reason)));
+    let (field, pending, result) = if preceding {
+        ("$.preceding_messages", "$.preceding_pending",
+            result.unwrap_or_else(|reason| json!({"status":"unavailable","reason":reason})))
+    } else {
+        ("$.quoted_message", "$.quote_pending",
+            result.unwrap_or_else(|reason| quote(parent, None, None, "", Some(reason))))
+    };
+    let has_resources = result["resources"].as_array().is_some_and(|items| !items.is_empty())
+        || result["items"].as_array().into_iter().flatten()
+            .any(|item| item["resources"].as_array().is_some_and(|items| !items.is_empty()));
     app.db.call(move |c| {
-        c.execute("UPDATE messages SET attachment=json_remove(json_set(attachment,'$.quoted_message',json(?1)),
-           '$.quote_pending', CASE WHEN json_array_length(?1,'$.resources')>0 THEN '$.resources_ready' ELSE '$.__unused' END) WHERE id=?2 AND json_extract(attachment,'$.quote_pending')=1", rusqlite::params![result.to_string(),id])?;
+        c.execute("UPDATE messages SET attachment=json_remove(json_set(attachment,?1,json(?2)),
+           ?3, CASE WHEN ?4 THEN '$.resources_ready' ELSE '$.__unused' END) WHERE id=?5 AND json_extract(attachment,?3)=1",
+            rusqlite::params![field,result.to_string(),pending,has_resources,id])?;
         Ok(())
     }).await?;
     app.notify.notify_one();
     Ok(true)
 }
 
-// Parent lookups do not share the attachment downloader.
+// Context lookups do not share the attachment downloader.
 pub async fn quote_worker(app: Arc<App>) {
     while !app.shutdown.is_cancelled() {
         if let Some(_permit) = app.service.gate.enter() {
             match prepare_quote(&app).await {
                 Ok(true) => continue,
                 Ok(false) => {}
-                Err(_) => tracing::warn!("Incoming quote preparation failed"),
+                Err(_) => tracing::warn!("Incoming message context preparation failed"),
             }
         }
         tokio::select! {
@@ -1223,6 +1343,69 @@ fn resource_reference(content: &Value, kind: &str, key: &Value) -> Value {
     let name = content["file_name"].as_str().unwrap_or(fallback);
     let name: String = name.chars().take(160).collect();
     json!({"kind":kind,"file_key":key,"file_name":name,"declared_duration_seconds":duration})
+}
+
+pub(crate) fn timestamp_millis(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn mention_keys(mentions: &Value) -> Vec<(&str, &Value)> {
+    let mut keys: Vec<_> = mentions.as_array().into_iter().flatten()
+        .filter_map(|mention| Some((mention["key"].as_str().filter(|key| !key.is_empty())?, mention)))
+        .collect();
+    keys.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+    keys
+}
+
+pub(crate) fn bare_mention(body: &str, mentions: &Value) -> bool {
+    let mut stripped = body.to_owned();
+    let mut found = false;
+    for key in mention_keys(mentions).into_iter().map(|(key, _)| key).chain(["@_all"]) {
+        if stripped.contains(key) {
+            found = true;
+            stripped = stripped.replace(key, "");
+        }
+    }
+    found && stripped.trim().is_empty()
+}
+
+pub(crate) fn render_mentions(body: &str, mentions: &Value) -> String {
+    let keys = mention_keys(mentions);
+    let mut remaining = body;
+    let mut rendered = String::new();
+    while let Some(pos) = remaining.find('@') {
+        rendered.push_str(&remaining[..pos]);
+        remaining = &remaining[pos..];
+        if let Some(after) = remaining.strip_prefix("@_all")
+            && !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        {
+            rendered.push_str("@所有人");
+            remaining = after;
+        } else if let Some((after, mention)) = keys.iter()
+            .find_map(|(key, mention)| Some((remaining.strip_prefix(key)?, *mention)))
+        {
+            let name = mention["name"].as_str().filter(|name| !name.is_empty());
+            let id = mention["id"]["open_id"].as_str().or_else(|| mention["id"].as_str())
+                .filter(|id| !id.is_empty());
+            rendered.push('@');
+            match (name, id) {
+                (Some(name), Some(id)) => {
+                    rendered.push_str(name);
+                    rendered.push('(');
+                    rendered.push_str(id);
+                    rendered.push(')');
+                }
+                (Some(label), None) | (None, Some(label)) => rendered.push_str(label),
+                (None, None) => rendered.push_str(&remaining[1..remaining.len() - after.len()]),
+            }
+            remaining = after;
+        } else {
+            rendered.push('@');
+            remaining = &remaining[1..];
+        }
+    }
+    rendered.push_str(remaining);
+    rendered
 }
 
 pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
@@ -1252,7 +1435,7 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
         if !text.is_empty() {
             text.push('\n');
         }
-        collect_post(&post["content"], &mut text, &mut resources);
+        collect_post(&post["content"], &msg["mentions"], &mut text, &mut resources);
         text = text.trim().to_owned();
     }
     let mut attachment = if let Some(key) = content["file_key"]
@@ -1270,7 +1453,7 @@ pub fn normalize(v: &Value) -> Result<Option<(String, String, String, Value)>> {
                 .get("file_name")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-        );
+        ).trim_end().to_owned();
     }
     if !resources.is_empty() {
         attachment["resources"] = json!(resources);
@@ -1297,11 +1480,11 @@ fn post_document(content: &Value) -> &Value {
         .unwrap_or(content)
 }
 
-fn collect_post(v: &Value, text: &mut String, resources: &mut Vec<Value>) {
+fn collect_post(v: &Value, mentions: &Value, text: &mut String, resources: &mut Vec<Value>) {
     match v {
         Value::Array(items) => {
             for item in items {
-                collect_post(item, text, resources);
+                collect_post(item, mentions, text, resources);
             }
             if !text.ends_with('\n') {
                 text.push('\n');
@@ -1320,12 +1503,44 @@ fn collect_post(v: &Value, text: &mut String, resources: &mut Vec<Value>) {
                     text.push_str("[image]");
                 }
             }
-            "text" | "a" | "code_block" | "md" => {
+            "a" => {
+                let label = v["text"].as_str().unwrap_or_default();
+                if let Some(href) = v["href"].as_str().filter(|href| !href.is_empty()) {
+                    text.push_str(&format!("[{label}]({href})"));
+                } else {
+                    text.push_str(label);
+                }
+            }
+            "text" | "code_block" | "md" => {
                 if let Some(t) = v["text"].as_str() {
                     text.push_str(t);
                 }
             }
-            "at" => text.push_str(v["user_name"].as_str().unwrap_or("@mention")),
+            "at" => {
+                let id = v["user_id"].as_str().unwrap_or_default();
+                let name = v["user_name"].as_str().filter(|name| !name.is_empty());
+                if matches!(id, "all" | "@_all") {
+                    text.push_str("@_all");
+                } else if id.starts_with("@_") {
+                    text.push_str(id);
+                } else if let Some(key) = mentions.as_array().into_iter().flatten().find_map(|mention| {
+                    let user = &mention["id"];
+                    (!id.is_empty() && [user, &user["open_id"], &user["user_id"], &user["union_id"]]
+                        .into_iter().any(|value| value == id))
+                        .then(|| mention["key"].as_str().filter(|key| !key.is_empty())).flatten()
+                }) {
+                    text.push_str(key);
+                } else if let Some(name) = name {
+                    text.push_str(&format!("@{name}"));
+                    if !id.is_empty() {
+                        text.push_str(&format!("({id})"));
+                    }
+                } else if !id.is_empty() {
+                    text.push_str(&format!("@{id}"));
+                } else {
+                    text.push_str("@mention");
+                }
+            }
             "media" | "file" | "audio" | "video" => {
                 if let Some(key) = v["file_key"].as_str().filter(|k| !k.is_empty()) {
                     if !resources.iter().any(|r| r["file_key"] == key) {

@@ -343,10 +343,11 @@ def run_checks(h):
         f"Owned FIFO batch instruction {number}" for number in range(3)
     ], batch_events
     for number, event in enumerate(batch_events):
-        assert event.tag == "dauerbot_event" and event.attrib == {
-            "event_id": batch_ids[number][0], "kind": "user", "source": "feishu",
-        }, event.attrib
-        assert event.findtext("metadata/message_id") == f"om_manager_batch_{number}"
+        assert event.tag == "dauerbot_event"
+        assert event.get("event_id") == batch_ids[number][0]
+        assert event.get("kind") == "user" and event.get("source") == "feishu"
+        assert event.get("message_id") == f"om_manager_batch_{number}"
+        assert event.find("metadata") is None
     assert before_restart[-1]["role"] == "tool"
     assert before_restart[-2]["tool_calls"][0]["function"]["name"] == "delegate"
     # Lose the process while the provider request is still in flight.

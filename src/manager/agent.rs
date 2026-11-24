@@ -149,12 +149,17 @@ fn append_inputs(
         )?;
         if !previously_ingested {
             let mut data = prompt_input(&raw, origin.as_deref())?;
-            let source = origin.as_deref()
-                .map(|source| trusted_source(c, project, source))
-                .transpose()?
-                .unwrap_or(Value::Null);
-            attach_quote(c, project, origin.as_deref(), &mut data, &mut 24000)?;
-            let images = prepare_images(c, project, origin.as_deref(), &mut data)?;
+            let (source, images) = if kind == "worker" {
+                (Value::Null, Vec::new())
+            } else {
+                let source = origin.as_deref()
+                    .map(|source| trusted_source(c, project, source))
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+                attach_quote(c, project, origin.as_deref(), &mut data, &mut 24000)?;
+                let images = prepare_images(c, project, origin.as_deref(), &mut data)?;
+                (source, images)
+            };
             let envelope = event::event_envelope(&id, origin.as_deref(), &kind, data, source);
             session::append(c, project, channel_id, &Message::user(envelope), &images)?;
             let seq = c.last_insert_rowid();
@@ -210,16 +215,20 @@ fn telemetry_inputs(
     c: &Connection,
     run: &str,
     includes_content: bool,
-) -> Result<Vec<(String, Option<String>)>> {
+) -> Result<Vec<(String, String, Option<String>)>> {
     Ok(c.prepare(
-        "SELECT i.id,CASE WHEN ? THEN json_extract(m.message_json,'$.content[0].text') END
+        "SELECT i.id,CASE
+             WHEN i.kind='schedule' THEN 'timer'
+             WHEN i.kind='worker' AND json_extract(i.payload,'$.kind')='background_tool_result'
+             THEN 'background_tool_result' ELSE i.kind END,
+         CASE WHEN ? THEN json_extract(m.message_json,'$.content[0].text') END
          FROM manager_run_inputs b JOIN manager_inputs i ON i.id=b.input_id
          JOIN manager_ingested_inputs x ON x.input_id=i.id
          LEFT JOIN manager_session_messages m ON m.seq=x.message_seq
          WHERE b.run_id=? ORDER BY i.rowid",
     )?
     .query_map(params![includes_content, run], |row| {
-        Ok((row.get(0)?, row.get(1)?))
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     })?
     .collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -1047,7 +1056,12 @@ mod tests {
                 "quoted_message": {"status": "ok", "message_id": "om_parent", "content": "<parent>"},
             }),
         )?.unwrap();
+        let mut image = crate::multimodal::fixture_resource(&app.dir, &project.id, &id);
+        image["message_id"] = json!("om_0123456789abcdef0123456789abcdef");
+        image["cache_source_id"] = image["message_id"].clone();
         app.db.sync(|c| {
+            c.execute("UPDATE messages SET attachment=json_set(attachment,'$.resources_ready',json('true'),'$.resources',json(?)) WHERE id=?",
+                params![json!([image]).to_string(), id])?;
             work::sync_inbound(c)?;
             route_event(c, &id)?;
             let channel = "feishu:cli_fixture:oc_fixture";
@@ -1061,26 +1075,39 @@ mod tests {
             };
             let xml = &text.text;
             assert!(xml.starts_with(&format!(
-                "<dauerbot_event event_id=\"{id}\" kind=\"user\" source=\"feishu\">"
+                "<dauerbot_event event_id=\"{id}\" kind=\"user\" source=\"feishu\""
             )));
             for field in [
-                "<bot_app_id>cli_fixture</bot_app_id>", "<chat_id>oc_fixture</chat_id>",
-                "<message_id>om_0123456789abcdef0123456789abcdef</message_id>", "<root_id>om_root</root_id>",
-                "<thread_id>omt_fixture</thread_id>", "<open_id>ou_fixture</open_id>",
-                "<name>A &amp; B</name>", "<quoted_message>",
-                "<content>&lt;parent&gt;</content>",
+                "chat_id=\"oc_fixture\"", "message_id=\"om_0123456789abcdef0123456789abcdef\"",
+                "root_id=\"om_root\"", "thread_id=\"omt_fixture\"", "sender=\"ou_fixture\"",
+                "<quoted_message message_id=\"om_parent\">", "<body>&lt;parent&gt;</body>",
                 "<body>Review &lt;code&gt; &amp; &quot;quotes&quot; provider&lt;&amp;credential</body>",
             ] {
                 assert_eq!(xml.matches(field).count(), 1, "{xml}");
             }
-            assert!(!xml.contains("trusted_source") && !xml.contains("platform"));
+            assert!(!xml.contains("metadata") && !xml.contains("bot_app_id"));
             let inputs = telemetry_inputs(c, &context.run, true)?;
-            assert_eq!(inputs, [(id.clone(), Some(xml.clone()))]);
-            assert_eq!(telemetry_inputs(c, &context.run, false)?, [(id.clone(), None)]);
+            assert_eq!(inputs, [(id.clone(), "user".into(), Some(xml.clone()))]);
+            assert_eq!(telemetry_inputs(c, &context.run, false)?, [(id.clone(), "user".into(), None)]);
             crate::manager_telemetry::assert_input_export(
                 inputs,
                 &xml.replace("provider&lt;&amp;credential", "[redacted]"),
             );
+            assert!(xml.contains("inline=\"true\""));
+            let worker = "fixture-worker-observation";
+            let payload = json!({"kind":"worker_run","delivery_status":"settled","error":"",
+                "semantic_task_success":"unconfirmed","worker_generation":"worker-gen"});
+            c.execute("INSERT INTO manager_inputs(id,project_id,origin_event_id,kind,payload,created_at,channel_id,signal)
+                VALUES(?,?,?,'worker',?,0,?,'wake')", params![worker,project.id,id,payload.to_string(),channel])?;
+            append_inputs(c, &project.id, channel, &context.run,
+                vec![(worker.into(), Some(id.clone()), "worker".into(), payload.to_string())])?;
+            let transcript = session::load(c, &project.id, channel)?;
+            let observation = transcript.last().unwrap();
+            assert!(observation.images.is_empty());
+            let Message::User { content } = &observation.message else { panic!("expected observation") };
+            let Some(rig_core::message::UserContent::Text(text)) = content.iter().next() else { panic!("expected worker envelope") };
+            assert_eq!(text.text, format!(
+                "<dauerbot_event event_id=\"{worker}\" kind=\"worker\" source=\"worker\" origin_event_id=\"{id}\">\n  <worker_run status=\"settled\" worker_generation=\"worker-gen\"/>\n</dauerbot_event>"));
             Ok(())
         })
     }

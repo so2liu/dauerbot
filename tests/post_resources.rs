@@ -29,8 +29,7 @@ fn localized_and_flat_posts_keep_one_caption_and_deduplicate_embedded_images() {
         assert_eq!((chat.as_str(), source.as_str()), ("oc_real", "om_original"));
         assert_eq!(text.matches("查看截图").count(), 1);
         assert!(text.starts_with("日常\n查看截图"));
-        assert!(text.contains("参考"));
-        assert!(!text.contains("https://"));
+        assert!(text.contains("[参考](https://example.invalid/private)"));
         assert_eq!(attachment["resources"].as_array().unwrap().len(), 1);
         assert_eq!(attachment["resources"][0]["file_key"], "img_actual");
         assert_eq!(attachment["source"]["sender"]["open_id"], "ou_real");
@@ -42,6 +41,13 @@ fn localized_and_flat_posts_keep_one_caption_and_deduplicate_embedded_images() {
     .unwrap()
     .unwrap();
     assert_eq!(text, "English only");
+    for (kind, body) in [
+        ("image", json!({"image_key":"img_single"})),
+        ("file", json!({"file_key":"file_single"})),
+    ] {
+        let (_, _, text, _) = feishu::normalize(&event(kind, body)).unwrap().unwrap();
+        assert_eq!(text, format!("[{kind} message]"));
+    }
 }
 
 type Requests = Arc<Mutex<Vec<(String, String, String)>>>;
