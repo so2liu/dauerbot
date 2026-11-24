@@ -1,10 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.6.19 — 2026-11-24
+
+### Changed
+
+- Simplify Manager `<dauerbot_event>` XML envelopes: project compact Feishu routing/topic attributes, format readable UTC timestamps, inline Feishu `@` mentions (and preserve `post` link URLs), merge video attachments with their 20% preview frames while omitting internal cache verification fields, and slim down `worker`, `timer`, and `proposal` events. (#190)
+- Automatically fetch up to three preceding messages (including verified image/file attachments) when a bare `@` mention arrives in a Feishu group chat or thread, degrading cleanly when group history permission is unavailable. (#190)
+- Name Langfuse admitted input spans by event kind (`manager.input.user`, `manager.input.worker`, `manager.input.timer`, `manager.input.proposal`, `manager.input.tool_result`) and extend XML envelope redaction to attributes and self-closing tags. (#190)
 
 ### Fixed
 
-- Keep signed updates from getting stuck on a stale or incompatible Agent MCP record. After handover, automatically verify and recover only the affected Agent, preserving its saved session and pending input without touching unidentified terminals.
+- Stop attaching original Feishu metadata, quoted messages, and inline images to `worker` observation events. (#190)
+- Keep signed updates from getting stuck on a stale or incompatible Agent MCP record. After handover, automatically verify and recover only the affected Agent, preserving its saved session and pending input without touching unidentified terminals. (#187)
+- Restart owned AGY executions blocked at a stale login prompt and re-arm explicit AGY recovery when the underlying execution changes. (#189)
 
 ## 0.6.18 — 2026-11-23
 
