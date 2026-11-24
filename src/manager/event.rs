@@ -237,6 +237,9 @@ fn context_message(
     if tag == "message" {
         attribute(output, "time", time(&message["create_time"]).as_deref());
     }
+    if message["preview_truncated"] == true {
+        attribute(output, "truncated", Some("true"));
+    }
     output.push_str(">\n");
     if let Some(body) = message["body"].as_str().or(message["content"].as_str())
         && (resources.is_empty() || !media_placeholder(body, message["msg_type"].as_str()))
@@ -556,13 +559,14 @@ mod tests {
             {"kind":"image","file_key":"secret-key","message_id":"om_current","frame_seconds":6,
                 "local_path":"/cache/frame.png","image_delivery":{"mode":"image_reference"}},
             {"kind":"image","quoted":true,"file_name":"parent.png","error":"Unavailable"}]},
-            "quoted_message":{"status":"ok","message_id":"om_parent","sender":"ou_parent","body":"Quote < &"}});
+            "quoted_message":{"status":"ok","message_id":"om_parent","sender":"ou_parent","body":"Quote < &","preview_truncated":true}});
         let xml = event_envelope("event", None, "user", data, source);
         assert!(xml.contains(r#"thread_id="omt_thread" root_id="om_root" parent_id="om_parent" message_id="om_current" sender="Sender(ou_sender)" time="1970-01-01T00:00:00Z" chat_name="Group &amp; chat" mention_all="true""#));
         assert!(xml.contains("<body>@Ten(ou_ten) @One(ou_one) @所有人</body>"));
         assert!(xml.contains(r#"<video name="clip.mp4" path="/cache/clip.mp4" size="184 KB" duration="30s" preview_path="/cache/frame.png" preview_at="6.0s" preview_inline="true"/>"#));
         let (current, quote) = xml.split_once("<quoted_message").unwrap();
         assert!(!current.contains("<image"));
+        assert!(quote.starts_with(r#" message_id="om_parent" sender="ou_parent" truncated="true">"#), "{quote}");
         assert!(quote.contains(r#"<image name="parent.png" error="Unavailable"/>"#));
         assert!(quote.contains("<body>Quote &lt; &amp;</body>"));
         for noise in [
