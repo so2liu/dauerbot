@@ -1630,15 +1630,28 @@ mod tests {
             .route("/open-apis/im/v1/messages", get(|Query(query): Query<HashMap<String, String>>| async move {
                 assert_eq!(query["sort_type"], "ByCreateTimeDesc");
                 assert_eq!(query["page_size"], "10");
+                let item = |id: &str, time: &str, kind: &str, body: Value| json!({"message_id":id,
+                    "chat_id":"oc_fixture","create_time":time,"msg_type":kind,
+                    "sender":{"id":"ou_fixture"},"body":{"content":body.to_string()}});
                 let current = match (query["container_id_type"].as_str(), query["container_id"].as_str()) {
-                    ("chat", "oc_fixture") => "om_chat",
-                    ("thread", "omt_fixture") => "",
+                    ("chat", "oc_fixture") => {
+                        assert_eq!(query.get("end_time").map(String::as_str), Some("5"));
+                        "om_chat"
+                    }
+                    ("thread", "omt_fixture") => {
+                        assert!(!query.contains_key("end_time"));
+                        if query.get("page_token").map(String::as_str) != Some("page-2") {
+                            let newer: Vec<_> = (0..10).map(|i| item(
+                                &format!("om_burst_{i}"), &(6000 - i * 100).to_string(),
+                                "text", json!({"text":"Burst"}),
+                            )).collect();
+                            return Json(json!({"code":0,"data":{"items":newer,"has_more":true,"page_token":"page-2"}})).into_response();
+                        }
+                        ""
+                    }
                     ("thread", "omt_denied") => return StatusCode::FORBIDDEN.into_response(),
                     pair => panic!("Unexpected container {pair:?}"),
                 };
-                let item = |id, time, kind, body: Value| json!({"message_id":id,
-                    "chat_id":"oc_fixture","create_time":time,"msg_type":kind,
-                    "sender":{"id":"ou_fixture"},"body":{"content":body.to_string()}});
                 let mut items = vec![item("om_newer", "5000", "text", json!({"text":"Newer"}))];
                 if !current.is_empty() {
                     items.push(item(current, "4000", "text", json!({"text":"Current"})));

@@ -1131,38 +1131,11 @@ fn remote_quote(
     Ok(result)
 }
 
-async fn fetch_quote(
+async fn fetch_im_messages_page(
     app: &App,
-    message: &db::Message,
-    parent: &str,
-    chat: &str,
-    bot: &str,
+    token: &str,
+    url: reqwest::Url,
 ) -> std::result::Result<Value, &'static str> {
-    let binding = app
-        .db
-        .bot(&message.project_id)
-        .await
-        .map_err(|_| "binding_unavailable")?;
-    if binding.app_id != bot {
-        return Err("binding_unavailable");
-    }
-    let token = token(app, &binding)
-        .await
-        .map_err(|_| "authentication_failed")?;
-    let base = app.config.read().await.feishu_base.clone();
-    let mut url = reqwest::Url::parse(&format!("{base}/open-apis/im/v1/messages"))
-        .map_err(|_| "invalid_endpoint")?;
-    if parent.is_empty() {
-        let thread = message.attachment["source"]["thread_id"].as_str().filter(|id| !id.is_empty());
-        let (container_type, container) = thread.map_or(("chat", chat), |id| ("thread", id));
-        url.query_pairs_mut()
-            .append_pair("container_id_type", container_type)
-            .append_pair("container_id", container)
-            .append_pair("sort_type", "ByCreateTimeDesc")
-            .append_pair("page_size", "10");
-    } else {
-        url.path_segments_mut().map_err(|_| "invalid_endpoint")?.push(parent);
-    }
     let mut response = app
         .http
         .get(url)
@@ -1190,27 +1163,104 @@ async fn fetch_quote(
     if result["code"].as_i64() != Some(0) {
         return Err("api_rejected");
     }
-    let items = result["data"]["items"]
-        .as_array()
-        .ok_or("invalid_response")?;
+    Ok(result["data"].clone())
+}
+
+async fn fetch_quote(
+    app: &App,
+    message: &db::Message,
+    parent: &str,
+    chat: &str,
+    bot: &str,
+) -> std::result::Result<Value, &'static str> {
+    let binding = app
+        .db
+        .bot(&message.project_id)
+        .await
+        .map_err(|_| "binding_unavailable")?;
+    if binding.app_id != bot {
+        return Err("binding_unavailable");
+    }
+    let token = token(app, &binding)
+        .await
+        .map_err(|_| "authentication_failed")?;
+    let base = app.config.read().await.feishu_base.clone();
     if parent.is_empty() {
-        let current = items.iter().position(|item| item["message_id"] == message.source_id);
+        let thread = message.attachment["source"]["thread_id"]
+            .as_str()
+            .filter(|id| !id.is_empty());
+        let (container_type, container) = thread.map_or(("chat", chat), |id| ("thread", id));
         let current_time = timestamp_millis(&message.attachment["source"]["create_time"]);
-        let mut preceding: Vec<_> = items.iter().enumerate()
-            .filter(|(index, item)| {
-                item["message_id"] != message.source_id && item["deleted"] != true
-                    && current.map_or_else(
-                        || timestamp_millis(&item["create_time"]).zip(current_time)
-                            .is_some_and(|(time, cutoff)| time <= cutoff),
-                        |current| *index > current,
-                    )
-            })
-            .filter_map(|(_, item)| remote_quote(item, item["message_id"].as_str()?, chat).ok())
-            .take(3)
-            .collect();
+        let end_time = (container_type == "chat")
+            .then_some(current_time)
+            .flatten()
+            .filter(|ms| *ms >= 0)
+            .map(|ms| ((ms / 1000) + 1).to_string());
+        let mut page_token: Option<String> = None;
+        let mut seen_current = false;
+        let mut preceding = Vec::new();
+        for _ in 0..5 {
+            let mut url = reqwest::Url::parse(&format!("{base}/open-apis/im/v1/messages"))
+                .map_err(|_| "invalid_endpoint")?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                pairs
+                    .append_pair("container_id_type", container_type)
+                    .append_pair("container_id", container)
+                    .append_pair("sort_type", "ByCreateTimeDesc")
+                    .append_pair("page_size", "10");
+                if let Some(end_time) = &end_time {
+                    pairs.append_pair("end_time", end_time);
+                }
+                if let Some(page_token) = &page_token {
+                    pairs.append_pair("page_token", page_token);
+                }
+            }
+            let data = fetch_im_messages_page(app, &token, url).await?;
+            let items = data["items"].as_array().ok_or("invalid_response")?;
+            for item in items {
+                if item["message_id"] == message.source_id {
+                    seen_current = true;
+                    preceding.clear();
+                    continue;
+                }
+                if item["deleted"] == true {
+                    continue;
+                }
+                let eligible = seen_current
+                    || timestamp_millis(&item["create_time"])
+                        .zip(current_time)
+                        .is_some_and(|(time, cutoff)| time <= cutoff);
+                if !eligible {
+                    continue;
+                }
+                if let Some(id) = item["message_id"].as_str()
+                    && let Ok(parsed) = remote_quote(item, id, chat)
+                {
+                    preceding.push(parsed);
+                    if preceding.len() == 3 {
+                        break;
+                    }
+                }
+            }
+            if preceding.len() == 3 || data["has_more"] != true {
+                break;
+            }
+            let Some(next) = data["page_token"].as_str().filter(|t| !t.is_empty()) else {
+                break;
+            };
+            page_token = Some(next.to_owned());
+        }
         preceding.reverse();
         return Ok(json!({"status":"ok","items":preceding}));
     }
+    let mut url = reqwest::Url::parse(&format!("{base}/open-apis/im/v1/messages"))
+        .map_err(|_| "invalid_endpoint")?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid_endpoint")?
+        .push(parent);
+    let data = fetch_im_messages_page(app, &token, url).await?;
+    let items = data["items"].as_array().ok_or("invalid_response")?;
     match items.as_slice() {
         [item] => remote_quote(item, parent, chat),
         [] => Err("not_found"),
