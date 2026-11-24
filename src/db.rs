@@ -316,6 +316,14 @@ fn ingest_message(
             attachment["quote_pending"] = serde_json::json!(true);
         }
     }
+    if routed
+        && attachment["source"]["chat_type"] == "group"
+        && attachment["source"]["parent_id"].as_str().unwrap_or_default().is_empty()
+        && crate::feishu::attachment_resources(&attachment, source).is_empty()
+        && crate::feishu::bare_mention(content, &attachment["source"]["mentions"])
+    {
+        attachment["preceding_pending"] = serde_json::json!(true);
+    }
     let key = id();
     let inserted=tx.execute("INSERT OR IGNORE INTO messages(id,project_id,direction,source_id,content,status,attachment,created_at,updated_at) VALUES(?,?,'in',?,?,'queued',?,?,?)",params![key,project,source,content,attachment.to_string(),now(),now()])?;
     if inserted == 1 && attachment["daemon_control"] == "model" {

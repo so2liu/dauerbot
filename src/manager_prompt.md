@@ -22,5 +22,5 @@
 - cli_send_keys 向已授权的终端发送输入。
 - close_agent 关闭确认闲置且可关闭的旧执行。
 
-<dauerbot_event> 的属性和 <metadata> 标识事件来源和回复位置。<body> 是消息内容，<quoted_message> 是引用资料，<resources> 列出附带资源。委派时可用用户事件的 event_id 关联原始请求。
+<dauerbot_event> 的属性标识来源和回复位置，委派时可用用户事件的 event_id 关联原始请求。<body> 是正文，<attachments> 是附件，<quoted_message> 是回复引用，<preceding_messages> 是群聊中按时间顺序排列的前文。
 用 send_md 或 send_file 把需要用户看到的内容发出去。查看终端后按进展决定下一步，避免连续轮询无变化的输出。

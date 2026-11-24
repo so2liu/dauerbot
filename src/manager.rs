@@ -963,7 +963,7 @@ fn observe(c: &Connection, project: &str) -> Result<()> {
             &id,
             "failed",
             origin.as_deref(),
-            &json!({"event_id":id,"status":"definitely_not_submitted","error":error}),
+            &json!({"kind":"worker_intent","event_id":id,"status":"definitely_not_submitted","error":error}),
         )?;
     }
     let runs=c.prepare("SELECT r.id,r.status,r.error,json_extract(e.payload,'$.origin_event_id'),r.event_id,r.generation,json_extract(e.payload,'$.worker_result') FROM work_runs r JOIN work_events e ON e.id=r.event_id WHERE r.project_id=? AND e.source IN ('management','manager_worker') AND r.status IN ('settled','completed','uncertain','failed','interrupted') ORDER BY r.rowid DESC LIMIT 32")?.query_map([project],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1069,29 +1069,42 @@ fn attach_quote(
     let Some(origin) = origin else { return Ok(()) };
     let raw: Option<String> = c
         .query_row(
-            "SELECT json_extract(m.attachment,'$.quoted_message') FROM work_events e
+            "SELECT m.attachment FROM work_events e
          JOIN messages m ON m.id=e.message_id AND m.project_id=e.project_id
          WHERE e.id=? AND e.project_id=? AND e.source='feishu' AND m.direction='in'
-           AND json_extract(m.attachment,'$.quoted_message.status')='ok'",
+           AND (json_extract(m.attachment,'$.quoted_message.status')='ok'
+             OR json_type(m.attachment,'$.preceding_messages')='object')",
             params![origin, project],
             |row| row.get(0),
         )
         .optional()?;
     if let Some(raw) = raw {
-        let mut quote: Value = serde_json::from_str(&raw)?;
-        quote.as_object_mut().unwrap().remove("resources");
-        let size = quote.to_string().len() + 64;
-        if size <= *remaining {
-            data["quoted_message"] = quote;
-            *remaining -= size;
+        let mut attachment: Value = serde_json::from_str(&raw)?;
+        let mut quote = attachment["quoted_message"].take();
+        if quote["status"] == "ok" {
+            quote.as_object_mut().unwrap().remove("resources");
+            let size = quote.to_string().len() + 64;
+            if size <= *remaining {
+                data["quoted_message"] = quote;
+                *remaining -= size;
+            }
+        }
+        let mut preceding = attachment["preceding_messages"].take();
+        if let Some(items) = preceding.get_mut("items").and_then(Value::as_array_mut) {
+            for item in items {
+                item.as_object_mut().unwrap().remove("resources");
+            }
+        }
+        if !preceding.is_null() && preceding.to_string().len() <= *remaining {
+            data["preceding_messages"] = preceding;
         }
     }
     Ok(())
 }
 
 fn prepared_input() -> String {
-    format!("NOT EXISTS(SELECT 1 FROM work_events e JOIN messages m ON m.id=e.message_id
-        WHERE e.id=manager_inputs.origin_event_id AND {})", crate::feishu::preparation_pending())
+    format!("(manager_inputs.kind='worker' OR NOT EXISTS(SELECT 1 FROM work_events e JOIN messages m ON m.id=e.message_id
+        WHERE e.id=manager_inputs.origin_event_id AND {}))", crate::feishu::preparation_pending())
 }
 fn image_source(
     c: &Connection,
@@ -1135,6 +1148,9 @@ fn prepare_images(
                     resource["cache_source_id"] == attachment["source"]["parent_id"]
                         && resource["cache_source_id"] == attachment["quoted_message"]["message_id"]
                         && attachment["quoted_message"]["status"] == "ok"
+                } else if resource["preceding"] == true {
+                    crate::feishu::preceding_resource_owner(&attachment, resource)
+                        .is_some_and(|id| resource["cache_source_id"] == id)
                 } else {
                     resource["cache_source_id"] == attachment["source_message_id"]
                 },
@@ -1445,7 +1461,7 @@ async fn prepare_group_context(app: &App, project: &str, channel_id: &str) {
              JOIN messages m ON m.id=e.message_id AND m.project_id=manager_inputs.project_id
              JOIN project_bots b ON b.project_id=manager_inputs.project_id
              CROSS JOIN manager_provider_config g WHERE manager_inputs.project_id=? AND manager_inputs.channel_id=? AND manager_inputs.status IN ('queued','processing')
-             AND e.source='feishu' AND m.direction='in' AND ({PROVIDER_CONFIGURED}) AND {prepared}
+             AND e.source='feishu' AND m.direction='in' AND manager_inputs.kind='user' AND ({PROVIDER_CONFIGURED}) AND {prepared}
              AND json_extract(m.attachment,'$.source.chat_type')='group'
              AND b.app_id=json_extract(m.attachment,'$.bot_app_id') ORDER BY manager_inputs.rowid DESC LIMIT 1"),
             params![project,channel_id], |r| r.get::<_, String>(0),
@@ -1599,6 +1615,121 @@ mod tests {
 
     fn ingest(app: &App, p: &Project, id: &str, text: &str) {
         app.db.ingest_bot(&p.id,"cli_fixture","oc_fixture",id,text,&json!({"source":{"message_type":"text","chat_id":"oc_fixture","chat_type":"p2p","sender":{"open_id":"ou_fixture"},"mentions":[]}})).unwrap();
+    }
+    #[tokio::test]
+    async fn bare_group_mention_prepares_preceding_messages_and_verifies_their_images() -> Result<()> {
+        use axum::{Json, Router, extract::Query, http::StatusCode, response::IntoResponse, routing::{get, post}};
+        use std::collections::HashMap;
+        let (_dir, app, project) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        app.config.write().await.feishu_base = format!("http://{}", listener.local_addr()?);
+        let fixture = Router::new()
+            .route("/open-apis/auth/v3/tenant_access_token/internal", post(|| async {
+                Json(json!({"code":0,"tenant_access_token":"fixture-token","expire":3600}))
+            }))
+            .route("/open-apis/im/v1/messages", get(|Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(query["sort_type"], "ByCreateTimeDesc");
+                assert_eq!(query["page_size"], "10");
+                let current = match (query["container_id_type"].as_str(), query["container_id"].as_str()) {
+                    ("chat", "oc_fixture") => "om_chat",
+                    ("thread", "omt_fixture") => "",
+                    ("thread", "omt_denied") => return StatusCode::FORBIDDEN.into_response(),
+                    pair => panic!("Unexpected container {pair:?}"),
+                };
+                let item = |id, time, kind, body: Value| json!({"message_id":id,
+                    "chat_id":"oc_fixture","create_time":time,"msg_type":kind,
+                    "sender":{"id":"ou_fixture"},"body":{"content":body.to_string()}});
+                let mut items = vec![item("om_newer", "5000", "text", json!({"text":"Newer"}))];
+                if !current.is_empty() {
+                    items.push(item(current, "4000", "text", json!({"text":"Current"})));
+                }
+                let mut deleted = item("om_deleted", "3900", "text", json!({"text":"Deleted"}));
+                deleted["deleted"] = json!(true);
+                items.push(deleted);
+                items.push(item("om_history_file", "3000", "file",
+                    json!({"file_key":"file_history","file_name":"fixture.txt"})));
+                items.push(item("om_history_image", "2000", "image", json!({"image_key":"img_history"})));
+                let mut text = item("om_history_text", "1000", "text", json!({"text":"Hi @_user_1"}));
+                text["mentions"] = json!([{"key":"@_user_1","id":"ou_friend","name":"Friend"}]);
+                items.push(text);
+                items.push(item("om_older", "0", "text", json!({"text":"Older"})));
+                Json(json!({"code":0,"data":{"items":items}})).into_response()
+            }))
+            .route("/open-apis/im/v1/messages/om_history_image/resources/img_history", get(|| async {
+                include_bytes!("../tests/fixtures/input.png").as_slice()
+            }))
+            .route("/open-apis/im/v1/messages/om_history_file/resources/file_history", get(|| async {
+                ([(axum::http::header::CONTENT_TYPE, "text/plain")], "Previous attachment")
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, fixture).await.unwrap() });
+        app.db.sync(|c| {
+            c.execute("INSERT INTO feishu_bot_identity(project_id,app_id,open_id) VALUES(?,'cli_fixture','ou_bot')", [&project.id])?;
+            Ok(())
+        })?;
+        let input = |id: &str, thread: &str, body: &str, parent: &str, resource| {
+            app.db.ingest_routed_bot(&project.id, "cli_fixture", "oc_fixture", id, body, &json!({
+                "file_key":resource,"kind":"image","source":{"chat_id":"oc_fixture","chat_type":"group",
+                    "thread_id":thread,"parent_id":parent,"create_time":"4000","message_type":"text",
+                    "mentions":[{"key":"@_user_1","id":{"open_id":"ou_bot"},"name":"Bot"}]}}))
+                .map(|id| id.unwrap())
+        };
+        for (source, thread) in [("om_chat", ""), ("om_thread", "omt_fixture"), ("om_denied", "omt_denied")] {
+            let id = input(source, thread, " @_user_1 \n", "", Value::Null)?;
+            assert_eq!(app.db.message(&id).await?.attachment["preceding_pending"], true);
+            assert!(crate::feishu::prepare_quote(&app).await?);
+            let mut message = app.db.message(&id).await?;
+            assert!(message.attachment["preceding_pending"].is_null());
+            if source == "om_denied" {
+                assert_eq!(message.attachment["preceding_messages"],
+                    json!({"status":"unavailable","reason":"permission_denied"}));
+            } else {
+                let items = message.attachment["preceding_messages"]["items"].as_array().unwrap();
+                assert_eq!(items.iter().map(|i| i["message_id"].as_str().unwrap()).collect::<Vec<_>>(),
+                    ["om_history_text", "om_history_image", "om_history_file"]);
+                assert_eq!(items[0]["body"], "Hi @Friend(ou_friend)");
+                if source == "om_chat" {
+                    let resources = crate::feishu::prepare_resources(&app, &message,
+                        std::time::Duration::from_secs(4), |_| None).await?;
+                    assert_eq!(resources.len(), 2);
+                    assert_eq!(resources[0]["cache_source_id"], "om_history_image");
+                    assert_eq!(resources[1]["cache_source_id"], "om_history_file");
+                    assert_eq!(fs::read_to_string(resources[1]["local_path"].as_str().unwrap())?, "Previous attachment");
+                    message = app.db.message(&id).await?;
+                    let origin = &message.id;
+                    app.db.sync(|c| {
+                        work::sync_inbound(c)?;
+                        let mut data = json!({});
+                        attach_quote(c, &project.id, Some(origin), &mut data, &mut 24000)?;
+                        let images = prepare_images(c, &project.id, Some(origin), &mut data)?;
+                        assert_eq!(images.len(), 1);
+                        assert_eq!(images[0].source_message_id, "om_history_image");
+                        let xml = event::event_envelope(origin, Some(origin), "user", data,
+                            trusted_source(c, &project.id, origin)?);
+                        assert!(xml.starts_with("<dauerbot_event "));
+                        let (direct, history) = xml.split_once("<preceding_messages>").unwrap();
+                        assert!(!direct.contains("<attachments>"));
+                        assert!(history.contains("Hi @Friend(ou_friend)"));
+                        assert!(history.contains("inline=\"true\""));
+                        assert!(history.contains("time=\"1970-01-01T00:00:02Z\""));
+                        let mut attachment = message.attachment.clone();
+                        attachment["resources"][0]["cache_source_id"] = json!("om_history_file");
+                        c.execute("UPDATE messages SET attachment=? WHERE id=?", params![attachment.to_string(),origin])?;
+                        assert!(prepare_images(c, &project.id, Some(origin), &mut json!({}))?.is_empty());
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        for (body, parent, resource) in [
+            ("@_user_1 please help", "", Value::Null),
+            ("@_user_1", "om_parent", Value::Null),
+            ("@_user_1", "", json!("img_direct")),
+        ] {
+            let id = input(&db::id(), "", body, parent, resource)?;
+            assert!(app.db.message(&id).await?.attachment["preceding_pending"].is_null());
+        }
+        server.abort();
+        Ok(())
     }
     #[tokio::test]
     async fn feishu_quote_cache_matches_exact_bot_chat_and_project() -> Result<()> {

@@ -214,7 +214,7 @@ fn trace_id(input: &str) -> String {
 
 pub(crate) struct Trace {
     exporter: Exporter,
-    inputs: Vec<(String, Option<String>)>,
+    inputs: Vec<(String, String, Option<String>)>,
     session: String,
     provider_key: String,
     root_output: Option<Value>,
@@ -234,7 +234,7 @@ impl Trace {
         project: &str,
         channel: &str,
         provider_key: &str,
-        inputs: Vec<(String, Option<String>)>,
+        inputs: Vec<(String, String, Option<String>)>,
     ) -> Self {
         let mut trace = Self {
             session: trace_id(&json!(["dauerbot.manager", project, channel]).to_string()),
@@ -255,9 +255,9 @@ impl Trace {
         trace
     }
 
-    pub(crate) fn set_inputs(&mut self, mut inputs: Vec<(String, Option<String>)>) {
+    pub(crate) fn set_inputs(&mut self, mut inputs: Vec<(String, String, Option<String>)>) {
         let secrets = self.secrets();
-        for (_, body) in &mut inputs {
+        for (_, _, body) in &mut inputs {
             *body = body
                 .take()
                 .filter(|_| self.exporter.includes_content())
@@ -289,7 +289,7 @@ impl Trace {
 
     fn payload(&self) -> Value {
         let end = self.ended.max(self.started);
-        let input_ids = self.inputs.iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let input_ids = self.inputs.iter().map(|(id, _, _)| id).collect::<Vec<_>>();
         let trace_id = trace_id(&self.root);
         let context = [
             text("langfuse.trace.name", TRACE_NAME),
@@ -312,7 +312,7 @@ impl Trace {
         let bodies = self
             .inputs
             .iter()
-            .filter_map(|(_, body)| body.as_deref())
+            .filter_map(|(_, _, body)| body.as_deref())
             .collect::<Vec<_>>();
         match bodies.as_slice() {
             [] => {}
@@ -330,7 +330,15 @@ impl Trace {
             "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":end.to_string(),
             "status":status(self.outcome),"attributes":root_attributes
         });
-        let admitted = self.inputs.iter().map(|(id, body)| {
+        let admitted = self.inputs.iter().map(|(id, kind, body)| {
+            let name = match kind.as_str() {
+                "user" => "manager.input.user",
+                "worker" => "manager.input.worker",
+                "timer" => "manager.input.timer",
+                "proposal" => "manager.input.proposal",
+                "background_tool_result" => "manager.input.tool_result",
+                _ => "manager.input",
+            };
             let mut attributes = vec![
                 text("langfuse.observation.type", "span"),
                 text("langfuse.observation.metadata.input_id", id),
@@ -339,7 +347,7 @@ impl Trace {
                 attributes.push(observation_content("langfuse.observation.input", body));
             }
             json!({
-                "spanId":span_id(),"name":"manager.user_input","kind":1,
+                "spanId":span_id(),"name":name,"kind":1,
                 "startTimeUnixNano":self.started.to_string(),"endTimeUnixNano":self.started.to_string(),
                 "status":{"code":1},"attributes":attributes
             })
@@ -554,7 +562,7 @@ fn number(key: &str, value: u64) -> Value {
 }
 
 #[cfg(test)]
-pub(crate) fn assert_input_export(inputs: Vec<(String, Option<String>)>, expected: &str) {
+pub(crate) fn assert_input_export(inputs: Vec<(String, String, Option<String>)>, expected: &str) {
     let exporter = Exporter::configured(Settings {
         enabled: true,
         include_content: true,
@@ -579,7 +587,7 @@ pub(crate) fn assert_input_export(inputs: Vec<(String, Option<String>)>, expecte
     assert_eq!(spans.len(), 2);
     for (span, name) in spans
         .iter()
-        .zip(["manager.interaction", "manager.user_input"])
+        .zip(["manager.interaction", "manager.input.user"])
     {
         assert_eq!(span["name"], name);
         assert!(
@@ -597,6 +605,26 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::Mutex;
+
+    #[test]
+    fn admitted_spans_use_event_kinds_without_recording_input_content() {
+        let exporter = Exporter::configured(Settings {
+            enabled: true,
+            public_key: "fixture-public".into(),
+            secret_key: "fixture-secret".into(),
+            ..Settings::default()
+        }).unwrap().unwrap();
+        let kinds = ["user", "worker", "timer", "proposal", "background_tool_result", "other"];
+        let mut trace = Trace::new(exporter, "project", "channel", "provider-key",
+            kinds.into_iter().map(|kind| (kind.into(), kind.into(), Some("private input".into()))).collect());
+        trace.export_on_drop = false;
+        let payload = trace.payload();
+        let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"].as_array().unwrap();
+        assert_eq!(spans[1..].iter().map(|span| span["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["manager.input.user", "manager.input.worker", "manager.input.timer", "manager.input.proposal",
+                "manager.input.tool_result", "manager.input"]);
+        assert!(!payload.to_string().contains("private input"));
+    }
 
     #[test]
     fn long_content_reaches_one_batch_trace_without_truncation() {
@@ -620,8 +648,8 @@ mod tests {
             "channel",
             "provider-credential",
             vec![
-                ("one".into(), Some(user.clone())),
-                ("two".into(), Some(user.clone())),
+                ("one".into(), "user".into(), Some(user.clone())),
+                ("two".into(), "user".into(), Some(user.clone())),
             ],
         );
         trace.export_on_drop = false;
@@ -665,7 +693,7 @@ mod tests {
             );
         }
         for span in &spans[1..3] {
-            assert_eq!(span["name"], "manager.user_input");
+            assert_eq!(span["name"], "manager.input.user");
             assert_eq!(
                 attribute(span, "langfuse.observation.input").unwrap()["stringValue"],
                 user
@@ -700,6 +728,7 @@ mod tests {
             "short-provider!",
             vec![(
                 "input".into(),
+                "user".into(),
                 Some(json!({"event":"user","data":{"body":"fixture-secret"}}).to_string()),
             )],
         );
@@ -755,7 +784,7 @@ mod tests {
             "project",
             "channel",
             "provider-credential",
-            vec![("input".into(), None)],
+            vec![("input".into(), "user".into(), None)],
         );
         trace.export_on_drop = false;
         trace.span("read_file", "tool").tool(
