@@ -1,6 +1,6 @@
 [package]
 name = "herdr-feishu-bridge"
-version = "0.6.18"
+version = "0.6.19"
 edition = "2024"
 rust-version = "1.95"
 description = "A local project daemon connecting Feishu to persistent HERDR agent sessions"
