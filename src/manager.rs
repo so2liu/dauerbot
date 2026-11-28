@@ -7,6 +7,7 @@ mod tools;
 mod channel;
 mod memory;
 mod session;
+mod reply;
 use crate::{
     App, db,
     db::Project,
@@ -123,6 +124,7 @@ pub fn migrate(c: &Connection, recover: bool) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS manager_input_claims(input_id TEXT PRIMARY KEY REFERENCES manager_inputs(id) ON DELETE CASCADE,run_id TEXT NOT NULL REFERENCES manager_runs(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS manager_claim_run ON manager_input_claims(run_id);")?;
     session::migrate(c)?;
     session::migrate_inputs(c)?;
+    reply::migrate(c)?;
     let transcript_recorded = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('manager_effects') WHERE name='transcript_recorded')",
         [], |row| row.get::<_, bool>(0),
@@ -781,6 +783,7 @@ fn write_file_checked(
     )
 }
 pub fn validate_outbox(c: &Connection, project: &str, attachment: &Value) -> Result<()> {
+    reply::validate_outbox(c, project, attachment)?;
     if let Some(revision) = attachment["manager_provider_revision"].as_i64() {
         let allowed: bool = c.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM manager_provider_config g JOIN projects p ON p.id=?
@@ -1056,6 +1059,7 @@ fn prompt_input(raw: &str, event_id: Option<&str>) -> Result<Value> {
 /// A durable claim survives process loss; the historical run/input join is not ownership.
 fn own_input(c: &Connection, run: &str, input: &str) -> Result<()> {
     c.execute("INSERT INTO manager_input_claims(input_id,run_id) VALUES(?,?) ON CONFLICT(input_id) DO UPDATE SET run_id=excluded.run_id", params![input, run])?;
+    reply::claim(c, input, run)?;
     ensure!(c.execute("UPDATE manager_inputs SET status='processing' WHERE id=? AND status IN ('queued','processing')", [input])? == 1, "Input is no longer claimable");
     Ok(())
 }
@@ -1429,6 +1433,11 @@ pub fn stop(c: &Connection, project: &str) -> Result<()> {
     c.execute(
         "UPDATE messages SET status='failed',error='Stopped by the user',updated_at=? WHERE project_id=? AND direction='out' AND status='pending' AND json_extract(attachment,'$.manager_receipt_origin') IS NOT NULL",
         params![db::now(), project],
+    )?;
+    c.execute(
+        "UPDATE manager_input_outcomes SET state='unreplied',deadline=NULL
+         WHERE state='delegated' AND input_id IN (SELECT id FROM manager_inputs WHERE project_id=?)",
+        [project],
     )?;
     let repairs=c.prepare("SELECT id FROM work_events WHERE project_id=? AND source='management' AND status='queued' AND json_extract(payload,'$.repair_incident') IS NOT NULL")?.query_map([project],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for id in repairs {

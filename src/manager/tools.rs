@@ -28,6 +28,7 @@ struct SendText {
     to: String,
     text: String,
     reply_to_message_id: Option<String>,
+    intent: Option<ReplyIntent>,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +37,14 @@ struct SendFile {
     to: String,
     path: String,
     reply_to_message_id: Option<String>,
+    intent: Option<ReplyIntent>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReplyIntent {
+    Progress,
+    Result,
 }
 
 #[derive(Deserialize)]
@@ -355,13 +364,13 @@ async fn perform(
                 .await
         }
         "send_md" | "send_file" => {
-            let (to, text, anchor, path) = if call.name == "send_md" {
+            let (to, text, anchor, path, intent) = if call.name == "send_md" {
                 let a: SendText = serde_json::from_value(call.arguments)?;
-                (a.to, a.text, a.reply_to_message_id, None)
+                (a.to, a.text, a.reply_to_message_id, None, a.intent)
             } else {
                 let a: SendFile = serde_json::from_value(call.arguments)?;
                 let path = crate::feishu::manager_file(&p, Path::new(&a.path))?;
-                (a.to, String::new(), a.reply_to_message_id, Some(path))
+                (a.to, String::new(), a.reply_to_message_id, Some(path), a.intent)
             };
             crate::feishu::recipient_type(&to)?;
             ensure!(
@@ -393,6 +402,9 @@ async fn perform(
                         crate::bot::get(&tx, &p.id)?.context("Connect this project's bot first")?;
                     let mut attachment =
                         json!({"to":to,"manager_effect":request,"reply_to_message_id":anchor});
+                    if matches!(intent, Some(ReplyIntent::Progress)) {
+                        attachment["discussion_intent"] = json!("progress");
+                    }
                     if let Some(path) = path {
                         attachment["path"] = json!(path);
                     }
@@ -534,12 +546,12 @@ pub(crate) fn definitions() -> Vec<ToolDefinition> {
         ),
         (
             "Send Markdown to a recipient or Feishu topic.",
-            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":reply_to}),
+            json!({"to":{"type":"string"},"text":{"type":"string"},"reply_to_message_id":reply_to,"intent":{"type":"string","enum":["progress","result"],"description":"Use progress for an interim status while the answer is outstanding. Use result for the answer."}}),
             vec!["to", "text"],
         ),
         (
             "Send a regular file to a recipient or Feishu topic. Relative paths start at the project workspace. Use send_md with the same anchor for accompanying text in a topic.",
-            json!({"to":{"type":"string"},"path":{"type":"string"},"reply_to_message_id":reply_to}),
+            json!({"to":{"type":"string"},"path":{"type":"string"},"reply_to_message_id":reply_to,"intent":{"type":"string","enum":["progress","result"],"description":"Use progress for an interim status while the answer is outstanding. Use result for the answer."}}),
             vec!["to", "path"],
         ),
         (

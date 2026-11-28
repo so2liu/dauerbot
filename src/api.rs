@@ -995,6 +995,29 @@ async fn outbox(
             {
                 attachment[crate::repair_lane::OUTBOX_KEY] = serde_json::to_value(lane)?;
             }
+            if input.source_event_id.is_none()
+                && input.intent.as_deref() != Some("progress")
+                && attachment["reply_to_message_id"].is_string()
+            {
+                // Copy the original provenance on retry, even when a legacy
+                // outbox entry was created before this metadata existed.
+                let saved: Option<Option<String>> = tx.query_row(
+                    "SELECT json_extract(attachment,'$.manager_compat_generation') FROM messages
+                     WHERE project_id=? AND direction='out' AND source_id=?",
+                    rusqlite::params![p.id,input.request_id], |row| row.get(0),
+                ).optional()?;
+                let generation = match saved {
+                    Some(previous) => previous,
+                    None if attachment[crate::repair_lane::OUTBOX_KEY].is_null()
+                        && crate::manager::uses_manager(&tx, &p.id)? => authority.as_ref()
+                            .filter(|a| a.generation == current.generation)
+                            .map(|a| a.generation.clone()),
+                    None => None,
+                };
+                if let Some(generation) = generation {
+                    attachment["manager_compat_generation"] = json!(generation);
+                }
+            }
             let binding = crate::bot::get(&tx, &p.id)?
                 .context("Connect a Feishu bot to this project first")?;
             if let Some(event) = &input.source_event_id {
