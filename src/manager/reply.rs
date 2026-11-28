@@ -185,7 +185,25 @@ fn has_reply(c: &Connection, project: &str, input: &str, route: &Route) -> Resul
            AND (f.run_id IN ({INPUT_RUNS})
                 OR json_extract(m.attachment,'$.discussion_scope')=?9
                 OR (json_extract(m.attachment,'$.task_worker_generation') IS NOT NULL AND
-                    json_extract(m.attachment,'$.reply_to_message_id')=?5))
+                    json_extract(m.attachment,'$.reply_to_message_id')=?5)
+                OR EXISTS(
+                    SELECT 1 FROM work_events e JOIN work_runs r ON r.event_id=e.id
+                    WHERE e.project_id=?1 AND e.source='management'
+                      AND json_extract(e.payload,'$.origin_event_id')=?9
+                      AND r.generation=json_extract(m.attachment,'$.manager_compat_generation')
+                      AND r.started_at<=m.created_at
+                      AND r.status IN ('submitted','running','settled','completed','uncertain')
+                      AND (json_extract(m.attachment,'$.reply_to_message_id')=?5 OR (
+                          (r.finished_at IS NULL OR r.finished_at>=m.created_at)
+                          AND NOT EXISTS(
+                              SELECT 1 FROM work_runs other JOIN work_events event ON event.id=other.event_id
+                              WHERE other.project_id=?1 AND other.generation=r.generation
+                                AND other.started_at<=m.created_at
+                                AND (other.finished_at IS NULL OR other.finished_at>=m.created_at)
+                                AND json_extract(event.payload,'$.origin_event_id') IS NOT ?9
+                          )
+                      ))
+                ))
          ORDER BY m.rowid DESC LIMIT 1"),
         params![project,route.app,route.chat,route.anchor,route.message,route.thread,route.direct,input,route.origin],
         |row| row.get(0),

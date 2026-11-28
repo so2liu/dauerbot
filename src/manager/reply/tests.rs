@@ -186,6 +186,37 @@ async fn uncertain_send_to_earlier_input_in_same_topic_prevents_replacement() ->
 }
 
 #[tokio::test]
+async fn compatibility_worker_reply_is_scoped_to_its_owned_work() -> Result<()> {
+    for status in ["sent", "uncertain"] {
+        let (_dir, app, project) = manager::tests::fixture().await;
+        let input = incoming(&app, &project.id, "om_user", "om_topic")?;
+        app.db.sync(|c| {
+            let tx = c.unchecked_transaction()?;
+            let turn = claim(&tx, &project.id, &input)?;
+            let delegated = manager::test_delegate(&tx, &project.id, "compat", Some(&input))?;
+            tx.execute(
+                "INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at)
+                 SELECT 'compat-work',project_id,task_id,id,'owned-gen','submitted',0,0
+                 FROM work_events WHERE id=?",
+                [&delegated],
+            )?;
+            let original = crate::db::enqueue_out_request(
+                &tx, &project.id, "cli_fixture", "native-reply", "Worker result",
+                json!({"to":"oc_fixture","reply_to_message_id":"om_topic",
+                       "manager_compat_generation":"owned-gen"}),
+            )?;
+            tx.execute("UPDATE messages SET status=? WHERE id=?", params![status,original])?;
+            finish(&tx, &turn, "Do not repeat the worker's reply.")?;
+            assert_eq!(outcome(&tx, &input)?, ("replied".into(), Some(original)));
+            assert_eq!(outbound_count(&tx, &project.id)?, 1);
+            tx.commit()?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn progress_and_replies_in_another_topic_do_not_satisfy_input() -> Result<()> {
     let (_dir, app, project) = manager::tests::fixture().await;
     let other_input = incoming(&app, &project.id, "om_other", "om_other_root")?;
