@@ -134,60 +134,89 @@ pub(super) fn validate_outbox(c: &Connection, project: &str, attachment: &Value)
         "Manager reply was stopped or superseded"
     );
     ensure!(
-        has_reply(c, project, input, &route)?.is_none() && !uncertain_send(c, input, &route)?,
+        has_reply(c, project, input, &route)?.is_none()
+            && !uncertain_send(c, project, input, &route)?,
         "A corresponding reply was already accepted or needs verification"
     );
     Ok(())
 }
 
-// A shared thread anchor is only evidence when the send belongs to this
-// input's turn. Independent workers can also attach the exact origin event.
+// Both admission checks resolve anchors from the same bot's inbound metadata
+// and sent receipts. A reply can target an earlier message within the topic.
+const TOPIC_ANCHORS: &str = "WITH inbound_topic AS (
+    SELECT source_id,json_extract(attachment,'$.source.parent_id') AS parent
+    FROM messages
+    WHERE project_id=?1 AND direction='in'
+      AND json_extract(attachment,'$.bot_app_id')=?2
+      AND json_extract(attachment,'$.source.chat_id')=?3
+      AND (json_extract(attachment,'$.source.root_id')=?4
+           OR json_extract(attachment,'$.source.thread_id')=?6)
+), topic(anchor) AS (
+    SELECT ?4 UNION SELECT ?5
+    UNION SELECT source_id FROM inbound_topic
+    UNION SELECT parent FROM inbound_topic
+    UNION SELECT json_extract(attachment,'$.sent_message_id') FROM messages
+       WHERE project_id=?1 AND direction='out' AND status='sent'
+         AND json_extract(attachment,'$.bot_app_id')=?2
+         AND json_extract(attachment,'$.sent_chat_id')=?3
+         AND (json_extract(attachment,'$.sent_root_id')=?4
+              OR json_extract(attachment,'$.sent_thread_id')=?6)
+)";
+
+const INPUT_RUNS: &str = "SELECT b.run_id FROM manager_run_inputs b
+    JOIN manager_inputs i ON i.id=b.input_id
+    WHERE b.input_id=?8 OR (i.project_id=?1 AND i.origin_event_id=?9 AND i.kind='worker'
+          AND json_extract(i.payload,'$.kind') IN ('worker_run','worker_intent'))";
+
 fn has_reply(c: &Connection, project: &str, input: &str, route: &Route) -> Result<Option<String>> {
     Ok(c.query_row(
-        "SELECT m.id FROM messages m
+        &format!("{TOPIC_ANCHORS} SELECT m.id FROM messages m
          LEFT JOIN manager_effects f ON f.id=m.source_id AND f.name IN ('send_md','send_file')
          WHERE m.project_id=?1 AND m.direction='out'
            AND m.status IN ('pending','sending','sent','uncertain')
            AND json_extract(m.attachment,'$.bot_app_id')=?2
-           AND (json_extract(m.attachment,'$.to') IN (?3,?8) OR json_extract(m.attachment,'$.sent_chat_id')=?3)
-           AND (json_extract(m.attachment,'$.reply_to_message_id') IN (?4,?5)
-                OR json_extract(m.attachment,'$.sent_thread_id')=?9
+           AND (json_extract(m.attachment,'$.to') IN (?3,?7) OR json_extract(m.attachment,'$.sent_chat_id')=?3)
+           AND (json_extract(m.attachment,'$.reply_to_message_id') IN (SELECT anchor FROM topic)
+                OR json_extract(m.attachment,'$.sent_thread_id')=?6
                 OR json_extract(m.attachment,'$.sent_root_id')=?4
-                OR (?8 IS NOT NULL AND json_extract(m.attachment,'$.reply_to_message_id') IS NULL)
-                OR EXISTS(SELECT 1 FROM messages a WHERE a.project_id=m.project_id
-                     AND a.direction='out' AND json_extract(a.attachment,'$.bot_app_id')=?2
-                     AND json_extract(a.attachment,'$.sent_chat_id')=?3
-                     AND json_extract(a.attachment,'$.sent_thread_id')=?9
-                     AND json_extract(a.attachment,'$.sent_message_id')=json_extract(m.attachment,'$.reply_to_message_id')))
+                OR (?7 IS NOT NULL AND json_extract(m.attachment,'$.reply_to_message_id') IS NULL))
            AND (m.status IN ('sending','uncertain')
                 OR COALESCE(json_extract(m.attachment,'$.discussion_intent'),'result')!='progress')
-           AND (
-             (f.id IS NOT NULL AND EXISTS(SELECT 1 FROM manager_run_inputs b
-                JOIN manager_inputs i ON i.id=b.input_id
-                WHERE b.run_id=f.run_id AND (b.input_id=?6 OR
-                   (i.origin_event_id=?7 AND i.kind='worker'
-                    AND json_extract(i.payload,'$.kind') IN ('worker_run','worker_intent')))))
-             OR json_extract(m.attachment,'$.discussion_scope')=?7
-             OR (json_extract(m.attachment,'$.task_worker_generation') IS NOT NULL AND
-                 json_extract(m.attachment,'$.reply_to_message_id')=?5)
-           )
-         ORDER BY m.rowid DESC LIMIT 1",
-        params![project,route.app,route.chat,route.anchor,route.message,input,route.origin,route.direct,route.thread],
+           AND (f.run_id IN ({INPUT_RUNS})
+                OR json_extract(m.attachment,'$.discussion_scope')=?9
+                OR (json_extract(m.attachment,'$.task_worker_generation') IS NOT NULL AND
+                    json_extract(m.attachment,'$.reply_to_message_id')=?5))
+         ORDER BY m.rowid DESC LIMIT 1"),
+        params![project,route.app,route.chat,route.anchor,route.message,route.thread,route.direct,input,route.origin],
         |row| row.get(0),
     ).optional()?)
 }
 
-fn uncertain_send(c: &Connection, input: &str, route: &Route) -> Result<bool> {
+fn uncertain_send(c: &Connection, project: &str, input: &str, route: &Route) -> Result<bool> {
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM manager_run_inputs b JOIN manager_effects f ON f.run_id=b.run_id
-          WHERE b.input_id=? AND f.name IN ('send_md','send_file')
+        &format!(
+            "{TOPIC_ANCHORS} SELECT EXISTS(SELECT 1 FROM manager_effects f
+          WHERE f.run_id IN ({INPUT_RUNS}) AND f.name IN ('send_md','send_file')
           AND (f.status IN ('submitting','uncertain')
                OR json_extract(f.result,'$.status') IN ('sending','uncertain')
                OR (json_extract(f.result,'$.status')='sent'
                    AND COALESCE(json_extract(f.arguments,'$.intent'),'result')!='progress'))
-          AND json_extract(f.arguments,'$.to') IN (?,?)
-          AND COALESCE(json_extract(f.arguments,'$.reply_to_message_id'),?) IN (?,?))",
-        params![input,route.chat,route.direct,route.anchor,route.anchor,route.message], |row| row.get(0),
+          AND json_extract(f.arguments,'$.to') IN (?3,?7)
+          AND (json_extract(f.arguments,'$.reply_to_message_id') IS NULL
+            OR json_extract(f.arguments,'$.reply_to_message_id') IN (SELECT anchor FROM topic)))"
+        ),
+        params![
+            project,
+            route.app,
+            route.chat,
+            route.anchor,
+            route.message,
+            route.thread,
+            route.direct,
+            input,
+            route.origin
+        ],
+        |row| row.get(0),
     )?)
 }
 
@@ -249,7 +278,7 @@ pub(super) fn finish(c: &Connection, context: &Context, final_text: &str) -> Res
             } else if outstanding(c, &context.project, &route.origin)? {
                 state = "delegated";
                 deadline = Some(now + DELEGATION_WAIT_MS);
-            } else if !uncertain_send(c, input, &route)? {
+            } else if !uncertain_send(c, &context.project, input, &route)? {
                 let text = final_text.trim();
                 let text = if text.is_empty()
                     || text.len() > crate::feishu::MAX_MARKDOWN_BYTES

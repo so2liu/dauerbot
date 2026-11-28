@@ -110,7 +110,9 @@ pub(super) fn reconcile(c: &Connection, now: i64) -> Result<()> {
         };
         let (state, outbox) = match has_reply(c, &candidate.project, &candidate.input, &route)? {
             Some(existing) => ("replied", Some(existing)),
-            None if uncertain_send(c, &candidate.input, &route)? => ("unreplied", None),
+            None if uncertain_send(c, &candidate.project, &candidate.input, &route)? => {
+                ("unreplied", None)
+            }
             None => (
                 "replied",
                 Some(enqueue(

@@ -155,6 +155,37 @@ async fn accepted_effects_suppress_finalize_even_after_a_reclaimed_turn() -> Res
 }
 
 #[tokio::test]
+async fn uncertain_send_to_earlier_input_in_same_topic_prevents_replacement() -> Result<()> {
+    for outbox_recorded in [true, false] {
+        let (_dir, app, project) = manager::tests::fixture().await;
+        incoming(&app, &project.id, "om_earlier", "om_topic")?;
+        let input = incoming(&app, &project.id, "om_current", "om_topic")?;
+        app.db.sync(|c| {
+            let tx = c.unchecked_transaction()?;
+            let turn = claim(&tx, &project.id, &input)?;
+            let original = send_effect(&tx, &turn, "om_earlier", "uncertain", "result")?;
+            if !outbox_recorded {
+                tx.execute("DELETE FROM messages WHERE id=?", [&original])?;
+            }
+            finish(&tx, &turn, "Do not repeat the first send.")?;
+            let expected = if outbox_recorded {
+                ("replied".into(), Some(original))
+            } else {
+                ("unreplied".into(), None)
+            };
+            assert_eq!(outcome(&tx, &input)?, expected);
+            assert_eq!(
+                outbound_count(&tx, &project.id)?,
+                i64::from(outbox_recorded)
+            );
+            tx.commit()?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn progress_and_replies_in_another_topic_do_not_satisfy_input() -> Result<()> {
     let (_dir, app, project) = manager::tests::fixture().await;
     let other_input = incoming(&app, &project.id, "om_other", "om_other_root")?;
