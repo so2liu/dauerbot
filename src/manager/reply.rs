@@ -144,7 +144,7 @@ pub(super) fn validate_outbox(c: &Connection, project: &str, attachment: &Value)
 // Both admission checks resolve anchors from the same bot's inbound metadata
 // and sent receipts. A reply can target an earlier message within the topic.
 const TOPIC_ANCHORS: &str = "WITH inbound_topic AS (
-    SELECT source_id,json_extract(attachment,'$.source.parent_id') AS parent
+    SELECT id,source_id,json_extract(attachment,'$.source.parent_id') AS parent
     FROM messages
     WHERE project_id=?1 AND direction='in'
       AND json_extract(attachment,'$.bot_app_id')=?2
@@ -193,8 +193,19 @@ fn has_reply(c: &Connection, project: &str, input: &str, route: &Route) -> Resul
                       AND r.generation=json_extract(m.attachment,'$.manager_compat_generation')
                       AND r.started_at<=m.created_at
                       AND r.status IN ('submitted','running','settled','completed','uncertain')
-                      AND (json_extract(m.attachment,'$.reply_to_message_id')=?5 OR (
+                      AND ((?5<>?4 AND json_extract(m.attachment,'$.reply_to_message_id')=?5) OR (
                           (r.finished_at IS NULL OR r.finished_at>=m.created_at)
+                          AND NOT EXISTS(
+                              SELECT 1 FROM inbound_topic anchor
+                              JOIN work_events source ON source.message_id=anchor.id
+                              JOIN work_events task ON task.project_id=?1 AND task.source='management'
+                                AND json_extract(task.payload,'$.origin_event_id')=source.id
+                              JOIN work_runs owning ON owning.event_id=task.id
+                              WHERE anchor.source_id=json_extract(m.attachment,'$.reply_to_message_id')
+                                AND anchor.source_id<>?4 AND source.id<>?9
+                                AND owning.generation=r.generation AND owning.started_at<=m.created_at
+                                AND owning.status IN ('submitted','running','settled','completed','uncertain')
+                          )
                           AND NOT EXISTS(
                               SELECT 1 FROM work_runs other JOIN work_events event ON event.id=other.event_id
                               WHERE other.project_id=?1 AND other.generation=r.generation

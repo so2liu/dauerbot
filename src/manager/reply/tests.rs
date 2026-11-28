@@ -190,6 +190,7 @@ async fn compatibility_worker_reply_is_scoped_to_its_owned_work() -> Result<()> 
     for status in ["sent", "uncertain"] {
         let (_dir, app, project) = manager::tests::fixture().await;
         let input = incoming(&app, &project.id, "om_user", "om_topic")?;
+        let next = incoming(&app, &project.id, "om_next", "om_topic")?;
         app.db.sync(|c| {
             let tx = c.unchecked_transaction()?;
             let turn = claim(&tx, &project.id, &input)?;
@@ -207,8 +208,20 @@ async fn compatibility_worker_reply_is_scoped_to_its_owned_work() -> Result<()> 
             )?;
             tx.execute("UPDATE messages SET status=? WHERE id=?", params![status,original])?;
             finish(&tx, &turn, "Do not repeat the worker's reply.")?;
-            assert_eq!(outcome(&tx, &input)?, ("replied".into(), Some(original)));
+            assert_eq!(outcome(&tx, &input)?, ("replied".into(), Some(original.clone())));
             assert_eq!(outbound_count(&tx, &project.id)?, 1);
+
+            tx.execute("UPDATE work_runs SET status='settled',finished_at=100 WHERE id='compat-work'", [])?;
+            tx.execute("UPDATE messages SET attachment=json_set(attachment,'$.reply_to_message_id','om_user') WHERE id=?", [&original])?;
+            let second = manager::test_delegate(&tx, &project.id, "compat-next", Some(&next))?;
+            tx.execute(
+                "INSERT INTO work_runs(id,project_id,task_id,event_id,generation,status,started_at,updated_at)
+                 SELECT 'next-work',project_id,task_id,id,'owned-gen','submitted',200,200
+                 FROM work_events WHERE id=?",
+                [&second],
+            )?;
+            let route = route(&tx, &project.id, &next)?.expect("fixture topic");
+            assert!(has_reply(&tx, &project.id, &next, &route)?.is_none());
             tx.commit()?;
             Ok(())
         })?;
