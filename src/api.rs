@@ -1004,7 +1004,7 @@ async fn outbox(
                 let saved: Option<Option<String>> = tx.query_row(
                     "SELECT json_extract(attachment,'$.manager_compat_generation') FROM messages
                      WHERE project_id=? AND direction='out' AND source_id=?",
-                    rusqlite::params![p.id,request], |row| row.get(0),
+                    rusqlite::params![p.id,input.request_id], |row| row.get(0),
                 ).optional()?;
                 let generation = match saved {
                     Some(previous) => previous,
