@@ -602,6 +602,7 @@ async fn drive_turn(
         let run = context.clone();
         let key = channel.to_owned();
         let finished = calls.is_empty();
+        let final_text = finished.then(|| rig_core::transcript::assistant_text_from_choice(&response.choice));
         let detached_result = app
             .db
             .call(move |c| {
@@ -638,7 +639,8 @@ async fn drive_turn(
                         [&id],
                     )?;
                 }
-                if finished {
+                if let Some(text) = final_text {
+                    reply::finish(&tx, &run, &text)?;
                     close_turn(&tx, &run)?;
                     recovered(&tx, &run)?;
                 }
@@ -687,9 +689,22 @@ pub(super) async fn run(app: Arc<App>) {
     tokio::spawn(autonomy::run(app.clone()));
     let mut tasks = tokio::task::JoinSet::new();
     let mut running = HashSet::new();
+    let mut receipts = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             _ = app.shutdown.cancelled() => break,
+            _ = receipts.tick() => {
+                if let Some(_permit) = app.service.manager_gate.enter()
+                    && let Err(error) = app.db.call(|c| {
+                        let tx = c.unchecked_transaction()?;
+                        reply::reconcile(&tx, db::now())?;
+                        tx.commit()?;
+                        Ok(())
+                    }).await
+                {
+                    tracing::warn!(%error, "Could not reconcile Manager reply outcomes");
+                }
+            }
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Ok(key)) = joined {
                     running.remove(&key);

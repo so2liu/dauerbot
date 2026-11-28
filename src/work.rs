@@ -158,6 +158,9 @@ pub fn migrate(c: &Connection) -> Result<()> {
           error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
           UNIQUE(project_id,source,source_id));
         CREATE INDEX IF NOT EXISTS work_event_queue ON work_events(project_id,status,created_at);
+        CREATE INDEX IF NOT EXISTS manager_outcome_delegations
+            ON work_events(project_id,json_extract(payload,'$.origin_event_id'))
+            WHERE source IN ('management','manager_worker') AND json_valid(payload);
         CREATE TABLE IF NOT EXISTS work_runs(
           id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
           task_id TEXT NOT NULL REFERENCES work_tasks(id) ON DELETE CASCADE,

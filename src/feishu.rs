@@ -142,6 +142,8 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+pub(crate) const MAX_MARKDOWN_BYTES: usize = 24_000;
+
 async fn send_json(
     request: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
 ) -> std::result::Result<Value, SendError> {
@@ -249,7 +251,7 @@ pub async fn send(
             json!({"file_key":v["data"]["file_key"].as_str().context("Missing file_key in the response").map_err(SendError::Uncertain)?}),
         )
     } else {
-        if m.content.len() > 24_000 {
+        if m.content.len() > MAX_MARKDOWN_BYTES {
             return Err(SendError::Precondition(anyhow::anyhow!(
                 "Markdown exceeds 24000 bytes; send it as a file"
             )));
